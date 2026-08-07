@@ -1,0 +1,27 @@
+# Configuration for tools/style_gate.py -- see code-style.md.
+#
+# Nothing here changes the rules. It says which files in *this* tree they
+# apply to.
+
+# Naming `Makefile` is what applies the tab rule to it and, more usefully,
+# brings it into the trailing-whitespace and final-newline checks at all --
+# a file with neither a suffix nor a shebang is otherwise not looked at.
+#
+# This is safe today because the Makefile has no `ifeq`/`ifdef`, whose body
+# must be SPACE-indented (a tab there reads as a recipe line). Add one and
+# the right answer changes: raise it rather than deleting this line to make
+# the gate quiet.
+indent_names = ["Makefile"]
+
+# ASCII for source, Markdown exempt -- which is exactly the global rule.
+# project.md is full of box-drawing, arrows and typographic dashes in its
+# measurement tables, and that is documentation doing what documentation may.
+# The Python and the Makefile are held to ASCII.
+ascii_only = true
+ascii_exclude_markdown = true
+
+# Below this the gate fails instead of passing, because "found nothing" in a
+# tree with sources means the file list collapsed, not that the tree came
+# back clean. Nine files match today; six is under the real count
+# deliberately, so adding a document does not require touching this.
+floor = 6

@@ -1,0 +1,17 @@
+# The translation target itself. Starfield.exe is a 102 MB copyrighted game
+# binary obtained through Steam; it is an input to this project, never a part
+# of it. Both the shipped and the Steamless-unpacked forms are named, because
+# the unpacked one is what the tooling actually reads and is the easy one to
+# add without thinking.
+Starfield.exe
+Starfield-unpacked.exe
+*.exe
+
+# Disassembly listings and scan output. `make scan` writes ~0.9 GB into
+# BUILD_DIR for a full .text listing, which is regenerable in about 30
+# seconds and has no business in history.
+build/
+*.asm
+
+__pycache__/
+*.pyc

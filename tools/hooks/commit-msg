@@ -1,0 +1,89 @@
+#!/bin/sh
+# Copied from ~/.claude/tools/commit-msg -- the source. Keep in sync;
+# fix drift the moment you notice it. Install with `make hooks`.
+# Commit message checks, following kernel practice.
+#
+# The copy that runs lives in .git/hooks, which is untracked; this one is in
+# the tree so it is reviewable, survives a clone, and can be diffed against
+# its siblings. `make hooks` installs it. Bypass with `git commit
+# --no-verify`, which is at least a decision rather than an accident.
+#
+# Two rules, and only two. An earlier version of this hook also rejected a
+# trailing period and any `word:` prefix, neither of which was ever asked
+# for, and rejected Signed-off-by, which is wanted -- it is the Developer
+# Certificate of Origin, and what a reviewer adds when taking responsibility
+# for a change.
+
+msg="$1"
+
+TOOLING='generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
+
+# What the prose check reads, and it is deliberately not the whole file.
+#
+# Two things are removed, for two different reasons.
+#
+# First, everything git is going to throw away: comment lines, and the diff
+# below the scissors line that `git commit -v` appends. Checking those
+# refuses a commit over text that will never be in it, and the case is not
+# hypothetical -- a change to THIS FILE shows its own vendor list in the
+# diff, so the hook refused every commit that edited it. (A message kept
+# with --cleanup=verbatim would retain comment lines; that is the one shape
+# where this is more lenient than the stored message.)
+#
+# Second, the directory name of the shared tooling tree, which is `.claude`.
+# Without this no commit could say where these files come from: this hook
+# lives at ~/.claude/tools/commit-msg, the style gate beside it, and the
+# guidelines under ~/.claude/guidelines/. Naming one read as a "tooling
+# reference" -- the rule firing on the one use it was never meant to cover,
+# where the workaround is to describe a path instead of writing it, making
+# the log vaguer exactly where it is trying to be exact.
+#
+# What is spared is exactly two NAMES: the directory `.claude`, written
+# with its leading dot, and the file `CLAUDE.md`. Neither is a plausible
+# spelling of attribution -- nobody credits a tool as ".claude" -- while
+# both are unavoidable when writing about these files. The bare vendor word
+# on its own is untouched and still refused.
+#
+# Only those names are neutralised, never the token around them. Stripping
+# whole path-shaped tokens instead would forgive anything hidden inside one,
+# and a trailer naming a vendor as the last element of a path under the tree
+# then passed; that was measured, and is why this is narrow.
+#
+# The trailer check below is deliberately left reading the raw message: it
+# keys on the trailer NAME rather than on any vendor, so a generated-by
+# trailer with any path at all is still refused.
+prose=$(sed -e '/^#.*>8/,$d' -e '/^#/d' "$msg" \
+	| sed -E 's#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
+
+# 1. No AI or tooling attribution. The single deviation from kernel practice,
+#    and it is absolute. Human co-authors and reviewers are fine; a generator
+#    is not an author and does not sign anything.
+if grep -qiE '^[[:space:]]*(assisted-by|generated-by|co-developed-by)[[:space:]]*:.*(claude|anthropic|copilot|chatgpt|gpt|gemini|llm|ai)\b' "$msg" \
+	|| grep -qiE '^[[:space:]]*(assisted-by|generated-by)[[:space:]]*:' "$msg"; then
+	echo "commit-msg: generator attribution trailer. A tool is not an author." >&2
+	grep -inE '^[[:space:]]*(assisted-by|generated-by|co-developed-by)[[:space:]]*:' "$msg" >&2
+	exit 1
+fi
+
+if printf '%s\n' "$prose" | grep -qiE "$TOOLING"; then
+	echo "commit-msg: tooling reference in the message." >&2
+	# Reported from the scrubbed text on purpose: the line is shown as the
+	# check read it, so what is left highlighted is the actual reason, not a
+	# path that was already forgiven.
+	printf '%s\n' "$prose" | grep -inE "$TOOLING" >&2
+	exit 1
+fi
+
+# 2. Subject at 75 columns, the kernel's limit, taken deliberately: it is what
+#    keeps `git log --oneline` and `git shortlog` readable at a terminal width.
+subject=$(sed -n '1p' "$msg")
+case "$subject" in
+	'#'*) exit 0 ;;
+esac
+if [ "${#subject}" -gt 75 ]; then
+	echo "commit-msg: subject is ${#subject} columns, limit is 75." >&2
+	echo "commit-msg:   $subject" >&2
+	exit 1
+fi
+
+exit 0
