@@ -196,7 +196,7 @@ HELPER_MNEMONICS = {
 #   vfmadd231 xmm1, xmm2, xmm3  ->  xmm1 = xmm2*xmm3 + xmm1
 #
 # All of these are NOT semantics-preserving: two roundings replace one.
-FMA_PATTERN = re.compile(r"^vf(n?)(madd|msub|maddsub|msubadd)(132|213|231)"
+FMA_PATTERN = re.compile(r"^vf(n?)(maddsub|msubadd|madd|msub)(132|213|231)"
                           r"([sp][sd])$")
 
 # Instructions with no lowering at all on this host. Each is a reason the
@@ -578,17 +578,57 @@ def lower_fma(match, registers, notes):
 	body = [f"movaps {factors[0]},{SCRATCH}", f"{mul} {factors[1]},{SCRATCH}"]
 	notes.append("needs a scratch register")
 
-	if operation == "maddsub":
-		notes.append("alternating add/sub across lanes -- addsubps, not addps")
-		body.append(f"{addsub} {addend},{SCRATCH}")
-		body.append(f"movaps {SCRATCH},{dst}")
-		return body, "F/addsub", notes
-	if operation == "msubadd":
-		notes.append("alternating sub/add -- the OPPOSITE lane pattern to "
-		             "addsubps, so the addend must be negated first; needs a "
-		             "sign-mask constant")
-		body.append(f"xorps signmask,{addend}")
-		body.append(f"{addsub} {addend},{SCRATCH}")
+	if operation in ("maddsub", "msubadd"):
+		# There is no addsubss or addsubsd. The FMA add/subtract forms are
+		# packed-only, so a scalar one is a decode error rather than a
+		# lowering problem.
+		if kind not in ("ps", "pd"):
+			return None, "F/addsub", notes + [
+				"no scalar addsub exists -- check the decode"]
+
+		if operation == "maddsub":
+			# SSE3 addsubps subtracts on the even lanes and adds on the
+			# odd ones, which is exactly what VFMADDSUB does. Confirmed by
+			# running it on the host rather than by reading the manual:
+			# {10,20,30,40} addsub {1,2,3,4} gives {9,22,27,44}.
+			notes.append("even lanes subtract, odd lanes add -- which is "
+			             "what addsubps already does")
+			body.append(f"{addsub} {addend},{SCRATCH}")
+			body.append(f"movaps {SCRATCH},{dst}")
+			return body, "F/addsub", notes
+
+		# VFMSUBADD is the opposite pattern -- even lanes add, odd lanes
+		# subtract -- and SSE has no instruction for it. Compute both
+		# results and blend: even lanes from the add, odd from the
+		# subtract.
+		#
+		# The obvious alternative is to negate the addend and reuse
+		# addsubps, since IEEE 754 makes a - b and a + (-b) the same
+		# operation, signed zeros included. **That is wrong, and it was
+		# caught by tests/fmaddsub_test.c rather than by reasoning.** The
+		# negation is a sign-bit flip across the whole register, and a NaN
+		# has a sign bit too; x86 propagates a source NaN with its sign
+		# preserved, so a NaN addend came out as ffc00000 where the
+		# hardware gives 7fc00000. 291 vectors in the special-value sweep
+		# disagreed, every one of them a NaN.
+		#
+		# Computing both and blending performs the very add and subtract
+		# the hardware does, so NaN propagation matches by construction.
+		# It also needs no sign-mask constant, which removes a whole
+		# requirement -- the rewriter does not have to add a read-only
+		# pool for this rule. Two more instructions across 14 sites.
+		blend = "blendps" if kind == "ps" else "blendpd"
+		selector = "$0xa" if kind == "ps" else "$0x2"
+		notes.append("even lanes add, odd lanes subtract -- the opposite of "
+		             "addsubps, so both results are computed and blended")
+		notes.append("NOT by negating the addend and reusing addsubps: that "
+		             "flips the sign bit of a NaN addend, which the hardware "
+		             "preserves")
+		notes.append("needs a second scratch, and no constant pool")
+		body.append(f"movaps {SCRATCH},{SCRATCH2}")
+		body.append(f"{add} {addend},{SCRATCH}")
+		body.append(f"{sub} {addend},{SCRATCH2}")
+		body.append(f"{blend} {selector},{SCRATCH2},{SCRATCH}")
 		body.append(f"movaps {SCRATCH},{dst}")
 		return body, "F/subadd", notes
 

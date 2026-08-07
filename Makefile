@@ -44,13 +44,15 @@ LISTING    = $(BUILD_DIR)/text.asm
 REPORT     = $(BUILD_DIR)/report.txt
 
 # The software F16C conversions. This is the only compiled code in the tree.
-OBJS       = $(BUILD_DIR)/f16c.o
-TEST_OBJS  = $(BUILD_DIR)/f16c_test.o
+OBJS       = $(BUILD_DIR)/f16c.o $(BUILD_DIR)/fmaddsub.o
+TEST_OBJS  = $(BUILD_DIR)/f16c_test.o $(BUILD_DIR)/fmaddsub_test.o
+TEST_BINS  = $(BUILD_DIR)/f16c_test $(BUILD_DIR)/fmaddsub_test
 TEST_BIN   = $(BUILD_DIR)/f16c_test
 DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
 .PHONY: all check style style-source style-docs verify check-f16c \
-        check-f16c-exhaustive check-f16c-oracle check-isa scan report \
+        check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-isa \
+        scan report \
         coverage hooks clean distclean help
 
 all: check
@@ -58,7 +60,7 @@ all: check
 # `check` is what must pass before committing. There is no test suite yet,
 # so it is the gate alone -- and it deliberately does not depend on `scan`,
 # which needs a binary a fresh clone does not have.
-check: style verify check-isa check-f16c check-f16c-oracle
+check: style verify check-isa check-f16c check-f16c-oracle check-fmaddsub
 
 style: style-source style-docs
 
@@ -90,6 +92,13 @@ check-f16c-exhaustive: $(TEST_BIN)
 check-f16c-oracle: $(TEST_BIN)
 	$(PYTHON) tools/f16c_oracle.py $(TEST_BIN)
 
+# The alternating-lane FMA lowerings. Separate from check-f16c because they
+# are a different rule with a different failure mode: F16C is an algorithm
+# that can be subtly inexact, while these are exact and can be subtly
+# BACKWARDS -- wrong on half the lanes, right on the other half.
+check-fmaddsub: $(BUILD_DIR)/fmaddsub_test
+	$(BUILD_DIR)/fmaddsub_test
+
 # The proof that matters for the translator: the code that replaces F16C
 # must not itself contain AVX or F16C. Checked by disassembling what was
 # actually built rather than by trusting the compiler flags -- a flag that
@@ -110,7 +119,10 @@ $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: tests/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
-$(TEST_BIN): $(TEST_OBJS) $(OBJS)
+$(BUILD_DIR)/f16c_test: $(BUILD_DIR)/f16c_test.o $(BUILD_DIR)/f16c.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD_DIR)/fmaddsub_test: $(BUILD_DIR)/fmaddsub_test.o $(BUILD_DIR)/fmaddsub.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 # Named explicitly, never bare. A bare `.SECONDARY:` applies to every target
@@ -188,8 +200,8 @@ hooks:
 # Named targets only. No `rm -rf` of a directory and no wildcard sweep: a
 # clean target is the one thing everybody runs without reading.
 clean:
-	rm -f $(LISTING) $(REPORT) $(OBJS) $(TEST_OBJS) $(TEST_BIN) $(DEPS)
-	@echo "clean: removed $(LISTING) $(REPORT) $(OBJS) $(TEST_OBJS) $(TEST_BIN) $(DEPS)"
+	rm -f $(LISTING) $(REPORT) $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
+	@echo "clean: removed $(LISTING) $(REPORT) $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@rmdir $(BUILD_DIR) 2>/dev/null || true
 
 # Adds only what this project's own tooling wrote. It does not sweep for
@@ -211,6 +223,8 @@ help:
 	@echo '              also all 2^32 singles; a couple of minutes'
 	@echo '  check-f16c-oracle'
 	@echo '              reference vs CPython binary16, an outside opinion'
+	@echo '  check-fmaddsub'
+	@echo '              the alternating-lane FMA lowerings'
 	@echo '  check-isa   prove the built object has no AVX, EVEX or F16C'
 	@echo '  scan        reproduce project.md from $$(TARGET) into $$(BUILD_DIR)'
 	@echo '  coverage    which VEX sites have a lowering rule, and the gaps'

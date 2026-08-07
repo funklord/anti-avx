@@ -204,9 +204,12 @@ this is where it breaks.
 **28 of the 421 are not plain FMA and Class F does not cover them.**
 `vfmaddsub231ps` (14) and `vfmsubadd231ps` (14) *alternate* add and subtract across
 the lanes of one vector. A `mulps` + `addps` sequence computes the wrong thing for
-half the elements, silently. They need `addsubps` (SSE3, present on Westmere) or a
-sign-flip mask, and they need their own rule written and tested separately. Lowering
-them with the Class F sequence is a correctness bug, not a precision one.
+half the elements, silently. Lowering them with the Class F sequence is a correctness
+bug, not a precision one — `tests/fmaddsub_test.c` demonstrates it rather than
+asserting it, by keeping the naive sequence around and checking it differs on exactly
+the two even lanes.
+
+**Written and tested: see Class F-addsub below.**
 
 ### Finding 5 — the binary contains real AVX-512, and it is dispatched
 
@@ -773,6 +776,71 @@ get the mapping from the SDM, not from intuition.
 
 If exact FP reproducibility matters anywhere (deterministic physics, replays, lockstep
 netcode), this rule is where it breaks. Flag every rewritten site so it can be audited.
+
+### Class F-addsub — alternating lanes (28 sites)
+
+`vfmaddsub` and `vfmsubadd` add on some lanes and subtract on others. The SDM, for
+the 231 forms:
+
+```
+VFMADDSUB231PS   even lanes  product - dst        odd lanes  product + dst
+VFMSUBADD231PS   even lanes  product + dst        odd lanes  product - dst
+```
+
+SSE3's `addsubps` subtracts on the even lanes and adds on the odd ones — exactly
+`VFMADDSUB`, exactly backwards for `VFMSUBADD`. That was **confirmed by running it**
+rather than read off the manual, because having it backwards is the failure the rule
+exists to prevent and the manual is what one misreads:
+
+```
+{10,20,30,40} addsubps {1,2,3,4}  ->  {9,22,27,44}       9 = 10-1, 22 = 20+2
+```
+
+**`vfmaddsub` (14 sites)** therefore needs nothing beyond `addsubps`:
+
+```
+vfmaddsub231ps %xmm2,%xmm1,%xmm0   →  movaps   %xmm1,%xmmT
+                                      mulps    %xmm2,%xmmT
+                                      addsubps %xmm0,%xmmT
+                                      movaps   %xmmT,%xmm0
+```
+
+**`vfmsubadd` (14 sites)** has no SSE instruction. Compute both and blend:
+
+```
+vfmsubadd231ps %xmm2,%xmm1,%xmm0   →  movaps   %xmm1,%xmmT
+                                      mulps    %xmm2,%xmmT
+                                      movaps   %xmmT,%xmmU
+                                      addps    %xmm0,%xmmT
+                                      subps    %xmm0,%xmmU
+                                      blendps  $0xa,%xmmU,%xmmT
+                                      movaps   %xmmT,%xmm0
+```
+
+> ⚠ **The obvious lowering is wrong, and testing is what found it.** Negating the
+> addend and reusing `addsubps` looks correct — IEEE 754 does make `a - b` and
+> `a + (-b)` the same operation, signed zeros included — and it is one instruction
+> shorter. But the negation is a sign-bit flip across the whole register, and **a NaN
+> has a sign bit too**. x86 propagates a source NaN with its sign preserved, so a NaN
+> addend came out of that sequence as `ffc00000` where the hardware gives `7fc00000`.
+> 291 vectors in the special-value sweep disagreed, every one of them a NaN.
+>
+> Computing both and blending performs the very add and subtract the hardware does,
+> so NaN propagation matches by construction rather than by argument. It also needs
+> **no sign-mask constant**, which removes a requirement the design would otherwise
+> have inherited: the rewriter does not have to add a read-only constant pool for
+> this rule. Two extra instructions across 14 sites is not a cost worth arguing about.
+
+Verification (`make check-fmaddsub`): the lane order checked directly; the naive
+sequence shown to differ on exactly the two even lanes; every combination of ten
+special values across the lanes, then a random tail, for `ps`; 200,000 vectors with
+signed zeros forced through both lanes for `pd`.
+
+**Unresolved, and narrowly so:** two lanes where *both* the product and the addend
+are NaN. Which NaN propagates depends on which operand the emitted instruction makes
+its destination, and that needs FMA hardware to settle. The exemption in the test is
+deliberately narrow — "both results are NaN" would have hidden the sign-flip bug
+above, so it requires both *inputs* to be NaN.
 
 ### Class H — hard, out-of-line helpers (87 sites)
 
