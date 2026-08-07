@@ -23,9 +23,14 @@ wins over the code.
 ## What exists
 
 ```
-project.md          the design, the measurements, and every open question
-code-style.md       style rules, copied from the global source
-tools/vex_scan.py   the operand-level scanner behind the figures in project.md
+project.md            the design, the measurements, and every open question
+code-style.md         style rules, copied from the global source
+tools/vex_scan.py     the operand-level scanner behind the figures in project.md
+tools/lower.py        the VEX to SSE lowering rules; 100% of sites covered
+tools/f16c_oracle.py  the reference checked against CPython's binary16
+src/f16c.c            software half-precision conversion, since Westmere has
+                      no F16C -- the only compiled code in the tree
+tests/f16c_test.c     exhaustive in both directions
 ```
 
 ## Reproducing the measurements
@@ -46,10 +51,13 @@ removes both files by name.
 ## Development
 
 ```sh
-make check      the style gate -- what must pass before committing
+make check      style gate, lowering proof, and the F16C tests
 make hooks      install the commit-msg hook into .git/hooks
 make help       every target
 ```
+
+`make check` needs no game binary. `make coverage` does, and exits non-zero while
+any VEX site lacks a lowering rule -- it is a gate rather than a report.
 
 ## Licence
 

@@ -171,6 +171,13 @@ SEQUENCE_MNEMONICS = {
 # Cross-lane operations with no compact SSE expression. At these counts a
 # call into a hand-written routine costs nothing measurable.
 HELPER_MNEMONICS = {
+	# F16C. The only rules here that are an algorithm rather than a
+	# substitution: Westmere has no half-precision instruction of any kind,
+	# so these call into src/f16c.c, which converts in integer arithmetic
+	# and with an explicitly-moded roundps so that nothing depends on MXCSR.
+	# See project.md, Finding 10.
+	"vcvtph2ps": "software half-to-single -- f16c_ph2ps_8 in src/f16c.c",
+	"vcvtps2ph": "software single-to-half -- f16c_ps2ph_8 in src/f16c.c",
 	"vpermilps": "immediate form is shufps; only variable control needs this",
 	"vpermilpd": "immediate form is shufpd; only variable control needs this",
 	"vperm2f128": "cross-lane, 256-bit only",
@@ -196,11 +203,6 @@ FMA_PATTERN = re.compile(r"^vf(n?)(madd|msub|maddsub|msubadd)(132|213|231)"
 # translator would have to refuse a binary, so the list is short by design
 # and every entry says what is actually missing.
 GAP_MNEMONICS = {
-	"vcvtph2ps": "F16C -- half-precision convert, Ivy Bridge and later. "
-	              "Westmere has no half-float instruction at all; this needs "
-	              "a software conversion routine.",
-	"vcvtps2ph": "F16C -- half-precision convert, Ivy Bridge and later. "
-	              "Same as vcvtph2ps: software, not a re-encoding.",
 	"vgatherdps": "AVX2 gather -- no SSE analogue; needs a scalar loop.",
 	"vgatherqps": "AVX2 gather -- no SSE analogue; needs a scalar loop.",
 	"vgatherdpd": "AVX2 gather -- no SSE analogue; needs a scalar loop.",

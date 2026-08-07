@@ -1,8 +1,12 @@
 # anti-avx -- ahead-of-time AVX to SSE binary translation.
 #
-# Nothing is compiled yet. The project is at the measurement stage, so this
-# file exists for the style gate, the git hooks, and `scan` -- the target
-# that reproduces every figure in project.md from the binary itself.
+# The only compiled code in the tree is src/f16c.c, the software
+# half-precision conversion that stands in for the F16C instructions
+# Westmere does not have. Everything else is analysis tooling in Python.
+#
+# So this file covers the style gate, the git hooks, the F16C tests, and
+# `scan` -- the target that reproduces every figure in project.md from the
+# binary itself.
 #
 # `scan` is the only target here that does real work, and it is deliberately
 # not part of `all` or `check`: it needs a 102 MB game binary that is not in
@@ -12,6 +16,16 @@
 PROJECT    = anti-avx
 PYTHON    ?= python3
 OBJDUMP   ?= objdump
+CC        ?= cc
+
+# -Os because size is what these projects optimise for. The ISA flags are
+# load-bearing rather than decoration: the whole point of this code is to
+# run where AVX and F16C do not exist, so the compiler is forbidden from
+# emitting either. -mno-f16c in particular stops it from "helpfully"
+# recognising the conversion idiom and emitting the very instruction the
+# code exists to replace.
+CFLAGS    ?= -Os -std=c11 -Wall -Wextra -msse4.1 -mno-avx -mno-f16c
+CPPFLAGS  += -Isrc -MMD -MP
 
 # Where build products land. Settable so an isolated run can be kept from
 # clobbering a plain one. BUILD_DIR is the canonical name across these
@@ -29,15 +43,22 @@ TARGET    ?= Starfield-unpacked.exe
 LISTING    = $(BUILD_DIR)/text.asm
 REPORT     = $(BUILD_DIR)/report.txt
 
-.PHONY: all check style style-source style-docs verify scan report coverage \
-        hooks clean distclean help
+# The software F16C conversions. This is the only compiled code in the tree.
+OBJS       = $(BUILD_DIR)/f16c.o
+TEST_OBJS  = $(BUILD_DIR)/f16c_test.o
+TEST_BIN   = $(BUILD_DIR)/f16c_test
+DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
+
+.PHONY: all check style style-source style-docs verify check-f16c \
+        check-f16c-exhaustive check-f16c-oracle check-isa scan report \
+        coverage hooks clean distclean help
 
 all: check
 
 # `check` is what must pass before committing. There is no test suite yet,
 # so it is the gate alone -- and it deliberately does not depend on `scan`,
 # which needs a binary a fresh clone does not have.
-check: style verify
+check: style verify check-isa check-f16c check-f16c-oracle
 
 style: style-source style-docs
 
@@ -45,6 +66,59 @@ style: style-source style-docs
 # game binary, so it belongs in `check` where `scan` and `coverage` do not.
 verify:
 	$(PYTHON) tools/lower.py verify
+
+# -- the software F16C conversions -------------------------------------------
+
+# Tests are built by the test target and by nothing else, so a plain build
+# stays fast. The cost of that choice is paid by the dependency rules below
+# being correct: -MMD -MP writes a .d beside every object, and every one of
+# them is read back, TEST OBJECTS INCLUDED. A test object whose .d is never
+# included does not rebuild when f16c.h changes, and the result is a test
+# binary built against one layout linking against another.
+check-f16c: $(TEST_BIN)
+	$(TEST_BIN)
+
+# All 2^32 singles rather than the default spread. A couple of minutes, and
+# a counted loop, so it terminates on its own; it is a separate target
+# because `make check` should not take minutes.
+check-f16c-exhaustive: $(TEST_BIN)
+	$(TEST_BIN) exhaustive
+
+# The reference checked against CPython's own binary16 support, which is the
+# only implementation on this machine that nobody here wrote. Exhaustive
+# over all 65,536 halves.
+check-f16c-oracle: $(TEST_BIN)
+	$(PYTHON) tools/f16c_oracle.py $(TEST_BIN)
+
+# The proof that matters for the translator: the code that replaces F16C
+# must not itself contain AVX or F16C. Checked by disassembling what was
+# actually built rather than by trusting the compiler flags -- a flag that
+# silently stopped applying would otherwise look exactly like a clean pass.
+check-isa: $(OBJS)
+	@$(OBJDUMP) -d $(OBJS) | awk -F'\t' 'NF>=3 { \
+		n = split($$2, b, " "); \
+		if (b[1] == "c4" || b[1] == "c5" || b[1] == "62") bad++ } \
+		/vcvtph2ps|vcvtps2ph/ { f16++ } \
+		END { \
+		  if (bad) { printf "check-isa: FAILED -- %d VEX/EVEX encodings\n", bad > "/dev/stderr"; exit 1 } \
+		  if (f16) { printf "check-isa: FAILED -- %d F16C instructions\n", f16 > "/dev/stderr"; exit 1 } \
+		  print "check-isa: no VEX, no EVEX, no F16C in the built object" }'
+
+$(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/%.o: tests/%.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(TEST_BIN): $(TEST_OBJS) $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
+
+# Named explicitly, never bare. A bare `.SECONDARY:` applies to every target
+# any pattern rule matches -- including the object pattern above -- and Make
+# then declines to rebuild a *missing* secondary whose dependant already
+# exists, which is how adding a source file leaves a stale binary and a
+# `make` that reports nothing to do.
+.SECONDARY: $(TEST_OBJS)
 
 style-source:
 	$(PYTHON) tools/style_gate.py
@@ -114,8 +188,8 @@ hooks:
 # Named targets only. No `rm -rf` of a directory and no wildcard sweep: a
 # clean target is the one thing everybody runs without reading.
 clean:
-	rm -f $(LISTING) $(REPORT)
-	@echo "clean: removed $(LISTING) $(REPORT)"
+	rm -f $(LISTING) $(REPORT) $(OBJS) $(TEST_OBJS) $(TEST_BIN) $(DEPS)
+	@echo "clean: removed $(LISTING) $(REPORT) $(OBJS) $(TEST_OBJS) $(TEST_BIN) $(DEPS)"
 	@rmdir $(BUILD_DIR) 2>/dev/null || true
 
 # Adds only what this project's own tooling wrote. It does not sweep for
@@ -132,6 +206,12 @@ help:
 	@echo '  check       the style gate -- what must pass before committing'
 	@echo '  style       indentation, whitespace and document checks'
 	@echo '  verify      assemble every lowering rule; prove no VEX survives'
+	@echo '  check-f16c  software half-precision conversions, exhaustive h->f'
+	@echo '  check-f16c-exhaustive'
+	@echo '              also all 2^32 singles; a couple of minutes'
+	@echo '  check-f16c-oracle'
+	@echo '              reference vs CPython binary16, an outside opinion'
+	@echo '  check-isa   prove the built object has no AVX, EVEX or F16C'
 	@echo '  scan        reproduce project.md from $$(TARGET) into $$(BUILD_DIR)'
 	@echo '  coverage    which VEX sites have a lowering rule, and the gaps'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
@@ -141,3 +221,9 @@ help:
 	@echo 'Variables:'
 	@echo '  BUILD_DIR   where products land (default: build)'
 	@echo '  TARGET      the binary to scan (default: Starfield-unpacked.exe)'
+
+# Every .d written by -MMD -MP above is read back here. Test objects are in
+# this list deliberately: leaving them out is the failure that produces a
+# test binary compiled against a stale header, which shows up as nonsense
+# assertion failures rather than as a build error.
+-include $(DEPS)

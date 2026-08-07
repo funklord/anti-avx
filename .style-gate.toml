@@ -22,6 +22,6 @@ ascii_exclude_markdown = true
 
 # Below this the gate fails instead of passing, because "found nothing" in a
 # tree with sources means the file list collapsed, not that the tree came
-# back clean. Nine files match today; six is under the real count
+# back clean. Thirteen files match today; eight is under the real count
 # deliberately, so adding a document does not require touching this.
-floor = 6
+floor = 8

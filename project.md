@@ -5,7 +5,8 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** design only. Nothing implemented.
+**Status:** design, measurement, and the lowering rules. The translator itself is not
+written. `src/f16c.c` is the only compiled code and is complete.
 
 ---
 
@@ -430,11 +431,16 @@ straight to 256-bit splitting, with no Class D term at all. Corrected below.
 cover. Over all 804,951 VEX sites:
 
 ```
-covered   804,939   99.9985%
+covered   804,939   99.9985%     <- before src/f16c.c existed
 gaps           12    0.0015%
   vcvtph2ps     8
   vcvtps2ph     4
 ```
+
+> **Resolved.** `src/f16c.c` implements both directions and Class H now calls
+> into it, so coverage is **804,951 of 804,951 -- 100.0000%, no gaps**. The
+> rest of this finding is why it was hard and what the routine had to avoid;
+> the verification is at the end of it.
 
 **Twelve sites, and they are the only ones in the binary with no lowering at all.**
 Both mnemonics are F16C -- half-precision float conversion, which arrived with Ivy
@@ -464,6 +470,55 @@ The loop mixes the hardware conversion with hand-rolled shift-and-mask sequences
 which suggests two pixel or sample formats being decoded side by side. Whatever it
 feeds, **it runs**, and a translated binary that ignores these twelve instructions
 faults exactly as the untranslated one does.
+
+#### The routine, and what it had to avoid
+
+`src/f16c.c`. The governing constraint turned out not to be the format but the
+floating-point environment: **nothing in it may depend on MXCSR.** `vcvtps2ph` takes
+its rounding mode from bits 2:0 of its own immediate, and the target uses 0 — round
+to nearest, ties to even — which ignores MXCSR entirely. Games routinely set
+flush-to-zero and denormals-are-zero for speed.
+
+That disqualifies the widely copied implementations. Giesen's `half_to_float_fast5`
+multiplies by a magic power of two and relies on exactly the denormal arithmetic DAZ
+switches off; `float_to_half_fast3` adds a magic constant and inherits whatever
+rounding mode MXCSR happens to hold. Both are correct in an ordinary process and
+wrong in the only kind of process this has to be correct in.
+
+So the routine uses integer arithmetic wherever the shift is constant, and `roundps`
+where it is not — `roundps` is SSE4.1, on Westmere, and takes its rounding mode from
+its own immediate rather than from MXCSR, which is precisely the property that lets
+it stand in for `vcvtps2ph`. The one float operation in each direction is a multiply
+by a power of two, which is exact under every rounding mode, on operands chosen so
+that no denormal ever arises: half-to-single scales integers in 0..1023, and
+single-to-half scales into 0..1024.
+
+#### Verification
+
+```
+all 65,536 halves          vector == scalar reference     exhaustive
+all 4,294,967,296 singles  vector == scalar reference     exhaustive, 48 s
+all 65,536 halves          reference == CPython binary16  exhaustive
+185,712 sampled singles    reference == CPython binary16  boundary-weighted
+built object               no VEX, no EVEX, no F16C       disassembled, not assumed
+```
+
+The second pair matters as much as the first. The vector code and the scalar
+reference were written by one hand on one afternoon, so however exhaustively they
+agree they are **one witness**: if the reference misunderstands the format, the
+vector code has been proved to misunderstand it identically. CPython's `struct` has
+supported binary16 as format `e` since 3.6 and is the closest thing to an
+independent implementation available on a machine with no F16C to ask.
+
+`check-isa` disassembles the built object rather than trusting `-mno-avx -mno-f16c`,
+because a compiler flag that silently stopped applying would look exactly like a
+clean pass.
+
+**What is still unverified: NaN payloads, against real silicon.** The routine
+preserves the payload and forces the quiet bit, per the SDM. CPython canonicalises
+NaN through a native float and so cannot confirm it — 2,044 halves and 252 singles
+differ from CPython in payload alone, with both sides NaN. Settling it needs an F16C
+machine, which is by definition not the translation target.
 
 Consequences:
 
@@ -549,10 +604,11 @@ assumes.
 AVX2-only ops with no SSE analogue, 32-bit PE, ELF, self-modifying code, packed
 executables.
 
-> **F16C cannot be scoped out.** `vcvtph2ps`/`vcvtps2ph` appear in ordinary
-> compiler output with no dispatcher in front of them (Finding 10), so they execute.
-> Twelve sites, and each needs a software conversion routine rather than a
-> substitution -- the only place in this design where that is true.
+> **F16C cannot be scoped out, and is not.** `vcvtph2ps`/`vcvtps2ph` appear in
+> ordinary compiler output with no dispatcher in front of them (Finding 10), so
+> they execute. Twelve sites, each needing a software conversion routine rather
+> than a substitution -- the only place in this design where that is true.
+> Implemented in `src/f16c.c`; see Finding 10 for the verification.
 
 > **EVEX is out of scope but it is *present*.** 179 AVX-512 instructions live in
 > `.text`, behind a CPUID/XGETBV dispatcher that never selects them on a non-AVX host
@@ -881,7 +937,7 @@ crash at an unpredictable moment.
 |---|---|---|---|
 | 0 | Full VEX inventory across all 58 MB of `.text` | Scope | **DONE** — see Measurements |
 | 0.5 | Operand-level re-measurement on the unpacked binary (`tools/vex_scan.py`) | Lowering rules can be costed and scoped from measured operand shapes, not a mnemonic histogram | **DONE** — Findings 5-8 |
-| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, 99.9985% coverage, every lowering assembles with no VEX left. The differential harness against an AVX host is not built. |
+| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. The differential harness against an AVX host is not built. |
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | |
@@ -938,10 +994,11 @@ the project's largest risk.
   Finding 6 rather than resolved, because the answer decides which document is wrong.
 - Does anything depend on exact FP reproducibility? Class F breaks bit-exactness, and
   `vfmaddsub`/`vfmsubadd` (28 sites) break *correctness* if lowered as plain FMA.
-- **New: who writes the F16C software routine, and is it correct at the edges?**
-  Finding 10. Half-float conversion is a well-known algorithm and a well-known place
-  to get denormals, infinities and NaNs wrong. It needs its own tests, not coverage
-  by the general harness.
+- ~~**Who writes the F16C software routine, and is it correct at the edges?**~~
+  **Resolved: `src/f16c.c`.** Exhaustive in both directions against a scalar
+  reference, and that reference checked against CPython's binary16. The one part
+  still unverified is NaN *payload* behaviour, which needs F16C hardware — see
+  Finding 10.
 - **New: the differential harness still has no AVX host.** `tools/lower.py verify`
   proves the emitted SSE assembles and contains no VEX; it does **not** prove the
   SSE computes what the VEX did. That needs either a machine with AVX or a software
