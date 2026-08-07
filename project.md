@@ -632,6 +632,33 @@ because it bears on whether a *correct* round-trip is achievable at all, and the
   the GNU assembler. That is a pipeline requirement nothing in this design had
   recorded.
 
+#### Reproducing the ddisasm prefix, without root
+
+Ddisasm is not in Debian and GrammaTech publish for Ubuntu `focal` only. The
+packages unpack into a prefix and run from there; nothing needs installing.
+
+```bash
+BASE=https://download.grammatech.com/gtirb/files/apt-repo/pool/stable
+UB=http://archive.ubuntu.com/ubuntu/pool/main
+mkdir -p prefix debs && cd debs
+curl -sSLO $BASE/d/ddisasm/ddisasm_1.9.5-focal_amd64.deb
+curl -sSLO $BASE/libg/libgtirb/libgtirb_2.3.2-focal_amd64.deb
+curl -sSLO $BASE/libg/libgtirb-pprinter/libgtirb-pprinter_2.2.5-focal_amd64.deb
+curl -sSLO $BASE/g/gtirb-pprinter/gtirb-pprinter_2.2.5-focal_amd64.deb
+curl -sSLO $BASE/libc/libcapstone-dev/libcapstone-dev_5.0.1_gt_amd64.deb
+# Debian 13 has Boost 1.83 and protobuf 3.21; focal's builds need these.
+curl -sSLO $UB/b/boost1.71/libboost-filesystem1.71.0_1.71.0-6ubuntu6_amd64.deb
+curl -sSLO $UB/b/boost1.71/libboost-program-options1.71.0_1.71.0-6ubuntu6_amd64.deb
+curl -sSLO $UB/p/protobuf/libprotobuf17_3.6.1.3-2ubuntu5.2_amd64.deb
+cd .. && for d in debs/*.deb; do dpkg-deb -x "$d" prefix/; done
+
+export DDISASM_PREFIX=$PWD/prefix
+make disassemble TARGET=Starfield-unpacked.exe
+```
+
+Do not link Debian's own Boost against these: 1.83 and 1.71 are not ABI
+compatible, so a symlink crashes rather than failing cleanly.
+
 #### Bounding it was not optional
 
 Two runs took 34 GB on a 47 GB machine. Unbounded, they would have gone to swap
