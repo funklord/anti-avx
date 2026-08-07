@@ -894,7 +894,84 @@ checked against eight high-bit rubbish patterns. Plus destination-aliases-source
 all 256, and a direct check that the 256-bit form stays inside its lanes: a cross-lane
 implementation would pass every 128-bit test and be wrong on all eight ymm sites.
 
-### Class H — hard, out-of-line helpers (25 cross-lane sites remain)
+### Class H-crosslane — the four cross-lane permutes (25 sites)
+
+The "genuinely hard" set shrinks one more time on inspection. Of the 25 sites, **22
+need no helper at all** once the 256-bit value is held as two 128-bit halves — which
+is what the Y-class representation already does. Only `vpermd` needs code.
+
+**`vperm2f128` (12 sites) is not a permute after the split.** Each output 128-bit lane
+is one of the four input lanes, or zero; the immediate just says which. Split into
+halves, it is at most two moves:
+
+```
+vperm2f128 $0x20,%ymm2,%ymm0,%ymm0   →  movaps lo(%ymm2),hi(%ymm0)
+vperm2f128 $0x1,%ymm0,%ymm0,%ymm0    →  a swap of the two halves
+```
+
+Ten of the twelve use `$0x1`, which swaps the halves and therefore needs a scratch —
+the second move would otherwise read the half the first has just overwritten. The
+rule reports that hazard rather than silently reordering, because which register is
+free is the allocator's business.
+
+**`vpermq` (6) and `vpermpd` (4) are immediate permutes of four 64-bit elements.**
+Cross-lane, but the control is a constant, so each output half is two chosen qwords
+and `shufpd` builds one from two registers in a single instruction — it takes the low
+result from the destination and the high result from the source. The two immediates
+that occur are both degenerate:
+
+```
+$0x4e   {2,3,0,1}   a half swap    →  two movaps, no shuffle at all
+$0x1b   {3,2,1,0}   a full reverse →  movaps + shufpd $1, per half
+```
+
+All ten sites take their source from memory, so in practice this is two loads and at
+most two shuffles.
+
+> `shufpd` on `vpermq`'s integer data crosses the SSE domain, which costs a cycle or
+> two on some parts and nothing at all in correctness. `punpck` pairs are the
+> alternative if it ever matters; at ten sites it does not.
+
+**`vpermd` (3 sites) is the only one needing a helper.** Eight 32-bit elements, a
+control *vector*, and any element free to come from anywhere.
+
+> ⚠ **Its operand order is the opposite of `vpermilps`.** objdump prints
+> `vpermd %ymm2,%ymm9,%ymm0` as *data, indices, dst* — `r/m` is the **data** — while
+> `vpermilps %xmm2,%xmm3,%xmm3` is *control, data, dst*, where `r/m` is the
+> **control**. The SDM sentences settle it: VPERMILPS "permutes values in xmm2 using
+> controls from xmm3/m128"; VPERMD "permutes doublewords in ymm3/m256 using indices
+> in ymm2". Both were decoded from real sites to be sure. Carrying the `vpermilps`
+> convention across gives a permute of the index vector by the data, which is
+> nonsense that still runs.
+
+`pshufb` permutes within one register; `vpermd` selects across two. The bridge is
+`pshufb`'s own zeroing rule — a control byte with bit 7 set writes zero — so each
+output half is built twice and merged:
+
+```
+from_low  = pshufb(data_low,  control with bit 7 set where index >= 4)
+from_high = pshufb(data_high, control with bit 7 set where index <  4)
+result    = from_low | from_high
+```
+
+Every element is non-zero in exactly one of the two, because bit 2 of the index
+decides which half it comes from and the two controls disagree on precisely that bit.
+The `or` then merges them with no blend and no mask register.
+
+**Every `vpermd` site in the binary is inside dispatched code.** All six lie between
+`0x1434d847d` and `0x1434d8f1d`, in the CPUID-gated checksum library of Finding 5 —
+including the three VEX-encoded `ymm` ones, not just the EVEX `zmm` ones. So none of
+them executes on a host without AVX2, and the helper is insurance rather than a hot
+path. It is written anyway: "unreachable" is an argument about control flow, and
+being correct is not.
+
+Verification (`make check-permd`) is **exhaustive over all 8^8 = 16,777,216 index
+combinations**, in under a second, with a rubbish pattern cycled through so every
+permutation is seen with several. Plus destination-aliases-source, and a direct check
+that every element can reach both halves. Both the index mask and the cross-lane merge
+were confirmed load-bearing by mutation: removing either makes the test fail.
+
+### Class H — F16C only (12 sites)
 
 `vpermilps` variable-control (23), `vpbroadcastd` (18), `vextracti128` (13),
 `vperm2f128` (12), `vpermq` (6), `vpermd` (6), `vpermpd` (4), `vinserti128` (3),

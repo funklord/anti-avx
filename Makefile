@@ -45,11 +45,11 @@ REPORT     = $(BUILD_DIR)/report.txt
 
 # The software F16C conversions. This is the only compiled code in the tree.
 OBJS       = $(BUILD_DIR)/f16c.o $(BUILD_DIR)/fmaddsub.o \
-             $(BUILD_DIR)/permil.o
+             $(BUILD_DIR)/permil.o $(BUILD_DIR)/permd.o
 TEST_OBJS  = $(BUILD_DIR)/f16c_test.o $(BUILD_DIR)/fmaddsub_test.o \
-             $(BUILD_DIR)/permil_test.o
+             $(BUILD_DIR)/permil_test.o $(BUILD_DIR)/permd_test.o
 TEST_BINS  = $(BUILD_DIR)/f16c_test $(BUILD_DIR)/fmaddsub_test \
-             $(BUILD_DIR)/permil_test
+             $(BUILD_DIR)/permil_test $(BUILD_DIR)/permd_test
 TEST_BIN   = $(BUILD_DIR)/f16c_test
 DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
@@ -65,7 +65,7 @@ all: check
 # so it is the gate alone -- and it deliberately does not depend on `scan`,
 # which needs a binary a fresh clone does not have.
 check: style verify check-isa check-f16c check-f16c-oracle check-fmaddsub \
-       check-permil
+       check-permil check-permd
 
 style: style-source style-docs
 
@@ -109,6 +109,12 @@ check-fmaddsub: $(BUILD_DIR)/fmaddsub_test
 check-permil: $(BUILD_DIR)/permil_test
 	$(BUILD_DIR)/permil_test
 
+# The vpermd cross-lane helper. Exhaustive over all 8^8 index combinations,
+# which takes a few seconds -- worth it, since sampling a permutation space
+# is how the awkward cases get missed.
+check-permd: $(BUILD_DIR)/permd_test
+	$(BUILD_DIR)/permd_test
+
 # The proof that matters for the translator: the code that replaces F16C
 # must not itself contain AVX or F16C. Checked by disassembling what was
 # actually built rather than by trusting the compiler flags -- a flag that
@@ -136,6 +142,9 @@ $(BUILD_DIR)/fmaddsub_test: $(BUILD_DIR)/fmaddsub_test.o $(BUILD_DIR)/fmaddsub.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/permil_test: $(BUILD_DIR)/permil_test.o $(BUILD_DIR)/permil.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD_DIR)/permd_test: $(BUILD_DIR)/permd_test.o $(BUILD_DIR)/permd.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 # Named explicitly, never bare. A bare `.SECONDARY:` applies to every target
@@ -240,6 +249,8 @@ help:
 	@echo '              the alternating-lane FMA lowerings'
 	@echo '  check-permil'
 	@echo '              the vpermilps variable-control helper, exhaustive'
+	@echo '  check-permd'
+	@echo '              the vpermd cross-lane helper, all 8^8 permutations'
 	@echo '  check-isa   prove the built object has no AVX, EVEX or F16C'
 	@echo '  scan        reproduce project.md from $$(TARGET) into $$(BUILD_DIR)'
 	@echo '  coverage    which VEX sites have a lowering rule, and the gaps'

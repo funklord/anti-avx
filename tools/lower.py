@@ -166,6 +166,10 @@ SEQUENCE_MNEMONICS = {
 	"vextracti128": "128-bit half extract -- Y-class, becomes a movdqa",
 	"vinserti128": "128-bit half insert -- Y-class, becomes a movdqa",
 	"vpermilps": "immediate control is shufps; variable control calls a helper",
+	"vperm2f128": "pure 128-bit lane selection -- moves, once halves are split",
+	"vpermq": "immediate 64-bit permute across four qwords -- shufpd pairs",
+	"vpermpd": "immediate 64-bit permute across four qwords -- shufpd pairs",
+	"vpermd": "variable 32-bit cross-lane permute -- calls src/permd.c",
 	"vzeroall": "zero all sixteen xmm registers, or the shadow slots",
 }
 
@@ -180,10 +184,6 @@ HELPER_MNEMONICS = {
 	"vcvtph2ps": "software half-to-single -- f16c_ph2ps_8 in src/f16c.c",
 	"vcvtps2ph": "software single-to-half -- f16c_ps2ph_8 in src/f16c.c",
 	"vpermilpd": "immediate form is shufpd; only variable control needs this",
-	"vperm2f128": "cross-lane, 256-bit only",
-	"vpermq": "cross-lane, 256-bit only",
-	"vpermd": "cross-lane, 256-bit only",
-	"vpermpd": "cross-lane, 256-bit only",
 	"vpermps": "cross-lane, 256-bit only",
 }
 
@@ -553,6 +553,27 @@ def lower_sequence(mnemonic, operands, notes):
 			body.append(f"movaps %xmm0,{dst}")
 		return body, "H/permil", notes
 
+	# The cross-lane permutes. Three of the four need no helper at all
+	# once the 256-bit value is held as two 128-bit halves, which is what
+	# the Y-class representation already does. `lo(r)` and `hi(r)` below
+	# name those halves the way `shadow(r)` names a Y2 slot.
+	if mnemonic == "vperm2f128":
+		return lower_perm2f128(imm, registers, notes)
+	if mnemonic in ("vpermq", "vpermpd"):
+		return lower_perm_qword(mnemonic, imm, registers, notes)
+	if mnemonic == "vpermd":
+		# objdump prints data, indices, dst -- r/m is the DATA here, the
+		# opposite of vpermilps. See src/permd.h.
+		if len(registers) != 3:
+			return None, "H/permd", notes + ["unexpected operand count"]
+		data, indices, dst = registers
+		notes.append("variable cross-lane permute -- calls the pshufb "
+		             "helper in src/permd.c")
+		notes.append("operand order is data, indices, dst -- the OPPOSITE "
+		             "of vpermilps, where r/m is the control")
+		notes.append(f"data={data} indices={indices} dst={dst}")
+		return ["call permd"], "H/permd", notes
+
 	# A compare whose AVX predicate has no SSE spelling and must be reversed.
 	predicate = compare_predicate(mnemonic)
 	if predicate is not None:
@@ -574,6 +595,87 @@ def lower_sequence(mnemonic, operands, notes):
 		return [f"xorps %xmm{n},%xmm{n}" for n in range(16)], "Z", notes
 
 	return None, "SEQUENCE", notes + ["sequence not implemented"]
+
+
+def lower_perm2f128(imm, registers, notes):
+	"""vperm2f128: each output 128-bit lane is one input lane, or zero.
+
+	Once the 256-bit values are held as two 128-bit halves this is not a
+	permute at all -- it is at most two moves. The immediate selects, for
+	each output half, one of the four input halves; bits 3 and 7 override
+	the selection with zero.
+	"""
+	if imm is None or len(registers) != 3:
+		return None, "Y/lane", notes + ["unexpected operand form"]
+	src2, src1, dst = registers
+	value = int(imm.lstrip("$"), 0)
+	sources = [f"lo({src1})", f"hi({src1})", f"lo({src2})", f"hi({src2})"]
+
+	notes.append("pure 128-bit lane selection -- no permute survives the "
+	             "split into halves")
+	body = []
+	for half, (shift, zero_bit) in enumerate(((0, 3), (4, 7))):
+		target = f"lo({dst})" if half == 0 else f"hi({dst})"
+		if value & (1 << zero_bit):
+			notes.append(f"bit {zero_bit} set: this half is zeroed, not moved")
+			body.append(f"xorps {target},{target}")
+		else:
+			source = sources[(value >> shift) & 3]
+			if source != target:
+				body.append(f"movaps {source},{target}")
+			else:
+				notes.append(f"{target} already holds what it needs")
+
+	# If the second move reads the half the first one just wrote, the
+	# sources have to be staged. Reported rather than silently reordered,
+	# because which register is free is the allocator's business.
+	if len(body) == 2 and body[0].startswith("movaps"):
+		written = body[0].rsplit(",", 1)[1]
+		if written in body[1]:
+			notes.append("the second move reads the half the first writes: "
+			             "stage through a scratch or emit in the other order")
+	return body, "Y/lane", notes
+
+
+def lower_perm_qword(mnemonic, imm, registers, notes):
+	"""vpermq and vpermpd: an immediate permute of four 64-bit elements.
+
+	Cross-lane, but the immediate is a constant, so each output half is two
+	chosen qwords and `shufpd` builds one from two registers in a single
+	instruction: it takes the low result from the destination and the high
+	result from the source.
+	"""
+	if imm is None or len(registers) != 2:
+		return None, "Y/permq", notes + ["unexpected operand form"]
+	src, dst = registers
+	value = int(imm.lstrip("$"), 0)
+	halves = (f"lo({src})", f"hi({src})")
+
+	notes.append("immediate control, so each output half is two chosen "
+	             "qwords and shufpd builds it in one instruction")
+	if mnemonic == "vpermq":
+		notes.append("shufpd on integer data crosses the SSE domain, which "
+		             "costs a cycle or two on some parts and nothing in "
+		             "correctness; punpck pairs are the alternative")
+
+	body = []
+	for half, shift in ((0, 0), (1, 4)):
+		first = (value >> shift) & 3
+		second = (value >> (shift + 2)) & 3
+		target = f"lo({dst})" if half == 0 else f"hi({dst})"
+		selector = (first & 1) | ((second & 1) << 1)
+		source_first = halves[first >> 1]
+		source_second = halves[second >> 1]
+		if selector == 2 and source_first == source_second:
+			# Identity: the low qword comes from the destination and the
+			# high one from the source, and both are the same register.
+			body.append(f"movaps {source_first},{target}")
+			continue
+		body.append(f"movaps {source_first},{target}")
+		body.append(f"shufpd ${selector:#x},{source_second},{target}")
+	notes.append("both output halves read both input halves, so they must "
+	             "be built before either is written back")
+	return body, "Y/permq", notes
 
 
 def lower_fma(match, registers, notes):
@@ -807,6 +909,7 @@ def verify():
 			                   .replace("%xmmU", "%xmm14")
 			                   .replace("signmask", "(%rsp)"))
 			text = re.sub(r"shadow\((%\w+)\)", r"(%rsp)", text)
+			text = re.sub(r"(?:lo|hi)\(%[xy](mm\d+)\)", r"%x\1", text)
 			samples.append((mnemonic, text))
 
 	body = "\n".join(f"\t{text}" for _m, text in samples)
@@ -868,6 +971,14 @@ def sample_operands(mnemonic):
 		return ["(%rsp)"]
 	if mnemonic == "vzeroall":
 		return []
+	# The cross-lane permutes: an immediate that actually crosses lanes, so
+	# verify() exercises the interesting arm rather than an identity.
+	if mnemonic == "vperm2f128":
+		return ["$0x21", "%ymm2", "%ymm1", "%ymm0"]
+	if mnemonic in ("vpermq", "vpermpd"):
+		return ["$0x1b", "%ymm1", "%ymm0"]
+	if mnemonic == "vpermd":
+		return ["%ymm2", "%ymm9", "%ymm0"]
 	# Splats take a memory or general-register source, never an xmm one --
 	# except the AVX2 register forms, which are covered by lower() itself.
 	if mnemonic in ("vbroadcastss", "vbroadcastsd", "vpbroadcastd"):
