@@ -377,6 +377,37 @@ dst is %xmm0                                     2,171   dst collides with the m
 (The first two overlap; the 608 is exact and is the expensive case — `%xmm0` holds a
 live value that has to be spilled around the blend.)
 
+**The majority case cannot use the obvious sequence at all**, which was found by
+building the rule and reading its output rather than by reasoning about it. The
+natural lowering is "save `%xmm0`, load the mask into it, move `src1` into `dst`,
+blend, restore `%xmm0`". When `dst` *is* `%xmm0` — 2,171 sites — that sequence
+destroys the mask on the third instruction and then destroys the result on the
+fifth. Both halves are wrong, and the output still assembles cleanly, so an
+assembler-level check does not catch it.
+
+The shapes and their correct sequences:
+
+```
+mask already in %xmm0        movaps src1,dst ; blendvps src2,dst
+                             cheapest -- nothing to save
+
+dst is %xmm0  (2,171)        movaps src1,%xmmT
+                             movaps mask,%xmm0        <- %xmm0 is dead, do not save it
+                             blendvps src2,%xmmT      <- blend in the scratch
+                             movaps %xmmT,%xmm0       <- and move back
+
+otherwise      (608 worst)   movaps %xmm0,%xmmT       <- save
+                             movaps mask,%xmm0
+                             movaps src1,dst
+                             blendvps src2,dst
+                             movaps %xmmT,%xmm0       <- restore
+```
+
+Two further aliases have to be handled by renaming rather than by ordering: if
+`src1` or `src2` is itself `%xmm0`, its value now lives in the scratch and the blend
+must refer to it there. The one case needing a **second** scratch is `dst == %xmm0`
+with `src2 == %xmm0`, where src2 has to be staged before the mask overwrites it.
+
 At 283 sites this was a footnote. At 3,542 it is a register-allocation problem in its
 own right, and it interacts directly with hard part 5: every one of these competes for
 the same scarce scratch registers as Y2 and the non-commutative C-alias sites.
@@ -392,6 +423,85 @@ The rule as written in Class D covers only the memory form, which is 735 of the 
 
 **Neither appears in milestone 0's cost model** — the table jumps from 3-operand movs
 straight to 256-bit splitting, with no Class D term at all. Corrected below.
+
+### Finding 10 — the binary needs F16C, which is not a re-encoding problem
+
+`tools/lower.py` carries a rule for every VEX mnemonic and reports what it cannot
+cover. Over all 804,951 VEX sites:
+
+```
+covered   804,939   99.9985%
+gaps           12    0.0015%
+  vcvtph2ps     8
+  vcvtps2ph     4
+```
+
+**Twelve sites, and they are the only ones in the binary with no lowering at all.**
+Both mnemonics are F16C -- half-precision float conversion, which arrived with Ivy
+Bridge in 2012. **Westmere does not have it**, confirmed against the host's own
+`/proc/cpuinfo` rather than from memory.
+
+This is a different kind of problem from everything else in this design. Every other
+rule is a re-encoding: the same operation exists in SSE and the work is getting the
+operands into the right registers. There is no SSE half-float instruction of any
+kind, so these need **a software conversion routine** -- shifts, masks, and explicit
+handling of denormals, infinities and NaNs.
+
+**They are not behind a dispatcher.** Unlike the AVX-512 of Finding 5, there is no
+`cpuid` or `xgetbv` anywhere in the surrounding 8 KB. They sit in ordinary compiler
+output at `0x142dc3aae`-`0x142dc3e27`, 127 bytes into a function, inside what is
+plainly a half-float decode loop:
+
+```
+vmovdqu   (%r10),%xmm6                 load packed halves
+vcvtph2ps (%r10,%rdx,1),%ymm10         hardware half -> single
+vpslld    $0x10,%xmm5,%xmm1            ... beside a manual shift-into-exponent
+vinsertf128 $0x1,%xmm1,%ymm0,%ymm8     rebuilt into 256-bit lanes
+vpand     %xmm5,%xmm14,%xmm1
+```
+
+The loop mixes the hardware conversion with hand-rolled shift-and-mask sequences,
+which suggests two pixel or sample formats being decoded side by side. Whatever it
+feeds, **it runs**, and a translated binary that ignores these twelve instructions
+faults exactly as the untranslated one does.
+
+Consequences:
+
+- **The hardware requirement is AVX2 *and* F16C**, not AVX2 alone. On Intel parts
+  that distinction never shows up -- F16C shipped a generation before AVX2, so
+  anything with AVX2 has it -- which is precisely why it goes unnoticed until
+  something tries to translate rather than run.
+- **A twelfth rule class is needed: software emulation.** It is the only place in
+  the design where correct output requires an algorithm rather than a substitution,
+  and the denormal and NaN cases are where such routines are usually wrong.
+- The sites are 256-bit, so they need the Y-class treatment as well.
+
+### Finding 11 — SSE has no greater-than compare, and the compiler used one
+
+AVX widened the compare predicate field from three bits to five. SSE has exactly
+eight predicates -- `eq lt le unord neq nlt nle ord` -- and the compiler emitted
+some of the twenty-four that only exist in AVX:
+
+```
+vcmpnle_uqps / vcmpnle_uqpd    4   quiet variant of nle
+vcmple_oqps  / vcmple_oqpd     4   quiet variant of le
+vcmpgt_oqps  / vcmpgt_oqpd     4   NO SSE EQUIVALENT
+```
+
+The `_oq`/`_uq` forms are the *quiet* variants of predicates SSE already has in
+signalling form. With floating-point exceptions masked -- which is every normal
+process -- they compute an identical result and differ only in whether a signalling
+NaN raises. Those eight lower by a mnemonic change and the difference is recorded
+rather than hidden.
+
+**`cmpgt` is the one that is not cosmetic.** There is no greater-than predicate in
+SSE at all, so it must become a less-than with **the operands exchanged** -- which
+changes which operand the destination has to hold and therefore interacts with the
+Class B/C rules. Four sites.
+
+This was not taken on trust: `as` rejects `cmpgtps %xmm1,%xmm0` outright with *no
+such instruction*, which is the assembler confirming the gap independently of the
+manual.
 
 ### Estimated cost of a translated binary
 
@@ -438,6 +548,11 @@ assumes.
 **Out of scope (v1):** AVX-512, EVEX, `vgather*`/`vperm*`/`vpsrav*` and other
 AVX2-only ops with no SSE analogue, 32-bit PE, ELF, self-modifying code, packed
 executables.
+
+> **F16C cannot be scoped out.** `vcvtph2ps`/`vcvtps2ph` appear in ordinary
+> compiler output with no dispatcher in front of them (Finding 10), so they execute.
+> Twelve sites, and each needs a software conversion routine rather than a
+> substitution -- the only place in this design where that is true.
 
 > **EVEX is out of scope but it is *present*.** 179 AVX-512 instructions live in
 > `.text`, behind a CPUID/XGETBV dispatcher that never selects them on a non-AVX host
@@ -766,7 +881,7 @@ crash at an unpredictable moment.
 |---|---|---|---|
 | 0 | Full VEX inventory across all 58 MB of `.text` | Scope | **DONE** — see Measurements |
 | 0.5 | Operand-level re-measurement on the unpacked binary (`tools/vex_scan.py`) | Lowering rules can be costed and scoped from measured operand shapes, not a mnemonic histogram | **DONE** — Findings 5-8 |
-| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | |
+| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, 99.9985% coverage, every lowering assembles with no VEX left. The differential harness against an AVX host is not built. |
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | |
@@ -823,6 +938,14 @@ the project's largest risk.
   Finding 6 rather than resolved, because the answer decides which document is wrong.
 - Does anything depend on exact FP reproducibility? Class F breaks bit-exactness, and
   `vfmaddsub`/`vfmsubadd` (28 sites) break *correctness* if lowered as plain FMA.
+- **New: who writes the F16C software routine, and is it correct at the edges?**
+  Finding 10. Half-float conversion is a well-known algorithm and a well-known place
+  to get denormals, infinities and NaNs wrong. It needs its own tests, not coverage
+  by the general harness.
+- **New: the differential harness still has no AVX host.** `tools/lower.py verify`
+  proves the emitted SSE assembles and contains no VEX; it does **not** prove the
+  SSE computes what the VEX did. That needs either a machine with AVX or a software
+  model of the VEX semantics, and until one exists milestone 1 is only half done.
 - ~~Does Starfield ship a Steam DRM wrapper?~~ **Resolved: yes.** `.bind`, 234 KB,
   owns the PE entry point. See "The hard parts" §4.
 - Is any of `.text` hand-written assembly or JIT-generated? Both break assumptions.

@@ -29,17 +29,22 @@ TARGET    ?= Starfield-unpacked.exe
 LISTING    = $(BUILD_DIR)/text.asm
 REPORT     = $(BUILD_DIR)/report.txt
 
-.PHONY: all check style style-source style-docs scan report hooks \
-        clean distclean help
+.PHONY: all check style style-source style-docs verify scan report coverage \
+        hooks clean distclean help
 
 all: check
 
 # `check` is what must pass before committing. There is no test suite yet,
 # so it is the gate alone -- and it deliberately does not depend on `scan`,
 # which needs a binary a fresh clone does not have.
-check: style
+check: style verify
 
 style: style-source style-docs
+
+# Assemble every lowering rule and prove no VEX prefix survives. Needs no
+# game binary, so it belongs in `check` where `scan` and `coverage` do not.
+verify:
+	$(PYTHON) tools/lower.py verify
 
 style-source:
 	$(PYTHON) tools/style_gate.py
@@ -72,6 +77,18 @@ $(LISTING): $(TARGET) | $(BUILD_DIR)
 $(REPORT): $(LISTING) tools/vex_scan.py | $(BUILD_DIR)
 	@echo "  vex_scan $< -> $@  (~75 s, ~1.1 GB RSS)"
 	$(PYTHON) tools/vex_scan.py $< > $@
+
+# Which VEX sites in the binary have a lowering rule, and which do not. The
+# gap list is the point: it is the set of instructions a translator would
+# have to refuse.
+#
+# This EXITS NON-ZERO while any gap remains, and that is deliberate -- it is
+# a gate, not a report. Twelve F16C sites are uncovered today (Finding 10),
+# so it fails today. Do not silence it with a `-` or a `|| true`: the whole
+# value of the target is that it goes quiet only when the binary can
+# actually be translated.
+coverage: $(LISTING)
+	$(PYTHON) tools/lower.py coverage $<
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -114,7 +131,9 @@ help:
 	@echo 'Targets:'
 	@echo '  check       the style gate -- what must pass before committing'
 	@echo '  style       indentation, whitespace and document checks'
+	@echo '  verify      assemble every lowering rule; prove no VEX survives'
 	@echo '  scan        reproduce project.md from $$(TARGET) into $$(BUILD_DIR)'
+	@echo '  coverage    which VEX sites have a lowering rule, and the gaps'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
 	@echo '  clean       remove the listing and the report'
 	@echo '  distclean   clean, plus __pycache__'
