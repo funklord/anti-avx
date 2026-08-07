@@ -32,6 +32,12 @@ CPPFLAGS  += -Isrc -MMD -MP
 # projects; do not introduce a synonym.
 BUILD_DIR ?= build
 
+# Bounds for the ddisasm run. The address-space cap is deliberately below
+# total RAM so that a run which does not fit is reported as a failed run
+# rather than absorbed by the machine.
+DDISASM_LIMIT_GB ?= 28
+DDISASM_TIMEOUT  ?= 3600
+
 # The translation target. Not in the repository -- see .gitignore. This is
 # the Steamless-unpacked form, which is what every measurement in project.md
 # was taken from; the shipped binary has a .bind DRM section that disassembles
@@ -57,7 +63,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
         check-isa \
         scan report \
-        coverage hooks clean distclean help
+        coverage disassemble hooks clean distclean help
 
 all: check
 
@@ -207,6 +213,24 @@ $(TARGET):
 	@echo "  Unpack it with Steamless first -- see project.md, hard part 4." >&2
 	@exit 1
 
+# -- disassembly (milestone 3) -----------------------------------------------
+
+# Ddisasm is not packaged for Debian and is not in this tree. Unpack
+# GrammaTech's focal builds into a scratch prefix and point DDISASM_PREFIX at
+# it; tools/run_ddisasm.sh does the rest. See project.md, Finding 12, for
+# what it needs and what happened.
+#
+# This target is NOT part of `check`, and not only because it needs the game
+# binary: on the real target it consumes tens of gigabytes and fails. The
+# bounds in run_ddisasm.sh are what keep that from taking the machine with
+# it, so do not invoke ddisasm directly to "save time".
+disassemble: | $(BUILD_DIR)
+	@test -n "$$DDISASM_PREFIX" || { \
+		echo "disassemble: set DDISASM_PREFIX to an unpacked ddisasm tree" >&2; \
+		exit 1; }
+	tools/run_ddisasm.sh $(TARGET) $(BUILD_DIR)/$(basename $(notdir $(TARGET))).gtirb \
+		$(DDISASM_LIMIT_GB) $(DDISASM_TIMEOUT)
+
 # -- git hooks ---------------------------------------------------------------
 
 # The hook lives in tools/hooks/ rather than only in .git/hooks so that it
@@ -254,6 +278,7 @@ help:
 	@echo '  check-isa   prove the built object has no AVX, EVEX or F16C'
 	@echo '  scan        reproduce project.md from $$(TARGET) into $$(BUILD_DIR)'
 	@echo '  coverage    which VEX sites have a lowering rule, and the gaps'
+	@echo '  disassemble ddisasm over $$(TARGET), under prlimit bounds'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
 	@echo '  clean       remove the listing and the report'
 	@echo '  distclean   clean, plus __pycache__'

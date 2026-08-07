@@ -561,6 +561,84 @@ This was not taken on trust: `as` rejects `cmpgtps %xmm1,%xmm0` outright with *n
 such instruction*, which is the assembler confirming the gap independently of the
 manual.
 
+### Finding 12 — milestone 3 does not pass on this machine
+
+**Ddisasm cannot disassemble the target here.** Two runs, both killed by
+`std::bad_alloc` at a peak RSS of **34.3 GB**, seven minutes in, in the *first*
+analysis phase.
+
+```
+address-space cap   outcome                        peak RSS    wall
+38 GB               std::bad_alloc -> SIGABRT       22.7 GB     3:16
+44 GB               std::bad_alloc -> SIGABRT       34.3 GB     7:00
+44 GB, -F           std::bad_alloc -> SIGABRT       34.3 GB     6:56
+```
+
+`-F` (skip function analysis) changes nothing, which locates the wall precisely: it
+is in `disassembly load`, the stage that builds the initial Datalog fact base, before
+any of the analyses `-F` would skip.
+
+**The requirement was measured rather than guessed.** Ddisasm was run over four PE
+binaries of increasing size and the cost normalised on instruction count, which is
+what actually drives it — `mshtml.dll` is larger than `wined3d.dll` on disk and
+cheaper to analyse, because most of it is not code:
+
+```
+binary          instructions   wall s   peak GB   s/Minsn   GB/Minsn
+user32.dll           156,062       28      0.84       179       5.38
+msxml3.dll           379,714       60      2.02       158       5.32
+wined3d.dll          457,842      143      2.90       312       6.33
+mshtml.dll           320,624       42      1.49       131       4.65
+                                                  mean 195       5.42
+```
+
+Starfield has **16,542,323 instructions — 36 times the largest sample**, which
+projects to roughly **54 minutes and 90 GB**. The observed failures are consistent
+with that: 34.3 GB consumed and still inside the first phase.
+
+**A 128 GB machine would very likely complete it.** Nothing here says the approach is
+impossible; it says the go/no-go cannot be answered on 47 GB. The extrapolation is a
+36-fold one from samples under half a million instructions, so treat 90 GB as an
+order-of-magnitude figure rather than a specification.
+
+#### The finding that matters more than the memory
+
+```
+WARNING: Input binary compiled with Profile Guided Optimization. (unsupported)
+```
+
+Ddisasm says so on every run, in the first half-second, and it is a statement about
+correctness rather than resources. PGO reorders basic blocks, splits functions into
+hot and cold fragments placed far apart, and duplicates code along hot paths — all of
+which attack exactly the code-discovery assumptions a static disassembler makes. A
+128 GB machine removes the memory wall and leaves this one standing.
+
+This deserves its own evaluation before any more is spent on the Ddisasm route,
+because it bears on whether a *correct* round-trip is achievable at all, and the
+744 data islands of Finding 8 are the ground truth to evaluate it against.
+
+#### What did work
+
+- **Ddisasm 1.9.5 runs on this host**, unpacked from GrammaTech's `focal` packages
+  into a scratch prefix with no root. It needs Ubuntu 20.04 Boost 1.71 and
+  `libprotobuf17`, which Debian 13 does not have; those come from the Ubuntu archive.
+  `tools/run_ddisasm.sh` runs it under `prlimit` and a `timeout`.
+- **Loading the 102 MB PE is not the problem.** With `-n` (no analysis) it parses in
+  1.2 s using 408 MB and writes a 130 MB GTIRB. The cost is entirely in the analysis.
+- **The round trip works end to end on small PEs.** `start.exe` (300 KB) goes to
+  GTIRB in 0.57 s and back out as assembly in 0.04 s.
+- **The output is MASM, not GAS.** For a PE target `gtirb-pprinter` emits
+  `INCLUDELIB` / `EXTERN name:PROC`, so reassembly needs `ml64` or `uasm` rather than
+  the GNU assembler. That is a pipeline requirement nothing in this design had
+  recorded.
+
+#### Bounding it was not optional
+
+Two runs took 34 GB on a 47 GB machine. Unbounded, they would have gone to swap
+rather than failing, which is the failure mode `running-code.md` exists to prevent.
+`prlimit --as` turned "the machine becomes unusable" into "the run reports
+`std::bad_alloc`", and the machine ended each attempt with 41 GB free and no orphans.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,
@@ -1144,7 +1222,7 @@ crash at an unpredictable moment.
 | 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. The differential harness against an AVX host is not built. |
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
-| 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | |
+| 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **FAILS on this hardware** — see Finding 12. Needs ~90 GB; the machine has 47. And ddisasm reports the binary as PGO-built, which it does not support. |
 | 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
@@ -1163,7 +1241,14 @@ the project's largest risk.
 
 ## Open questions
 
-- Does Ddisasm handle a 102 MB PE at all? Runtime and memory footprint unknown.
+- ~~Does Ddisasm handle a 102 MB PE at all? Runtime and memory footprint unknown.~~
+  **Resolved: not on 47 GB.** ~90 GB projected, `std::bad_alloc` at 34.3 GB observed.
+  Finding 12.
+- **New: does Ddisasm's lack of PGO support sink the approach?** It warns on every
+  run. This is the open question that now matters most, and it is a correctness
+  question rather than a capacity one.
+- **New: what assembles the output?** `gtirb-pprinter` emits MASM for a PE target, so
+  the reassembly step needs `ml64` or `uasm`, neither of which is on this machine.
 - ~~Is the 4 MB sample representative?~~ **No — resolved by milestone 0.** Real VEX
   density is 4.84%, not 12.4%, and the sample missed FMA and 256-bit arithmetic
   entirely. No `vpgather*` or `vpsrav*` anywhere, which was the main scoping fear.
