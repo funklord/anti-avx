@@ -165,6 +165,7 @@ SEQUENCE_MNEMONICS = {
 	"vinsertf128": "128-bit half insert -- Y-class, becomes a movaps",
 	"vextracti128": "128-bit half extract -- Y-class, becomes a movdqa",
 	"vinserti128": "128-bit half insert -- Y-class, becomes a movdqa",
+	"vpermilps": "immediate control is shufps; variable control calls a helper",
 	"vzeroall": "zero all sixteen xmm registers, or the shadow slots",
 }
 
@@ -178,7 +179,6 @@ HELPER_MNEMONICS = {
 	# See project.md, Finding 10.
 	"vcvtph2ps": "software half-to-single -- f16c_ph2ps_8 in src/f16c.c",
 	"vcvtps2ph": "software single-to-half -- f16c_ps2ph_8 in src/f16c.c",
-	"vpermilps": "immediate form is shufps; only variable control needs this",
 	"vpermilpd": "immediate form is shufpd; only variable control needs this",
 	"vperm2f128": "cross-lane, 256-bit only",
 	"vpermq": "cross-lane, 256-bit only",
@@ -515,6 +515,43 @@ def lower_sequence(mnemonic, operands, notes):
 			return [f"{move} {source},{dst}"], "Y/insert", notes
 		notes.append("upper half: writes the Y2 shadow slot for this register")
 		return [f"{move} {source},shadow({dst})"], "Y2/insert", notes
+
+	# vpermilps. The two forms could hardly be more different in cost: an
+	# immediate control is a plain shufps, while a variable control has no
+	# SSE instruction at all and calls out of line.
+	if mnemonic == "vpermilps":
+		if imm is not None:
+			# A single-source four-element permute. shufps takes its low
+			# two elements from the destination and its high two from the
+			# source, so aiming both at the same register makes it one.
+			data, dst = registers[0], registers[-1]
+			notes.append("immediate control is a shufps with both operands "
+			             "the same register -- no helper needed")
+			if data == dst:
+				return [f"shufps {imm},{dst},{dst}"], "D/permute", notes
+			return ([f"movaps {data},{dst}", f"shufps {imm},{dst},{dst}"],
+			        "D/permute", notes)
+
+		# Variable control. objdump prints control, data, dst -- the VEX
+		# vvvv field holds the DATA and r/m the CONTROL, which is the easy
+		# thing to get backwards.
+		if len(registers) != 3:
+			return None, "H/permil", notes + ["unexpected operand count"]
+		control, data, dst = registers
+		notes.append("variable control -- no SSE instruction; calls the "
+		             "pshufb helper in src/permil.c")
+		notes.append("the helper is written to clobber only %xmm0 and "
+		             "%xmm1 and no general register, which is what keeps "
+		             "the call site cheap")
+		body = []
+		if data != "%xmm0":
+			body.append(f"movaps {data},%xmm0")
+		if control != "%xmm1":
+			body.append(f"movaps {control},%xmm1")
+		body.append("call permilps_var")
+		if dst != "%xmm0":
+			body.append(f"movaps %xmm0,{dst}")
+		return body, "H/permil", notes
 
 	# A compare whose AVX predicate has no SSE spelling and must be reversed.
 	predicate = compare_predicate(mnemonic)

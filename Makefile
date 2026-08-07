@@ -44,14 +44,18 @@ LISTING    = $(BUILD_DIR)/text.asm
 REPORT     = $(BUILD_DIR)/report.txt
 
 # The software F16C conversions. This is the only compiled code in the tree.
-OBJS       = $(BUILD_DIR)/f16c.o $(BUILD_DIR)/fmaddsub.o
-TEST_OBJS  = $(BUILD_DIR)/f16c_test.o $(BUILD_DIR)/fmaddsub_test.o
-TEST_BINS  = $(BUILD_DIR)/f16c_test $(BUILD_DIR)/fmaddsub_test
+OBJS       = $(BUILD_DIR)/f16c.o $(BUILD_DIR)/fmaddsub.o \
+             $(BUILD_DIR)/permil.o
+TEST_OBJS  = $(BUILD_DIR)/f16c_test.o $(BUILD_DIR)/fmaddsub_test.o \
+             $(BUILD_DIR)/permil_test.o
+TEST_BINS  = $(BUILD_DIR)/f16c_test $(BUILD_DIR)/fmaddsub_test \
+             $(BUILD_DIR)/permil_test
 TEST_BIN   = $(BUILD_DIR)/f16c_test
 DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
 .PHONY: all check style style-source style-docs verify check-f16c \
-        check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-isa \
+        check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
+        check-isa \
         scan report \
         coverage hooks clean distclean help
 
@@ -60,7 +64,8 @@ all: check
 # `check` is what must pass before committing. There is no test suite yet,
 # so it is the gate alone -- and it deliberately does not depend on `scan`,
 # which needs a binary a fresh clone does not have.
-check: style verify check-isa check-f16c check-f16c-oracle check-fmaddsub
+check: style verify check-isa check-f16c check-f16c-oracle check-fmaddsub \
+       check-permil
 
 style: style-source style-docs
 
@@ -99,6 +104,11 @@ check-f16c-oracle: $(TEST_BIN)
 check-fmaddsub: $(BUILD_DIR)/fmaddsub_test
 	$(BUILD_DIR)/fmaddsub_test
 
+# The vpermilps variable-control helper. Its permutation space is small
+# enough to cover completely, so this is exhaustive rather than sampled.
+check-permil: $(BUILD_DIR)/permil_test
+	$(BUILD_DIR)/permil_test
+
 # The proof that matters for the translator: the code that replaces F16C
 # must not itself contain AVX or F16C. Checked by disassembling what was
 # actually built rather than by trusting the compiler flags -- a flag that
@@ -123,6 +133,9 @@ $(BUILD_DIR)/f16c_test: $(BUILD_DIR)/f16c_test.o $(BUILD_DIR)/f16c.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/fmaddsub_test: $(BUILD_DIR)/fmaddsub_test.o $(BUILD_DIR)/fmaddsub.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD_DIR)/permil_test: $(BUILD_DIR)/permil_test.o $(BUILD_DIR)/permil.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 # Named explicitly, never bare. A bare `.SECONDARY:` applies to every target
@@ -225,6 +238,8 @@ help:
 	@echo '              reference vs CPython binary16, an outside opinion'
 	@echo '  check-fmaddsub'
 	@echo '              the alternating-lane FMA lowerings'
+	@echo '  check-permil'
+	@echo '              the vpermilps variable-control helper, exhaustive'
 	@echo '  check-isa   prove the built object has no AVX, EVEX or F16C'
 	@echo '  scan        reproduce project.md from $$(TARGET) into $$(BUILD_DIR)'
 	@echo '  coverage    which VEX sites have a lowering rule, and the gaps'

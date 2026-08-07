@@ -842,7 +842,59 @@ its destination, and that needs FMA hardware to settle. The exemption in the tes
 deliberately narrow — "both results are NaN" would have hidden the sign-flip bug
 above, so it requires both *inputs* to be NaN.
 
-### Class H — hard, out-of-line helpers (87 sites)
+### Class H-permil — vpermilps with a control vector (23 sites)
+
+The immediate form is a `shufps` and is handled inline. The variable form has no SSE
+instruction, and is the one that needs a helper.
+
+What the instruction does, per element:
+
+```
+DEST[i] := SRC1[ SRC2[i][1:0] ]
+```
+
+Element `i` of the result is whichever element of the *data* operand the low two bits
+of element `i` of the *control* operand select. **Bits 31:2 of each control element
+are ignored**, which is part of the contract rather than a detail — the compiler does
+leave rubbish up there.
+
+> **Operand order is the easy thing to get backwards.** objdump prints the variable
+> form as `vpermilps %xmm2,%xmm3,%xmm3` — that is *control, data, dst*, because the
+> VEX `vvvv` field holds the **data** and `r/m` holds the **control**. Decoded from a
+> real site rather than assumed: `c4 e2 61 0c da` has `vvvv = 3`, `rm = 2`, and the
+> SDM reads "permute values in xmm2 using controls from xmm3/m128".
+
+**It is an in-lane permute.** The 256-bit form permutes within each 128-bit half
+independently, so it is exactly two calls and never a cross-lane shuffle. That is what
+keeps it cheap and separates it from `vperm2f128` and `vpermq`, which are the genuinely
+cross-lane ones.
+
+SSSE3's `pshufb` is already a variable-control permute — it just works on bytes. So
+the whole job is turning four element selectors into sixteen byte selectors:
+
+```
+pand   {3,3,3,3}                  bits 1:0 of each control element
+pslld  $2                         element index -> index of its first byte
+pshufb {0,0,0,0,4,4,4,4,8,8,8,8,12,12,12,12}
+                                  replicate that byte across its element
+paddb  {0,1,2,3} x4               ... and step through the four bytes
+pshufb <that>,data                the permute itself
+```
+
+> ⚠ **The `pand` is not optional.** Without it the shift can push a control bit into
+> position 7, and `pshufb` reads bit 7 of a control byte as *write zero here* — so an
+> element whose control happened to hold 32 comes back zeroed instead of permuted.
+> This is verified by mutation rather than by argument: building the helper with the
+> mask removed makes `tests/permil_test.c` fail on exactly the `0x20` and `0xfffffffc`
+> control patterns, which is the check being shown to be worth something.
+
+Verification (`make check-permil`) is **exhaustive over the permutation space** —
+four elements selected by two bits each is 4^4 = 256 permutations, and every one is
+checked against eight high-bit rubbish patterns. Plus destination-aliases-source for
+all 256, and a direct check that the 256-bit form stays inside its lanes: a cross-lane
+implementation would pass every 128-bit test and be wrong on all eight ymm sites.
+
+### Class H — hard, out-of-line helpers (25 cross-lane sites remain)
 
 `vpermilps` variable-control (23), `vpbroadcastd` (18), `vextracti128` (13),
 `vperm2f128` (12), `vpermq` (6), `vpermd` (6), `vpermpd` (4), `vinserti128` (3),
@@ -858,6 +910,13 @@ just `shufps` and needs no helper at all, so **Class H is 87 sites, not 137** �
 count that actually needs a hand-written stub is 87 rather than 138. Roughly a third of
 the "genuinely hard" set evaporates on inspection, which is the same lesson as
 `vzeroupper` in Finding 3.
+
+**Both forms are now implemented**, which splits the count again: the 50 immediate
+sites lower inline to `shufps` (class `D/permute`), and the 23 variable ones call the
+helper in `src/permil.c` (class `H/permil`). What is left genuinely needing a
+hand-written stub nobody has written yet is **25 cross-lane sites** —
+`vperm2f128` (12), `vpermq` (6), `vpermpd` (4), `vpermd` (3) — plus the 12 F16C sites,
+which are written. See Class H-permil below.
 
 ```
 requiring an out-of-line helper                     87
