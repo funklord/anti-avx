@@ -58,6 +58,22 @@ NOPS = {
 	8: b"\x0f\x1f\x84\x00\x00\x00\x00\x00",
 }
 
+def nop_padding(length):
+	"""Padding of any length, built from the longest nops available.
+
+	The table above stops at eight because that is all an in-place patch
+	ever needs. A detour window widened over a following instruction can
+	need more, and a KeyError there is a crash rather than a wrong answer
+	-- but only because the table was indexed directly. Compose instead.
+	"""
+	out = bytearray()
+	while length > 0:
+		take = min(length, 8)
+		out += NOPS[take]
+		length -= take
+	return bytes(out)
+
+
 # Instructions whose VEX form puts the DESTINATION in vvvv rather than in
 # the modrm reg field, which holds an opcode extension instead.
 #
@@ -284,7 +300,7 @@ def build_patches(listing, ranges=None):
 			# fixed, and a branch to the original start lands on the nop
 			# and falls straight through -- so both the entry address and
 			# the end address survive.
-			replacement = NOPS[-grew] + replacement
+			replacement = nop_padding(-grew) + replacement
 		if ranges is not None and not covered_by(ranges, address, len(encoding)):
 			stats["outside .pdata"] += 1
 			blocked[f"{mnemonic} (no unwind data)"] += 1

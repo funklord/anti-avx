@@ -43,6 +43,7 @@ from collections import Counter
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import lower
 import patch as inplace
+import targets as target_set
 
 JMP_REL32 = 0xE9
 SECTION_NAME = b".avxsse\0"
@@ -79,38 +80,171 @@ def encode_jump(from_end, to_address):
 	return bytes([JMP_REL32]) + struct.pack("<i", to_address - from_end)
 
 
-def build_stub(site, encoding, vex, tail, has_immediate, stub_address):
-	"""The stub body for one Class C site, placed at stub_address.
+def lower_vex(address, encoding, operands, mnemonic, at):
+	"""Lower one VEX instruction for execution at `at`. Bytes, or None.
 
-	Returns the bytes, or None if this site cannot be expressed.
+	Used for the Class C site itself and for a swallowed instruction that
+	turns out to be VEX too -- which most of them are, since VEX code comes
+	in runs. Copying such an instruction into a stub unchanged would leave
+	AVX in the output, which is the one thing the whole exercise is for.
+	Inside a stub there is room, so it is lowered rather than refused.
 	"""
-	destination, source = registers_of(vex, tail)
-	body = bytearray(encode_movaps(destination, source))
+	vex = inplace.decode_vex(encoding)
+	if vex is None:
+		return None
+	# **Only mnemonics with a direct SSE form.** Stripping a VEX prefix is
+	# a lowering only for those; for anything else it produces bytes that
+	# are not an instruction. vbroadcastss is the one that got through
+	# here: 0F 38 18 exists only under VEX, so `66 0f 38 18` decodes to
+	# nothing at all and the disassembler desynchronises from there.
+	# Class D, F and H need real sequences and belong in their own tools.
+	if mnemonic in inplace.DESTINATION_IN_VVVV:
+		return None
+	if (mnemonic not in lower.DIRECT_MNEMONICS
+			and mnemonic not in lower.NDS_MNEMONICS):
+		return None
+	tail = encoding[vex["length"]:]
+	if len(tail) < 2:
+		return None
+	fields = inplace.split_operands(operands)
+	registers = [o for o in fields if not o.startswith("$")]
+	has_immediate = len(registers) != len(fields)
+
+	body = bytearray()
+	if len(registers) == 3 and registers[-1] != registers[-2]:
+		destination, source = registers_of(vex, tail)
+		body += encode_movaps(destination, source)
+	elif len(registers) == 3:
+		pass				# destination already holds the first source
+	elif len(registers) != 2:
+		return None			# four-operand forms are not Class A/B/C
 
 	operation = inplace.sse_encoding(vex, tail)
 	if operation is None:
 		return None
 
 	if rip_relative(tail):
-		# The displacement is relative to the end of the instruction, and
-		# the instruction has moved. Recompute it against where it now
-		# ends. The field sits four bytes from the end, or five when an
+		# Relative to the end of the instruction, and the instruction has
+		# moved. The field sits four bytes from the end, or five when an
 		# immediate follows it.
 		offset = len(operation) - 4 - (1 if has_immediate else 0)
 		if offset < 0:
 			return None
 		old = struct.unpack_from("<i", operation, offset)[0]
-		target = site + len(encoding) + old
-		new_end = stub_address + len(body) + len(operation)
+		target = address + len(encoding) + old
+		new_end = at + len(body) + len(operation)
 		operation = (operation[:offset]
 		             + struct.pack("<i", target - new_end)
 		             + operation[offset + 4:])
 	body += operation
-
-	# Back to the instruction after the original, which is not the same as
-	# the instruction after the jump unless the site was exactly five bytes.
-	body += encode_jump(stub_address + len(body) + 5, site + len(encoding))
 	return bytes(body)
+
+
+def build_stub(site, encoding, operands, mnemonic, window, displaced,
+               stub_address):
+	"""The stub body for one site, placed at stub_address."""
+	body = bytearray()
+	lowered = lower_vex(site, encoding, operands, mnemonic, stub_address)
+	if lowered is None:
+		return None
+	body += lowered
+
+	for address, moved, comment, moved_operands, moved_mnemonic in displaced:
+		at = stub_address + len(body)
+		if moved and moved[0] in (0xC4, 0xC5):
+			# The swallowed instruction is VEX as well. Lower it here
+			# rather than carry it across.
+			fixed = lower_vex(address, moved, moved_operands, moved_mnemonic, at)
+		else:
+			# objdump comments a resolved target for several shapes, so the
+			# comment only means a RIP displacement when the operand says
+			# (%rip). Anything else copies across untouched.
+			rip = comment if "(%rip)" in moved_operands else None
+			fixed = relocate(moved, address, at, rip)
+		if fixed is None:
+			return None
+		body += fixed
+
+	# Back to the instruction after the WINDOW, which is not the instruction
+	# after the original once the window has been widened.
+	body += encode_jump(stub_address + len(body) + 5, site + window)
+	return bytes(body)
+
+
+CONTROL_PREFIXES = ("j", "call", "ret", "loop", "iret", "syscall", "sysret",
+                    "int", "ud", "hlt")
+
+
+def parse_with_comments(listing):
+	"""Like patch.parse_listing, but keeps objdump's resolved-target comment.
+
+	A displaced instruction that is RIP-relative has to have its
+	displacement recomputed, and the comment is where the absolute target
+	can be read without writing a full instruction decoder.
+	"""
+	pending = None
+	for line in open(listing, "r", errors="replace"):
+		parts = line.split("\t")
+		if len(parts) == 2 and pending is not None:
+			try:
+				pending[1].extend(bytes.fromhex(parts[1].strip()))
+			except ValueError:
+				pass
+			continue
+		if pending is not None:
+			yield (pending[0], bytes(pending[1]), pending[2], pending[3],
+			       pending[4])
+			pending = None
+		if len(parts) < 3:
+			continue
+		head = parts[0]
+		colon = head.rfind(":")
+		if colon < 0:
+			continue
+		try:
+			address = int(head[:colon].strip(), 16)
+		except ValueError:
+			continue
+		try:
+			encoding = bytes.fromhex(parts[1].strip())
+		except ValueError:
+			continue
+		body = parts[2]
+		comment = None
+		hash_at = body.find("#")
+		if hash_at >= 0:
+			trailing = body[hash_at + 1:].strip()
+			if trailing.startswith("0x"):
+				try:
+					comment = int(trailing.split()[0], 16)
+				except ValueError:
+					comment = None
+			body = body[:hash_at]
+		fields = body.strip().split(None, 1)
+		if not fields:
+			continue
+		pending = [address, bytearray(encoding), fields[0],
+		           (fields[1] if len(fields) > 1 else ""), comment]
+	if pending is not None:
+		yield (pending[0], bytes(pending[1]), pending[2], pending[3], pending[4])
+
+
+def relocate(encoding, old_address, new_address, rip_target):
+	"""An instruction copied to a new address, with its RIP displacement fixed.
+
+	Locating the displacement without decoding the instruction: it is the
+	four-byte little-endian value equal to `target - end`, and it is found
+	by searching for exactly that. Where it appears more than once the
+	position is ambiguous and the site is refused rather than guessed at.
+	"""
+	if rip_target is None:
+		return encoding
+	old = struct.pack("<i", rip_target - (old_address + len(encoding)))
+	first = encoding.find(old)
+	if first < 0 or encoding.find(old, first + 1) >= 0:
+		return None
+	new = struct.pack("<i", rip_target - (new_address + len(encoding)))
+	return encoding[:first] + new + encoding[first + 4:]
 
 
 def collect(binary, listing):
@@ -119,9 +253,26 @@ def collect(binary, listing):
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
 	nds = lower.NDS_MNEMONICS
 
+	# Everything anything can branch to. A window may not contain one of
+	# these anywhere but at its first byte.
+	groups = target_set.collect(binary)
+	blocked = set()
+	for values in groups.values():
+		blocked |= values
+	instructions = list(parse_with_comments(listing))
+	for i, (address, _e, mnemonic, operands, _c) in enumerate(instructions):
+		if mnemonic.startswith(("j", "call", "loop")) and operands:
+			first = operands.split()[0]
+			if first.startswith("0x"):
+				try:
+					blocked.add(int(first, 16))
+				except ValueError:
+					pass
+
 	candidates = []
 	skipped = Counter()
-	for address, encoding, mnemonic, operands in inplace.parse_listing(listing):
+	for index, (address, encoding, mnemonic, operands,
+	            _comment) in enumerate(instructions):
 		if not encoding or encoding[0] not in (0xC4, 0xC5):
 			continue
 		vex = inplace.decode_vex(encoding)
@@ -133,15 +284,40 @@ def collect(binary, listing):
 		registers = [o for o in fields if not o.startswith("$")]
 		if len(registers) != 3 or registers[-1] == registers[-2]:
 			continue			# not Class C
-		if len(encoding) < 5:
-			skipped["shorter than a jump"] += 1
-			continue
-		if not inplace.covered_by(ranges, address, len(encoding)):
+		has_immediate = any(o.startswith("$") for o in fields)
+		displaced = []
+		window = len(encoding)
+
+		if window < 5:
+			# Too short for a jump on its own. Widen over the instruction
+			# that follows, which is safe only when nothing can branch to
+			# it -- see tools/targets.py for how that set is built.
+			if index + 1 >= len(instructions):
+				skipped["nothing follows"] += 1
+				continue
+			nxt_address, nxt_encoding, nxt_mnemonic, _ops, nxt_comment = \
+				instructions[index + 1]
+			if nxt_address != address + window:
+				skipped["next instruction not adjacent"] += 1
+				continue
+			if nxt_address in blocked:
+				skipped["next instruction is a branch target"] += 1
+				continue
+			if nxt_mnemonic.startswith(CONTROL_PREFIXES):
+				skipped["next instruction transfers control"] += 1
+				continue
+			displaced.append((nxt_address, nxt_encoding, nxt_comment,
+			                  instructions[index + 1][3], nxt_mnemonic))
+			window += len(nxt_encoding)
+			if window < 5:
+				skipped["still too short"] += 1
+				continue
+
+		if not inplace.covered_by(ranges, address, window):
 			skipped["outside .pdata"] += 1
 			continue
-		candidates.append((address, encoding, vex,
-		                   encoding[vex["length"]:],
-		                   any(o.startswith("$") for o in fields)))
+		candidates.append((address, encoding, operands, mnemonic, window,
+		                   displaced))
 	return patches, candidates, stats, skipped
 
 
@@ -208,7 +384,7 @@ def main(argv):
 		return apply_all(argv[1], argv[2], argv[3])
 
 	if mode == "verify":
-		return verify(argv[1], argv[2])
+		return verify(argv[1], argv[2], argv[3] if len(argv) > 3 else None)
 
 	print(f"detour.py: unknown mode {mode!r}", file=sys.stderr)
 	return 2
@@ -246,32 +422,45 @@ def apply_all(binary, listing, output):
 
 	blob = bytearray()
 	placed = []
-	for site, encoding, vex, tail, has_immediate in candidates:
-		stub_address = stub_base + len(blob)
-		body = build_stub(site, encoding, vex, tail, has_immediate, stub_address)
-		if body is None:
+	# Windows must not overlap. Two Class C sites can sit next to each
+	# other, and then the first one's widened window swallows the second --
+	# which would otherwise be patched a second time, on top of the jump
+	# already written there. Taking them in address order and refusing any
+	# site that starts inside a committed window is the whole fix.
+	refused = overlapped = 0
+	committed_to = 0
+	for site, encoding, operands, mnemonic, window, displaced in sorted(candidates):
+		if site < committed_to:
+			overlapped += 1
 			continue
-		placed.append((site, encoding, stub_address))
+		stub_address = stub_base + len(blob)
+		body = build_stub(site, encoding, operands, mnemonic, window,
+		                  displaced, stub_address)
+		if body is None:
+			refused += 1
+			continue
+		placed.append((site, window, stub_address))
+		committed_to = site + window
 		blob += body
 
-	for site, encoding, stub_address in placed:
+	for site, window, stub_address in placed:
 		offset = raddr + (site - vaddr)
 		jump = encode_jump(site + 5, stub_address)
-		pad = len(encoding) - 5
-		data[offset:offset + len(encoding)] = jump + (
-			inplace.NOPS[pad] if pad else b"")
+		pad = window - 5
+		data[offset:offset + window] = jump + inplace.nop_padding(pad)
 
 	image, section_va = add_section(bytes(data), SECTION_NAME, bytes(blob),
 	                                SECTION_FLAGS)
 	assert section_va == stub_base - image_base, "stub section moved"
 	open(output, "wb").write(image)
-	print(f"apply: {len(patches):,} in-place patches, {len(placed):,} detours")
+	print(f"apply: {len(patches):,} in-place patches, {len(placed):,} detours, "
+	      f"{overlapped:,} skipped for overlap, {refused:,} refused")
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "
 	      f"{len(blob):,} bytes")
 	return 0
 
 
-def verify(original, patched):
+def verify(original, patched, listing=None):
 	a = open(original, "rb").read()
 	b = open(patched, "rb").read()
 	problems = 0
@@ -290,15 +479,51 @@ def verify(original, patched):
 	print(f"verify: VEX in .text {len(before_vex):,} -> {len(after_vex):,}"
 	      f"  ({len(before_vex) - len(after_vex):,} removed, "
 	      f"{100.0 * (len(before_vex) - len(after_vex)) / len(before_vex):.1f}%)")
+	# Boundaries. A widened window deliberately swallows the instruction
+	# after the site, so that address stops being a boundary -- which is
+	# intended, and is exactly the thing that has to be justified rather
+	# than tolerated. Every lost boundary must be one that was swallowed on
+	# purpose, and none of them may be somewhere anything can branch to.
 	lost = before_bounds - after_bounds
-	if lost:
-		print(f"verify: FAILED -- {len(lost):,} instruction boundaries lost",
-		      file=sys.stderr)
-		for address in sorted(lost)[:8]:
+	if listing is None:
+		if lost:
+			print(f"verify: {len(lost):,} boundaries lost; pass the listing "
+			       "to check they were swallowed deliberately")
+		return 1 if problems else 0
+
+	_patches, candidates, _stats, _skipped = collect(original, listing)
+	swallowed = set()
+	committed_to = 0
+	for site, _encoding, _operands, _mnemonic, window, displaced in sorted(candidates):
+		if site < committed_to:
+			continue			# same overlap rule apply() uses
+		committed_to = site + window
+		for address, _moved, _comment, _ops, _mn in displaced:
+			swallowed.add(address)
+	groups = target_set.collect(original)
+	reachable = set()
+	for values in groups.values():
+		reachable |= values
+
+	unexplained = lost - swallowed
+	if unexplained:
+		print(f"verify: FAILED -- {len(unexplained):,} boundaries lost that "
+		      f"were not swallowed on purpose", file=sys.stderr)
+		for address in sorted(unexplained)[:8]:
 			print(f"    0x{address:x}", file=sys.stderr)
 		problems += 1
 	else:
-		print(f"verify: all {len(before_bounds):,} .text boundaries preserved")
+		print(f"verify: {len(lost):,} boundaries lost, every one an "
+		      f"instruction a widened window swallowed deliberately")
+
+	dangerous = swallowed & reachable
+	if dangerous:
+		print(f"verify: FAILED -- {len(dangerous):,} swallowed instructions "
+		      f"are branch targets", file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: none of the {len(swallowed):,} swallowed instructions "
+		      f"is reachable by any branch")
 
 	done = subprocess.run(["objdump", "-d", "-j", ".avxsse", patched],
 	                      capture_output=True, text=True, errors="replace")

@@ -269,8 +269,8 @@ $(DETOURED): $(TARGET) $(LISTING) tools/detour.py tools/patch.py | $(BUILD_DIR)
 
 detour: $(DETOURED)
 
-detour-verify: $(DETOURED)
-	$(PYTHON) tools/detour.py verify $(TARGET) $(DETOURED)
+detour-verify: $(DETOURED) $(LISTING)
+	$(PYTHON) tools/detour.py verify $(TARGET) $(DETOURED) $(LISTING)
 
 # -- git hooks ---------------------------------------------------------------
 

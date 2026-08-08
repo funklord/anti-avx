@@ -894,9 +894,9 @@ packs `Characteristics` as the last four bytes of a 40-byte entry, and one field
 many in the pack wrote it past the end. The section came out `READONLY, NOREAD` rather
 than executable — which objdump says plainly and nothing else would have.
 
-#### What remains
+#### What remained after this stage
 
-142,470 VEX instructions, so the binary still faults:
+142,470 VEX instructions, before the windows were widened (Finding 16):
 
 ```
 class C shorter than a jump     91,039   needs the indirect-target problem solved
@@ -909,6 +909,88 @@ EVEX passthrough                   287   correct as is
 ```
 
 Nothing here has been executed, and the invariants remain structural.
+
+### Finding 16 — the indirect branch targets can be enumerated
+
+Finding 15 stopped at the 91,039 four-byte Class C sites because widening a detour
+window past the instruction it replaces needs to know nothing branches into the
+window, and indirect branches are not in the disassembly. They can largely be
+enumerated, and `tools/targets.py` does it from four sources:
+
+```
+.reloc  (absolute pointers)      91,617   COMPLETE, not a heuristic
+.pdata  (function starts)       236,427   complete for what it covers
+.xdata  (EH handlers)                 6
+switch tables (3,009 found)      14,789   inferred, see below
+union                           276,809
+```
+
+**`.reloc` is what makes this tractable.** Every absolute address stored anywhere in
+the image has a base relocation, because the loader must fix it up if the image moves.
+So every vtable entry, function pointer and TLS callback is there by construction —
+this is a completeness argument, not a scan.
+
+**Switch tables are the one inferred source, and that is stated rather than buried.**
+MSVC x64 stores each entry as an offset relative to the table's own address, so nothing
+relocates them and nothing marks them as addresses. They are found by self-consistency:
+a run of four or more values at address `T` where `T + value` lands in `.text` every
+time. A table this misses is a table whose targets are absent from the set — the
+dangerous direction — so the scan is deliberately over-inclusive.
+
+With direct branch targets from the disassembly, the blocked set is 1,370,048
+addresses. Against it, **85,575 of the 91,039 four-byte sites (94%) can widen safely**;
+1,740 are correctly refused because the next instruction genuinely is a branch target.
+
+Combined result on the real binary:
+
+```
+VEX in .text            805,131 ->      56,984   748,147 removed, 92.9%
+  in place                                       567,736
+  detoured                                       145,398
+size                102,242,144 -> 104,544,256   +2,302,112, the stub section
+sections after .text                             byte-identical
+boundaries lost              65,039              every one deliberately swallowed
+swallowed instructions       66,715              none reachable by any branch
+stub section                                     0 VEX, 145,398 jumps back
+```
+
+The counts close: 66,715 swallowed minus 65,039 lost boundaries is 1,676, exactly the
+sites refused for an ambiguous displacement.
+
+#### Three bugs the verifier found, none visible in the output
+
+**Overlapping windows.** Two Class C sites can be adjacent, so the first one's widened
+window swallows the second — which was then patched again, on top of the jump already
+written there. Taking sites in address order and refusing any that starts inside a
+committed window is the whole fix; it costs 33,426 sites.
+
+**Swallowed VEX carried across unlowered.** The instruction a window swallows is
+usually VEX too, since VEX code comes in runs, and copying it into a stub verbatim
+leaves AVX in the output — the one thing the exercise is for. Inside a stub there is
+room, so it is lowered rather than refused. 80,015 instructions were affected.
+
+**Stripping a VEX prefix is not always a lowering.** `vbroadcastss` is Class D: opcode
+`0F 38 18` exists *only* under VEX, so `66 0f 38 18` is not an instruction at all and
+the disassembler desynchronises from there. The lowering now requires the mnemonic to
+have a direct SSE form, which is the check that was missing.
+
+#### What remains
+
+56,984 VEX instructions in `.text`, so it still faults:
+
+```
+would grow in place              25,887   SSE encoding one byte longer
+overlapping windows              33,426   the second of two adjacent sites
+outside .pdata                   15,465   not provably code
+next instruction is a target      1,740   correctly refused
+next transfers control            2,255   a displaced branch needs re-targeting
+sequences (D, F, Y, H)           ~5,400   and the scratch register problem
+```
+
+The overlap and one-byte-growth cases are both addressable — a second pass would take
+the sites the first refused — and neither needs new information. The remaining
+sequences need a register allocator, which is the next real piece of work rather than
+another special case.
 
 ### Estimated cost of a translated binary
 
@@ -1494,7 +1576,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **MOSTLY** — A/B/Z in place (Finding 14) plus Class C by detour into an appended stub section (Finding 15). **662,661 of 805,131 VEX sites, 82.3%**, with no Ddisasm and no relocation of existing code. The 91,039 four-byte Class C forms need the indirect-branch-target problem solved first. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **748,147 of 805,131 VEX sites, 92.9%**, with no Ddisasm and no relocation of existing code. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
