@@ -38,6 +38,9 @@ BUILD_DIR ?= build
 DDISASM_LIMIT_GB ?= 28
 DDISASM_TIMEOUT  ?= 3600
 
+# Iterations per timed run in `make bench`.
+BENCH_ITERATIONS ?= 100000
+
 # The translation target. Not in the repository -- see .gitignore. This is
 # the Steamless-unpacked form, which is what every measurement in project.md
 # was taken from; the shipped binary has a .bind DRM section that disassembles
@@ -63,7 +66,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
         check-isa \
         scan report \
-        coverage disassemble patch patch-plan patch-verify detour \
+        coverage disassemble patch patch-plan patch-verify detour bench \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -272,6 +275,17 @@ detour: $(DETOURED)
 detour-verify: $(DETOURED) $(LISTING)
 	$(PYTHON) tools/detour.py verify $(TARGET) $(DETOURED) $(LISTING)
 
+# -- measuring the cost ------------------------------------------------------
+
+# What a detour actually costs on this CPU, which is the translation target.
+# NOT part of `check`: it is a timing measurement, so it is slow and its
+# result depends on what else the machine is doing.
+$(BUILD_DIR)/icache_bench: tools/icache_bench.c | $(BUILD_DIR)
+	$(CC) -O2 -std=c11 -Wall -Wextra -o $@ $<
+
+bench: $(BUILD_DIR)/icache_bench
+	$(BUILD_DIR)/icache_bench $(BENCH_ITERATIONS)
+
 # -- git hooks ---------------------------------------------------------------
 
 # The hook lives in tools/hooks/ rather than only in .git/hooks so that it
@@ -288,8 +302,9 @@ hooks:
 # clean target is the one thing everybody runs without reading.
 clean:
 	rm -f $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) \
+	      $(BUILD_DIR)/icache_bench \
 	      $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
-	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
+	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@rmdir $(BUILD_DIR) 2>/dev/null || true
 
 # Adds only what this project's own tooling wrote. It does not sweep for
@@ -329,6 +344,7 @@ help:
 	@echo '  detour      in-place patches plus Class C detours'
 	@echo '  detour-verify'
 	@echo '              sections, boundaries and the stub section'
+	@echo '  bench       what a detour costs on this CPU (a timing run)'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
 	@echo '  clean       remove the listing and the report'
 	@echo '  distclean   clean, plus __pycache__'

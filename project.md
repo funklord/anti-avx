@@ -1296,6 +1296,67 @@ a binary the build step did not rebuild. The same applies to a *disassembly* of 
 and an ad-hoc `objdump` has no dependency on the thing it describes, where `make`
 would have. Half an hour went into chasing it.
 
+### Finding 22 — what a detour actually costs, measured
+
+The cost model in this document counts instructions and says +1.34%. It does not
+model the front end at all, and the fair objection to the whole approach is that
+176,893 jumps into a section 144 MB from `.text` will cost far more in fetch and
+instruction-cache behaviour than they do in issue slots.
+
+That is measurable here, and unusually directly: **this machine is the target**, a
+Xeon X5675 with a 32 KB 4-way L1i. `tools/icache_bench.c` generates the same loop
+twice at run time -- once straight, once with every Nth adjacent pair replaced by a
+jump into a stub that performs the pair and jumps back, which is the widened-window
+shape of Finding 16 -- with the stubs mapped 64 MB away so they share no page and no
+cache set with the body.
+
+At the real density of **1.07% of instructions**:
+
+```
+mix                          3 KB body   24 KB    96 KB
+SSE addps  (one FP port)         +0.1%    +2.0%    +1.1%
+mov r8-r11 (dependency chain)    -0.6%    +2.0%    +2.4%
+3-byte nop (saturates nothing)  +12.0%   +10.5%    +8.4%
+```
+
+**The spread between the mixes is the finding, and it is larger than the density.**
+`addps` saturates the single FP add port, so the jumps issue elsewhere and their
+fetch bubbles overlap with work that was going to take that long anyway. Nops
+saturate nothing, so the same bubbles are fully exposed.
+
+That matters for reading the number. This binary is **52% scalar float by instruction
+count** -- it looks far more like the first row than the third -- but quoting only the
+first would understate a detour that lands in a stretch of pointer chasing or integer
+setup. The honest bracket is **1-2% where the code is FP-bound, up to about 10% where
+it is not**.
+
+The shape of the curve is worth as much as the point:
+
+```
+detour density   addps    nop
+       1.07%     +1.1%   +8.4%
+       2.13%     +3.8%  +19.8%
+       6.25%    +31.1%  +74.7%
+      12.50%    +75.2% +142.1%
+      25.00%   +204.3% +281.9%
+```
+
+Cost is roughly linear in density until about 6%, then runs away. **The objection that
+this approach produces a slideshow assumes a density around 25%** -- and at 25% it
+would be right. The measured rate is a twentieth of that, because VEX is only 4.87% of
+this binary to begin with and 70.5% of those sites never become detours at all.
+
+#### What this does not measure
+
+The benchmark controls density and working-set size; it does not know **where** the
+detours fall. If they cluster inside the hottest inner loop the cost is worse than
+this, and if they sit in initialisation it is nil. Which of those is true cannot be
+known without running the game, which needs the remaining 23,923 VEX sites gone and a
+Windows host.
+
+It also measures a loop with perfect branch-target locality after the first pass. A
+detour taken once and never again pays a cold miss this does not model.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,
