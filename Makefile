@@ -66,8 +66,8 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
         check-isa \
         scan report \
-        coverage disassemble patch patch-plan patch-verify detour bench \
-        placement \
+        coverage disassemble patch patch-plan patch-verify detour bench outside \
+        placement check-aliasing \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -76,8 +76,8 @@ all: check
 # `check` is what must pass before committing. There is no test suite yet,
 # so it is the gate alone -- and it deliberately does not depend on `scan`,
 # which needs a binary a fresh clone does not have.
-check: style verify check-isa check-f16c check-f16c-oracle check-fmaddsub \
-       check-permil check-permd
+check: style verify check-aliasing check-isa check-f16c check-f16c-oracle \
+       check-fmaddsub check-permil check-permd
 
 style: style-source style-docs
 
@@ -85,6 +85,12 @@ style: style-source style-docs
 # game binary, so it belongs in `check` where `scan` and `coverage` do not.
 verify:
 	$(PYTHON) tools/lower.py verify
+
+# Prove no lowering reads a register it has already overwritten. Needs no
+# game binary either: it assembles its own operand shapes, lowers them, and
+# disassembles the result back to simulate the register moves.
+check-aliasing:
+	$(PYTHON) tools/detour.py selftest
 
 # -- the software F16C conversions -------------------------------------------
 
@@ -293,6 +299,10 @@ bench: $(BUILD_DIR)/icache_bench
 placement: $(LISTING)
 	$(PYTHON) tools/placement.py report $(TARGET) $<
 
+# Which of the sites .pdata refuses to vouch for are real leaf functions.
+outside: $(LISTING)
+	$(PYTHON) tools/outside.py report $(TARGET) $<
+
 # -- git hooks ---------------------------------------------------------------
 
 # The hook lives in tools/hooks/ rather than only in .git/hooks so that it
@@ -353,6 +363,7 @@ help:
 	@echo '              sections, boundaries and the stub section'
 	@echo '  bench       what a detour costs on this CPU (a timing run)'
 	@echo '  placement   where the detours land: functions and loop bodies'
+	@echo '  outside     the code .pdata does not describe'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
 	@echo '  clean       remove the listing and the report'
 	@echo '  distclean   clean, plus __pycache__'

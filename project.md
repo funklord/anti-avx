@@ -1414,6 +1414,167 @@ because 99.4% of them contain nothing. If it is dominated by a handful of dense 
 kernels, those specific routines run about three times slower. Which is true needs a
 profile, and a profile needs the binary to run.
 
+### Finding 24 -- the code `.pdata` does not describe
+
+With the detour engine complete, the largest remaining refusal was not a missing
+lowering rule. It was the code oracle declining to vouch for bytes:
+
+```
+outside .pdata                       16,256      68% of everything left
+next instruction transfers control    2,968
+next instruction is a branch target   2,044
+sequence with no usable scratch       1,850
+no direct SSE form                      710
+sequence shape not handled               89
+operand shape not A/B/C                   9
+```
+
+`function_ranges` had already named the cause -- the x64 ABI lets a function that
+neither allocates stack nor calls anything omit its unwind data -- and estimated
+14,162 sites lost to it. What it could not say was how many of the 16,256 were that,
+and how many were objdump walking into data. **The two need opposite work**: a leaf
+function's VEX must be lowered, and a constant pool that happens to decode as VEX
+must be left alone, because "patching" it corrupts the data.
+
+`tools/outside.py`, `make outside`, answers it. The first attempt got it wrong in a
+way worth recording: it grouped each run of non-`.pdata` instructions and tested
+whether anything branched to the run's *first* address. But MSVC pads between
+functions with `int3`, so a run begins with padding, and every genuine leaf function
+came back "unreferenced". **Splitting the run at its padding is what makes the test
+ask about the function rather than about the gap before it.**
+
+The second error was the target set. `targets.py` recovers branch targets from
+`.reloc`, `.pdata`, `.xdata` and switch tables, and **a `call rel32` is none of
+those** -- it is PC-relative, carries no relocation, and appears in no table.
+Scanning the disassembly for direct calls and jumps adds 1,093,239 more targets and
+moves 656 chunks from "uncalled" to "called". 0x1402a9fa0 is the shape of the class:
+
+```
+vmovaps %xmm1,%xmm2               called twice, from 0x142661c35
+vxorps  %xmm1,%xmm1,%xmm1         and 0x142661d14
+vmovss  %xmm2,%xmm1,%xmm2
+vinsertps $0x30,%xmm2,%xmm0,%xmm0
+ret
+```
+
+Pure register work and a `ret`: it touches no stack and calls nothing, so MSVC omits
+its unwind data exactly as the ABI permits.
+
+#### Why the extension is sound rather than merely permissive
+
+Four conditions, each ruling out a different way of being wrong: bracketed by `int3`,
+entered by a call or jump, ending in a control transfer, and containing no byte
+objdump failed to decode.
+
+The load-bearing one is the second, and the argument is about **alignment, not
+appearance**. The chunk's first address is the target of a real call, so the sweep is
+provably on an instruction boundary there; x86 decoding forward from a known-correct
+boundary is deterministic, so every instruction in the chunk is correctly decoded;
+and the terminating `ret` or `jmp` confirms the chunk is a whole function rather than
+the sweep running past its end. Nothing here rests on the code looking plausible.
+
+```
+called, and ends in a transfer     2,074 chunks   13,813 sites   accepted
+uncalled, ends in a transfer         868 chunks    3,343 sites   refused
+called, but runs off the end          43 chunks      129 sites   refused
+contains (bad) -- not code            20 chunks      315 sites   refused
+uncalled, runs off the end             1 chunk         4 sites   refused
+```
+
+`outside .pdata` fell from 16,256 to 3,378.
+
+### Finding 25 -- the aliasing bug the extension uncovered
+
+Reaching further into the binary put a stub under inspection that turned out to be
+wrong, and the fault was not in the new oracle. It was in the Class C lowering, and
+it had been there since Class C was written.
+
+`vmovss %xmm2,%xmm1,%xmm2` is src2 `%xmm2`, src1 `%xmm1`, destination `%xmm2`. The
+lowering emitted:
+
+```
+movaps %xmm1,%xmm2        the destination is set up from src1 ...
+movss  %xmm2,%xmm2        ... which has already destroyed src2
+```
+
+`lower_vex` decided whether to emit the leading `movaps` by testing whether the
+destination differed from src1. It never tested whether the destination *was* src2 --
+in which case that `movaps` overwrites src2 before the operation reads it.
+
+**9,000 sites, and the worst of them are silent.** `vsubss` is the most common at
+1,210, and it is not commutative: `vsubss %xmm0,%xmm1,%xmm0` should compute
+`xmm1 - xmm0` and instead became `movaps %xmm1,%xmm0; subss %xmm0,%xmm0`, which is
+**always exactly zero**. Nothing about that output looks wrong. It assembles, it
+disassembles, it carries no VEX, and every structural check the verifier makes passes
+-- because every one of them is about *shape*, and this is about *meaning*.
+
+Swapping the operands would fix the commutative cases and quietly break the rest.
+Even where the arithmetic commutes the NaN propagation does not: x86 chooses which
+source NaN survives by operand order. That is the same trap `src/fmaddsub.c` fell
+into, where negating the addend to reuse `addsubps` disagreed with the hardware on
+291 vectors, every one of them a NaN. So src2 is preserved in a scratch and the
+operand order is kept exactly as the VEX form had it:
+
+```
+movaps %xmm2,%xmm4        scratch <- src2
+movaps %xmm1,%xmm2        destination <- src1
+addss  %xmm4,%xmm2        src1 OP src2, in that order
+```
+
+1,524 of the 9,000 find a scratch; 6,232 do not and are now refused rather than
+mis-lowered. **Coverage went down, from 98.7% to 97.8%, and that is the fix working.**
+
+#### The check that would have caught it
+
+`make check-aliasing`, and the condition is one sentence covering every class: **at
+the final operation, the reg operand must still hold the original src1 and the rm
+operand the original src2.** Class A and B satisfy it by emitting nothing first;
+Class C has to satisfy it while inserting a `movaps`, and the aliasing case while
+inserting two.
+
+It needs no execution and no AVX machine, which matters because this one has neither.
+Each lowering is assembled, lowered, and disassembled back, and the register moves are
+simulated symbolically -- so what is tested is the bytes that would actually be
+written rather than a rule table's description of them. Disabling the fix makes it
+report all 16 aliasing shapes and neither of the two controls, which is what says the
+test discriminates rather than merely passes.
+
+### Finding 26 -- one selection rule, executed once
+
+The aliasing fix made the verifier fail: 356 boundaries lost that were not swallowed
+on purpose. The binary was correct; the checker was wrong.
+
+`apply` and `verify` each carried their own copy of the rule for choosing which
+candidates become detours. A candidate whose stub cannot be built is refused and
+writes nothing, so `apply` left its window uncommitted and went on to detour a later
+site inside it. `verify`'s copy committed the window regardless, so it never expected
+that later site -- nor the instruction its widened window swallowed.
+
+The divergence had been there the whole time. What made it visible was refusals
+rising from 762 to 2,402 when the aliasing check started declining sites with no
+scratch. **A model of a rule is a second implementation, and two implementations of
+one rule drift.** `place_stubs` is now the only copy and both call it.
+
+The `NameError` that followed is worth one line, because it is `build-and-commit.md`'s
+rule again: the refactor broke `apply`, `apply` wrote nothing, and `verify` ran
+happily against the binary left over from the previous run and reported a clean pass.
+The output is deleted before the run now, so a crash cannot leave a stale artifact
+for the next step to bless.
+
+### Final state
+
+```
+in place                                      578,652
+detoured                                      174,531
+VEX in .text            805,131 ->      17,929   787,202 removed, 97.8%
+```
+
+Every invariant holds on a freshly built binary: the file grows only by the stub
+section, every section after `.text` is byte-identical, all 64,135 lost boundaries
+are instructions a widened window swallowed deliberately, none of them is reachable
+by any branch, and the stub section carries 0 VEX instructions with exactly one jump
+back per detour.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,

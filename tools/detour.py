@@ -45,6 +45,7 @@ from collections import Counter
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import lower
+import outside
 import patch as inplace
 import scratch as scratch_finder
 import targets as target_set
@@ -534,7 +535,35 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	body = bytearray()
 	if len(registers) == 3 and registers[-1] != registers[-2]:
 		destination, source = registers_of(vex, tail)
-		body += encode_movaps(destination, source)
+		if ((tail[1] >> 6) & 3) == 3 and registers[0] == registers[-1]:
+			# **src2 and the destination are the same register.** The movaps
+			# below overwrites the destination with src1, which destroys
+			# src2 before the operation reads it. For a commutative
+			# operation that gives the wrong operand; for a subtract it
+			# gives a constant. `vsubss %xmm0,%xmm1,%xmm0` lowered without
+			# this check becomes `movaps %xmm1,%xmm0; subss %xmm0,%xmm0`,
+			# which is always exactly zero, and nothing about the output
+			# looks wrong -- it assembles, it disassembles, it carries no
+			# VEX, and every structural check passes.
+			#
+			# Swapping the operands would fix the commutative cases and
+			# quietly break the rest. Even where the arithmetic commutes the
+			# NaN propagation does not: x86 picks which source NaN survives
+			# by operand order, which is the same trap the fmsubadd negation
+			# fell into (src/fmaddsub.c, 291 disagreeing vectors, all NaN).
+			#
+			# So src2 is preserved in a scratch and the operand order is
+			# kept exactly as the VEX form had it.
+			source2 = (vex["B"] << 3) | (tail[1] & 7)
+			if scratch is None or scratch in (destination, source, source2):
+				return None
+			body += encode_movaps(scratch, source2)
+			body += encode_movaps(destination, source)
+			vex = dict(vex, B=scratch >> 3)
+			tail = bytes([tail[0], (tail[1] & 0xF8) | (scratch & 7)]) \
+				+ tail[2:]
+		else:
+			body += encode_movaps(destination, source)
 	elif len(registers) == 3:
 		pass				# destination already holds the first source
 	elif len(registers) != 2:
@@ -674,9 +703,6 @@ def relocate(encoding, old_address, new_address, rip_target):
 
 def collect(binary, listing):
 	"""(in-place patches, class C detour candidates, statistics)."""
-	ranges = inplace.function_ranges(binary)
-	patches, stats, _blocked = inplace.build_patches(listing, ranges)
-
 	# Everything anything can branch to. A window may not contain one of
 	# these anywhere but at its first byte.
 	groups = target_set.collect(binary)
@@ -694,6 +720,17 @@ def collect(binary, listing):
 					blocked.add(int(first, 16))
 				except ValueError:
 					pass
+
+	# The code oracle, in two parts. .pdata is the binary's own statement
+	# about where its functions are and needs no disassembly to read, but the
+	# x64 ABI lets a leaf function omit its unwind data -- and refusing those
+	# was the largest single reason sites survived. tools/outside.py recovers
+	# them, under conditions strict enough that data cannot pass: bracketed
+	# by int3, entered by a call or jump, ending in a control transfer, and
+	# containing no byte objdump failed to decode.
+	described = inplace.function_ranges(binary)
+	ranges = sorted(described + outside.leaf_ranges(plain, described, blocked))
+	patches, stats, _blocked = inplace.build_patches(listing, ranges)
 
 	# Anything already rewritten in place needs nothing further. Everything
 	# else that HAS a lowering is a detour candidate -- not just Class C.
@@ -735,14 +772,24 @@ def collect(binary, listing):
 		# liveness scan; a site with no dead register is left alone rather
 		# than spilled, because a stub that moves rsp breaks stack walking
 		# (see tools/scratch.py).
+		# A Class C site whose src2 IS the destination needs one too, for the
+		# reason spelled out in lower_vex: the movaps that sets up the
+		# destination would destroy src2 first.
+		aliased = (not needs_sequence and len(registers) == 3
+		           and registers[-1] != registers[-2]
+		           and registers[0] == registers[-1])
 		scratch = None
-		if needs_sequence:
+		if needs_sequence or aliased:
 			scratch = scratch_finder.find_scratch(plain, index)
 			trial = lower_vex(address, encoding, operands, mnemonic,
 			                  address, scratch, address)
 			if trial is None:
-				skipped["sequence with no usable scratch" if scratch is None
-				        else "sequence shape not handled"] += 1
+				if aliased:
+					skipped["src2 aliases dst, no scratch"] += 1
+				else:
+					skipped["sequence with no usable scratch"
+					        if scratch is None
+					        else "sequence shape not handled"] += 1
 				continue
 		displaced = []
 		window = len(encoding)
@@ -825,11 +872,133 @@ def add_section(data, name, payload, flags):
 	return bytes(image), vaddr
 
 
+# Enough of the operand shapes to exercise every path: commutative and not,
+# scalar and packed, float and integer, with an immediate and without. Each
+# is written with src2 AND the destination as %xmm2, which is the aliasing
+# case, plus the two shapes it must not disturb.
+SELFTEST = [
+	"vsubss %xmm2,%xmm1,%xmm2",	"vsubps %xmm2,%xmm1,%xmm2",
+	"vdivss %xmm2,%xmm1,%xmm2",	"vdivps %xmm2,%xmm1,%xmm2",
+	"vmulss %xmm2,%xmm1,%xmm2",	"vaddps %xmm2,%xmm1,%xmm2",
+	"vmaxss %xmm2,%xmm1,%xmm2",	"vminss %xmm2,%xmm1,%xmm2",
+	"vandps %xmm2,%xmm1,%xmm2",	"vxorps %xmm2,%xmm1,%xmm2",
+	"vpand %xmm2,%xmm1,%xmm2",	"vpor %xmm2,%xmm1,%xmm2",
+	"vunpcklps %xmm2,%xmm1,%xmm2",	"vsubsd %xmm2,%xmm1,%xmm2",
+	"vshufps $0x1b,%xmm2,%xmm1,%xmm2",
+	"vsubss %xmm3,%xmm1,%xmm2",	# plain Class C, must be unaffected
+	"vsubss %xmm3,%xmm2,%xmm2",	# Class B, must stay a single instruction
+	"vsubss %xmm9,%xmm1,%xmm9",	# aliasing, and needs REX
+]
+
+REGISTER = re.compile(r"%xmm(\d+)")
+
+
+def selftest():
+	"""Prove no lowering reads a register it has already overwritten.
+
+	The condition is one sentence and it covers every class: **at the final
+	operation, the reg operand must still hold the original src1 and the rm
+	operand the original src2.** Class A and B satisfy it by emitting nothing
+	first; Class C has to satisfy it while inserting a movaps, and the
+	aliasing case has to satisfy it while inserting two.
+
+	Checking it needs no execution and no AVX machine, which matters because
+	this one has neither. Each lowering is disassembled back and the register
+	moves are simulated symbolically, so what is tested is the bytes that
+	would actually be written rather than a rule table's description of them.
+	"""
+	import tempfile
+	from pathlib import Path
+
+	source = ".text\n" + "".join(f"\t{text}\n" for text in SELFTEST)
+	failures = 0
+	with tempfile.TemporaryDirectory() as tmp:
+		asm, obj, raw = (Path(tmp) / n for n in ("t.s", "t.o", "t.txt"))
+		asm.write_text(source)
+		done = subprocess.run(["as", "--64", "-o", str(obj), str(asm)],
+		                      capture_output=True, text=True)
+		if done.returncode != 0:
+			print(done.stderr.rstrip(), file=sys.stderr)
+			return 1
+		raw.write_text(subprocess.run(["objdump", "-d", str(obj)],
+		                              capture_output=True, text=True).stdout)
+		sites = list(inplace.parse_listing(str(raw)))
+
+		for address, encoding, mnemonic, operands in sites:
+			registers = [o for o in inplace.split_operands(operands)
+			             if not o.startswith("$")]
+			source2, source1, destination = (int(REGISTER.search(r).group(1))
+			                                 for r in (registers[0],
+			                                           registers[-2],
+			                                           registers[-1]))
+			# 15 is free by construction here; the real allocator asks the
+			# liveness scan instead.
+			body = lower_vex(address, encoding, operands, mnemonic, 0,
+			                 scratch=15)
+			if body is None:
+				print(f"selftest: {mnemonic} {operands}: refused",
+				      file=sys.stderr)
+				failures += 1
+				continue
+
+			(Path(tmp) / "b.bin").write_bytes(body)
+			text = subprocess.run(
+				["objdump", "-D", "-b", "binary", "-m", "i386:x86-64",
+				 "-M", "att", str(Path(tmp) / "b.bin")],
+				capture_output=True, text=True).stdout
+			steps = []
+			for line in text.splitlines():
+				parts = line.split("\t")
+				if len(parts) < 3:
+					continue
+				name, _, arguments = parts[2].strip().partition(" ")
+				steps.append((name, REGISTER.findall(arguments)))
+			if not steps:
+				print(f"selftest: {mnemonic}: emitted nothing readable",
+				      file=sys.stderr)
+				failures += 1
+				continue
+
+			state = {n: n for n in range(16)}
+			for name, arguments in steps[:-1]:
+				if name != "movaps" or len(arguments) != 2:
+					print(f"selftest: {mnemonic}: unexpected setup {name}",
+					      file=sys.stderr)
+					failures += 1
+					break
+				state[int(arguments[1])] = state[int(arguments[0])]
+			name, arguments = steps[-1]
+			if len(arguments) < 2:
+				continue
+			rm, reg = int(arguments[-2]), int(arguments[-1])
+			if state[reg] != source1 or state[rm] != source2:
+				print(f"selftest: {mnemonic} {operands} -> {name}: reg holds "
+				      f"xmm{state[reg]} (want src1 xmm{source1}), rm holds "
+				      f"xmm{state[rm]} (want src2 xmm{source2})",
+				      file=sys.stderr)
+				failures += 1
+			elif reg != destination:
+				print(f"selftest: {mnemonic}: result lands in xmm{reg}, not "
+				      f"xmm{destination}", file=sys.stderr)
+				failures += 1
+
+	if failures:
+		print(f"selftest: {failures} of {len(SELFTEST)} lowerings are wrong",
+		      file=sys.stderr)
+		return 1
+	print(f"selftest: {len(SELFTEST)} lowerings, none reads a register it "
+	      f"has overwritten")
+	return 0
+
+
 def main(argv):
 	if not argv or argv[0] in ("-h", "--help"):
 		print(__doc__.strip())
 		return 0
 	mode = argv[0]
+
+	if mode == "selftest":
+		return selftest()
 
 	if mode == "plan":
 		_patches, candidates, stats, skipped = collect(argv[1], argv[2])
@@ -849,46 +1018,49 @@ def main(argv):
 	return 2
 
 
-def apply_all(binary, listing, output):
-	patches, candidates, _stats, _skipped = collect(binary, listing)
-	data = bytearray(open(binary, "rb").read())
-	vaddr, raddr, _size = inplace.text_mapping(binary)
-
-	# The in-place work first: it does not move anything, so the addresses
-	# the detours are computed against are unaffected either way.
-	for address, original, replacement, _kind, _mnemonic in patches:
-		offset = raddr + (address - vaddr)
-		if bytes(data[offset:offset + len(original)]) != original:
-			raise SystemExit(f"0x{address:x}: bytes on disk do not match")
-		data[offset:offset + len(original)] = replacement
-
-	# Lay the stubs out. The section's address is not known until its size
-	# is, and the size depends on the stubs, which depend on the address --
-	# so measure with a placeholder address first, then build for real.
-	pe = struct.unpack_from("<I", bytes(data), 0x3C)[0]
+def stub_base_of(data):
+	"""Where the stub section will start: past every section, page aligned."""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
 	opt = pe + 24
-	alignment = struct.unpack_from("<I", bytes(data), opt + 32)[0]
-	sections = struct.unpack_from("<H", bytes(data), pe + 6)[0]
-	opt_size = struct.unpack_from("<H", bytes(data), pe + 20)[0]
+	alignment = struct.unpack_from("<I", data, opt + 32)[0]
+	sections = struct.unpack_from("<H", data, pe + 6)[0]
+	opt_size = struct.unpack_from("<H", data, pe + 20)[0]
 	table = opt + opt_size
 	highest = 0
 	for i in range(sections):
 		off = table + i * 40
-		vsize, va, _rsize, _raddr = struct.unpack_from("<IIII", bytes(data), off + 8)
+		vsize, va, _rsize, _raddr = struct.unpack_from("<IIII", data, off + 8)
 		highest = max(highest, va + vsize)
-	image_base = struct.unpack_from("<Q", bytes(data), opt + 24)[0]
-	stub_base = image_base + (highest + alignment - 1) // alignment * alignment
+	image_base = struct.unpack_from("<Q", data, opt + 24)[0]
+	return image_base + (highest + alignment - 1) // alignment * alignment
 
+
+def place_stubs(candidates, stub_base):
+	"""Choose and build the stubs. (placed, blob, swallowed, overlap, refused)
+
+	**One selection rule, executed once and used by both apply and verify.**
+	It used to be written twice, and the two copies disagreed: a candidate
+	whose stub could not be built is refused and writes nothing, so apply
+	left its window uncommitted and went on to detour a later site inside
+	it, while verify's copy committed the window regardless and therefore
+	never expected that later site -- or the instruction its widened window
+	swallowed. That surfaced as 356 lost boundaries reported as unexplained,
+	every one of them correct in the binary and wrong only in the model.
+
+	The count of refusals is what made it visible, having gone from 762 to
+	2,402 when the src2-aliasing check started refusing sites with no
+	scratch. The divergence was there the whole time.
+
+	Windows must not overlap for the original reason too: two Class C sites
+	can sit next to each other, and the first one's widened window swallows
+	the second, which would otherwise be patched again on top of the jump
+	already written there.
+	"""
 	# The constant pool goes first, so its address is the section's and the
 	# 16-byte alignment SSE memory operands need comes free.
 	blob = bytearray(PERMIL_POOL)
 	pool = stub_base
-	placed = []
-	# Windows must not overlap. Two Class C sites can sit next to each
-	# other, and then the first one's widened window swallows the second --
-	# which would otherwise be patched a second time, on top of the jump
-	# already written there. Taking them in address order and refusing any
-	# site that starts inside a committed window is the whole fix.
+	placed, swallowed = [], set()
 	refused = overlapped = 0
 	committed_to = 0
 	for (site, encoding, operands, mnemonic, window, displaced,
@@ -905,6 +1077,30 @@ def apply_all(binary, listing, output):
 		placed.append((site, window, stub_address))
 		committed_to = site + window
 		blob += body
+		for address, _moved, _comment, _ops, _mn in displaced:
+			swallowed.add(address)
+	return placed, blob, swallowed, overlapped, refused
+
+
+def apply_all(binary, listing, output):
+	patches, candidates, _stats, _skipped = collect(binary, listing)
+	data = bytearray(open(binary, "rb").read())
+	vaddr, raddr, _size = inplace.text_mapping(binary)
+
+	# The in-place work first: it does not move anything, so the addresses
+	# the detours are computed against are unaffected either way.
+	for address, original, replacement, _kind, _mnemonic in patches:
+		offset = raddr + (address - vaddr)
+		if bytes(data[offset:offset + len(original)]) != original:
+			raise SystemExit(f"0x{address:x}: bytes on disk do not match")
+		data[offset:offset + len(original)] = replacement
+
+	# Lay the stubs out. The section's address is not known until its size
+	# is, and the size depends on the stubs, which depend on the address --
+	# so measure with a placeholder address first, then build for real.
+	stub_base = stub_base_of(bytes(data))
+	placed, blob, _swallowed, overlapped, refused = place_stubs(candidates,
+	                                                            stub_base)
 
 	for site, window, stub_address in placed:
 		offset = raddr + (site - vaddr)
@@ -914,6 +1110,8 @@ def apply_all(binary, listing, output):
 
 	image, section_va = add_section(bytes(data), SECTION_NAME, bytes(blob),
 	                                SECTION_FLAGS)
+	pe = struct.unpack_from("<I", bytes(data), 0x3C)[0]
+	image_base = struct.unpack_from("<Q", bytes(data), pe + 24 + 24)[0]
 	assert section_va == stub_base - image_base, "stub section moved"
 	open(output, "wb").write(image)
 	print(f"apply: {len(patches):,} in-place patches, {len(placed):,} detours, "
@@ -955,15 +1153,9 @@ def verify(original, patched, listing=None):
 		return 1 if problems else 0
 
 	_patches, candidates, _stats, _skipped = collect(original, listing)
-	swallowed = set()
-	committed_to = 0
-	for (site, _encoding, _operands, _mnemonic, window, displaced,
-	     _scratch) in sorted(candidates, key=lambda c: c[0]):
-		if site < committed_to:
-			continue			# same overlap rule apply() uses
-		committed_to = site + window
-		for address, _moved, _comment, _ops, _mn in displaced:
-			swallowed.add(address)
+	# The same call apply makes, so the two cannot drift apart.
+	_placed, _blob, swallowed, _overlapped, _refused = place_stubs(
+		candidates, stub_base_of(open(original, "rb").read()))
 	groups = target_set.collect(original)
 	reachable = set()
 	for values in groups.values():
