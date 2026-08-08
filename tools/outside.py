@@ -46,9 +46,12 @@ wrong:
   * **Bracketed by `int3`.** MSVC pads between functions with `cc`, so
     padding is where a function provably ends. Splitting there is what makes
     the chunk start at a function start rather than mid-padding.
-  * **Starts at something that calls or jumps to it.** A constant pool is
-    not the target of a call. This is the positive evidence that the bytes
-    are entered as code.
+  * **Starts at something that enters it.** A call, a jump, or a
+    RIP-relative `lea` taking its address. A constant pool is none of those.
+    This is the positive evidence that the bytes are entered as code, and
+    the `lea` half was the last of the three to be found -- see
+    `lea_targets`, which is why 865 chunks that looked unreferenced were
+    not.
   * **Ends in a control transfer.** Compiler output does not fall off the
     end of a function into padding. A chunk ending any other way is one the
     disassembler desynchronised inside, so its boundaries are not trustworthy
@@ -60,6 +63,15 @@ wrong:
 The 20 `(bad)` regions and the 44 that run off the end stay refused. That is
 the trade `function_ranges` describes, kept: being slightly less effective
 is the right price for not corrupting data.
+
+The "uncalled" row above was itself measured twice for the same reason. With
+calls and jumps alone it held 868 chunks; adding `lea` moved 865 of them into
+the accepted row, and those 865 are 99.9% 16-byte aligned and 813 of them end
+in `ret`. They are address-taken leaf functions -- a copy constructor at
+0x1402ce510 that does a `vmovups` pair and a `lock xadd` on a refcount, a
+setter at 0x140544cf0 that stores one float and returns `this`. Nothing calls
+them because every call site inlined them, and the linker kept the out-of-line
+COMDAT copy that the address-taking needs.
 
   report <binary> <listing>
 """
@@ -80,6 +92,34 @@ TERMINATORS = ("ret", "retq", "jmp", "jmpq", "ud2")
 def covered(starts, ranges, address):
 	i = bisect.bisect_right(starts, address) - 1
 	return i >= 0 and address < ranges[i][1]
+
+
+def lea_targets(listing):
+	"""Addresses taken by a RIP-relative `lea`, which nothing else records.
+
+	This is the third way a function is reachable and the last one found.
+	`lea rax,[rip+f]` is how MSVC takes a function's address, and it is
+	**PC-relative, so it produces no relocation** -- `.reloc` is complete for
+	absolute addresses and this is not one. It is not a call either. So a
+	function whose address is only ever taken this way is invisible to both
+	of the other two scans, and 865 of the 868 chunks that looked entirely
+	unreferenced turned out to be exactly that: address-taken leaf functions,
+	stored as pointers and called indirectly.
+
+	164,395 addresses across the binary. None of them fell inside a detour
+	window when that was measured, so nothing was wrong in the output -- but
+	that was an observation about one binary rather than a property of the
+	rewriter, and an indirect call landing in the middle of a window is not
+	something to leave resting on luck.
+	"""
+	import detour				# late: detour imports this module
+	found = set()
+	for _address, _encoding, mnemonic, operands, comment in \
+			detour.parse_with_comments(listing):
+		if mnemonic == "lea" and isinstance(comment, int) \
+				and "(%rip)" in operands:
+			found.add(comment)
+	return found
 
 
 def call_targets(instructions):
@@ -178,9 +218,12 @@ def main(argv):
 		known |= group
 	relocated = len(known)
 	known |= call_targets(instructions)
+	called = len(known)
+	known |= lea_targets(listing)
 
 	print(f"branch targets from .reloc/.pdata/.xdata/tables {relocated:>9,}")
-	print(f"  plus direct call and jump destinations        {len(known):>9,}")
+	print(f"  plus direct call and jump destinations        {called:>9,}")
+	print(f"  plus addresses taken by a RIP-relative lea    {len(known):>9,}")
 	print()
 
 	found = chunks(instructions, ranges)

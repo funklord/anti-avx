@@ -734,7 +734,7 @@ def collect(binary, listing):
 	instructions = list(parse_with_comments(listing))
 	# The liveness scan wants the plain four-field shape.
 	plain = [(a, e, m, o) for a, e, m, o, _c in instructions]
-	for i, (address, _e, mnemonic, operands, _c) in enumerate(instructions):
+	for i, (address, _e, mnemonic, operands, comment) in enumerate(instructions):
 		if mnemonic.startswith(("j", "call", "loop")) and operands:
 			first = operands.split()[0]
 			if first.startswith("0x"):
@@ -742,6 +742,13 @@ def collect(binary, listing):
 					blocked.add(int(first, 16))
 				except ValueError:
 					pass
+		elif mnemonic == "lea" and isinstance(comment, int) \
+				and "(%rip)" in operands:
+			# A function address taken PC-relatively, so no relocation
+			# records it and no call names it. It can still be called
+			# through the pointer, which makes it a branch target like any
+			# other -- see outside.lea_targets.
+			blocked.add(comment)
 
 	# The code oracle, in two parts. .pdata is the binary's own statement
 	# about where its functions are and needs no disassembly to read, but the

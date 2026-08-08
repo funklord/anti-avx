@@ -1685,16 +1685,53 @@ That is twice now that this check has caught something the reasoning behind a ch
 had missed, and once that it was itself the thing at fault. Its value is not that it
 agrees; it is that it is written from the other end.
 
+### Finding 30 -- the third way a function is reachable
+
+3,343 sites sat in 868 chunks that were shaped exactly like functions --
+`int3`-bracketed, cleanly decoded, ending in a transfer -- and that **nothing
+appeared to reference**. Neither `.reloc`, nor `.pdata`, nor a switch table, nor any
+direct call or jump in 16.5 million instructions.
+
+Before deciding whether to touch them, the question was whether anything reaches them
+at all. `.reloc` is complete for absolute addresses by construction, and direct calls
+and jumps are in the disassembly, so one path remained: a RIP-relative operand. There
+are 1,192 landing inside these chunks, **every one of them a `lea`**, and 865 of the
+868 chunk starts are the target of one.
+
+`lea rax,[rip+f]` is how MSVC takes a function's address, and it is **PC-relative, so
+it produces no relocation** -- `.reloc` is complete for absolute addresses and this is
+not one. It is not a call either. A function whose address is only ever taken this way
+is invisible to both of the other scans.
+
+What they are is legible once found: a copy constructor at 0x1402ce510 doing a
+`vmovups` pair and a `lock xadd` on a refcount, a setter at 0x140544cf0 storing one
+float and returning `this`. 99.9% are 16-byte aligned and 813 of 868 end in `ret`.
+Nothing calls them because every call site inlined them, and the linker kept the
+out-of-line COMDAT copy that address-taking requires.
+
+`outside .pdata` fell from 3,570 to 397, and coverage from 98.3% to 98.7%.
+
+#### It was a safety question too, and the answer was luck
+
+An address taken by `lea` can be called through the pointer, which makes it a branch
+target -- and a branch target inside a detour window is an indirect call landing in
+the middle of a jump. 164,395 such addresses exist in this binary.
+
+Measured against the output as it then stood: **none of them fell strictly inside a
+committed window.** So nothing was wrong. But that is an observation about one binary
+rather than a property of the rewriter, and the three scans now feed one set, so it
+is a property.
+
 ### Final state
 
 ```
-in place                                      578,652
-detoured                                      178,150
-VEX in .text            805,131 ->      13,809   791,322 removed, 98.3%
+in place                                      581,374
+detoured                                      178,545
+VEX in .text            805,131 ->      10,618   794,513 removed, 98.7%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 65,946 lost boundaries
+section, every section after `.text` is byte-identical, all 66,108 lost boundaries
 are instructions a widened window swallowed deliberately, none of them is reachable
 by any branch, and the stub section carries 0 VEX instructions with exactly one jump
 back per detour.
@@ -1703,11 +1740,11 @@ What remains, in order of size:
 
 ```
 src2 aliases dst, no scratch           3,718
-outside .pdata                         3,570
 sequence with no usable scratch          780
 no direct SSE form                       710
-next instruction is a branch target      515
-next instruction transfers control       445
+next instruction is a branch target      509
+next instruction transfers control       423
+outside .pdata                           397
 sequence shape not handled               164
 ```
 
