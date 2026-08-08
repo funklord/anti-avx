@@ -1614,16 +1614,48 @@ names its register as a source and does not read it, which is the entire reason
 `evidence.md`'s rule about suspecting the gate first, arrived at from the other end:
 the code was checked before the gate was believed.
 
+### Finding 28 -- widen the window backwards, not just forwards
+
+A site shorter than five bytes cannot hold a jump, so its window has to widen
+over a neighbour. **Which neighbour decides which address ends up inside the
+window, and the one inside is the one nothing may branch to.**
+
+Widening forward keeps the window's first byte where the site already is and
+swallows the instruction that follows. Widening backward puts the first byte on
+the previous instruction and swallows the site itself. The second reaches sites the
+first cannot, for two reasons that are both properties of compiler output: a
+compiler branches to the top of a block far more often than into the middle of one,
+and the instruction after a site is frequently a `call` or a jump, which cannot be
+swallowed at all.
+
+Measured before it was written -- 3,237 sites that forward widening cannot reach and
+backward widening can. The two forward skip reasons collapsed:
+
+```
+                                       before   after
+next instruction is a branch target     1,732     505
+next instruction transfers control      2,334     441
+```
+
+The previous instruction must still fall through into the site, so anything that
+transfers control rules it out. A `call` is excluded for a sharper reason than
+falling through: it returns to the site, and that return would land in the middle of
+a window.
+
+The gain in finished sites is smaller than 3,237 because overlap absorbs much of it
+-- windows that now extend backwards collide with windows already committed, and
+skipped-for-overlap rose from 33,375 to 35,401. Net, VEX fell from 15,647 to 14,757.
+
 ### Final state
 
 ```
 in place                                      578,652
-detoured                                      176,442
-VEX in .text            805,131 ->      15,647   789,484 removed, 98.1%
+detoured                                      177,294
+VEX in .text            805,131 ->      14,757   790,374 removed, 98.2%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 65,057 lost boundaries
+section, every section after `.text` is byte-identical, all 65,727 lost boundaries
 are instructions a widened window swallowed deliberately, none of them is reachable
 by any branch, and the stub section carries 0 VEX instructions with exactly one jump
 back per detour.
@@ -1632,12 +1664,18 @@ What remains, in order of size:
 
 ```
 src2 aliases dst, no scratch           4,550
-outside .pdata                         3,410
-next instruction transfers control     2,334
-next instruction is a branch target    1,732
+outside .pdata                         3,570
 sequence with no usable scratch          931
 no direct SSE form                       710
+next instruction is a branch target      505
+next instruction transfers control       441
 ```
+
+The two scratch categories are now more than a third of the remainder, and the cause
+underneath them is a call at which xmm4 and xmm5 are both live. Getting past that
+needs either interprocedural knowledge or somewhere to spill -- and spilling was
+rejected deliberately, because the stubs have no `.pdata` and a moved `rsp` breaks
+stack walking. Reopening it is a design decision rather than an incremental fix.
 
 ### Estimated cost of a translated binary
 

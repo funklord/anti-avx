@@ -8,16 +8,22 @@ one byte longer. Class C is the obvious case -- `vaddss %xmm2,%xmm1,%xmm0` is fo
 and becomes `movaps` plus `addss`, which is seven -- so the expansion has to
 live somewhere else and the site has to jump to it.
 
-**Only sites already five bytes or longer are detoured, and that is what
-makes this sound.** A near jump is five bytes, so overwriting a five-byte
-instruction with one leaves both its start and its end address exactly where
-they were. Nothing can branch into the middle of an instruction, so there is
-no address whose meaning changes. The four-byte register-to-register forms
-would have to swallow the instruction after them to make room, and that
-reopens a question this cannot answer: an indirect branch through a jump
-table can target that instruction, and jump tables in x64 MSVC hold
-table-relative offsets that no relocation records, so they cannot be
-enumerated. Those sites are left alone.
+**A near jump is five bytes**, so overwriting a five-byte instruction with
+one leaves both its start and its end address exactly where they were, and
+no address changes meaning. The four-byte register-to-register forms have to
+swallow a neighbour to make room, which is safe only where nothing can
+branch to the address that ends up inside the window. tools/targets.py
+enumerates what can be branched to, including the switch tables that hold
+table-relative offsets no relocation records.
+
+**Which neighbour is a choice, and both directions are used.** Widening
+forward keeps the window's first byte where the site already is and swallows
+the instruction after it, so that instruction is the one that must be
+unreachable. Widening backward puts the first byte on the previous
+instruction and swallows the site itself. The second reaches 3,237 sites the
+first cannot, because a compiler branches to the top of a block far more
+often than into the middle of one -- and because the instruction after a
+site is frequently a call or a jump, which cannot be swallowed at all.
 
 The stubs go in a new section appended to the image. Adding one is cheap:
 the section table has room for eleven more entries, and nothing else in the
@@ -593,35 +599,51 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	return bytes(body)
 
 
-def build_stub(site, encoding, operands, mnemonic, window, displaced,
-               stub_address, scratch=None, pool=0):
-	"""The stub body for one site, placed at stub_address."""
+def moved_instruction(entry, at):
+	"""One swallowed instruction, re-encoded to execute at `at`."""
+	address, moved, comment, moved_operands, moved_mnemonic = entry
+	if moved and moved[0] in (0xC4, 0xC5):
+		# The swallowed instruction is VEX as well. Lower it here rather
+		# than carry it across.
+		return lower_vex(address, moved, moved_operands, moved_mnemonic, at)
+	# objdump comments a resolved target for several shapes, so the comment
+	# only means a RIP displacement when the operand says (%rip). Anything
+	# else copies across untouched.
+	rip = comment if "(%rip)" in moved_operands else None
+	return relocate(moved, address, at, rip)
+
+
+def build_stub(start, encoding, operands, mnemonic, window, displaced,
+               stub_address, scratch=None, pool=0, preceding=()):
+	"""The stub body for one window, placed at stub_address.
+
+	`start` is the window's first byte, which is the site's own address
+	unless the window was widened backwards -- in which case `preceding`
+	holds the instructions that come before the site and must execute first.
+	"""
 	body = bytearray()
-	lowered = lower_vex(site, encoding, operands, mnemonic, stub_address,
-	                    scratch, pool)
+	for entry in preceding:
+		fixed = moved_instruction(entry, stub_address + len(body))
+		if fixed is None:
+			return None
+		body += fixed
+
+	site = start + sum(len(entry[1]) for entry in preceding)
+	lowered = lower_vex(site, encoding, operands, mnemonic,
+	                    stub_address + len(body), scratch, pool)
 	if lowered is None:
 		return None
 	body += lowered
 
-	for address, moved, comment, moved_operands, moved_mnemonic in displaced:
-		at = stub_address + len(body)
-		if moved and moved[0] in (0xC4, 0xC5):
-			# The swallowed instruction is VEX as well. Lower it here
-			# rather than carry it across.
-			fixed = lower_vex(address, moved, moved_operands, moved_mnemonic, at)
-		else:
-			# objdump comments a resolved target for several shapes, so the
-			# comment only means a RIP displacement when the operand says
-			# (%rip). Anything else copies across untouched.
-			rip = comment if "(%rip)" in moved_operands else None
-			fixed = relocate(moved, address, at, rip)
+	for entry in displaced:
+		fixed = moved_instruction(entry, stub_address + len(body))
 		if fixed is None:
 			return None
 		body += fixed
 
 	# Back to the instruction after the WINDOW, which is not the instruction
 	# after the original once the window has been widened.
-	body += encode_jump(stub_address + len(body) + 5, site + window)
+	body += encode_jump(stub_address + len(body) + 5, start + window)
 	return bytes(body)
 
 
@@ -792,38 +814,78 @@ def collect(binary, listing):
 					        else "sequence shape not handled"] += 1
 				continue
 		displaced = []
+		preceding = []
+		start = address
 		window = len(encoding)
 
 		if window < 5:
-			# Too short for a jump on its own. Widen over the instruction
-			# that follows, which is safe only when nothing can branch to
-			# it -- see tools/targets.py for how that set is built.
+			# Too short for a jump on its own, so the window has to widen
+			# over a neighbour. Which neighbour decides which address ends
+			# up in the middle of the window, and the one in the middle is
+			# the one nothing may branch to.
+			reason = None
 			if index + 1 >= len(instructions):
-				skipped["nothing follows"] += 1
-				continue
-			nxt_address, nxt_encoding, nxt_mnemonic, _ops, nxt_comment = \
-				instructions[index + 1]
-			if nxt_address != address + window:
-				skipped["next instruction not adjacent"] += 1
-				continue
-			if nxt_address in blocked:
-				skipped["next instruction is a branch target"] += 1
-				continue
-			if nxt_mnemonic.startswith(CONTROL_PREFIXES):
-				skipped["next instruction transfers control"] += 1
-				continue
-			displaced.append((nxt_address, nxt_encoding, nxt_comment,
-			                  instructions[index + 1][3], nxt_mnemonic))
-			window += len(nxt_encoding)
-			if window < 5:
-				skipped["still too short"] += 1
+				reason = "nothing follows"
+			else:
+				nxt_address, nxt_encoding, nxt_mnemonic, nxt_operands, \
+					nxt_comment = instructions[index + 1]
+				if nxt_address != address + window:
+					reason = "next instruction not adjacent"
+				elif nxt_address in blocked:
+					reason = "next instruction is a branch target"
+				elif nxt_mnemonic.startswith(CONTROL_PREFIXES):
+					reason = "next instruction transfers control"
+				elif window + len(nxt_encoding) < 5:
+					reason = "still too short"
+				else:
+					displaced.append((nxt_address, nxt_encoding, nxt_comment,
+					                  nxt_operands, nxt_mnemonic))
+					window += len(nxt_encoding)
+
+			if reason is not None:
+				# **Backwards instead.** Forward widening leaves the window
+				# starting where the site already starts and swallows the
+				# next instruction, so that instruction is the one that must
+				# be unreachable. Putting the window's first byte on the
+				# PREVIOUS instruction swallows the site itself instead --
+				# and the site is frequently unreachable where its
+				# successor is not, because a compiler branches to the top
+				# of a block rather than into the middle of one.
+				#
+				# The previous instruction still has to fall through to
+				# here, so anything that transfers control rules it out: a
+				# call returns to the site, which would be a return into the
+				# middle of a window.
+				#
+				# Worth 3,237 sites that forward widening cannot reach,
+				# measured before it was written.
+				previous = instructions[index - 1] if index else None
+				if previous is None:
+					pass
+				elif previous[0] + len(previous[1]) != address:
+					pass		# not adjacent; something lies between
+				elif address in blocked:
+					pass		# the site is branched to; it cannot vanish
+				elif previous[2].startswith(CONTROL_PREFIXES):
+					pass		# does not fall through into the site
+				elif len(previous[1]) + len(encoding) < 5:
+					pass
+				else:
+					preceding.append((previous[0], previous[1], previous[4],
+					                  previous[3], previous[2]))
+					start = previous[0]
+					window = len(previous[1]) + len(encoding)
+					reason = None
+
+			if reason is not None:
+				skipped[reason] += 1
 				continue
 
-		if not inplace.covered_by(ranges, address, window):
+		if not inplace.covered_by(ranges, start, window):
 			skipped["outside .pdata"] += 1
 			continue
-		candidates.append((address, encoding, operands, mnemonic, window,
-		                   displaced, scratch))
+		candidates.append((start, encoding, operands, mnemonic, window,
+		                   displaced, scratch, preceding))
 	return patches, candidates, stats, skipped
 
 
@@ -1063,22 +1125,31 @@ def place_stubs(candidates, stub_base):
 	placed, swallowed = [], set()
 	refused = overlapped = 0
 	committed_to = 0
-	for (site, encoding, operands, mnemonic, window, displaced,
-	     scratch) in sorted(candidates, key=lambda c: c[0]):
-		if site < committed_to:
+	for (start, encoding, operands, mnemonic, window, displaced,
+	     scratch, preceding) in sorted(candidates, key=lambda c: c[0]):
+		if start < committed_to:
 			overlapped += 1
 			continue
 		stub_address = stub_base + len(blob)
-		body = build_stub(site, encoding, operands, mnemonic, window,
-		                  displaced, stub_address, scratch, pool)
+		body = build_stub(start, encoding, operands, mnemonic, window,
+		                  displaced, stub_address, scratch, pool, preceding)
 		if body is None:
 			refused += 1
 			continue
-		placed.append((site, window, stub_address))
-		committed_to = site + window
+		placed.append((start, window, stub_address))
+		committed_to = start + window
 		blob += body
-		for address, _moved, _comment, _ops, _mn in displaced:
-			swallowed.add(address)
+		# Every boundary strictly inside the window disappears. The window's
+		# first byte keeps its boundary, because the jump is written there.
+		offset = 0
+		for entry in preceding:
+			if offset:
+				swallowed.add(entry[0])
+			offset += len(entry[1])
+		if preceding:
+			swallowed.add(start + offset)	# the site, now inside the window
+		for entry in displaced:
+			swallowed.add(entry[0])
 	return placed, blob, swallowed, overlapped, refused
 
 
