@@ -752,6 +752,9 @@ def collect(binary, listing):
 	# containing no byte objdump failed to decode.
 	described = inplace.function_ranges(binary)
 	ranges = sorted(described + outside.leaf_ranges(plain, described, blocked))
+	# What each function never touches, for the sites the forward scan
+	# cannot get past. Computed once; it is a pass over the whole listing.
+	scope = scratch_finder.function_scope(plain, ranges)
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
 
 	# Anything already rewritten in place needs nothing further. Everything
@@ -802,7 +805,7 @@ def collect(binary, listing):
 		           and registers[0] == registers[-1])
 		scratch = None
 		if needs_sequence or aliased:
-			scratch = scratch_finder.find_scratch(plain, index)
+			scratch = scratch_finder.find_scratch(plain, index, scope=scope)
 			trial = lower_vex(address, encoding, operands, mnemonic,
 			                  address, scratch, address)
 			if trial is None:

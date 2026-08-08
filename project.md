@@ -1646,16 +1646,55 @@ The gain in finished sites is smaller than 3,237 because overlap absorbs much of
 -- windows that now extend backwards collide with windows already committed, and
 skipped-for-overlap rose from 33,375 to 35,401. Net, VEX fell from 15,647 to 14,757.
 
+### Finding 29 -- a register a whole function never touches
+
+The forward scan asks "is this register overwritten before it is read on every path
+from here", and where it cannot get an answer the site is refused. There is a second,
+much weaker question that sometimes answers when the first cannot: **is the register
+named anywhere in this function at all?**
+
+If xmm4 appears nowhere in a function then nothing in the function reads it; no callee
+can expect it, because nothing is passed in it; and no caller can expect it, because
+it is volatile. So it is free at *every* point in that function, including points no
+forward scan can reach.
+
+Only xmm4 and xmm5 qualify. **xmm0 to xmm3 cannot join them**, and the reason is worth
+recording because it is not obvious: a wrapper that calls `g(a, b, c)` forwards its own
+arguments in place and never names them, so "unmentioned" does not imply "unread" for
+an argument register.
+
+#### The check earned its keep twice more
+
+Adding the rule made `make scratch-check` fail with 22 claims that a path reads. Both
+causes are the same thing -- **a `.pdata` entry is not always a whole function** --
+and neither was visible from the rule as stated:
+
+  * **Falling off the end.** 0x140a234dd ends at 0x140a235f2 with no terminator and
+    runs straight into the next entry, which reads xmm4. The first version looked
+    only at jumps leaving the range and missed fall-through entirely.
+  * **A branch to another entry.** Treating that as a tail call, and so as an ABI
+    boundary, is wrong: the same function's other half has an entry of its own, and
+    `je 0x140a2371f` in that range goes to it.
+
+The rule is now the blunt one -- any jump out of the range, any indirect jump, and any
+range not ending in a control transfer disqualifies it. Real tail calls are lost with
+them, which costs coverage and nothing else. 1,501 sites were predicted before the
+tightening and 668 claims rest on the argument after it.
+
+That is twice now that this check has caught something the reasoning behind a change
+had missed, and once that it was itself the thing at fault. Its value is not that it
+agrees; it is that it is written from the other end.
+
 ### Final state
 
 ```
 in place                                      578,652
-detoured                                      177,294
-VEX in .text            805,131 ->      14,757   790,374 removed, 98.2%
+detoured                                      178,150
+VEX in .text            805,131 ->      13,809   791,322 removed, 98.3%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 65,727 lost boundaries
+section, every section after `.text` is byte-identical, all 65,946 lost boundaries
 are instructions a widened window swallowed deliberately, none of them is reachable
 by any branch, and the stub section carries 0 VEX instructions with exactly one jump
 back per detour.
@@ -1663,19 +1702,20 @@ back per detour.
 What remains, in order of size:
 
 ```
-src2 aliases dst, no scratch           4,550
+src2 aliases dst, no scratch           3,718
 outside .pdata                         3,570
-sequence with no usable scratch          931
+sequence with no usable scratch          780
 no direct SSE form                       710
-next instruction is a branch target      505
-next instruction transfers control       441
+next instruction is a branch target      515
+next instruction transfers control       445
+sequence shape not handled               164
 ```
 
-The two scratch categories are now more than a third of the remainder, and the cause
-underneath them is a call at which xmm4 and xmm5 are both live. Getting past that
-needs either interprocedural knowledge or somewhere to spill -- and spilling was
-rejected deliberately, because the stubs have no `.pdata` and a moved `rsp` breaks
-stack walking. Reopening it is a design decision rather than an incremental fix.
+The two scratch categories are still the largest, and the cause underneath them is
+now a function in which xmm4 and xmm5 are both genuinely used. Getting past that needs
+either interprocedural knowledge or somewhere to spill -- and spilling was rejected
+deliberately, because the stubs have no `.pdata` and a moved `rsp` breaks stack
+walking. Reopening it is a design decision rather than an incremental fix.
 
 ### Estimated cost of a translated binary
 

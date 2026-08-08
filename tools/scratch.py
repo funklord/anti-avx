@@ -50,9 +50,10 @@ is read unless the instruction is one of the few known to overwrite it
 completely.
 
   measure <listing>    how many sites needing a scratch can get one
-  check <listing>      prove every scratch it claims is really dead
+  check <listing> [binary]   prove every scratch it claims is dead
 """
 
+import bisect
 import sys
 from collections import Counter
 
@@ -211,13 +212,92 @@ def dead_from(instructions, position, read, depth, addresses, visiting,
 	                        addresses, visiting | {position}, budget)
 
 
-def find_scratch(instructions, index, limit=60):
+# Volatile under Win64 and not argument registers, which is what lets the
+# whole-function argument below work. xmm0 to xmm3 cannot join them: a
+# wrapper that calls g(a, b, c) forwards its own arguments in place and
+# never names them, so "unmentioned" does not imply "dead" for those.
+FUNCTION_SCRATCH = (4, 5)
+
+
+def function_scope(instructions, ranges):
+	"""Per function, the registers it provably never touches.
+
+	A different argument from the forward scan, and it reaches where that one
+	cannot. If xmm4 is not named anywhere in a function then nothing in the
+	function reads it; no callee can expect it, because nothing is passed in
+	it; and no caller can expect it, because it is volatile. So it is free at
+	*every* point in that function, including points the forward scan cannot
+	get past.
+
+	The way out is control leaving the range, and **a `.pdata` entry is not
+	always a whole function**. MSVC splits one function across two entries,
+	and the second half is entered with registers live -- so any way out at
+	all disqualifies the range. Both of these were found by the check
+	rejecting claims this made:
+
+	  * **Falling off the end.** 0x140a234dd ends at 0x140a235f2 without a
+	    terminator and runs straight on into the next entry, which reads
+	    xmm4. The first version only looked at jumps and missed it entirely.
+	  * **A branch to another entry.** Treating that as a tail call, and so
+	    as an ABI boundary, is wrong: the same function's other half has an
+	    entry of its own, and `je 0x140a2371f` in that range goes to it.
+
+	So the rule is the blunt one: any jump whose target is not inside the
+	range, any indirect jump, and any range that does not end in a control
+	transfer. Real tail calls are lost with it, which costs coverage and
+	costs nothing else.
+	"""
+	starts = [start for start, _end in ranges]
+	mentioned = [set() for _ in ranges]
+	escapes = [False] * len(ranges)
+	last = [None] * len(ranges)
+	for address, _encoding, mnemonic, operands in instructions:
+		i = bisect.bisect_right(starts, address) - 1
+		if i < 0 or address >= ranges[i][1]:
+			continue
+		mentioned[i].update(xmm_numbers(operands))
+		last[i] = mnemonic
+		if not mnemonic.startswith(("j", "loop")):
+			continue
+		target = branch_target(operands)
+		if target is None or not ranges[i][0] <= target < ranges[i][1]:
+			escapes[i] = True
+	for i, mnemonic in enumerate(last):
+		# A range that does not end by transferring control falls through
+		# into whatever follows it, carrying live registers with it.
+		if mnemonic is None or not (mnemonic.startswith(("ret", "jmp", "ud"))
+		                            or mnemonic == "int3"):
+			escapes[i] = True
+	free = [frozenset() if escapes[i]
+	        else frozenset(r for r in FUNCTION_SCRATCH
+	                       if r not in mentioned[i])
+	        for i in range(len(ranges))]
+	return starts, ranges, free
+
+
+def scope_free(scope, address):
+	"""The whole-function free registers at `address`, if any."""
+	if scope is None:
+		return frozenset()
+	starts, ranges, free = scope
+	i = bisect.bisect_right(starts, address) - 1
+	if i < 0 or address >= ranges[i][1]:
+		return frozenset()
+	return free[i]
+
+
+def find_scratch(instructions, index, limit=60, scope=None):
 	"""A register number free to clobber at instructions[index], or None."""
 	# The site's own operands are live: they are what the sequence works on.
 	site_registers = frozenset(xmm_numbers(instructions[index][3]))
 	free = dead_from(instructions, index + 1, site_registers, limit,
 	                 address_index(instructions), set(), [BUDGET])
 	for candidate in sorted(free):
+		return candidate
+	# The forward scan gave nothing. Ask the weaker question the whole
+	# function can answer.
+	for candidate in sorted(scope_free(scope, instructions[index][0])
+	                        - site_registers):
 		return candidate
 	return None
 
@@ -331,29 +411,56 @@ def wants_scratch(mnemonic, operands):
 	return mnemonic not in inplace.DESTINATION_IN_VVVV and mnemonic != "(bad)"
 
 
-def check(listing):
+def check(listing, binary=None):
 	instructions = list(inplace.parse_listing(listing))
 	addresses = address_index(instructions)
-	checked = live = unknown = 0
+	scope = None
+	if binary is not None:
+		import outside
+		import targets as target_set
+		blocked = set()
+		for values in target_set.collect(binary).values():
+			blocked |= values
+		for _a, _e, mnemonic, operands in instructions:
+			if mnemonic.startswith(("j", "call", "loop")) and operands:
+				target = branch_target(operands)
+				if target is not None:
+					blocked.add(target)
+		described = inplace.function_ranges(binary)
+		ranges = sorted(described
+		                + outside.leaf_ranges(instructions, described, blocked))
+		scope = function_scope(instructions, ranges)
+	checked = live = unknown = whole = 0
 	for i, (address, encoding, mnemonic, operands) in enumerate(instructions):
 		if encoding[:1] not in (b"\xc4", b"\xc5"):
 			continue
 		if not wants_scratch(mnemonic, operands):
 			continue
-		register = find_scratch(instructions, i)
+		register = find_scratch(instructions, i, scope=scope)
 		if register is None:
 			continue
 		checked += 1
 		verdict = walk(instructions, addresses, i + 1, register, 60)
 		if verdict == READ:
+			# A whole-function claim is allowed to fail the path walk only
+			# by being unresolvable, never by a read: if the register is
+			# named nowhere in the function, no path through it reads one.
 			live += 1
 			if live <= 5:
 				print(f"check: 0x{address:x} {mnemonic}: xmm{register} is "
 				      f"read on some path", file=sys.stderr)
 		elif verdict == UNKNOWN:
-			unknown += 1
+			# The forward walk could not settle it. If the claim rests on
+			# the whole-function argument instead, check that premise --
+			# which catches a mistake in the range indexing even though the
+			# ABI half of the argument is not something a tool can check.
+			if register in scope_free(scope, address):
+				whole += 1
+			else:
+				unknown += 1
 	print(f"check: {checked:,} claimed scratch registers")
 	print(f"check: {live:,} read on some path (must be 0), "
+	      f"{whole:,} resting on the whole-function argument, "
 	      f"{unknown:,} unverifiable")
 	return 1 if live else 0
 
@@ -363,7 +470,7 @@ def main(argv):
 		print(__doc__.strip())
 		return 0
 	if argv[0] == "check":
-		return check(argv[1])
+		return check(argv[1], argv[2] if len(argv) > 2 else None)
 	if argv[0] != "measure":
 		print(f"scratch.py: unknown mode {argv[0]!r}", file=sys.stderr)
 		return 2

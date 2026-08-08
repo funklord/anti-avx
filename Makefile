@@ -307,7 +307,7 @@ outside: $(LISTING)
 # by enumerating paths rather than intersecting sets. Needs the listing, so
 # it cannot live in `check`.
 scratch-check: $(LISTING)
-	$(PYTHON) tools/scratch.py check $<
+	$(PYTHON) tools/scratch.py check $< $(TARGET)
 
 # -- git hooks ---------------------------------------------------------------
 
