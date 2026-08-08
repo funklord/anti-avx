@@ -837,6 +837,79 @@ Nothing here has been executed. The invariants are structural: sizes, boundaries
 which bytes changed. That the rewritten instructions *compute* the same thing rests on
 the lowering rules and their tests, not on this tool.
 
+### Finding 15 — Class C by detour, and where it has to stop
+
+Class C cannot be rewritten in place: four bytes become seven. `tools/detour.py`
+appends a stub section and turns each site into a jump into it.
+
+```
+class C sites (dst != src1)      187,609
+  detoured                        94,925   50.6%
+  shorter than a jump             91,039   48.5%   left alone -- see below
+  outside .pdata                   1,645    0.9%
+```
+
+Combined with the in-place work, on the real binary:
+
+```
+size                102,242,144 -> 103,548,928   +1,306,784, the stub section
+sections after .text                             byte-identical
+VEX in .text            805,131 ->     142,470   662,661 removed, 82.3%
+  in place                                       567,736
+  detoured                                        94,925
+instruction boundaries       16,542,323          all preserved
+stub section                                     0 VEX, 94,925 jumps back
+```
+
+The counts reconcile exactly: 567,736 plus 94,925 is 662,661, and the stub section
+holds one jump back per detour.
+
+#### Why only the sites that are already five bytes
+
+A near jump is five bytes. Overwriting a five-byte instruction with one leaves its
+start and its end address exactly where they were, and **no address inside an
+instruction can be a branch target**, so nothing observable changes. That is the whole
+soundness argument, and it is why the length threshold is not an optimisation.
+
+The 91,039 four-byte register-to-register forms would have to swallow the instruction
+after them to make room. That reopens a question this cannot answer: an indirect
+branch through a jump table can target that next instruction, and **x64 MSVC switch
+tables hold offsets relative to the table, which no relocation records** — so the set
+of indirect targets cannot be enumerated from the file. Extending a window over an
+unknown branch target puts the landing site in the middle of a jump. They are left
+alone rather than guessed at.
+
+#### Two things that are fatal if got wrong
+
+**A RIP-relative operand moved into a stub is a different distance from its target.**
+Every site with a memory operand has one, and a displacement left alone points
+somewhere arbitrary. Checked rather than assumed: 12,507 stubs had their resolved
+target compared against the original instruction's, with **no mismatches**.
+
+**The jump back goes to the instruction after the original, not after the jump.**
+Those differ whenever the site was longer than five bytes, which is half of them.
+
+A third was caught by reading the output instead of trusting it: the section header
+packs `Characteristics` as the last four bytes of a 40-byte entry, and one field too
+many in the pack wrote it past the end. The section came out `READONLY, NOREAD` rather
+than executable — which objdump says plainly and nothing else would have.
+
+#### What remains
+
+142,470 VEX instructions, so the binary still faults:
+
+```
+class C shorter than a jump     91,039   needs the indirect-target problem solved
+A/B that would grow             25,887   SSE encoding one byte longer
+outside .pdata                  15,465   not provably code
+sequences (D, F, Y, H)          ~5,400   more than one instruction, and register
+                                         pressure -- the scratch has to come from
+                                         somewhere
+EVEX passthrough                   287   correct as is
+```
+
+Nothing here has been executed, and the invariants remain structural.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,
@@ -1421,7 +1494,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **PARTLY** — A/B/Z done as an in-place byte patch needing no relocation and no Ddisasm (Finding 14): 567,736 sites, 70.5%. Class C needs the blocked pipeline. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **MOSTLY** — A/B/Z in place (Finding 14) plus Class C by detour into an appended stub section (Finding 15). **662,661 of 805,131 VEX sites, 82.3%**, with no Ddisasm and no relocation of existing code. The 91,039 four-byte Class C forms need the indirect-branch-target problem solved first. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 

@@ -63,7 +63,8 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
         check-isa \
         scan report \
-        coverage disassemble patch patch-plan patch-verify hooks clean \
+        coverage disassemble patch patch-plan patch-verify detour \
+        detour-plan detour-verify hooks clean \
         distclean help
 
 all: check
@@ -234,7 +235,8 @@ disassemble: | $(BUILD_DIR)
 
 # -- in-place rewriting (milestone 4) ----------------------------------------
 
-PATCHED = $(BUILD_DIR)/$(basename $(notdir $(TARGET)))-sse.exe
+PATCHED  = $(BUILD_DIR)/$(basename $(notdir $(TARGET)))-sse.exe
+DETOURED = $(BUILD_DIR)/$(basename $(notdir $(TARGET)))-detour.exe
 
 # What can be rewritten without moving anything, and what cannot.
 patch-plan: $(LISTING)
@@ -255,6 +257,21 @@ patch: $(PATCHED)
 patch-verify: $(PATCHED)
 	$(PYTHON) tools/patch.py verify $(TARGET) $(PATCHED)
 
+# Class C, which cannot be rewritten in place: a stub section is appended and
+# each site becomes a jump into it. Only sites already five bytes or longer
+# are touched -- see project.md, Finding 15, for why the shorter ones are
+# left alone rather than made to fit.
+detour-plan: $(LISTING)
+	$(PYTHON) tools/detour.py plan $(TARGET) $<
+
+$(DETOURED): $(TARGET) $(LISTING) tools/detour.py tools/patch.py | $(BUILD_DIR)
+	$(PYTHON) tools/detour.py apply $(TARGET) $(LISTING) $@
+
+detour: $(DETOURED)
+
+detour-verify: $(DETOURED)
+	$(PYTHON) tools/detour.py verify $(TARGET) $(DETOURED)
+
 # -- git hooks ---------------------------------------------------------------
 
 # The hook lives in tools/hooks/ rather than only in .git/hooks so that it
@@ -270,8 +287,9 @@ hooks:
 # Named targets only. No `rm -rf` of a directory and no wildcard sweep: a
 # clean target is the one thing everybody runs without reading.
 clean:
-	rm -f $(LISTING) $(REPORT) $(PATCHED) $(BUILD_DIR)/patched.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
-	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
+	rm -f $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) \
+	      $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
+	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@rmdir $(BUILD_DIR) 2>/dev/null || true
 
 # Adds only what this project's own tooling wrote. It does not sweep for
@@ -307,6 +325,10 @@ help:
 	@echo '  patch       rewrite classes A/B/Z in place into $$(BUILD_DIR)'
 	@echo '  patch-verify'
 	@echo '              size, headers, and instruction boundaries preserved'
+	@echo '  detour-plan what Class C would be detoured'
+	@echo '  detour      in-place patches plus Class C detours'
+	@echo '  detour-verify'
+	@echo '              sections, boundaries and the stub section'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
 	@echo '  clean       remove the listing and the report'
 	@echo '  distclean   clean, plus __pycache__'
