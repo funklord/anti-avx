@@ -187,9 +187,71 @@ def lower_fma(vex, tail, mnemonic, scratch):
 	return bytes(body)
 
 
+# Load one element, then spread it. The load width is the whole point: a
+# single pshufd would do the job in one instruction and would read 128 bits
+# where vbroadcastss reads 32, so a source four bytes from the end of a
+# mapped page would fault where the original did not. The narrow load stays
+# narrow and the spread is a separate register-to-register instruction.
+#
+# vbroadcastsd is the exception, and not by cheating: movddup is SSE3, reads
+# exactly 64 bits, and duplicates them -- the whole instruction in one.
+BROADCASTS = {
+	# mnemonic: (load prefix, load opcode, spread prefix, spread opcode)
+	"vbroadcastss": (0xF3, b"\x0f\x10", None, b"\x0f\xc6"),
+	"vbroadcastsd": (0xF2, b"\x0f\x12", None, None),
+	"vpbroadcastd": (0x66, b"\x0f\x6e", 0x66, b"\x0f\x70"),
+}
+
+
+def lower_broadcast(vex, tail, mnemonic, encoding, address, at):
+	"""vbroadcastss / vbroadcastsd / vpbroadcastd. Needs no scratch."""
+	if vex["L"]:
+		return None			# 256-bit needs the Y representation
+	load_prefix, load_opcode, spread_prefix, spread_opcode = \
+		BROADCASTS[mnemonic]
+	modrm = tail[1]
+	destination = (vex["R"] << 3) | ((modrm >> 3) & 7)
+
+	body = bytearray()
+	if ((modrm >> 6) & 3) == 3:
+		# The AVX2 register form. There is nothing to load; the value has
+		# to reach the destination before it can be spread across it.
+		source = (vex["B"] << 3) | (modrm & 7)
+		if spread_opcode is None:
+			return None		# movddup from a register is a different shape
+		if destination != source:
+			body += encode_rr(None, MOVAPS, destination, source)
+	else:
+		load = bytearray()
+		if load_prefix is not None:
+			load.append(load_prefix)
+		rex = 0x40 | (vex["R"] << 2) | (vex["X"] << 1) | vex["B"]
+		if rex != 0x40:
+			load.append(rex)
+		load += load_opcode
+		load += tail[1:]
+		if rip_relative(tail):
+			# Relative to the end of the instruction, and the instruction
+			# has moved. There is no immediate on a broadcast, so the
+			# displacement is the last four bytes.
+			old = struct.unpack_from("<i", load, len(load) - 4)[0]
+			target = address + len(encoding) + old
+			displacement = target - (at + len(load))
+			if not -(1 << 31) <= displacement < (1 << 31):
+				return None
+			load[len(load) - 4:] = struct.pack("<i", displacement)
+		body += load
+
+	if spread_opcode is not None:
+		# shufps $0 / pshufd $0: every lane takes element zero.
+		body += encode_rr(spread_prefix, spread_opcode, destination,
+		                  destination, 0x00)
+	return bytes(body)
+
+
 SEQUENCE_MNEMONICS = frozenset((
 	"vblendvps", "vblendvpd", "vfmadd231ps", "vfmadd231ss",
-))
+)) | frozenset(BROADCASTS)
 
 
 def encode_jump(from_end, to_address):
@@ -224,6 +286,9 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None):
 				return None
 			if mnemonic.startswith("vblendv"):
 				return lower_blendv(vex, tail, mnemonic, scratch)
+			if mnemonic in BROADCASTS:
+				return lower_broadcast(vex, tail, mnemonic, encoding,
+				                       address, at)
 			return lower_fma(vex, tail, mnemonic, scratch)
 		return None
 	tail = encoding[vex["length"]:]
@@ -256,8 +321,11 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None):
 		old = struct.unpack_from("<i", operation, offset)[0]
 		target = address + len(encoding) + old
 		new_end = at + len(body) + len(operation)
+		displacement = target - new_end
+		if not -(1 << 31) <= displacement < (1 << 31):
+			return None
 		operation = (operation[:offset]
-		             + struct.pack("<i", target - new_end)
+		             + struct.pack("<i", displacement)
 		             + operation[offset + 4:])
 	body += operation
 	return bytes(body)
@@ -436,7 +504,8 @@ def collect(binary, listing):
 		scratch = None
 		if needs_sequence:
 			scratch = scratch_finder.find_scratch(plain, index)
-			trial = lower_vex(address, encoding, operands, mnemonic, 0, scratch)
+			trial = lower_vex(address, encoding, operands, mnemonic,
+			                  address, scratch)
 			if trial is None:
 				skipped["sequence with no usable scratch" if scratch is None
 				        else "sequence shape not handled"] += 1

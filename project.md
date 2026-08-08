@@ -1136,6 +1136,65 @@ shift group (destination in vvvv)          304
 its destination outright — so it is a `movss` plus a `shufps` away. It is unfinished
 here rather than hard.
 
+### Finding 19 — the broadcasts, and a load width that matters
+
+`vbroadcastss` was the largest unwritten sequence at 694 sites, and it needs no
+scratch: it writes its destination outright.
+
+```
+vbroadcastss m32,%xmm0   ->  movss  m32,%xmm0        32-bit load
+                             shufps $0,%xmm0,%xmm0   lane 0 to all four
+```
+
+**A single `pshufd $0` would do the whole job in one instruction, and it would be
+wrong.** `VBROADCASTSS` reads 32 bits; `pshufd` reads 128. A source four bytes from
+the end of a mapped page faults under the replacement where the original was fine —
+a difference that would appear only on the pages where it matters and never in
+testing. The narrow load stays narrow and the spread is a separate register-to-
+register instruction.
+
+`vbroadcastsd` is the one case where a single instruction is honest: SSE3's `movddup`
+reads exactly 64 bits and duplicates them. `vpbroadcastd` takes `movd` plus
+`pshufd $0`, integer domain throughout.
+
+Verified by disassembling the stubs rather than trusting the encoder — `f3 0f 10 00`
+followed by `0f c6 c0 00` is a 32-bit load and a broadcast, and there are no invalid
+decodes in the section. 71 RIP-relative broadcast stubs had their resolved target
+compared against the original instruction's, with no mismatches.
+
+```
+VEX in .text            805,131 ->      24,001   781,130 removed, 97.0%
+size                102,242,144 -> 104,957,440   +2,714,651, the stub section
+boundaries lost              67,219              every one deliberately swallowed
+swallowed instructions       67,974              none reachable by any branch
+stub section                                     0 VEX, 176,815 jumps back
+```
+
+One crash on the way, worth recording because it was in the *checking* rather than
+the output: `collect()` trial-lowers each candidate to find out whether its shape is
+handled, and passed a placeholder address of zero. The RIP displacement arithmetic
+then overflowed a signed 32-bit field and raised rather than answering the question.
+The trial uses the site's own address now, and both displacement computations refuse
+a site that will not fit rather than crashing — which cannot happen today, since the
+stubs sit 144 MB from `.text`, but a crash is a poor way to learn that stopped being
+true.
+
+#### The residue after the broadcasts
+
+```
+outside .pdata (not provably code)      17,234
+lowerable, no safe window or no scratch  5,187
+256-bit (needs the Y representation)       943
+shift group (destination in vvvv)          304
+(bad) -- data, not code                    180
+sequence not implemented                   153   vpermilps 65, FMA 132/213 forms 88
+```
+
+The 153 left are `vpermilps` with variable control, which is the Class H helper call
+rather than an inline sequence, and the FMA orderings other than 231 — `lower_fma`
+handles only `dst = src1*src2 + dst`, and the 132 and 213 forms put the addend
+somewhere else. Both are small and known.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,
@@ -1720,7 +1779,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **780,260 of 805,131 VEX sites, 96.9%** (Finding 18), with no Ddisasm and no relocation of existing code. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **781,130 of 805,131 VEX sites, 97.0%** (Finding 19), with no Ddisasm and no relocation of existing code. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
