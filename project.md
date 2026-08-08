@@ -674,6 +674,89 @@ rather than failing, which is the failure mode `running-code.md` exists to preve
 `prlimit --as` turned "the machine becomes unusable" into "the run reports
 `std::bad_alloc`", and the machine ended each attempt with 41 GB free and no orphans.
 
+### Finding 13 — the PGO warning does not sink the approach
+
+Finding 12 flagged `WARNING: Input binary compiled with Profile Guided Optimization.
+(unsupported)` as the thing that mattered more than the memory, and said it needed
+evaluating before more was spent on the Ddisasm route. It has been evaluated. **On the
+available evidence it is a caution, not a blocker**, and the memory wall remains the
+real obstacle.
+
+**What actually triggers it.** The PE carries an `IMAGE_DEBUG_TYPE_POGO` debug
+directory entry whose signature is `'LTCG'` — a link-time-codegen section map, which
+ordinary MSVC builds have. It is not a marker of profile-guided hot/cold splitting.
+Four other binaries on this machine carry it and provoke the identical warning.
+
+**What PGO actually did to this binary.** The POGO entry maps `.text` completely:
+
+```
+.text$di      0x1000       2,789,280     dynamic initialisers
+.text$mn      0x2a9fa0    55,216,464     the bulk of the code
+.text$mn$00   0x37528f0           96
+.text$x       0x3752950    1,225,840     EH funclets
+.text$yd      0x387ddc0    1,839,532     atexit destructors
+                          -----------
+                           61,071,212  = the whole .text, exactly
+```
+
+`.text$mn` is **one contiguous range**. There is no separate cold section and no split
+hot/cold region — the layout is the same shape as a 90 KB MSVC executable's, only
+larger. The feared PGO artefact, code fragments exiled to a distant region, is not
+visible in the section map.
+
+**The warning was tested rather than reasoned about.** Four binaries carrying it, small
+enough to fit, were disassembled and their code/data split audited against an
+independent linear sweep. A byte that cannot decode as an instruction but which
+Ddisasm calls code is the failure that matters, because anything rewritten there
+corrupts the output:
+
+```
+binary                     .text bytes   undecodable   called code   unaccounted
+d3ddriverquery64.exe            90,540             4             0             0
+GameOverlayRenderer64.dll    1,080,596           666             0             0
+iscriptevaluator.exe                 -            61             1*            0
+obse_1_2_416.dll                     -            12             0             0
+mciseq.dll     (no POGO)             -             0             0             0
+start.exe      (no POGO)             -             0             0             0
+```
+
+Every byte of `.text` is accounted for in all six. The metric is not vacuous — it
+could have reached 666 on one of them and reached 0.
+
+**\*The single apparent failure is a defect in the ground truth, not in Ddisasm.**
+At `0x140016348` in `iscriptevaluator.exe` the linear sweep had walked into a jump
+table, desynchronised, and decoded `62 01 00 cc cc` as one bogus five-byte
+instruction — swallowing a legitimate `int3` padding byte. Ddisasm had the table
+correctly split into 4-byte data blocks and called that byte a one-byte code block,
+which is right. Verified by reading both disassemblies.
+
+**Control Flow Guard, the other "unsupported" warning in the same cluster, does not
+apply.** `DllCharacteristics` is `0x8160`; the `GUARD_CF` bit is clear.
+
+#### What this does not establish
+
+The samples are 90 KB to 1 MB of `.text`. Starfield's is **61 MB and 16.5 million
+instructions** — a sixty-fold extrapolation, and the actual binary could not be tested
+because of Finding 12. Scale is exactly where code-discovery problems appear.
+
+The audit tests **code/data separation only**. It says nothing about whether the
+reassembled output is correct — that needs a MASM assembler, which this machine does
+not have — nor about symbolisation or jump-table recovery at scale.
+
+And "unsupported" is GrammaTech's word, not a measurement. It plausibly means "we do
+not test this configuration" rather than "this produces wrong output", but that
+reading is inference. The honest position is that **the specific risk the warning
+guards could not be reproduced**, not that it does not exist.
+
+#### A correction to Finding 8
+
+Finding 8 proposed the 744 undecodable islands as "the ground truth to audit against".
+This experiment shows that is too strong. **A linear sweep over-marks**: on walking
+into data it desynchronises, and its `(bad)` runs bleed into the legitimate code that
+follows, as they did at `0x140016348`. The island list is a useful screen — it found
+the one case worth inspecting out of 743 bytes — but it is not a clean oracle. An
+apparent disagreement has to be read before it counts as one.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,
@@ -1257,7 +1340,7 @@ crash at an unpredictable moment.
 | 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. The differential harness against an AVX host is not built. |
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
-| 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **FAILS on this hardware** — see Finding 12. Needs ~90 GB; the machine has 47. And ddisasm reports the binary as PGO-built, which it does not support. |
+| 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
 | 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
@@ -1279,9 +1362,11 @@ the project's largest risk.
 - ~~Does Ddisasm handle a 102 MB PE at all? Runtime and memory footprint unknown.~~
   **Resolved: not on 47 GB.** ~90 GB projected, `std::bad_alloc` at 34.3 GB observed.
   Finding 12.
-- **New: does Ddisasm's lack of PGO support sink the approach?** It warns on every
-  run. This is the open question that now matters most, and it is a correctness
-  question rather than a capacity one.
+- ~~**Does Ddisasm's lack of PGO support sink the approach?**~~ **Resolved so far as
+  it can be here: no.** The warning fires on an LTCG section map that ordinary MSVC
+  builds carry; four binaries carrying it disassemble with a clean code/data split.
+  Finding 13. What remains untested is whether that holds sixty times larger, which
+  needs the machine Finding 12 asks for.
 - **New: what assembles the output?** `gtirb-pprinter` emits MASM for a PE target, so
   the reassembly step needs `ml64` or `uasm`, neither of which is on this machine.
 - ~~Is the 4 MB sample representative?~~ **No — resolved by milestone 0.** Real VEX
