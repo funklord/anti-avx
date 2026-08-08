@@ -90,8 +90,11 @@ DEFAULTS: Config = {
 	# exactly like a clean tree -- see the note on collapse() below.
 	"floor": 1,
 
-	# ASCII-only content. Off by default: two projects require it, one
+	# ASCII-only content. Off by default: three projects require it, one
 	# explicitly exempts Markdown, and it is not yet a global rule.
+	# In Python it means ASCII *outside string literals*, which is what the
+	# rule has always said -- a tick a program prints is output, not prose.
+	# Other languages get the whole file, having no tokenizer here.
 	"ascii_only": False,
 	"ascii_exclude_markdown": True,
 
@@ -396,6 +399,46 @@ def is_python(path: Path) -> bool:
 	return first.startswith(b"#!") and b"python" in first
 
 
+def python_ascii_problems(text: str, where: Path):
+	"""Non-ASCII outside string literals, or None if it cannot be read.
+
+	The rule this enforces has always allowed Unicode in what a program
+	*prints* -- "a tick a program prints is output, not prose" -- and
+	forbidden it in the text the repository writes about itself. A
+	whole-file byte check cannot tell those apart, so a project with two
+	status ticks in f-strings had to switch the check off for its comments
+	as well, and an em dash duly reached one. tokenize makes the
+	distinction for free, and only for Python; everything else keeps the
+	byte check.
+
+	Returning None rather than [] when the file will not tokenise matters:
+	the caller then falls back to the *stricter* whole-file check. A file
+	nobody can parse is not a file that has been cleared, and a
+	non-breaking space between two tokens is exactly the kind of thing
+	that both breaks tokenize and needs reporting.
+	"""
+	literal = {tokenize.STRING}
+	for name in ("FSTRING_MIDDLE",):
+		kind = getattr(tokenize, name, None)
+		if kind is not None:
+			literal.add(kind)
+	problems = []
+	try:
+		for token in tokenize.generate_tokens(io.StringIO(text).readline):
+			if token.type in literal:
+				continue
+			for offset, char in enumerate(token.string):
+				if ord(char) > 127:
+					row, col = token.start
+					problems.append(Problem(
+					    where, row, col + offset + 1,
+					    f"non-ASCII {char!r} outside a string literal"))
+					break
+	except (tokenize.TokenError, SyntaxError, IndentationError):
+		return None
+	return problems
+
+
 def python_literal_lines(text: str) -> frozenset[int]:
 	"""Rows inside multi-line Python string literals.
 
@@ -500,15 +543,25 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 	raw      = path.read_bytes()
 
 	if cfg["ascii_only"] and not (cfg["ascii_exclude_markdown"] and path.suffix == ".md"):
-		try:
-			raw.decode("ascii")
-		except UnicodeDecodeError as exc:
-			offset  = exc.start
-			line_no = raw.count(b"\n", 0, offset) + 1
-			col_no  = offset - (raw.rfind(b"\n", 0, offset) + 1) + 1
-			problems.append(Problem(rel, line_no, col_no,
-			                        f"non-ASCII byte 0x{raw[offset]:02x}"))
-			return problems
+		found = None
+		if is_python(path):
+			try:
+				found = python_ascii_problems(raw.decode("utf-8"), rel)
+			except UnicodeDecodeError:
+				found = None            # not UTF-8 either; the bytes decide
+		if found is None:
+			try:
+				raw.decode("ascii")
+			except UnicodeDecodeError as exc:
+				offset  = exc.start
+				line_no = raw.count(b"\n", 0, offset) + 1
+				col_no  = offset - (raw.rfind(b"\n", 0, offset) + 1) + 1
+				found = [Problem(rel, line_no, col_no,
+				                 f"non-ASCII byte 0x{raw[offset]:02x}")]
+			else:
+				found = []
+		if found:
+			return found
 
 	text = raw.decode("utf-8", errors="replace")
 	if raw and not raw.endswith(b"\n"):

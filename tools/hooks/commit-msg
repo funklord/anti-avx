@@ -30,19 +30,26 @@ TOOLING='generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # with --cleanup=verbatim would retain comment lines; that is the one shape
 # where this is more lenient than the stored message.)
 #
-# Second, the directory name of the shared tooling tree, which is `.claude`.
-# Without this no commit could say where these files come from: this hook
-# lives at ~/.claude/tools/commit-msg, the style gate beside it, and the
-# guidelines under ~/.claude/guidelines/. Naming one read as a "tooling
-# reference" -- the rule firing on the one use it was never meant to cover,
-# where the workaround is to describe a path instead of writing it, making
-# the log vaguer exactly where it is trying to be exact.
+# Second, the names of the shared tooling tree. Without this no commit could
+# say where these files come from: this hook lives at
+# ~/.claude/tools/commit-msg, the style gate beside it, and the guidelines
+# under ~/.claude/guidelines/. Naming one read as a "tooling reference" --
+# the rule firing on the one use it was never meant to cover, where the
+# workaround is to describe a path instead of writing it, making the log
+# vaguer exactly where it is trying to be exact.
 #
-# What is spared is exactly two NAMES: the directory `.claude`, written
-# with its leading dot, and the file `CLAUDE.md`. Neither is a plausible
-# spelling of attribution -- nobody credits a tool as ".claude" -- while
-# both are unavoidable when writing about these files. The bare vendor word
-# on its own is untouched and still refused.
+# What is spared is exactly three NAMES: the directory `.claude`, written
+# with its leading dot; the file `CLAUDE.md`; and `claude-guidelines`, the
+# repository the guidelines live in. None is a plausible spelling of
+# attribution -- nobody credits a tool as ".claude" -- while all three are
+# unavoidable when writing about these files. The bare vendor word on its
+# own is untouched and still refused.
+#
+# The third arrived the way the first two did: a commit reconciling a
+# project style file against its source could not name the repository the
+# source is in, and the message had to say "the repository holding it"
+# instead. A rule that makes the log vaguer where it is trying to be exact
+# is the rule misfiring, not the message.
 #
 # Only those names are neutralised, never the token around them. Stripping
 # whole path-shaped tokens instead would forgive anything hidden inside one,
@@ -52,8 +59,12 @@ TOOLING='generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # The trailer check below is deliberately left reading the raw message: it
 # keys on the trailer NAME rather than on any vendor, so a generated-by
 # trailer with any path at all is still refused.
+# `claude-guidelines` is substituted before `.claude` so that the longer
+# name cannot be left half-scrubbed by the shorter one if either is edited
+# later. Neither matches the other today; the ordering is a guard, not a
+# fix.
 prose=$(sed -e '/^#.*>8/,$d' -e '/^#/d' "$msg" \
-	| sed -E 's#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
+	| sed -E 's#claude-guidelines#tooling-guidelines#g; s#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
 
 # 1. No AI or tooling attribution. The single deviation from kernel practice,
 #    and it is absolute. Human co-authors and reviewers are fine; a generator
