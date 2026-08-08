@@ -757,6 +757,86 @@ follows, as they did at `0x140016348`. The island list is a useful screen — it
 the one case worth inspecting out of 743 bytes — but it is not a clean oracle. An
 apparent disagreement has to be read before it counts as one.
 
+### Finding 14 — most of the rewrite needs no relocation at all
+
+Milestone 4 was specified as classes A/B/C/Z through the Ddisasm pipeline, and
+milestone 3 blocked. It turns out most of it never needed that pipeline.
+
+**A VEX instruction and its SSE equivalent are usually the same length.** The VEX
+prefix packs the legacy prefix, the REX bits, the opcode map and an extra register
+operand into two or three bytes; the SSE form spells the same things out as a legacy
+prefix, a REX byte and a `0F` escape. Count them and they frequently come to the same
+total, and where SSE is shorter the difference is a nop.
+
+So classes A, B and Z can be **patched into the binary in place**:
+
+```
+patchable in place    567,736   70.5%   A 469,859  B 78,624  Z 19,253
+needs relocation      197,607   24.6%   Class C -- one extra mov, cannot fit
+would grow in place    25,887    3.2%   SSE encoding is one byte longer
+outside .pdata         13,820    1.7%   not provably code; skipped
+```
+
+**That sidesteps hard part 2 entirely for those sites.** Nothing moves, so every
+address is unchanged, and `.pdata`, `.xdata`, the base relocations, the jump tables
+and the import directory are all still correct *because they were never touched*. The
+output is the same size as the input and byte-identical outside the rewritten
+instructions.
+
+`tools/patch.py`, `make patch`. Verified on the real binary:
+
+```
+size unchanged                       102,242,144 bytes
+bytes differing                        1,237,391   every one inside .text
+headers                                byte-identical
+VEX-encoded instructions       805,131 -> 237,395   567,736 removed, exactly the
+                                                    number patched
+instruction boundaries              16,542,323      all preserved
+```
+
+Class C is left alone, so the binary still faults — later, and at a site the tool can
+name, which is what milestone 4 asks for.
+
+#### Two bugs the verification caught, and the invariant that caught them
+
+Neither was visible in the output. Both were found because the counts did not
+reconcile: 585,327 instructions stopped being VEX when only 581,556 had been patched.
+
+**objdump wraps long encodings onto a continuation line.**
+
+```
+1402aa9db:	c5 f8 10 1d 8d cb 79
+1402aa9e2:	04
+```
+
+Those trailing bytes are part of the instruction. Reading only the first line makes an
+eight-byte instruction look like seven, and writing a seven-byte replacement over it
+strands the last byte and corrupts both. This hit **every instruction with a 32-bit
+displacement** — the most common shape in the binary.
+
+**A RIP-relative displacement is measured from the end of the instruction.** An
+encoding that shrinks and is padded afterwards ends a byte early, so every such
+displacement points somewhere else. The fix is to pad at the **front**: the end
+address stays fixed, and a branch to the original start lands on the nop and falls
+straight through, so both addresses survive.
+
+The invariant that exposes this class of error is worth stating on its own:
+
+> **Every address that began an instruction must still begin one.** A patch that
+> changes a length without meaning to desynchronises the disassembler downstream, and
+> that shows up here immediately. `make patch-verify` checks all 16.5 million.
+
+#### What it does not do
+
+The patched binary **will not run**. 237,395 VEX instructions remain, so it still
+faults with `EXCEPTION_ILLEGAL_INSTRUCTION` — just after 70.5% more of the work has
+happened. Class C is the bulk of what is left and genuinely needs somewhere to put an
+extra instruction, which is the relocation machinery this approach avoids.
+
+Nothing here has been executed. The invariants are structural: sizes, boundaries, and
+which bytes changed. That the rewritten instructions *compute* the same thing rests on
+the lowering rules and their tests, not on this tool.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,
@@ -1341,7 +1421,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **PARTLY** — A/B/Z done as an in-place byte patch needing no relocation and no Ddisasm (Finding 14): 567,736 sites, 70.5%. Class C needs the blocked pipeline. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 

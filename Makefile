@@ -63,7 +63,8 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
         check-isa \
         scan report \
-        coverage disassemble hooks clean distclean help
+        coverage disassemble patch patch-plan patch-verify hooks clean \
+        distclean help
 
 all: check
 
@@ -231,6 +232,29 @@ disassemble: | $(BUILD_DIR)
 	tools/run_ddisasm.sh $(TARGET) $(BUILD_DIR)/$(basename $(notdir $(TARGET))).gtirb \
 		$(DDISASM_LIMIT_GB) $(DDISASM_TIMEOUT)
 
+# -- in-place rewriting (milestone 4) ----------------------------------------
+
+PATCHED = $(BUILD_DIR)/$(basename $(notdir $(TARGET)))-sse.exe
+
+# What can be rewritten without moving anything, and what cannot.
+patch-plan: $(LISTING)
+	$(PYTHON) tools/patch.py plan $(TARGET) $<
+
+# Rewrite classes A, B and Z in place. No relocation, no reassembly: the
+# output is the same size as the input and byte-identical outside the
+# instructions it rewrote.
+$(PATCHED): $(TARGET) $(LISTING) tools/patch.py | $(BUILD_DIR)
+	$(PYTHON) tools/patch.py apply $(TARGET) $(LISTING) $@
+
+patch: $(PATCHED)
+
+# The invariants. `verify` disassembles both binaries and checks that every
+# address which began an instruction still does -- the check that caught
+# both bugs this tool has had, and the one worth running after any change
+# to it.
+patch-verify: $(PATCHED)
+	$(PYTHON) tools/patch.py verify $(TARGET) $(PATCHED)
+
 # -- git hooks ---------------------------------------------------------------
 
 # The hook lives in tools/hooks/ rather than only in .git/hooks so that it
@@ -246,8 +270,8 @@ hooks:
 # Named targets only. No `rm -rf` of a directory and no wildcard sweep: a
 # clean target is the one thing everybody runs without reading.
 clean:
-	rm -f $(LISTING) $(REPORT) $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
-	@echo "clean: removed $(LISTING) $(REPORT) $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
+	rm -f $(LISTING) $(REPORT) $(PATCHED) $(BUILD_DIR)/patched.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
+	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@rmdir $(BUILD_DIR) 2>/dev/null || true
 
 # Adds only what this project's own tooling wrote. It does not sweep for
@@ -279,6 +303,10 @@ help:
 	@echo '  scan        reproduce project.md from $$(TARGET) into $$(BUILD_DIR)'
 	@echo '  coverage    which VEX sites have a lowering rule, and the gaps'
 	@echo '  disassemble ddisasm over $$(TARGET), under prlimit bounds'
+	@echo '  patch-plan  what can be rewritten in place, and what cannot'
+	@echo '  patch       rewrite classes A/B/Z in place into $$(BUILD_DIR)'
+	@echo '  patch-verify'
+	@echo '              size, headers, and instruction boundaries preserved'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
 	@echo '  clean       remove the listing and the report'
 	@echo '  distclean   clean, plus __pycache__'
