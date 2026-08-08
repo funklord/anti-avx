@@ -37,6 +37,7 @@ Two details are easy to get wrong and both are fatal.
   verify  <original> <patched>          the invariants
 """
 
+import re
 import struct
 import subprocess
 import sys
@@ -92,6 +93,15 @@ def encode_rr(prefix, opcode, reg, rm, immediate=None):
 		out.append(immediate)
 	return bytes(out)
 
+
+FMA_PATTERN = re.compile(r"^vf(n?)(maddsub|msubadd|madd|msub)(132|213|231)"
+                          r"([sp][sd])$")
+
+# The legacy prefix each element type needs.
+FMA_PREFIX = {"ps": None, "pd": 0x66, "ss": 0xF3, "sd": 0xF2}
+
+# Stands in for "this operand is the original memory operand".
+MEMORY = object()
 
 MOVAPS = b"\x0f\x28"
 BLENDVPS = b"\x0f\x38\x14"
@@ -160,32 +170,146 @@ def lower_blendv(vex, tail, mnemonic, scratch):
 	return bytes(body)
 
 
-def lower_fma(vex, tail, mnemonic, scratch):
-	"""The 231 multiply-add forms: dst = src1*src2 + dst.
+def encode_mem(prefix, opcode, reg, vex, tail, address, encoding, at):
+	"""An SSE instruction reusing the original instruction's memory operand.
 
-	Two roundings replace one, so this is not bit-exact -- Class F's
-	standing caveat, recorded at every site it touches.
+	The modrm reg field is rewritten, because the destination of the piece
+	being emitted is rarely the destination the original named. Everything
+	from modrm onward -- sib, displacement -- is carried across unchanged
+	except for a RIP displacement, which is measured from the end of the
+	instruction and so has to be recomputed where the instruction now ends.
 	"""
-	if vex["L"] or scratch is None:
+	out = bytearray()
+	if prefix is not None:
+		out.append(prefix)
+	rex = 0x40 | ((reg >> 3) << 2) | (vex["X"] << 1) | vex["B"]
+	if rex != 0x40:
+		out.append(rex)
+	out += opcode
+	out.append((tail[1] & 0xC7) | ((reg & 7) << 3))
+	out += tail[2:]
+	if rip_relative(tail):
+		old = struct.unpack_from("<i", out, len(out) - 4)[0]
+		target = address + len(encoding) + old
+		displacement = target - (at + len(out))
+		if not -(1 << 31) <= displacement < (1 << 31):
+			return None
+		out[len(out) - 4:] = struct.pack("<i", displacement)
+	return bytes(out)
+
+
+def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0):
+	"""The fused multiply-adds. NOT bit-exact: two roundings replace one.
+
+	The 132/213/231 suffix says which operand is the addend, taken from the
+	SDM rather than from intuition. In AT&T order the operands print as
+	src2, src1, dst:
+
+	    132   dst = dst  * src2 + src1
+	    213   dst = src1 * dst  + src2
+	    231   dst = src1 * src2 + dst
+
+	The scalar forms carry a trap. VFMADD213SS leaves DEST[127:32]
+	**unchanged**, so the result cannot be moved back with a movaps -- that
+	would overwrite the upper lanes with whatever the scratch held. movss
+	and movsd write only their own width and leave the rest alone, which is
+	exactly what is wanted.
+	"""
+	match = FMA_PATTERN.match(mnemonic)
+	if match is None or vex["L"] or scratch is None:
 		return None
+	negated, operation, order, kind = match.groups()
 	modrm = tail[1]
-	if ((modrm >> 6) & 3) != 3:
-		return None
+	memory = ((modrm >> 6) & 3) != 3
 	destination = (vex["R"] << 3) | ((modrm >> 3) & 7)
-	source2 = (vex["B"] << 3) | (modrm & 7)
+	# With a memory operand there is no src2 register; MEMORY stands in for
+	# it below and is emitted by reusing the original operand bytes.
+	source2 = MEMORY if memory else (vex["B"] << 3) | (modrm & 7)
 	source1 = vex["vvvv"]
 	if scratch in (destination, source1, source2):
 		return None
-	packed = mnemonic.endswith("ps")
-	scalar_prefix = None if packed else 0xF3
-	multiply = b"\x0f\x59"
-	add = b"\x0f\x58"
-	body = bytearray()
-	body += encode_rr(None, MOVAPS, scratch, source1)
-	body += encode_rr(scalar_prefix, multiply, scratch, source2)
-	body += encode_rr(scalar_prefix, add, destination, scratch)
-	return bytes(body)
 
+	if order == "132":
+		factors, addend = (destination, source2), source1
+	elif order == "213":
+		factors, addend = (source1, destination), source2
+	else:
+		factors, addend = (source1, source2), destination
+
+	prefix = FMA_PREFIX[kind]
+	scalar = kind[0] == "s"
+	multiply, add, subtract = b"\x0f\x59", b"\x0f\x58", b"\x0f\x5c"
+
+	def move_result(source, target):
+		"""Into the destination, without disturbing what has to stay put."""
+		if scalar:
+			return encode_rr(prefix, b"\x0f\x10", target, source)
+		return encode_rr(None, MOVAPS, target, source)
+
+	def operate(opcode, target, operand):
+		"""One piece, whether its source is a register or the memory one."""
+		if operand is MEMORY:
+			return encode_mem(prefix, opcode, target, vex, tail, address,
+			                  encoding, at + len(body))
+		return encode_rr(prefix, opcode, target, operand)
+
+	body = bytearray()
+	if factors[0] is MEMORY:
+		# The memory operand can only be read, never be the copy's source.
+		return None
+	body += encode_rr(None, MOVAPS, scratch, factors[0])
+	piece = operate(multiply, scratch, factors[1])
+	if piece is None:
+		return None
+	body += piece
+
+	if operation == "maddsub" and not negated:
+		# Even lanes subtract and odd lanes add, which is what addsubps
+		# already does -- confirmed on the host, project.md Finding 4.
+		if scalar:
+			return None
+		piece = operate(b"\x0f\xd0", scratch, addend) if addend is MEMORY \
+			else encode_rr(0xF2 if kind == "ps" else 0x66, b"\x0f\xd0",
+			               scratch, addend)
+		if piece is None or addend is MEMORY:
+			return None		# addsub needs its own prefix; not worth the case
+		body += piece
+		body += move_result(scratch, destination)
+		return bytes(body)
+	if operation == "msubadd":
+		# The opposite lane pattern needs both results and a blend, and so
+		# a second scratch. Refused rather than approximated.
+		return None
+
+	if negated:
+		# dst = addend - product.
+		if addend is MEMORY:
+			return None		# the addend would have to be loaded first
+		if addend != destination:
+			body += move_result(addend, destination)
+		body += encode_rr(prefix, subtract, destination, scratch)
+		return bytes(body)
+
+	if operation == "msub":
+		# dst = product - addend. Subtraction does not commute, so this
+		# cannot be accumulated into the destination.
+		piece = operate(subtract, scratch, addend)
+		if piece is None:
+			return None
+		body += piece
+		body += move_result(scratch, destination)
+		return bytes(body)
+
+	# madd: dst = product + addend.
+	if addend == destination:
+		body += encode_rr(prefix, add, destination, scratch)
+		return bytes(body)
+	piece = operate(add, scratch, addend)
+	if piece is None:
+		return None
+	body += piece
+	body += move_result(scratch, destination)
+	return bytes(body)
 
 # Load one element, then spread it. The load width is the whole point: a
 # single pshufd would do the job in one instruction and would read 128 bits
@@ -355,7 +479,7 @@ def lower_broadcast(vex, tail, mnemonic, encoding, address, at):
 
 
 SEQUENCE_MNEMONICS = frozenset((
-	"vblendvps", "vblendvpd", "vfmadd231ps", "vfmadd231ss", "vpermilps",
+	"vblendvps", "vblendvpd", "vpermilps",
 )) | frozenset(BROADCASTS)
 
 
@@ -386,7 +510,7 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	if mnemonic in inplace.DESTINATION_IN_VVVV:
 		return None
 	if not inplace.has_direct_sse_form(mnemonic):
-		if mnemonic in SEQUENCE_MNEMONICS:
+		if mnemonic in SEQUENCE_MNEMONICS or FMA_PATTERN.match(mnemonic):
 			tail = encoding[vex["length"]:]
 			if len(tail) < 2:
 				return None
@@ -397,7 +521,8 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 				                       address, at)
 			if mnemonic == "vpermilps":
 				return lower_permilps(vex, tail, operands, scratch, at, pool)
-			return lower_fma(vex, tail, mnemonic, scratch)
+			return lower_fma(vex, tail, mnemonic, scratch, address,
+			                 encoding, at)
 		return None
 	tail = encoding[vex["length"]:]
 	if len(tail) < 2:
@@ -595,7 +720,8 @@ def collect(binary, listing):
 		# this only handled Class C. It quietly excluded every mnemonic
 		# that is DIRECT-only -- vcomiss and the rest -- as well as the
 		# sequences, long after the code below had learned to handle them.
-		needs_sequence = mnemonic in SEQUENCE_MNEMONICS
+		needs_sequence = (mnemonic in SEQUENCE_MNEMONICS
+		                  or FMA_PATTERN.match(mnemonic) is not None)
 		if not inplace.has_direct_sse_form(mnemonic) and not needs_sequence:
 			skipped["no direct SSE form"] += 1
 			continue

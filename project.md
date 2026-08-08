@@ -1237,6 +1237,65 @@ representation. The rest want a scratch that the forward scan cannot find. Nothi
 here is a missing rule: the rule exists, is tested, and is emitted correctly where a
 register is available.
 
+### Finding 21 — the FMA orderings, and what actually blocks them
+
+`lower_fma` handled one shape: `vfmadd231{ps,ss}`. It now handles every
+multiply-add the binary contains — the 132 and 213 orderings, the subtract and
+negated forms, and the memory-operand cases.
+
+The 132/213/231 suffix says which operand is the addend, and in AT&T order, where
+the operands print as src2, src1, dst:
+
+```
+132   dst = dst  * src2 + src1
+213   dst = src1 * dst  + src2
+231   dst = src1 * src2 + dst
+```
+
+That mapping was checked symbolically against the SDM formula for ten shapes before
+any of it ran, with no mismatches. It is the part where an error would be invisible:
+every ordering produces a plausible-looking sequence and only one is right.
+
+**The scalar forms carry a trap.** `VFMADD213SS` leaves `DEST[127:32]` *unchanged*,
+so the result cannot be moved back with a `movaps` — that would overwrite the upper
+lanes with whatever the scratch held. `movss` and `movsd` write only their own width,
+which is exactly what is wanted.
+
+`vfnmsub` does not occur in this binary, which is worth knowing: it is the one form
+needing a genuine negation, and therefore a sign-mask constant. `vfmsubadd` is
+refused — its lane pattern needs both results and a blend, so a second scratch.
+
+#### What actually blocks the FMA sites
+
+The orderings were never the constraint. Across all 421:
+
+```
+256-bit (needs the Y representation)   191   45%
+no dead register                       126   30%
+memory operand                          70   17%   -- now handled
+lowerable                               34    8%
+```
+
+Adding every ordering and the memory operand together moved 25 sites. **Register
+pressure and the 256-bit representation are what stand between here and the rest**,
+and neither is a missing rule.
+
+```
+VEX in .text            805,131 ->      23,923   781,208 removed, 97.0%
+```
+
+#### A stale artifact, and the rule that exists for it
+
+An emitted stub appeared to jump into the middle of another one — a corruption that
+would have been catastrophic. It was not real: `build/after.asm` had been
+disassembled before the last change and compared against a binary rebuilt after it.
+The stub was correct all along.
+
+`build-and-commit.md` states the rule as never concluding a test passes or fails from
+a binary the build step did not rebuild. The same applies to a *disassembly* of one,
+and an ad-hoc `objdump` has no dependency on the thing it describes, where `make`
+would have. Half an hour went into chasing it.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,
