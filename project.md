@@ -1561,19 +1561,83 @@ happily against the binary left over from the previous run and reported a clean 
 The output is deleted before the run now, so a crash cannot leave a stale artifact
 for the next step to bless.
 
+### Finding 27 -- the scan was stopping at branches, not running out of room
+
+The aliasing fix left 6,232 sites refused for want of a scratch register, and the
+obvious remedy -- scan further -- turned out to be worth almost nothing. Measured
+rather than assumed:
+
+```
+a branch ends the scan     5,255      85%
+call, xmm4 and xmm5 live     370
+ret                          332
+limit reached                170       widening the window buys this many
+```
+
+`limit` was never the constraint. **The scan stopped at the first branch**, because
+the module was written to avoid needing a control flow graph.
+
+It still does not need one. An unconditional jump has exactly one successor, so the
+scan continues there; a conditional branch has two, and a register is free only if it
+is free on **both**, so the two answers are intersected. Anything unresolvable -- an
+indirect jump, a target outside the listing, a back edge, an exhausted budget --
+contributes the empty set. That is the conservative direction by construction: it can
+only refuse a register that was in fact free, never claim one that was live.
+
+A `ret` was also made to free xmm1 to xmm5. They are volatile under Win64, so the
+caller of the function about to return cannot expect them to have survived; xmm0 is
+excluded because it carries the result.
+
+Sites that can get a scratch went from 21,735 to 27,016.
+
+#### Two checks, because this is the direction that is dangerous to get wrong
+
+Claiming a live register corrupts arithmetic silently, exactly as Finding 25 did. So
+the change carries two pieces of evidence rather than a plausibility argument.
+
+**It never loses.** Every site where the old scan found a register, the new one finds
+one too -- 0 regressions across 33,702 sites. A new answer that differs is a
+different *valid* choice, since the old scan returned the first kill it met and this
+one returns the lowest free register.
+
+**Every claim is verified the other way round.** `make scratch-check` enumerates
+concrete paths one at a time and asks of each whether the register is written before
+it is read, where `find_scratch` recurses and intersects dead sets. A fault in the
+intersection or the union appears here as a path the set arithmetic missed. All
+27,016 claims pass, with none unverifiable.
+
+Writing it twice earned its keep immediately, though not in the direction expected.
+The first version of the checker tested `register in sources` before `kills ==
+register` and reported 597 violations -- every one of them a zeroing idiom, which
+names its register as a source and does not read it, which is the entire reason
+`ZEROING` exists. **The checker was wrong and the search was right**, which is
+`evidence.md`'s rule about suspecting the gate first, arrived at from the other end:
+the code was checked before the gate was believed.
+
 ### Final state
 
 ```
 in place                                      578,652
-detoured                                      174,531
-VEX in .text            805,131 ->      17,929   787,202 removed, 97.8%
+detoured                                      176,442
+VEX in .text            805,131 ->      15,647   789,484 removed, 98.1%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 64,135 lost boundaries
+section, every section after `.text` is byte-identical, all 65,057 lost boundaries
 are instructions a widened window swallowed deliberately, none of them is reachable
 by any branch, and the stub section carries 0 VEX instructions with exactly one jump
 back per detour.
+
+What remains, in order of size:
+
+```
+src2 aliases dst, no scratch           4,550
+outside .pdata                         3,410
+next instruction transfers control     2,334
+next instruction is a branch target    1,732
+sequence with no usable scratch          931
+no direct SSE form                       710
+```
 
 ### Estimated cost of a translated binary
 

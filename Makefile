@@ -67,7 +67,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         check-isa \
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
-        placement check-aliasing \
+        placement check-aliasing scratch-check \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -303,6 +303,12 @@ placement: $(LISTING)
 outside: $(LISTING)
 	$(PYTHON) tools/outside.py report $(TARGET) $<
 
+# Prove every register the liveness scan claims as scratch is really dead,
+# by enumerating paths rather than intersecting sets. Needs the listing, so
+# it cannot live in `check`.
+scratch-check: $(LISTING)
+	$(PYTHON) tools/scratch.py check $<
+
 # -- git hooks ---------------------------------------------------------------
 
 # The hook lives in tools/hooks/ rather than only in .git/hooks so that it
@@ -364,6 +370,7 @@ help:
 	@echo '  bench       what a detour costs on this CPU (a timing run)'
 	@echo '  placement   where the detours land: functions and loop bodies'
 	@echo '  outside     the code .pdata does not describe'
+	@echo '  scratch-check  prove every claimed scratch register is dead'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
 	@echo '  clean       remove the listing and the report'
 	@echo '  distclean   clean, plus __pycache__'
