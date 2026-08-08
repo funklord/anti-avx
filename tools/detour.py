@@ -45,6 +45,7 @@ from collections import Counter
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import lower
 import patch as inplace
+import scratch as scratch_finder
 import targets as target_set
 
 JMP_REL32 = 0xE9
@@ -77,12 +78,126 @@ def encode_movaps(destination, source):
 	return bytes(out)
 
 
+def encode_rr(prefix, opcode, reg, rm, immediate=None):
+	"""A register-to-register SSE instruction, with REX only where needed."""
+	out = bytearray()
+	if prefix is not None:
+		out.append(prefix)
+	rex = 0x40 | ((reg >> 3) << 2) | (rm >> 3)
+	if rex != 0x40:
+		out.append(rex)
+	out += opcode
+	out.append(0xC0 | ((reg & 7) << 3) | (rm & 7))
+	if immediate is not None:
+		out.append(immediate)
+	return bytes(out)
+
+
+MOVAPS = b"\x0f\x28"
+BLENDVPS = b"\x0f\x38\x14"
+BLENDVPD = b"\x0f\x38\x15"
+
+
+def lower_blendv(vex, tail, mnemonic, scratch):
+	"""vblendvps/vblendvpd: SSE takes the mask in an implicit %xmm0.
+
+	Four registers are named -- mask, src2, src1, dst -- and only three fit,
+	so the mask has to be moved into %xmm0 and whatever %xmm0 held has to
+	survive. Where the destination IS %xmm0 its old value is dead, but it
+	still cannot hold the mask and the result at once, so the blend runs in
+	the scratch. See project.md Finding 9 for how the naive ordering
+	destroys the mask and then the result.
+	"""
+	if (vex["L"]):
+		return None			# 256-bit needs the Y representation
+	modrm = tail[1]
+	if ((modrm >> 6) & 3) != 3:
+		return None			# memory src2; not handled here
+	is4 = tail[2] if len(tail) > 2 else None
+	if is4 is None:
+		return None
+	destination = (vex["R"] << 3) | ((modrm >> 3) & 7)
+	source2 = (vex["B"] << 3) | (modrm & 7)
+	source1 = vex["vvvv"]
+	mask = (is4 >> 4) & 0xF
+	opcode = BLENDVPS if mnemonic == "vblendvps" else BLENDVPD
+
+	body = bytearray()
+	if mask == 0:
+		# Cheapest shape: the mask is already where SSE wants it.
+		if destination != source1:
+			body += encode_rr(None, MOVAPS, destination, source1)
+		body += encode_rr(0x66, opcode, destination, source2)
+		return bytes(body)
+
+	if scratch is None:
+		return None
+	if scratch in (destination, source1, source2, mask, 0):
+		return None
+
+	if destination == 0:
+		# %xmm0 is written by the instruction, so its incoming value is
+		# dead -- but it cannot be the blend's destination while it holds
+		# the mask, so the blend runs in the scratch and moves back.
+		body += encode_rr(None, MOVAPS, scratch, source1)
+		body += encode_rr(None, MOVAPS, 0, mask)
+		body += encode_rr(0x66, opcode, scratch, source2)
+		body += encode_rr(None, MOVAPS, 0, scratch)
+		return bytes(body)
+
+	# %xmm0 holds something live. Save it, then rename any operand that
+	# referred to it, because the mask is about to overwrite it.
+	body += encode_rr(None, MOVAPS, scratch, 0)
+	body += encode_rr(None, MOVAPS, 0, mask)
+	if source1 == 0:
+		source1 = scratch
+	if source2 == 0:
+		source2 = scratch
+	if destination != source1:
+		body += encode_rr(None, MOVAPS, destination, source1)
+	body += encode_rr(0x66, opcode, destination, source2)
+	body += encode_rr(None, MOVAPS, 0, scratch)
+	return bytes(body)
+
+
+def lower_fma(vex, tail, mnemonic, scratch):
+	"""The 231 multiply-add forms: dst = src1*src2 + dst.
+
+	Two roundings replace one, so this is not bit-exact -- Class F's
+	standing caveat, recorded at every site it touches.
+	"""
+	if vex["L"] or scratch is None:
+		return None
+	modrm = tail[1]
+	if ((modrm >> 6) & 3) != 3:
+		return None
+	destination = (vex["R"] << 3) | ((modrm >> 3) & 7)
+	source2 = (vex["B"] << 3) | (modrm & 7)
+	source1 = vex["vvvv"]
+	if scratch in (destination, source1, source2):
+		return None
+	packed = mnemonic.endswith("ps")
+	scalar_prefix = None if packed else 0xF3
+	multiply = b"\x0f\x59"
+	add = b"\x0f\x58"
+	body = bytearray()
+	body += encode_rr(None, MOVAPS, scratch, source1)
+	body += encode_rr(scalar_prefix, multiply, scratch, source2)
+	body += encode_rr(scalar_prefix, add, destination, scratch)
+	return bytes(body)
+
+
+SEQUENCE_MNEMONICS = frozenset((
+	"vblendvps", "vblendvpd", "vfmadd231ps", "vfmadd231ss",
+))
+
+
 def encode_jump(from_end, to_address):
 	"""jmp rel32, whose displacement is measured from the end of the jump."""
 	return bytes([JMP_REL32]) + struct.pack("<i", to_address - from_end)
 
 
-def lower_vex(address, encoding, operands, mnemonic, at):
+def lower_vex(address, encoding, operands, mnemonic, at, scratch=None):
 	"""Lower one VEX instruction for execution at `at`. Bytes, or None.
 
 	Used for the Class C site itself and for a swallowed instruction that
@@ -103,6 +218,13 @@ def lower_vex(address, encoding, operands, mnemonic, at):
 	if mnemonic in inplace.DESTINATION_IN_VVVV:
 		return None
 	if not inplace.has_direct_sse_form(mnemonic):
+		if mnemonic in SEQUENCE_MNEMONICS:
+			tail = encoding[vex["length"]:]
+			if len(tail) < 2:
+				return None
+			if mnemonic.startswith("vblendv"):
+				return lower_blendv(vex, tail, mnemonic, scratch)
+			return lower_fma(vex, tail, mnemonic, scratch)
 		return None
 	tail = encoding[vex["length"]:]
 	if len(tail) < 2:
@@ -142,10 +264,11 @@ def lower_vex(address, encoding, operands, mnemonic, at):
 
 
 def build_stub(site, encoding, operands, mnemonic, window, displaced,
-               stub_address):
+               stub_address, scratch=None):
 	"""The stub body for one site, placed at stub_address."""
 	body = bytearray()
-	lowered = lower_vex(site, encoding, operands, mnemonic, stub_address)
+	lowered = lower_vex(site, encoding, operands, mnemonic, stub_address,
+	                    scratch)
 	if lowered is None:
 		return None
 	body += lowered
@@ -252,7 +375,6 @@ def collect(binary, listing):
 	"""(in-place patches, class C detour candidates, statistics)."""
 	ranges = inplace.function_ranges(binary)
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
-	nds = lower.NDS_MNEMONICS
 
 	# Everything anything can branch to. A window may not contain one of
 	# these anywhere but at its first byte.
@@ -261,6 +383,8 @@ def collect(binary, listing):
 	for values in groups.values():
 		blocked |= values
 	instructions = list(parse_with_comments(listing))
+	# The liveness scan wants the plain four-field shape.
+	plain = [(a, e, m, o) for a, e, m, o, _c in instructions]
 	for i, (address, _e, mnemonic, operands, _c) in enumerate(instructions):
 		if mnemonic.startswith(("j", "call", "loop")) and operands:
 			first = operands.split()[0]
@@ -291,16 +415,32 @@ def collect(binary, listing):
 		vex = inplace.decode_vex(encoding)
 		if vex is None or mnemonic in inplace.DESTINATION_IN_VVVV:
 			continue
-		if mnemonic not in nds:
-			continue
-		if not inplace.has_direct_sse_form(mnemonic):
+		# There was a `mnemonic not in nds` test here, left over from when
+		# this only handled Class C. It quietly excluded every mnemonic
+		# that is DIRECT-only -- vcomiss and the rest -- as well as the
+		# sequences, long after the code below had learned to handle them.
+		needs_sequence = mnemonic in SEQUENCE_MNEMONICS
+		if not inplace.has_direct_sse_form(mnemonic) and not needs_sequence:
 			skipped["no direct SSE form"] += 1
 			continue
 		fields = inplace.split_operands(operands)
 		registers = [o for o in fields if not o.startswith("$")]
-		if len(registers) not in (2, 3):
+		if not needs_sequence and len(registers) not in (2, 3):
 			skipped["operand shape not A/B/C"] += 1
 			continue
+
+		# A sequence may need somewhere to put an intermediate. Ask the
+		# liveness scan; a site with no dead register is left alone rather
+		# than spilled, because a stub that moves rsp breaks stack walking
+		# (see tools/scratch.py).
+		scratch = None
+		if needs_sequence:
+			scratch = scratch_finder.find_scratch(plain, index)
+			trial = lower_vex(address, encoding, operands, mnemonic, 0, scratch)
+			if trial is None:
+				skipped["sequence with no usable scratch" if scratch is None
+				        else "sequence shape not handled"] += 1
+				continue
 		displaced = []
 		window = len(encoding)
 
@@ -333,7 +473,7 @@ def collect(binary, listing):
 			skipped["outside .pdata"] += 1
 			continue
 		candidates.append((address, encoding, operands, mnemonic, window,
-		                   displaced))
+		                   displaced, scratch))
 	return patches, candidates, stats, skipped
 
 
@@ -445,13 +585,14 @@ def apply_all(binary, listing, output):
 	# site that starts inside a committed window is the whole fix.
 	refused = overlapped = 0
 	committed_to = 0
-	for site, encoding, operands, mnemonic, window, displaced in sorted(candidates):
+	for (site, encoding, operands, mnemonic, window, displaced,
+	     scratch) in sorted(candidates, key=lambda c: c[0]):
 		if site < committed_to:
 			overlapped += 1
 			continue
 		stub_address = stub_base + len(blob)
 		body = build_stub(site, encoding, operands, mnemonic, window,
-		                  displaced, stub_address)
+		                  displaced, stub_address, scratch)
 		if body is None:
 			refused += 1
 			continue
@@ -510,7 +651,8 @@ def verify(original, patched, listing=None):
 	_patches, candidates, _stats, _skipped = collect(original, listing)
 	swallowed = set()
 	committed_to = 0
-	for site, _encoding, _operands, _mnemonic, window, displaced in sorted(candidates):
+	for (site, _encoding, _operands, _mnemonic, window, displaced,
+	     _scratch) in sorted(candidates, key=lambda c: c[0]):
 		if site < committed_to:
 			continue			# same overlap rule apply() uses
 		committed_to = site + window

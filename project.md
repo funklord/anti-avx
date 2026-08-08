@@ -1063,6 +1063,79 @@ piece of work rather than another special case.
 The other 17,718 are deliberate: bytes not provably code, the shift group whose
 destination lives in vvvv, and data.
 
+### Finding 18 — a scratch register, without touching the stack
+
+Hard part 5 is where to get a scratch for the multi-instruction sequences.
+`tools/scratch.py` answers it, and the first thing to say is what it does **not** do.
+
+**Spilling to the stack is the obvious answer and it is wrong here.** Win64 has no red
+zone, so a stub would have to move `rsp` — and the stubs live in a section with no
+`.pdata`, so `RtlVirtualUnwind` finds no unwind data, treats the stub as a leaf, and
+reads the frame from an `rsp` that has moved. Anything walking the stack while a stub
+runs — an exception, a sampling profiler — then gets a wrong answer. Four saved
+instructions is a poor price for a broken unwind.
+
+So the scratch has to be a register that is already dead, found by scanning forward
+from the site. That is sound without a CFG because it never has to prove a register is
+dead *everywhere*, only that nothing reads it before something overwrites it:
+
+- a **full write** kills whatever the register held;
+- a **call** kills xmm4 and xmm5 outright — volatile under Win64 and not argument
+  registers, so no caller can expect them to survive and no callee is passed anything
+  in them. xmm0-xmm3 are argument registers, so a call *reads* them; xmm6-xmm15 are
+  preserved, so a call says nothing about them;
+- anything else that transfers control ends the scan.
+
+Scan depth is not the constraint — 60 instructions and 240 give 1,590 and 1,592 —
+control flow is.
+
+#### Most of these never needed a scratch
+
+Measuring which sites actually need one was worth more than the allocator:
+
+```
+vblendv*, mask already in xmm0    1,362   none needed -- it is already where SSE wants it
+vbroadcast*, writes its dst         772   none needed
+vblendv*, needs a scratch         2,210   ->   773 found (35%)
+FMA, needs a scratch                230   ->    51 found (22%)
+256-bit (ymm)                       808   not a scratch problem at all
+```
+
+#### Result
+
+```
+VEX in .text            805,131 ->      24,871   780,260 removed, 96.9%
+  in place                                       567,883
+  detoured                                       176,121
+size                102,242,144 -> 104,945,152   +2,702,751, the stub section
+boundaries lost              67,043              every one deliberately swallowed
+swallowed instructions       67,974              none reachable by any branch
+stub section                                     0 VEX, 176,121 jumps back
+```
+
+67,974 swallowed minus 67,043 lost is 931, exactly the refused sites.
+
+**A third filter narrower than its machinery.** A leftover `mnemonic not in nds` test
+sat at the top of the candidate loop from when the detour engine handled only Class C.
+It excluded every DIRECT-only mnemonic — `vcomiss` and its relatives — as well as
+every sequence, long after the code below had learned to handle them. That one line
+was worth 9,241 sites.
+
+#### The residue
+
+```
+outside .pdata (not provably code)      17,234
+lowerable, no safe window or no scratch  5,363
+256-bit (needs the Y representation)       943
+sequence not implemented                   847   vbroadcastss 694, vpermilps 65, ...
+shift group (destination in vvvv)          304
+(bad) -- data, not code                    180
+```
+
+`vbroadcastss` is the largest remaining sequence and needs **no** scratch — it writes
+its destination outright — so it is a `movss` plus a `shufps` away. It is unfinished
+here rather than hard.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,
@@ -1647,7 +1720,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **771,639 of 805,131 VEX sites, 95.8%** (Finding 17), with no Ddisasm and no relocation of existing code. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **780,260 of 805,131 VEX sites, 96.9%** (Finding 18), with no Ddisasm and no relocation of existing code. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
