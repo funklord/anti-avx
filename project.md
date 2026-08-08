@@ -992,6 +992,77 @@ the sites the first refused — and neither needs new information. The remaining
 sequences need a register allocator, which is the next real piece of work rather than
 another special case.
 
+### Finding 17 — the second pass, and what the residue really was
+
+Finding 16 left 56,984 VEX instructions and a prediction about what they were. The
+prediction was wrong in a useful way, and **measuring the residue rather than trusting
+the projection is what found the remaining work**.
+
+The projection said 33,426 sites had been lost to overlapping windows. They had not:
+a swallowed Class C instruction is *lowered inside the stub that swallowed it*, so
+those sites were already handled. What was actually left:
+
+```
+class A, SSE is 1B longer     23,029   <- never even considered for a detour
+outside .pdata                17,234
+no direct SSE form             9,428
+class C, not detoured          4,484
+class B, SSE is 1B longer      2,316   <- likewise
+```
+
+Two eligibility bugs, both the same shape: **a filter narrower than the machinery
+behind it.**
+
+**`detour.py` only ever considered Class C.** 25,345 class A and B sites were left
+alone for no better reason than that their SSE encoding is one byte longer than the
+VEX one, which is precisely what a stub exists for. A site that does not fit in place
+and does have a lowering is a detour candidate whatever class it belongs to.
+
+**The mnemonic tables do not list the compare forms.** objdump folds the predicate
+into the name -- `vcmpneqps`, not `vcmpps` with an immediate -- so every compare
+failed a table lookup and was filed under "no direct SSE form". The encoding still
+carries the predicate as an imm8, so the SSE form is a plain prefix strip. Only for
+the eight predicates SSE has: an AVX-only predicate would leave an immediate `cmpps`
+cannot decode, and those still need the operand exchange of Finding 11.
+
+Result:
+
+```
+VEX in .text            805,131 ->      33,492   771,639 removed, 95.8%
+  in place                                       567,883
+  detoured                                       167,697
+size                102,242,144 -> 104,830,464   +2,588,320, the stub section
+sections after .text                             byte-identical
+boundaries lost              66,551              every one deliberately swallowed
+swallowed instructions       67,554              none reachable by any branch
+stub section                                     0 VEX, 167,697 jumps back
+```
+
+The counts close again: 67,554 swallowed minus 66,551 lost boundaries is 1,003,
+exactly the sites refused for an ambiguous displacement.
+
+#### The residue, measured rather than projected
+
+```
+outside .pdata (not provably code)      17,234
+lowerable, no safe detour window        10,407
+needs a real sequence (D/F/H/Y)          5,358   vblendvps 3,471, vbroadcastss 749,
+                                                 vextractf128 379, FMA 237, ...
+destination-in-vvvv (shift group)          304
+(bad) -- data, not code                    180
+four-operand form                            9
+```
+
+Only two of these are work rather than policy. The 10,407 without a window are mostly
+sites whose following instruction transfers control -- a displaced branch needs
+re-targeting, which is mechanical but is new machinery. The 5,358 sequences need the
+Class D, F, H and Y rules, which exist and are tested, plus somewhere to get a scratch
+register; that is the register allocator hard part 5 names, and it is the next real
+piece of work rather than another special case.
+
+The other 17,718 are deliberate: bytes not provably code, the shift group whose
+destination lives in vvvv, and data.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,
@@ -1576,7 +1647,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **748,147 of 805,131 VEX sites, 92.9%**, with no Ddisasm and no relocation of existing code. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **771,639 of 805,131 VEX sites, 95.8%** (Finding 17), with no Ddisasm and no relocation of existing code. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Class C by detour: a stub section, and a jump at every site.
+"""Detours: a stub section, and a jump at every site that will not fit.
 
-tools/patch.py rewrites the classes whose SSE form is no longer than the VEX
-one. Class C is not one of them -- `vaddss %xmm2,%xmm1,%xmm0` is four bytes
+tools/patch.py rewrites the sites whose SSE form is no longer than the VEX
+one. Everything else that HAS a lowering comes here -- Class C by
+construction, and the class A and B sites whose SSE encoding happens to be
+one byte longer. Class C is the obvious case -- `vaddss %xmm2,%xmm1,%xmm0` is four bytes
 and becomes `movaps` plus `addss`, which is seven -- so the expansion has to
 live somewhere else and the site has to jump to it.
 
@@ -100,8 +102,7 @@ def lower_vex(address, encoding, operands, mnemonic, at):
 	# Class D, F and H need real sequences and belong in their own tools.
 	if mnemonic in inplace.DESTINATION_IN_VVVV:
 		return None
-	if (mnemonic not in lower.DIRECT_MNEMONICS
-			and mnemonic not in lower.NDS_MNEMONICS):
+	if not inplace.has_direct_sse_form(mnemonic):
 		return None
 	tail = encoding[vex["length"]:]
 	if len(tail) < 2:
@@ -269,22 +270,37 @@ def collect(binary, listing):
 				except ValueError:
 					pass
 
+	# Anything already rewritten in place needs nothing further. Everything
+	# else that HAS a lowering is a detour candidate -- not just Class C.
+	#
+	# The first version of this only considered Class C, which left 25,345
+	# class A and B sites untouched for no better reason than that their
+	# SSE encoding is one byte longer than the VEX one. A site that does
+	# not fit in place and does have a lowering is exactly what a stub is
+	# for, whichever class it belongs to.
+	already = {address for address, *_rest in patches}
+
 	candidates = []
 	skipped = Counter()
 	for index, (address, encoding, mnemonic, operands,
 	            _comment) in enumerate(instructions):
 		if not encoding or encoding[0] not in (0xC4, 0xC5):
 			continue
+		if address in already:
+			continue
 		vex = inplace.decode_vex(encoding)
 		if vex is None or mnemonic in inplace.DESTINATION_IN_VVVV:
 			continue
 		if mnemonic not in nds:
 			continue
+		if not inplace.has_direct_sse_form(mnemonic):
+			skipped["no direct SSE form"] += 1
+			continue
 		fields = inplace.split_operands(operands)
 		registers = [o for o in fields if not o.startswith("$")]
-		if len(registers) != 3 or registers[-1] == registers[-2]:
-			continue			# not Class C
-		has_immediate = any(o.startswith("$") for o in fields)
+		if len(registers) not in (2, 3):
+			skipped["operand shape not A/B/C"] += 1
+			continue
 		displaced = []
 		window = len(encoding)
 
@@ -374,7 +390,7 @@ def main(argv):
 
 	if mode == "plan":
 		_patches, candidates, stats, skipped = collect(argv[1], argv[2])
-		print(f"class C detour candidates {len(candidates):>10,}")
+		print(f"detour candidates (A/B/C) {len(candidates):>10,}")
 		for reason, count in skipped.most_common():
 			print(f"  skipped, {reason:<24} {count:>10,}")
 		print(f"\nstub bytes (estimate)     {len(candidates) * 15:>10,}")

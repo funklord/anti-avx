@@ -58,6 +58,28 @@ NOPS = {
 	8: b"\x0f\x1f\x84\x00\x00\x00\x00\x00",
 }
 
+def has_direct_sse_form(mnemonic):
+	"""True if stripping the VEX prefix alone yields a real SSE instruction.
+
+	The mnemonic tables in lower.py do not list the compare forms, because
+	objdump folds the predicate into the name -- `vcmpneqps` rather than
+	`vcmpps` with an immediate. The encoding still carries the predicate as
+	an imm8, so the SSE form really is a plain prefix strip.
+
+	Only for the eight predicates SSE has, though. AVX widened the field to
+	thirty-two, and an SSE `cmpps` carrying one of the new values is not a
+	valid instruction -- those need the operand exchange in lower.py and
+	belong in a sequence, not here.
+	"""
+	if mnemonic in lower.DIRECT_MNEMONICS or mnemonic in lower.NDS_MNEMONICS:
+		return True
+	predicate = lower.compare_predicate(mnemonic)
+	if predicate is None:
+		return False
+	name, avx_only = predicate
+	return not avx_only and name in lower.SSE_PREDICATES
+
+
 def nop_padding(length):
 	"""Padding of any length, built from the longest nops available.
 
@@ -91,6 +113,10 @@ DESTINATION_IN_VVVV = frozenset("""
 	vpsllw vpslld vpsllq vpsrlw vpsrld vpsrlq vpsraw vpsrad
 	vpslldq vpsrldq
 """.split())
+
+
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+import lower			# noqa: E402  -- after the sys.path fix above
 
 
 def parse_listing(path):
@@ -233,7 +259,7 @@ def classify(mnemonic, vex, operands, direct, nds):
 	# extension, so dropping vvvv would silently retarget the write.
 	if mnemonic in DESTINATION_IN_VVVV:
 		return None
-	if mnemonic not in direct and mnemonic not in nds:
+	if not has_direct_sse_form(mnemonic):
 		return None
 
 	registers = [o for o in operands if not o.startswith("$")]
