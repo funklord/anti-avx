@@ -1349,13 +1349,70 @@ this binary to begin with and 70.5% of those sites never become detours at all.
 #### What this does not measure
 
 The benchmark controls density and working-set size; it does not know **where** the
-detours fall. If they cluster inside the hottest inner loop the cost is worse than
-this, and if they sit in initialisation it is nil. Which of those is true cannot be
-known without running the game, which needs the remaining 23,923 VEX sites gone and a
-Windows host.
+detours fall. That is Finding 23.
 
 It also measures a loop with perfect branch-target locality after the first pass. A
 detour taken once and never again pays a cold miss this does not model.
+
+### Finding 23 — where the detours land
+
+Finding 22 measured what a detour costs and could not say where they fall. Execution
+counts need the game running, but the structure is in the binary and carries most of
+the question. `tools/placement.py`, `make placement`.
+
+**Four fifths of the code is untouched.** Weighting by instructions rather than
+counting functions, because the dense ones are small:
+
+```
+density        functions  instructions  % of .text  measured slowdown
+  none           222,348    11,282,539      79.75%      1.00
+  0-1%             1,652       667,603       4.72%      1.01
+  1-5%             4,483     1,067,253       7.54%      1.03
+  5-10%            3,041       562,016       3.97%      1.31
+  10-25%           3,738       456,785       3.23%      1.75
+  over 25%         1,165       111,633       0.79%      3.04
+```
+
+The tail that the benchmark says is genuinely expensive — over 25% density, where the
+same loop runs three times slower — is **0.79% of `.text`**. Only 6.0% of functions
+contain a detour at all.
+
+Weighting those measured slowdowns by static code volume gives **+5.5%**. That figure
+assumes execution time is spread like code size, which it certainly is not, so it is
+an upper bound on the average rather than a prediction.
+
+#### The loop metric, which is the one that matters
+
+A whole-binary average says nothing about a detour inside an inner loop, which is paid
+every iteration. A backward branch whose target lies in the same function is a loop,
+and its body is the span between them — findable without a CFG or symbols. 150,881 of
+them:
+
+```
+loop body size      loops   containing a detour
+  0-64B            73,334        472    0.6%
+  64-256B          41,509      1,823    4.4%
+  256-1024B        29,121      4,470   15.3%
+  1024-4096B        5,284      1,141   21.6%
+  4096B+            1,633        208   12.7%
+```
+
+**The tightest loops are 99.4% clean.** That is the shape a hot inner loop has, the
+shape most likely to sit in L1i, and therefore the shape where a jump to a section
+144 MB away would hurt most — and it is almost entirely untouched. Detours concentrate
+in large bodies, which are more often straight-line arithmetic than iteration.
+
+#### The honest residual risk
+
+The densest functions are vectorised maths — the worst is 57.6% detoured and reads
+`vshufps`/`vmulps`/`vrcpps`, a reciprocal or normalise kernel. That is exactly the
+kind of routine that *can* be hot. 1,165 such functions exist and none of this says
+whether any of them runs often.
+
+So the bound is: if the hot set is dominated by tight loops, the cost is near zero,
+because 99.4% of them contain nothing. If it is dominated by a handful of dense SIMD
+kernels, those specific routines run about three times slower. Which is true needs a
+profile, and a profile needs the binary to run.
 
 ### Estimated cost of a translated binary
 

@@ -67,6 +67,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         check-isa \
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench \
+        placement \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -286,6 +287,12 @@ $(BUILD_DIR)/icache_bench: tools/icache_bench.c | $(BUILD_DIR)
 bench: $(BUILD_DIR)/icache_bench
 	$(BUILD_DIR)/icache_bench $(BENCH_ITERATIONS)
 
+# Where the detours land: per-function density and, more to the point, how
+# many loop bodies contain one. Static structure only -- it cannot say which
+# loops execute.
+placement: $(LISTING)
+	$(PYTHON) tools/placement.py report $(TARGET) $<
+
 # -- git hooks ---------------------------------------------------------------
 
 # The hook lives in tools/hooks/ rather than only in .git/hooks so that it
@@ -345,6 +352,7 @@ help:
 	@echo '  detour-verify'
 	@echo '              sections, boundaries and the stub section'
 	@echo '  bench       what a detour costs on this CPU (a timing run)'
+	@echo '  placement   where the detours land: functions and loop bodies'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
 	@echo '  clean       remove the listing and the report'
 	@echo '  distclean   clean, plus __pycache__'
