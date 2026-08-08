@@ -1195,6 +1195,48 @@ rather than an inline sequence, and the FMA orderings other than 231 — `lower_
 handles only `dst = src1*src2 + dst`, and the 132 and 213 forms put the addend
 somewhere else. Both are small and known.
 
+### Finding 20 — the vpermilps helper, inlined rather than called
+
+Class H was specified as a `call` into a hand-written routine. **In a stub it must not
+be a call**, and for the same reason spilling was rejected in Finding 18: a `call`
+pushes a return address, so `rsp` moves inside code with no `.pdata`, and any stack
+walk during the helper reads a bogus frame. Stub space is free, so the sequence is
+inlined.
+
+`src/permil.c` keeps its value as the *tested specification* — exhaustive over all 256
+permutations and mutation-checked — and the emitted code matches it instruction for
+instruction:
+
+```
+pand   [pool+0x00],%xmm7      bits 1:0 of each control element
+pslld  $0x2,%xmm7             element index -> its first byte
+pshufb [pool+0x10],%xmm7      replicate that byte across the element
+paddb  [pool+0x20],%xmm7      ... and step through its four bytes
+movaps %xmm2,%xmm1            destination takes the data
+pshufb %xmm7,%xmm1            the permute itself
+```
+
+The three constants live at the start of the stub section. That placement is not
+cosmetic: a non-VEX SSE instruction with a memory operand faults on an unaligned
+address, and the section begins on a page boundary, so offset zero is 16-byte aligned
+by construction.
+
+**The immediate form needed none of this.** It is a `shufps` with both operands the
+same register, and 50 of the 53 sites handled here are that. Only 3 of the
+variable-control sites could be done, because only 3 have a dead register to build the
+byte control in — the control operand itself is never dead at any of them.
+
+```
+VEX in .text            805,131 ->      23,948   781,183 removed, 97.0%
+```
+
+#### What the remaining vpermilps needs
+
+20 sites, and they are not all the same problem. Eight are 256-bit and need the Y
+representation. The rest want a scratch that the forward scan cannot find. Nothing
+here is a missing rule: the rule exists, is tested, and is emitted correctly where a
+register is available.
+
 ### Estimated cost of a translated binary
 
 Rebuilt from the measured splits above. The earlier estimate is kept alongside,

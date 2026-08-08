@@ -203,6 +203,111 @@ BROADCASTS = {
 }
 
 
+# The three constants the variable-control permute needs, laid out once at
+# the start of the stub section. They must be 16-byte aligned: a non-VEX SSE
+# instruction with a memory operand faults on an unaligned address, and the
+# section begins on a page boundary so offset zero is aligned by
+# construction.
+PERMIL_POOL = (
+	bytes([3, 0, 0, 0] * 4)					# bits 1:0 of each control element
+	+ bytes([0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12])
+	+ bytes([0, 1, 2, 3] * 4)				# step through an element's bytes
+)
+POOL_MASK3, POOL_BCAST, POOL_STEP = 0, 16, 32
+
+
+def encode_rip(prefix, opcode, reg, target, at):
+	"""An SSE instruction whose memory operand is RIP-relative."""
+	out = bytearray()
+	if prefix is not None:
+		out.append(prefix)
+	rex = 0x40 | ((reg >> 3) << 2)
+	if rex != 0x40:
+		out.append(rex)
+	out += opcode
+	out.append(((reg & 7) << 3) | 5)		# mod 00, rm 101 -- RIP + disp32
+	displacement = target - (at + len(out) + 4)
+	if not -(1 << 31) <= displacement < (1 << 31):
+		return None
+	out += struct.pack("<i", displacement)
+	return bytes(out)
+
+
+def encode_pslld_immediate(destination, amount):
+	"""pslld $imm,xmm -- the destination is in r/m and reg is the extension."""
+	out = bytearray([0x66])
+	rex = 0x40 | (destination >> 3)
+	if rex != 0x40:
+		out.append(rex)
+	out += b"\x0f\x72"
+	out.append(0xC0 | (6 << 3) | (destination & 7))
+	out.append(amount)
+	return bytes(out)
+
+
+def lower_permilps(vex, tail, operands, scratch, at, pool):
+	"""vpermilps, both forms.
+
+	The immediate form is a shufps and needs nothing. The variable form has
+	no SSE instruction, and `project.md` calls for a helper -- but a call
+	inside a stub pushes a return address, which moves rsp in code with no
+	.pdata, and that is the same broken-unwind trade rejected for spilling.
+	Stub space is free, so the sequence is inlined instead.
+
+	SSSE3's pshufb is already a variable-control permute; it just works on
+	bytes. Turning four element selectors into sixteen byte selectors is
+	four instructions and three constants -- see src/permil.c, where the
+	same sequence is exhaustively tested.
+
+	Operand order is control, data, dst: the VEX vvvv field holds the DATA
+	and r/m the CONTROL, which is the opposite of vpermd.
+	"""
+	if vex["L"]:
+		return None			# 256-bit needs the Y representation
+	modrm = tail[1]
+	if ((modrm >> 6) & 3) != 3:
+		return None			# memory operand; not handled here
+	destination = (vex["R"] << 3) | ((modrm >> 3) & 7)
+	control = (vex["B"] << 3) | (modrm & 7)
+	data = vex["vvvv"]
+
+	if any(o.startswith("$") for o in inplace.split_operands(operands)):
+		# Immediate control: a single-source four-element permute, which is
+		# exactly shufps with both operands the same register.
+		immediate = tail[2] if len(tail) > 2 else None
+		if immediate is None:
+			return None
+		body = bytearray()
+		if destination != control:
+			body += encode_rr(None, MOVAPS, destination, control)
+		body += encode_rr(None, b"\x0f\xc6", destination, destination,
+		                  immediate)
+		return bytes(body)
+
+	if scratch is None or scratch in (destination, data, control):
+		return None
+
+	body = bytearray()
+	body += encode_rr(None, MOVAPS, scratch, control)
+	for offset, prefix, opcode in (
+			(POOL_MASK3, 0x66, b"\x0f\xdb"),		# pand  -- bits 1:0
+			(None, None, None),						# pslld $2, below
+			(POOL_BCAST, 0x66, b"\x0f\x38\x00"),	# pshufb -- replicate
+			(POOL_STEP, 0x66, b"\x0f\xfc")):		# paddb  -- 0,1,2,3
+		if offset is None:
+			body += encode_pslld_immediate(scratch, 2)
+			continue
+		piece = encode_rip(prefix, opcode, scratch, pool + offset,
+		                   at + len(body))
+		if piece is None:
+			return None
+		body += piece
+	if destination != data:
+		body += encode_rr(None, MOVAPS, destination, data)
+	body += encode_rr(0x66, b"\x0f\x38\x00", destination, scratch)
+	return bytes(body)
+
+
 def lower_broadcast(vex, tail, mnemonic, encoding, address, at):
 	"""vbroadcastss / vbroadcastsd / vpbroadcastd. Needs no scratch."""
 	if vex["L"]:
@@ -250,7 +355,7 @@ def lower_broadcast(vex, tail, mnemonic, encoding, address, at):
 
 
 SEQUENCE_MNEMONICS = frozenset((
-	"vblendvps", "vblendvpd", "vfmadd231ps", "vfmadd231ss",
+	"vblendvps", "vblendvpd", "vfmadd231ps", "vfmadd231ss", "vpermilps",
 )) | frozenset(BROADCASTS)
 
 
@@ -259,7 +364,8 @@ def encode_jump(from_end, to_address):
 	return bytes([JMP_REL32]) + struct.pack("<i", to_address - from_end)
 
 
-def lower_vex(address, encoding, operands, mnemonic, at, scratch=None):
+def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
+              pool=0):
 	"""Lower one VEX instruction for execution at `at`. Bytes, or None.
 
 	Used for the Class C site itself and for a swallowed instruction that
@@ -289,6 +395,8 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None):
 			if mnemonic in BROADCASTS:
 				return lower_broadcast(vex, tail, mnemonic, encoding,
 				                       address, at)
+			if mnemonic == "vpermilps":
+				return lower_permilps(vex, tail, operands, scratch, at, pool)
 			return lower_fma(vex, tail, mnemonic, scratch)
 		return None
 	tail = encoding[vex["length"]:]
@@ -332,11 +440,11 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None):
 
 
 def build_stub(site, encoding, operands, mnemonic, window, displaced,
-               stub_address, scratch=None):
+               stub_address, scratch=None, pool=0):
 	"""The stub body for one site, placed at stub_address."""
 	body = bytearray()
 	lowered = lower_vex(site, encoding, operands, mnemonic, stub_address,
-	                    scratch)
+	                    scratch, pool)
 	if lowered is None:
 		return None
 	body += lowered
@@ -505,7 +613,7 @@ def collect(binary, listing):
 		if needs_sequence:
 			scratch = scratch_finder.find_scratch(plain, index)
 			trial = lower_vex(address, encoding, operands, mnemonic,
-			                  address, scratch)
+			                  address, scratch, address)
 			if trial is None:
 				skipped["sequence with no usable scratch" if scratch is None
 				        else "sequence shape not handled"] += 1
@@ -645,7 +753,10 @@ def apply_all(binary, listing, output):
 	image_base = struct.unpack_from("<Q", bytes(data), opt + 24)[0]
 	stub_base = image_base + (highest + alignment - 1) // alignment * alignment
 
-	blob = bytearray()
+	# The constant pool goes first, so its address is the section's and the
+	# 16-byte alignment SSE memory operands need comes free.
+	blob = bytearray(PERMIL_POOL)
+	pool = stub_base
 	placed = []
 	# Windows must not overlap. Two Class C sites can sit next to each
 	# other, and then the first one's widened window swallows the second --
@@ -661,7 +772,7 @@ def apply_all(binary, listing, output):
 			continue
 		stub_address = stub_base + len(blob)
 		body = build_stub(site, encoding, operands, mnemonic, window,
-		                  displaced, stub_address, scratch)
+		                  displaced, stub_address, scratch, pool)
 		if body is None:
 			refused += 1
 			continue

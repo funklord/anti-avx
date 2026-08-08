@@ -144,6 +144,46 @@ def find_scratch(instructions, index, limit=60):
 	return None
 
 
+def dies_here(instructions, index, register, limit=60):
+	"""True if `register` is not read again after instructions[index].
+
+	A narrower question than find_scratch answers, and a more useful one for
+	a sequence whose control operand it is allowed to destroy: the site
+	itself reads the register, so what matters is only what happens after.
+	Same scan, same conservative direction -- an unresolved answer is "still
+	live".
+	"""
+	for step in range(1, limit + 1):
+		position = index + step
+		if position >= len(instructions):
+			return False
+		_address, _encoding, mnemonic, operands = instructions[position]
+
+		if mnemonic in ("call", "callq"):
+			# Volatile and not an argument register, so a call ends its life.
+			return register in DEAD_AT_CALL
+		if mnemonic.startswith(CONTROL):
+			return False
+
+		fields = inplace.split_operands(operands)
+		registers = [o for o in fields if not o.startswith("$")]
+		if not registers:
+			continue
+		destination = xmm_numbers(registers[-1])
+		sources = []
+		for operand in registers[:-1]:
+			sources.extend(xmm_numbers(operand))
+		if register in sources:
+			return False
+		if register in destination:
+			if mnemonic in FULL_WRITE and len(destination) == 1:
+				return register not in sources
+			if mnemonic in ZEROING:
+				return True
+			return False			# partial write leaves it alive
+	return False
+
+
 def main(argv):
 	if not argv or argv[0] in ("-h", "--help"):
 		print(__doc__.strip())
