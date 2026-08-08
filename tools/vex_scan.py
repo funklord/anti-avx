@@ -490,8 +490,24 @@ def report(total, vex_total, evex_total, vex_by_mnemonic, name_v_total,
 		print(f"  {m:<16} {form:<10} {c:>8,}")
 	print()
 
-	print("== top VEX mnemonics ==")
-	for m, c in vex_by_mnemonic.most_common(40):
+	# The COMPLETE inventory, not a top-N.
+	#
+	# This used to print the top 40, and that truncation had a cost. The
+	# lowering table in tools/lower.py has to carry a rule for every
+	# mnemonic that occurs, so building it needed the whole list -- and
+	# because the report would not give it, the list got extracted with an
+	# ad-hoc grep into a file beside the report that `make clean` did not
+	# know to remove. A second, slightly different counter is exactly the
+	# drift `evidence.md` warns about: that grep matched only lines with a
+	# decodable mnemonic and so missed the 180 VEX-prefixed byte sequences
+	# that disassemble to `(bad)`, which is why its total came to 804,809
+	# against this tool's 805,131.
+	#
+	# There is one authority now and it prints everything it counted.
+	# `(bad)` is included deliberately -- those bytes really do carry a VEX
+	# prefix, and Finding 8 is about what they are.
+	print(f"== VEX mnemonics ({len(vex_by_mnemonic)} distinct, all listed) ==")
+	for m, c in vex_by_mnemonic.most_common():
 		print(f"  {m:<24} {c:>10,}")
 	print()
 

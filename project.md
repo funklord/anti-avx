@@ -126,6 +126,14 @@ objdump -d -j .text Starfield-unpacked.exe > text.asm    # ~0.9 GB, ~30 s
 python3 tools/vex_scan.py text.asm                       # ~75 s, ~1.1 GB RSS
 ```
 
+or `make scan`, which writes both into `$(BUILD_DIR)` and is what `make clean`
+removes. The report carries the **complete** VEX mnemonic inventory — 216 entries
+summing to the headline total, `(bad)` included — because that whole list is what a
+lowering table has to be built against. It is deliberately not a top-N: the earlier
+truncation is what caused a second, slightly different mnemonic count to be extracted
+by hand, and two counters that disagree by 322 instructions is the drift
+`evidence.md` is about.
+
 ### Finding 1 — the binary is overwhelmingly scalar
 
 52% of VEX instructions are **scalar** float ops on single values. The top mnemonics:
