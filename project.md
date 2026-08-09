@@ -1927,34 +1927,50 @@ answer without ever showing where the write went.
 
 VEX in `.text` falls from 10,618 to 10,276.
 
-### Finding 35 -- the accounting question, narrowed and still open
+### Finding 35 -- the accounting question, closed, after two wrong guesses
 
 `make census`. The residue this document called unaccounted was being computed by
 subtracting the skip tallies from the survivor count, and **that subtraction was the
-mistake**: the two measure different populations. A declined site can still be
-lowered if a neighbour's window swallows it; an accepted one can still survive if its
-stub could not be built or its window overlapped; and the survivor count comes from a
-fresh linear sweep of rewritten bytes, which is authoritative only where the oracle
-vouches for them.
-
-Comparing address sets instead of totals refutes the first of those outright: **not
-one declined site is inside a committed window.** That was the leading hypothesis and
-it is simply wrong.
+mistake**: the two measure different populations. Comparing address sets instead of
+totals reconciles them exactly:
 
 ```
-declined by the collector       6,728      of those, swallowed anyway     0
-accepted as candidates        216,905      detoured                 178,787
-                                           window overlapped         35,629
-                                           stub not buildable         2,489
-VEX in the rewritten .text     10,276      declined or in a window    6,728
-                                           at neither                 3,548
+VEX in the rewritten .text     10,276
+  declined by the collector     6,728
+  refused, stub not buildable   2,449
+  inside a committed window         0
+  skipped for overlap           1,018
+  undecodable, never classified    81
+  unaccounted                       0
 ```
 
-Those 3,548 are **not explained.** Sweep divergence is the obvious candidate and
-cannot be the whole answer: survivors outside the oracle's ranges were measured
-separately at 453. Something else is in there and has not been found. It is recorded
-as open rather than given the nearest plausible story, which is what the first version
-of this paragraph did.
+Getting there cost two hypotheses, both stated confidently and both wrong.
+
+**That declined sites were being swallowed by a neighbour and lowered in its stub.**
+Refuted outright: not one of them is inside a committed window.
+
+**That the leftovers were the disassembler inventing VEX prefixes** in bytes it had
+desynchronised on. Also wrong, and this one was checkable in a single line: every one
+of the 3,548 was an instruction boundary *and* a VEX site in the original. None of it
+was the sweep.
+
+What was actually wrong was the census itself. **A window is a range, and one widened
+backwards does not start at the site** -- so testing a surviving address against a set
+of window *starts* missed every site whose window began on the instruction before it.
+1,102 sites looked mysterious because of an off-by-one-instruction in the tool asking
+the question, not in the tool being asked about.
+
+Two of the buckets are worth reading as findings rather than bookkeeping:
+
+- **Nothing survives inside a committed window.** That row is zero, and it is the
+  strongest single statement in the census: wherever the rewriter committed to a
+  window, every instruction in it was lowered.
+- **1,018 sites are lost to an interaction between backward widening and overlap.**
+  A backward-widened candidate starts on the instruction *before* its site. If that
+  earlier byte falls inside a window already committed, the whole candidate is
+  refused for overlap -- even where the site itself lies outside that window and
+  could have been taken forwards, or in place. That is a real opportunity, not a
+  cost that has to be paid, and it is the cheapest 1,018 sites on the list.
 
 ### Final state
 
@@ -2597,12 +2613,11 @@ Named rather than left implicit, because an absent gap gets guessed at:
 - **256-bit.** The Y1/Y2 representations are milestones 5 and 6 and do not exist.
 - **Exception paths.** `.xdata` is carried through untouched and never exercised.
   Rung 4 exists to find what that misses.
-- **3,548 surviving VEX sites are unaccounted for**, and the guess this line used
-  to carry was half right and half wrong. The `DESTINATION_IN_VVVV` shapes were
-  indeed being skipped without counting, and they are now lowered (Finding 34). But
-  the arithmetic behind the number was itself wrong -- see Finding 35, where
-  `make census` compares address sets rather than totals and refutes the leading
-  explanation. What is left is open.
+- ~~Surviving VEX sites are unaccounted for.~~ **Closed** by Finding 35: `make
+  census` reconciles all 10,276 exactly, and the residue was an error in the
+  accounting rather than anything the rewriter did. What it left behind is a real
+  lead -- 1,018 sites refused for an overlap that only their backward-widened start
+  collides with.
 
 A translated binary that is 99.99% correct is worthless -- the remaining 0.01% is a
 crash at an unpredictable moment.

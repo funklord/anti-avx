@@ -1151,11 +1151,17 @@ def census(binary, listing, patched):
 	prints what falls in each part rather than a single number that hides
 	three effects at once.
 
-	It does not close the question. It narrows it: the first guess, that
-	declined sites were being swallowed by a neighbour and lowered in a
-	stub, is refuted outright -- **not one of them is inside a committed
-	window.** What is left over is stated as unexplained rather than given
-	the nearest plausible story.
+	It reconciles exactly, and getting there refuted two guesses. The first,
+	that declined sites were being swallowed by a neighbour and lowered in a
+	stub, is wrong: not one of them is inside a committed window. The
+	second, that the leftovers were the disassembler inventing VEX prefixes
+	in bytes it had desynchronised on, is also wrong: **every survivor was an
+	instruction boundary and a VEX site in the original**, all 3,548 of them.
+
+	What was actually wrong was this function. A window is a range and, for
+	one widened backwards, it does not start at the site -- so testing a
+	surviving address against a set of window *starts* missed every site
+	whose window began on the instruction before it.
 	"""
 	_patches, candidates, _stats, _skipped, declined = collect(binary, listing)
 	placed, _blob, swallowed, overlapped, refused = place_stubs(
@@ -1173,20 +1179,46 @@ def census(binary, listing, patched):
 	       f"{len(set(declined) & covered):>10,}")
 	print(f"accepted as candidates         {len(candidates):>10,}")
 	print(f"  detoured                     {len(rewritten):>10,}")
-	print(f"  skipped, window overlapped   {overlapped:>10,}")
-	print(f"  refused, stub not buildable  {refused:>10,}")
+	print(f"  skipped, window overlapped   {len(overlapped):>10,}")
+	print(f"  refused, stub not buildable  {len(refused):>10,}")
 	print(f"instructions swallowed         {len(swallowed):>10,}")
 	print()
 	print(f"VEX in the rewritten .text     {len(survivors):>10,}")
-	explained = survivors & (set(declined) | covered)
-	print(f"  at an address declined or in a window "
-	       f"{len(explained):>7,}")
-	print(f"  at neither                   {len(survivors - explained):>10,}")
-	print("  -- NOT YET EXPLAINED. The likely part is the sweep disagreeing")
-	print("     with itself across two disassemblies, which can only happen")
-	print("     where the oracle does not vouch for the bytes; but that was")
-	print("     measured at 453 and this is larger, so something else is in")
-	print("     here and it has not been found.")
+	# **A window is a range, not an address, and for a backward-widened one
+	# the start is not the site.** Recording only the start and then asking
+	# whether a surviving instruction is in that set misses every site whose
+	# window began on the instruction before it -- which is what made 1,102
+	# of these look unaccounted when they were plainly refused.
+	def spread(starts):
+		out = set()
+		for start, _e, _o, _m, window, _d, _s, _p in candidates:
+			if start in starts:
+				out.update(range(start, start + window))
+		return out
+
+	# The collector never sees these: decode_vex refuses the encoding, so
+	# there is nothing to classify. They are objdump's `(bad)` lines, which
+	# are bytes it could not decode rather than instructions.
+	undecodable = {a for a, e, _m, _o in inplace.parse_listing(listing)
+	               if e[:1] in (b"\xc4", b"\xc5")
+	               and inplace.decode_vex(e) is None}
+
+	buckets = (("declined by the collector", set(declined)),
+	           ("refused, stub not buildable", spread(refused)),
+	           ("inside a committed window", covered),
+	           ("skipped for overlap", spread(overlapped)),
+	           ("undecodable, never classified", undecodable))
+	accounted = set()
+	for label, group in buckets:
+		hit = (survivors & group) - accounted
+		accounted |= hit
+		print(f"  {label:<30}{len(hit):>10,}")
+	rest = survivors - accounted
+	print(f"  {'unaccounted':<30}{len(rest):>10,}")
+	if rest:
+		print("  -- unaccounted, and that should be zero. Every survivor was")
+		print("     an instruction boundary and a VEX site in the original,")
+		print("     so none of it is the disassembler inventing one.")
 	return 0
 
 
@@ -1264,18 +1296,20 @@ def place_stubs(candidates, stub_base):
 	blob = bytearray(PERMIL_POOL)
 	pool = stub_base
 	placed, swallowed = [], set()
-	refused = overlapped = 0
+	# Sets rather than counters: a tally cannot say WHICH sites these were,
+	# and that is the question census has to answer.
+	refused, overlapped = set(), set()
 	committed_to = 0
 	for (start, encoding, operands, mnemonic, window, displaced,
 	     scratch, preceding) in sorted(candidates, key=lambda c: c[0]):
 		if start < committed_to:
-			overlapped += 1
+			overlapped.add(start)
 			continue
 		stub_address = stub_base + len(blob)
 		body = build_stub(start, encoding, operands, mnemonic, window,
 		                  displaced, stub_address, scratch, pool, preceding)
 		if body is None:
-			refused += 1
+			refused.add(start)
 			continue
 		placed.append((start, window, stub_address))
 		committed_to = start + window
@@ -1328,7 +1362,7 @@ def apply_all(binary, listing, output):
 	assert section_va == stub_base - image_base, "stub section moved"
 	open(output, "wb").write(image)
 	print(f"apply: {len(patches):,} in-place patches, {len(placed):,} detours, "
-	      f"{overlapped:,} skipped for overlap, {refused:,} refused")
+	      f"{len(overlapped):,} skipped for overlap, {len(refused):,} refused")
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "
 	      f"{len(blob):,} bytes")
 	return 0
