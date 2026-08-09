@@ -72,7 +72,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         check-isa \
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
-        placement check-aliasing check-lowering scratch-check \
+        placement check-aliasing check-lowering scratch-check check-pe \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -334,6 +334,64 @@ placement: $(LISTING)
 outside: $(LISTING)
 	$(PYTHON) tools/outside.py report $(TARGET) $<
 
+# -- the end-to-end test, on a PE this project builds itself ----------------
+
+PE_SAMPLE  = $(BUILD_DIR)/avxtest.exe
+PE_LISTING = $(BUILD_DIR)/avxtest.asm
+PE_FIXED   = $(BUILD_DIR)/avxtest-sse.exe
+# Wine wants an absolute prefix, and it is kept under BUILD_DIR so that it is
+# this build's to remove rather than something in the user's home.
+PE_PREFIX  = $(abspath $(BUILD_DIR))/wineprefix
+# winedbg is disabled deliberately. The original is MEANT to die of an
+# illegal instruction, and with the debugger enabled that crash starts
+# winedbg and waits -- two minutes of timeout for a result already known.
+# Measured: with the override the same crash returns 29 immediately, and 29
+# is the low byte of STATUS_ILLEGAL_INSTRUCTION.
+WINE_ENV   = WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d
+
+$(PE_SAMPLE): tools/pe_build.py | $(BUILD_DIR)
+	$(PYTHON) tools/pe_build.py sample $@
+
+$(PE_LISTING): $(PE_SAMPLE)
+	objdump -d -j .text $< > $@
+
+$(PE_FIXED): $(PE_SAMPLE) $(PE_LISTING) tools/detour.py tools/patch.py \
+             tools/outside.py tools/scratch.py tools/targets.py
+	$(PYTHON) tools/detour.py apply $(PE_SAMPLE) $(PE_LISTING) $@
+
+# Build an AVX PE, rewrite it, and run both under wine. The original must
+# fail -- this CPU has no AVX -- and the rewritten one must return 169.
+#
+# **Both halves are assertions.** If the original succeeded, the machine
+# would have AVX and the test would be proving nothing; that is the vacuous
+# pass this shape exists to prevent.
+#
+# Termination: every wine invocation is wrapped in a timeout, and the
+# wineserver it leaves behind is killed afterwards rather than left to idle.
+check-pe: $(PE_FIXED)
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-pe: wine is not installed"; exit 1; }
+	@mkdir -p $(PE_PREFIX)
+	@WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all timeout 300 wine wineboot -i \
+		>/dev/null 2>&1 || true
+
+	@set -e; \
+	$(WINE_ENV) timeout 120 wine $(PE_FIXED) \
+		>/dev/null 2>&1 && rewritten=0 || rewritten=$$?; \
+	$(WINE_ENV) timeout 120 wine $(PE_SAMPLE) \
+		>/dev/null 2>&1 && original=0 || original=$$?; \
+	pkill -x wineserver >/dev/null 2>&1 || true; \
+	echo "check-pe: original exits $$original, rewritten exits $$rewritten"; \
+	if [ "$$original" = "169" ]; then \
+		echo "check-pe: the ORIGINAL returned 169 -- this CPU has AVX, so" \
+		     "the test proves nothing here"; exit 1; \
+	fi; \
+	if [ "$$rewritten" != "169" ]; then \
+		echo "check-pe: the rewritten binary returned $$rewritten, want 169" \
+		     "(36 is the src2-aliasing bug)"; exit 1; \
+	fi; \
+	echo "check-pe: AVX in, SSE out, and the answer survived the trip"
+
 # Prove every register the liveness scan claims as scratch is really dead,
 # by enumerating paths rather than intersecting sets. Needs the listing, so
 # it cannot live in `check`.
@@ -356,9 +414,18 @@ hooks:
 # clean target is the one thing everybody runs without reading.
 clean:
 	rm -f $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(GENERATED) \
+	      $(PE_SAMPLE) $(PE_LISTING) $(PE_FIXED) \
 	      $(BUILD_DIR)/icache_bench \
 	      $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
+	@# The wine prefix is a directory this build created, so it goes
+	@# wholesale -- but only after checking the variable is non-empty and
+	@# not something that could resolve outside the build tree.
+	@case "$(PE_PREFIX)" in \
+	  */wineprefix) test -d "$(PE_PREFIX)" && rm -rf "$(PE_PREFIX)" && \
+	                echo "clean: removed $(PE_PREFIX)" || true ;; \
+	  *) echo "clean: refusing to remove '$(PE_PREFIX)'" ;; \
+	esac
 	@rmdir $(BUILD_DIR) 2>/dev/null || true
 
 # Adds only what this project's own tooling wrote. It does not sweep for
@@ -399,6 +466,7 @@ help:
 	@echo '  detour-verify'
 	@echo '              sections, boundaries and the stub section'
 	@echo '  check-lowering  execute every lowering and check the result'
+	@echo '  check-pe    build an AVX PE, rewrite it, run both under wine'
 	@echo '  bench       what a detour costs on this CPU (a timing run)'
 	@echo '  placement   where the detours land: functions and loop bodies'
 	@echo '  outside     the code .pdata does not describe'

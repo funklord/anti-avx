@@ -1784,6 +1784,79 @@ the test. Three consecutive all-NaN rows fixed it.
 A generated case with no reference in the C file is a failure, never a skip, so a
 mnemonic added to the generator cannot silently stop being covered.
 
+### Finding 32 -- milestone 2: a PE built here, rewritten here, and run
+
+Every claim about the Starfield rewrite is structural, because that binary cannot be
+run here: it is a Windows program, this is Linux, and it wants AVX from a CPU that
+has none. **A PE this project builds itself removes both obstacles at once** -- wine
+answers the first, and the second stops being an obstacle and becomes the experiment.
+
+The asymmetry is the whole test. The original must fail, because its second
+instruction is AVX and this Westmere does not implement it. The rewritten one must
+run and return the right answer. Neither result means much alone.
+
+```
+original    exit 29     0x1D, the low byte of STATUS_ILLEGAL_INSTRUCTION
+rewritten   exit 169    the answer
+```
+
+`make check-pe`, five seconds from clean. There is no mingw here, so `tools/pe_build.py`
+assembles with `as` and writes the headers itself -- less of a detour than it sounds,
+since `detour.py` already appends a section to a 102 MB PE without disturbing it, and
+these are the same fields read from the other side. No imports and no relocations:
+returning from a PE entry point ends the thread with that value as the exit code, and
+leaving `DllCharacteristics` at zero means the image loads at its preferred base.
+
+#### What the program is chosen to do
+
+The arithmetic exists to make one instruction observable:
+
+```
+vsubss %xmm0,%xmm1,%xmm0     dst = src1 - src2, with dst AND src2 both %xmm0
+```
+
+That is Finding 25's aliasing case. Lowered correctly it is 10 - 3 = 7 and the
+program returns 169. Lowered the way the bug did it -- `movaps %xmm1,%xmm0` then
+`subss %xmm0,%xmm0` -- it is 0 and the program returns 36. **Rebuilding the rewriter
+with the fix removed and running it produces 36**, so the test discriminates rather
+than merely passes.
+
+The whole chain is visible in the output. The site is four bytes, too short for a
+jump, so it widens over the eight-byte `vmovss` that follows into a twelve-byte
+window, and the stub reads:
+
+```
+movaps %xmm0,%xmm4              scratch <- src2
+movaps %xmm1,%xmm0              destination <- src1
+subss  %xmm4,%xmm0              src1 - src2, in that order
+movss  -0x2ffa(%rip),%xmm2      the swallowed instruction, displacement redone
+jmp    0x140001024              back past the window
+```
+
+The scratch is `%xmm4`, chosen by the whole-function rule of Finding 29: the function
+names only `%xmm0` to `%xmm3`, ends in a `ret`, and jumps nowhere.
+
+#### Two things it checks that were not the point
+
+The constants sit in `.text` past the code and are loaded RIP-relatively, so a linear
+disassembly walks straight into them and decodes nonsense. `.pdata` covers the
+function only. **They come out byte-identical**, which is the code oracle doing its
+job on a case small enough to read.
+
+And the test asserts the original *fails*. On a machine with AVX it would return 169
+and prove nothing -- a vacuous pass of exactly the kind `evidence.md` describes -- so
+that outcome is a failure with its own message.
+
+#### An aside worth keeping
+
+The expected crash first cost two minutes per run: wine starts winedbg on an
+unhandled exception and waits. `AeDebug` did not help, and `Auto=0` made it worse,
+that value meaning *prompt* rather than *do not launch*. Disabling winedbg outright
+with `WINEDLLOVERRIDES=winedbg.exe=d` returns the same crash in no time at all. It is
+the crash-handler-attaches-a-debugger pattern from `running-code.md`, met from the
+other side: here the debugger was hanging a test rather than eating 15 GB, and the
+fix was the same -- do not let it attach.
+
 ### Final state
 
 ```
@@ -2397,7 +2470,7 @@ crash at an unpredictable moment.
 | 0 | Full VEX inventory across all 58 MB of `.text` | Scope | **DONE** — see Measurements |
 | 0.5 | Operand-level re-measurement on the unpacked binary (`tools/vex_scan.py`) | Lowering rules can be costed and scoped from measured operand shapes, not a mnemonic histogram | **DONE** — Findings 5-8 |
 | 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. Class A/B/C lowerings are now **executed** and checked against GCC's SSE intrinsics (Finding 31), which is the differential harness this row asked for, minus the AVX host: the reference is the compiler rather than the original instruction, because no AVX exists here to run. |
-| 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
+| 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
 | 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **794,513 of 805,131 VEX sites, 98.7%** (Findings 24 to 30), with no Ddisasm and no relocation of existing code. |
