@@ -334,63 +334,78 @@ placement: $(LISTING)
 outside: $(LISTING)
 	$(PYTHON) tools/outside.py report $(TARGET) $<
 
-# -- the end-to-end test, on a PE this project builds itself ----------------
+# -- the end-to-end test, on PEs this project builds itself ------------------
 
-PE_SAMPLE  = $(BUILD_DIR)/avxtest.exe
-PE_LISTING = $(BUILD_DIR)/avxtest.asm
-PE_FIXED   = $(BUILD_DIR)/avxtest-sse.exe
+PE_NAMES   = aliasing memory branch
+PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
+PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
+PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
 # Wine wants an absolute prefix, and it is kept under BUILD_DIR so that it is
 # this build's to remove rather than something in the user's home.
 PE_PREFIX  = $(abspath $(BUILD_DIR))/wineprefix
-# winedbg is disabled deliberately. The original is MEANT to die of an
+# winedbg is disabled deliberately. The originals are MEANT to die of an
 # illegal instruction, and with the debugger enabled that crash starts
 # winedbg and waits -- two minutes of timeout for a result already known.
 # Measured: with the override the same crash returns 29 immediately, and 29
 # is the low byte of STATUS_ILLEGAL_INSTRUCTION.
 WINE_ENV   = WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d
 
-$(PE_SAMPLE): tools/pe_build.py | $(BUILD_DIR)
-	$(PYTHON) tools/pe_build.py sample $@
+# Named, and named HERE rather than beside the other one, because .SECONDARY
+# expands its prerequisites where it is read -- listed before PE_LISTINGS is
+# defined it silently protects nothing. Without it make deletes the listings
+# as intermediates, and a missing secondary is not rebuilt when the thing
+# depending on it already exists, which is how a stale rewrite would go
+# unnoticed.
+.SECONDARY: $(PE_LISTINGS)
 
-$(PE_LISTING): $(PE_SAMPLE)
+$(BUILD_DIR)/pe-%.exe: tools/pe_build.py | $(BUILD_DIR)
+	$(PYTHON) tools/pe_build.py sample $* $@
+
+$(BUILD_DIR)/pe-%.asm: $(BUILD_DIR)/pe-%.exe
 	objdump -d -j .text $< > $@
 
-$(PE_FIXED): $(PE_SAMPLE) $(PE_LISTING) tools/detour.py tools/patch.py \
-             tools/outside.py tools/scratch.py tools/targets.py
-	$(PYTHON) tools/detour.py apply $(PE_SAMPLE) $(PE_LISTING) $@
+$(BUILD_DIR)/sse-%.exe: $(BUILD_DIR)/pe-%.exe $(BUILD_DIR)/pe-%.asm \
+                           tools/detour.py tools/patch.py tools/outside.py \
+                           tools/scratch.py tools/targets.py tools/lower.py
+	$(PYTHON) tools/detour.py apply $(BUILD_DIR)/pe-$*.exe \
+	          $(BUILD_DIR)/pe-$*.asm $@
 
-# Build an AVX PE, rewrite it, and run both under wine. The original must
-# fail -- this CPU has no AVX -- and the rewritten one must return 169.
+# Build AVX PEs, rewrite them, and run both halves under wine. The originals
+# must fail -- this CPU has no AVX -- and each rewritten one must return its
+# own expected answer.
 #
-# **Both halves are assertions.** If the original succeeded, the machine
-# would have AVX and the test would be proving nothing; that is the vacuous
-# pass this shape exists to prevent.
+# **Both halves are assertions.** If an original succeeded, the machine would
+# have AVX and the test would be proving nothing; that is the vacuous pass
+# this shape exists to prevent, so it fails with its own message.
 #
-# Termination: every wine invocation is wrapped in a timeout, and the
-# wineserver it leaves behind is killed afterwards rather than left to idle.
-check-pe: $(PE_FIXED)
+# Termination: every wine invocation is wrapped in a timeout, and the trap
+# reaps the wineserver even when an assertion fails part way through.
+check-pe: $(PE_FIXED) $(PE_SOURCES)
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-pe: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
-	@WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all timeout 300 wine wineboot -i \
-		>/dev/null 2>&1 || true
-
+	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
-	$(WINE_ENV) timeout 120 wine $(PE_FIXED) \
-		>/dev/null 2>&1 && rewritten=0 || rewritten=$$?; \
-	$(WINE_ENV) timeout 120 wine $(PE_SAMPLE) \
-		>/dev/null 2>&1 && original=0 || original=$$?; \
-	pkill -x wineserver >/dev/null 2>&1 || true; \
-	echo "check-pe: original exits $$original, rewritten exits $$rewritten"; \
-	if [ "$$original" = "169" ]; then \
-		echo "check-pe: the ORIGINAL returned 169 -- this CPU has AVX, so" \
-		     "the test proves nothing here"; exit 1; \
-	fi; \
-	if [ "$$rewritten" != "169" ]; then \
-		echo "check-pe: the rewritten binary returned $$rewritten, want 169" \
-		     "(36 is the src2-aliasing bug)"; exit 1; \
-	fi; \
-	echo "check-pe: AVX in, SSE out, and the answer survived the trip"
+	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	for name in $(PE_NAMES); do \
+		want=`$(PYTHON) tools/pe_build.py names | \
+		      awk -v n=$$name '$$1 == n { print $$2 }'`; \
+		$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-$$name.exe \
+			>/dev/null 2>&1 && new=0 || new=$$?; \
+		$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/pe-$$name.exe \
+			>/dev/null 2>&1 && old=0 || old=$$?; \
+		echo "check-pe: $$name -- original $$old, rewritten $$new, want $$want"; \
+		if [ "$$old" = "$$want" ]; then \
+			echo "check-pe: the ORIGINAL $$name returned $$want -- this CPU"; \
+			echo "          has AVX, so the test proves nothing here"; \
+			exit 1; \
+		fi; \
+		if [ "$$new" != "$$want" ]; then \
+			echo "check-pe: rewritten $$name returned $$new, want $$want"; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "check-pe: AVX in, SSE out, and the answers survived the trip"
 
 # Prove every register the liveness scan claims as scratch is really dead,
 # by enumerating paths rather than intersecting sets. Needs the listing, so
@@ -414,7 +429,7 @@ hooks:
 # clean target is the one thing everybody runs without reading.
 clean:
 	rm -f $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(GENERATED) \
-	      $(PE_SAMPLE) $(PE_LISTING) $(PE_FIXED) \
+	      $(PE_SOURCES) $(PE_LISTINGS) $(PE_FIXED) \
 	      $(BUILD_DIR)/icache_bench \
 	      $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"

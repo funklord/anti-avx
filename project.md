@@ -1857,6 +1857,38 @@ the crash-handler-attaches-a-debugger pattern from `running-code.md`, met from t
 other side: here the debugger was hanging a test rather than eating 15 GB, and the
 fix was the same -- do not let it attach.
 
+### Finding 33 -- three programs, each aimed at the machinery
+
+Extending `check-pe` is cheap now that the harness exists, and the programs worth
+adding test the **rewriter**, not the arithmetic -- `check-lowering` already executes
+the lowerings across 37 mnemonics. What only a whole binary can exercise is windows,
+branch targets, RIP displacements moved into a stub, and the code oracle.
+
+```
+aliasing  169   dst == src2, the Finding 25 shape; 36 if it regresses
+memory     16   a site whose own source is memory, detoured 12 KB away
+branch      6   a four-byte site with a branch target immediately after it
+```
+
+Every one begins with `vzeroupper`, which has no SSE form and must be *erased* rather
+than lowered. This CPU faults on it, so a program that runs at all proves Class Z
+worked.
+
+The third is the interesting one. Forward widening must refuse it -- swallowing the
+next instruction would leave the branch landing in the middle of the five-byte jump
+that replaced it -- so backward widening takes the `nop` in front instead, and the
+window comes out exactly five bytes with no padding:
+
+```
+   14000101c:  74 05                je     0x140001023
+   14000101e:  e9 0d 30 00 00       jmp    0x140004030     <- the window
+   140001023:  f3 0f 58 c0          addss  %xmm0,%xmm0     <- still a boundary
+```
+
+The branch is taken at run time, so the target really is entered. Had the rewriter
+swallowed it, the program would not merely compute the wrong number -- it would jump
+into the middle of an instruction.
+
 ### Final state
 
 ```
@@ -2428,24 +2460,82 @@ Ranked by risk, and none of them are performance:
 
 ## Verification strategy
 
-Correctness cannot be established by "it booted." Proposed ladder:
+Correctness cannot be established by "it booted." The ladder below was proposed
+before any of it existed; the status on each rung is what is actually in the tree
+now.
 
-1. **Unit-level.** For each lowering rule, generate a test harness executing the VEX
-   form on an AVX host and the SSE form on both, comparing full register and flag
-   state across randomised inputs. Flags matter — `comiss`/`ucomiss` set them.
+1. **Unit-level.** For each lowering rule, execute it and compare against a
+   reference across inputs including the awkward ones. **Done, with one
+   substitution.** The plan said "the VEX form on an AVX host"; there is no AVX
+   host, so the reference is GCC compiling the equivalent SSE intrinsic. See
+   Finding 31. Flags are still not compared, and `comiss`/`ucomiss` set them, so
+   that gap is real and named in *What is still not verified* below.
 
-2. **Differential tracing.** Run original on an AVX machine and translated on the
-   host under a tracer, comparing architectural state at basic-block boundaries.
-   Divergence localises the faulty rule. Expensive but decisive.
+2. **Differential tracing.** Run original and translated side by side, comparing
+   architectural state at block boundaries. **Not done, and not possible here** --
+   it needs the AVX machine rung 1 also wanted.
 
-3. **Static self-check.** After rewriting, assert no VEX encodings remain
-   (`objdump -d | grep -cP '\tv[a-z0-9]+ '` → 0) and that every original function
-   entry has a valid `.pdata` entry pointing at it.
+3. **Static self-check.** After rewriting, assert no VEX remains and that the
+   structure is intact. **Done and considerably exceeded** -- `make detour-verify`
+   checks section-by-section identity, boundary reconciliation, branch
+   reachability of everything swallowed, and that the stub section contains no VEX
+   with exactly one jump back per detour.
 
-4. **Soak.** Long gameplay sessions; exception-handling paths are the least exercised
-   and most likely to be broken by bad `.xdata`.
+4. **Soak.** Long gameplay sessions. **Not started.** Starfield has never been run,
+   translated or otherwise; there is no Windows host here.
 
-A translated binary that is 99.99% correct is worthless — the remaining 0.01% is a
+### The machine, because it decides what can be tested
+
+    Xeon X5675 (Westmere), SSE4.2 + AES-NI + PCLMULQDQ, no AVX, no F16C, no FMA
+    Linux, wine 10.0, binutils as/objdump/objcopy, gcc -- and no mingw
+
+**The absence of AVX is the project's premise and its best test instrument.** This
+CPU cannot execute the input and can execute the output, so "the original must
+crash and the rewritten one must work" is a real experiment rather than a wish. It
+is also why every reference has to come from somewhere other than the original
+instruction.
+
+The absence of mingw is why `tools/pe_build.py` writes PE headers by hand rather
+than compiling with MSVC or a cross-compiler.
+
+### What each check proves, and what it does not
+
+| check | proves | does not touch |
+|---|---|---|
+| `make style` | tabs, alignment, ASCII, and that documents name no missing file | anything about behaviour |
+| `make verify` | every lowering rule assembles, and no VEX or EVEX prefix survives | what any of them computes |
+| `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
+| `make check-lowering` | 37 mnemonics x 3 operand shapes executed on this CPU, every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | memory-operand forms, 256-bit, and the helper classes |
+| `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
+| `make check-pe` | three PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
+| `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity | **semantics -- every one of these is about shape** |
+| `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
+
+The row to keep in mind is `detour-verify`. It is the only check that runs against
+the real target, and it is entirely structural. **Everything known about Starfield's
+translation is that it is well formed.** The semantic evidence all comes from small
+things: the lowerings executed in isolation, and three PEs built for the purpose.
+
+### What is still not verified
+
+Named rather than left implicit, because an absent gap gets guessed at:
+
+- **Starfield has never been run.** No Windows host, and 10,618 VEX sites survive
+  anyway, so it would not get far.
+- **Flags.** `comiss` and `ucomiss` set EFLAGS and nothing compares them. The
+  lowering is a prefix strip, so the risk is low, but low is not measured.
+- **The helper classes are not wired in.** `f16c`, `fmaddsub`, `permil` and `permd`
+  are exhaustively tested and unreachable from the rewriter.
+- **256-bit.** The Y1/Y2 representations are milestones 5 and 6 and do not exist.
+- **Exception paths.** `.xdata` is carried through untouched and never exercised.
+  Rung 4 exists to find what that misses.
+- **~1,391 surviving VEX sites are unaccounted for.** The refusal counters explain
+  9,227 of 10,618. The remainder is most likely the shapes `collect` skips without
+  counting -- `DESTINATION_IN_VVVV` forms and the 180 `(bad)` decodes -- but that
+  is a guess and is written here as one.
+
+A translated binary that is 99.99% correct is worthless -- the remaining 0.01% is a
 crash at an unpredictable moment.
 
 ---

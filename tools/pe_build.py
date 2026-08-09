@@ -36,7 +36,8 @@ The layout is deliberately the shape the rewriter expects to find:
   * `.pdata` and `.xdata` give the function the unwind data a non-leaf
     function must have, so `patch.function_ranges` sees it.
 
-  sample <out.exe>     build the AVX test program
+  names                    list the programs and their expected exit codes
+  sample <name> <out.exe>  build one
 """
 
 import struct
@@ -53,28 +54,42 @@ HEADER_SIZE = 0x400
 CODE = 0x60000020		# CODE | EXECUTE | READ
 DATA = 0x40000040		# INITIALIZED_DATA | READ
 
-# The program. Every arithmetic step is AVX, and the subtract is written in
-# the one operand shape that has already been got wrong once:
+# The programs. Each exists to exercise a piece of the REWRITER, not to
+# vary the arithmetic -- tests/lowering_test.c already executes the lowerings
+# themselves across 37 mnemonics. What only a whole binary can test is the
+# machinery around them: windows, branch targets, RIP displacements moved
+# into a stub, and the code oracle deciding what is code.
 #
-#     vsubss %xmm0,%xmm1,%xmm0    is  dst = src1 - src2, with dst AND src2
-#                                 both %xmm0 -- Finding 25's aliasing case.
+# Every one begins with `vzeroupper`, which is Class Z and must be erased
+# rather than lowered: it has no SSE form and this CPU faults on it, so a
+# program that runs at all proves it was removed.
 #
-# Lowered correctly that is 10 - 3 = 7, and the program returns 169. Lowered
-# the way the bug did it -- movaps %xmm1,%xmm0 then subss %xmm0,%xmm0 -- it
-# is 0, and the program returns 36. The two answers are far apart on purpose:
-# a wrong lowering here cannot look like a rounding difference.
-PROGRAM = """
+# Exit codes are small and far apart on purpose. A wrong lowering should not
+# be able to look like a rounding difference.
+
+PROGRAMS = {}
+
+# 1. The aliasing case, and the reason this file exists.
+#
+#     vsubss %xmm0,%xmm1,%xmm0   is dst = src1 - src2 with dst AND src2 both
+#                                %xmm0 -- Finding 25.
+#
+# Lowered correctly that is 10 - 3 = 7 and the answer is 169. Lowered the way
+# the bug did it -- movaps %xmm1,%xmm0 then subss %xmm0,%xmm0 -- it is 0 and
+# the answer is 36.
+PROGRAMS["aliasing"] = (169, """
 	.text
 	.globl _start
 _start:
-	subq	$40, %rsp		/* non-leaf: it must have unwind data */
+	subq	$40, %rsp
+	vzeroupper
 	vxorps	%xmm3, %xmm3, %xmm3
 	vmovss	three(%rip), %xmm0
 	vmovss	ten(%rip), %xmm1
 	vsubss	%xmm0, %xmm1, %xmm0	/* dst == src2: 10 - 3 = 7 */
 	vmovss	six(%rip), %xmm2
 	vaddss	%xmm2, %xmm0, %xmm0	/* 7 + 6 = 13 */
-	vmulss	%xmm0, %xmm0, %xmm0	/* 13 * 13 = 169 */
+	vmulss	%xmm0, %xmm0, %xmm0	/* 169 */
 	vaddss	%xmm3, %xmm0, %xmm0	/* + 0, so the zeroing idiom is used */
 	vcvttss2si %xmm0, %eax
 	addq	$40, %rsp
@@ -84,7 +99,60 @@ func_end:
 three:	.float 3.0
 ten:	.float 10.0
 six:	.float 6.0
-"""
+""")
+
+# 2. A site whose own operand is memory, detoured. The stub executes at an
+# address 12 KB from where the instruction was, so the RIP displacement has
+# to be recomputed or the load reads the wrong bytes -- and reading the wrong
+# bytes here gives an answer, not a crash, which is why it is worth a test.
+PROGRAMS["memory"] = (16, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	ten(%rip), %xmm1
+	vaddss	six(%rip), %xmm1, %xmm0	/* Class C, src2 in memory: 10 + 6 */
+	vcvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+ten:	.float 10.0
+six:	.float 6.0
+""")
+
+# 3. A four-byte site with a branch target immediately after it, which is
+# the case forward widening MUST refuse: swallowing that instruction would
+# leave the jump landing in the middle of the five-byte jump that replaced
+# it. Backward widening takes it instead, over the `nop` in front.
+#
+# The branch is taken at run time, so the target really is entered. If the
+# rewriter swallowed it anyway the program does not merely compute the wrong
+# number, it jumps into the middle of an instruction.
+PROGRAMS["branch"] = (6, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	three(%rip), %xmm0
+	vmovss	ten(%rip), %xmm1
+	xorl	%ecx, %ecx
+	cmpl	$0, %ecx
+	je	skip			/* taken */
+	nop				/* what the window widens backwards over */
+	vsubss	%xmm0, %xmm1, %xmm0	/* four bytes, and skipped at run time */
+skip:
+	vaddss	%xmm0, %xmm0, %xmm0	/* 3 + 3 = 6; this is the branch target */
+	vcvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+""")
 
 
 def assemble(source):
@@ -200,17 +268,22 @@ def main(argv):
 	if not argv or argv[0] in ("-h", "--help"):
 		print(__doc__.strip())
 		return 0
+	if argv[0] == "names":
+		for name, (code, _source) in PROGRAMS.items():
+			print(f"{name} {code}")
+		return 0
 	if argv[0] != "sample":
 		print(f"pe_build.py: unknown mode {argv[0]!r}", file=sys.stderr)
 		return 2
-	text, code_size = assemble(PROGRAM)
-	sections = build(argv[1], text, code_size)
-	print(f"pe_build: {argv[1]}, {len(text)} bytes of .text, "
-	      f"function is {code_size} of them")
-	for name, rva, offset, body, _flags in sections:
-		print(f"  {name.decode():<8} rva 0x{rva:x}  file 0x{offset:x}  "
-		      f"{len(body)} bytes")
-	print("  expected exit code 169; a wrong aliasing lowering gives 36")
+	name, output = argv[1], argv[2]
+	if name not in PROGRAMS:
+		print(f"pe_build.py: no program {name!r}", file=sys.stderr)
+		return 2
+	expected, source = PROGRAMS[name]
+	text, code_size = assemble(source)
+	sections = build(output, text, code_size)
+	print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
+	      f"function is {code_size} of them, expected exit code {expected}")
 	return 0
 
 
