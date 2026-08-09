@@ -1972,12 +1972,63 @@ Two of the buckets are worth reading as findings rather than bookkeeping:
   could have been taken forwards, or in place. That is a real opportunity, not a
   cost that has to be paid, and it is the cheapest 1,018 sites on the list.
 
+### Finding 36 -- take the next one with you
+
+Finding 35's census left a lead rather than a cost: 1,018 sites lost where only a
+backward-widened candidate's *start* collided with a committed window. Measured
+before anything was written, and the measurement decided the design -- **in all
+1,053 such candidates the covering window ended exactly at the site.** Not most. All
+of them.
+
+That makes the fix a small one. Before committing a window, look at the candidate
+that follows: if it widened backwards, if the start it needs is inside this window,
+and if its site sits exactly at this window's end, then extend this window by that
+one instruction and lower it in this stub. It is safe for the same two reasons the
+candidate itself was -- the site is not a branch target, or backward widening would
+never have been allowed to swallow it, and the extended window stays inside one
+function, because the two windows overlap and each was already checked.
+
+A rescued site is visible end to end. Three consecutive Class C instructions, the
+middle one unreachable any other way:
+
+```
+1402ccf56:  e9 61 06 6c 08    jmp 0x14898d5bc      one window, three instructions
+1402ccf5b:  0f 1f 80 ...      nopl
+1402ccf62:  c3                ret                  untouched
+```
+```
+14898d5bc:  movaps %xmm1,%xmm2 ; addss %xmm0,%xmm2
+            movaps %xmm3,%xmm1 ; mulss %xmm3,%xmm1
+            movaps %xmm2,%xmm0 ; addss %xmm1,%xmm0
+            jmp    0x1402ccf62
+```
+
+The dependency between them survives because they are emitted in order: the second
+computes `%xmm1` and the third consumes it.
+
+#### The passenger must not cost the ride
+
+The first version marked the rescued candidate as consumed before knowing whether
+the extended stub would build. 26 of them did not build, and those sites then
+belonged to nobody -- not placed, not overlapped, not refused. **The census caught
+it immediately**, which is the second time that tool has found something the change
+that produced it did not.
+
+Building the extended stub first and falling back to the plain one restores them.
+Taking a passenger along now never costs the stub that was going anyway.
+
+```
+skipped for overlap    1,018 -> 97
+VEX in .text          10,276 -> 9,355
+unaccounted                      0
+```
+
 ### Final state
 
 ```
 in place                                      581,374
 detoured                                      178,545
-VEX in .text            805,131 ->      10,618   794,513 removed, 98.7%
+VEX in .text            805,131 ->       9,355   795,776 removed, 98.8%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub

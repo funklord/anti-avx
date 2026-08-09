@@ -1300,14 +1300,69 @@ def place_stubs(candidates, stub_base):
 	# and that is the question census has to answer.
 	refused, overlapped = set(), set()
 	committed_to = 0
-	for (start, encoding, operands, mnemonic, window, displaced,
-	     scratch, preceding) in sorted(candidates, key=lambda c: c[0]):
+	entries = sorted(candidates, key=lambda c: c[0])
+	rescued = set()
+	for i, entry in enumerate(entries):
+		start, encoding, operands, mnemonic, window, displaced, \
+			scratch, preceding = entry
+		if i in rescued:
+			continue		# already taken along by an earlier stub
 		if start < committed_to:
 			overlapped.add(start)
 			continue
+
+		# **Take the next one with us rather than lose it.** A candidate
+		# widened backwards starts on the instruction BEFORE its site, so
+		# when that earlier byte falls inside the window about to be
+		# committed the whole candidate is refused -- even though its site
+		# sits outside, untouched, and cannot be reached any other way,
+		# having gone backwards precisely because forward widening was
+		# refused.
+		#
+		# Measured before it was written: 1,053 sites, and in every one of
+		# them the covering window ends EXACTLY at the site. So extending
+		# this window by that one instruction rescues all of them.
+		#
+		# It is safe for the same reasons the candidate itself was: the
+		# site is not a branch target, or backward widening would not have
+		# been allowed to swallow it; and the extended window stays inside
+		# one function, because the two windows overlap and each was
+		# already checked to lie within one.
+		extension = None
+		for j in range(i + 1, len(entries)):
+			other = entries[j]
+			if other[0] >= start + window:
+				break
+			following = other[7]
+			if not following or other[1][:1] not in (b"\xc4", b"\xc5"):
+				continue
+			site = other[0] + sum(len(e[1]) for e in following)
+			if site != start + window:
+				continue
+			extension = (j, [(site, other[1], None, other[2], other[3])],
+			             len(other[1]))
+			break
+
 		stub_address = stub_base + len(blob)
-		body = build_stub(start, encoding, operands, mnemonic, window,
-		                  displaced, stub_address, scratch, pool, preceding)
+		body = None
+		if extension:
+			j, extra, grew = extension
+			body = build_stub(start, encoding, operands, mnemonic,
+			                  window + grew, list(displaced) + extra,
+			                  stub_address, scratch, pool, preceding)
+			if body is None:
+				# The extended stub would not build. Fall back to the plain
+				# one rather than lose both -- taking a passenger along must
+				# never cost the stub that was going anyway.
+				extension = None
+			else:
+				window += grew
+				displaced = list(displaced) + extra
+				rescued.add(j)
+		if body is None:
+			body = build_stub(start, encoding, operands, mnemonic, window,
+			                  displaced, stub_address, scratch, pool,
+			                  preceding)
 		if body is None:
 			refused.add(start)
 			continue
