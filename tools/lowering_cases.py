@@ -70,6 +70,19 @@ CASES = [
 DESTINATION = 0
 SCRATCH = 15
 
+# The shift-by-immediate forms, whose destination is in vvvv and whose
+# modrm.rm is therefore the SOURCE. They print as imm, src, dst -- two
+# registers, not three -- so they need shapes of their own. A distinct
+# immediate per mnemonic keeps one reference per entry.
+SHIFTS = [("vpsrld", "$0x2"), ("vpslld", "$0x3"), ("vpsrlq", "$0x5"),
+          ("vpsllq", "$0x1"), ("vpsrad", "$0x4"), ("vpsrldq", "$0x4"),
+          ("vpslldq", "$0x2"), ("vpsrlw", "$0x1"), ("vpsllw", "$0x2")]
+
+# (name, source register) for a shift: the destination is always xmm0, so
+# "same" is the case patch.py takes in place and "distinct" is the one that
+# needs the source copied first.
+SHIFT_SHAPES = [("distinct", 1), ("same", 0)]
+
 # (name, src2, src1) -- AT&T order is src2, src1, dst.
 SHAPES = [
 	("distinct", 2, 1),
@@ -103,6 +116,12 @@ def build():
 			operands = f"%xmm{source2},%xmm{source1},%xmm{DESTINATION}"
 			text = f"{mnemonic} {immediate + ',' if immediate else ''}{operands}"
 			wanted.append((mnemonic, shape, source1, source2, text))
+
+	for mnemonic, immediate in SHIFTS:
+		for shape, source in SHIFT_SHAPES:
+			text = f"{mnemonic} {immediate},%xmm{source},%xmm{DESTINATION}"
+			# Both source slots name the same register: a shift has one.
+			wanted.append((mnemonic, shape, source, source, text))
 
 	assembled = assemble([text for *_rest, text in wanted])
 	if len(assembled) != len(wanted):

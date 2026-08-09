@@ -73,6 +73,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
+        census \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -330,6 +331,12 @@ bench: $(BUILD_DIR)/icache_bench
 placement: $(LISTING)
 	$(PYTHON) tools/placement.py report $(TARGET) $<
 
+# Reconcile what survives against what the rewriter declined, by comparing
+# address sets rather than totals.
+census: $(LISTING) $(DETOURED)
+	objdump -d -j .text $(DETOURED) > $(BUILD_DIR)/after.asm
+	$(PYTHON) tools/detour.py census $(TARGET) $(LISTING) $(BUILD_DIR)/after.asm
+
 # Which of the sites .pdata refuses to vouch for are real leaf functions.
 outside: $(LISTING)
 	$(PYTHON) tools/outside.py report $(TARGET) $<
@@ -431,7 +438,7 @@ clean:
 	rm -f $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(GENERATED) \
 	      $(PE_SOURCES) $(PE_LISTINGS) $(PE_FIXED) \
 	      $(BUILD_DIR)/icache_bench \
-	      $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
+	      $(BUILD_DIR)/after.asm $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@# The wine prefix is a directory this build created, so it goes
 	@# wholesale -- but only after checking the variable is non-empty and
@@ -485,6 +492,7 @@ help:
 	@echo '  bench       what a detour costs on this CPU (a timing run)'
 	@echo '  placement   where the detours land: functions and loop bodies'
 	@echo '  outside     the code .pdata does not describe'
+	@echo '  census      what survives the rewrite, and why'
 	@echo '  scratch-check  prove every claimed scratch register is dead'
 	@echo '  hooks       install the commit-msg hook into .git/hooks'
 	@echo '  clean       remove the listing and the report'

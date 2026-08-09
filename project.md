@@ -1889,6 +1889,73 @@ The branch is taken at run time, so the target really is entered. Had the rewrit
 swallowed it, the program would not merely compute the wrong number -- it would jump
 into the middle of an instruction.
 
+### Finding 34 -- the shift-by-immediate forms, which were invisible
+
+Counting what actually survived, by mnemonic, turned up a class the rewriter had
+never attempted: `vpsrld`, `vpslld`, `vpsrlq` and their relatives, 323 sites. They
+were not refused for any recorded reason. `collect` skipped `DESTINATION_IN_VVVV`
+outright and **without counting it**, so they were part of the residue this document
+could not account for.
+
+The guard was right and too broad. VEX puts the destination in `vvvv` and uses
+`modrm.reg` as an opcode extension, so `modrm.rm` names the *source* -- dropping the
+prefix leaves an SSE instruction that writes the source register while looking
+entirely reasonable. But that is only true when the two registers differ:
+
+```
+c5 f1 72 d1 02    vpsrld $0x2,%xmm1,%xmm1
+66 0f 72 d1 02    psrld  $0x2,%xmm1          same modrm, same length
+```
+
+Equal registers means the same bytes with a different prefix, and the same length, so
+`patch.py` takes it in place. Where they differ the source is copied first:
+
+```
+vpsrld $0x2,%xmm1,%xmm0  ->  movdqa %xmm1,%xmm0 ; psrld $0x2,%xmm0
+```
+
+`movdqa` rather than `movaps`, which would move the same bits in a byte less: these
+are integer instructions and Westmere charges a bypass delay for a value crossing
+between the integer and floating-point domains.
+
+Nine mnemonics went into `check-lowering` with them, in both shapes, taking it to 129
+cases and 1,032 executions. Mutating the lowering to leave `rm` pointing at the
+source is caught 144 times over -- and the diagnostic is worth reading, because it is
+the *bystander* check that catches it: `xmm0` holds the unshifted source and `xmm1`
+holds the shifted value. Comparing only the destination would have seen a wrong
+answer without ever showing where the write went.
+
+VEX in `.text` falls from 10,618 to 10,276.
+
+### Finding 35 -- the accounting question, narrowed and still open
+
+`make census`. The residue this document called unaccounted was being computed by
+subtracting the skip tallies from the survivor count, and **that subtraction was the
+mistake**: the two measure different populations. A declined site can still be
+lowered if a neighbour's window swallows it; an accepted one can still survive if its
+stub could not be built or its window overlapped; and the survivor count comes from a
+fresh linear sweep of rewritten bytes, which is authoritative only where the oracle
+vouches for them.
+
+Comparing address sets instead of totals refutes the first of those outright: **not
+one declined site is inside a committed window.** That was the leading hypothesis and
+it is simply wrong.
+
+```
+declined by the collector       6,728      of those, swallowed anyway     0
+accepted as candidates        216,905      detoured                 178,787
+                                           window overlapped         35,629
+                                           stub not buildable         2,489
+VEX in the rewritten .text     10,276      declined or in a window    6,728
+                                           at neither                 3,548
+```
+
+Those 3,548 are **not explained.** Sweep divergence is the obvious candidate and
+cannot be the whole answer: survivors outside the oracle's ranges were measured
+separately at 453. Something else is in there and has not been found. It is recorded
+as open rather than given the nearest plausible story, which is what the first version
+of this paragraph did.
+
 ### Final state
 
 ```
@@ -2530,10 +2597,12 @@ Named rather than left implicit, because an absent gap gets guessed at:
 - **256-bit.** The Y1/Y2 representations are milestones 5 and 6 and do not exist.
 - **Exception paths.** `.xdata` is carried through untouched and never exercised.
   Rung 4 exists to find what that misses.
-- **~1,391 surviving VEX sites are unaccounted for.** The refusal counters explain
-  9,227 of 10,618. The remainder is most likely the shapes `collect` skips without
-  counting -- `DESTINATION_IN_VVVV` forms and the 180 `(bad)` decodes -- but that
-  is a guess and is written here as one.
+- **3,548 surviving VEX sites are unaccounted for**, and the guess this line used
+  to carry was half right and half wrong. The `DESTINATION_IN_VVVV` shapes were
+  indeed being skipped without counting, and they are now lowered (Finding 34). But
+  the arithmetic behind the number was itself wrong -- see Finding 35, where
+  `make census` compares address sets rather than totals and refutes the leading
+  explanation. What is left is open.
 
 A translated binary that is 99.99% correct is worthless -- the remaining 0.01% is a
 crash at an unpredictable moment.

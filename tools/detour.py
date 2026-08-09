@@ -41,6 +41,7 @@ Two details are easy to get wrong and both are fatal.
   plan    <binary> <listing>            what would be detoured
   apply   <binary> <listing> <out>      in-place patches plus detours
   verify  <original> <patched>          the invariants
+  census  <binary> <listing> <patched>  what survives, and why
 """
 
 import re
@@ -84,6 +85,62 @@ def encode_movaps(destination, source):
 	out += b"\x0f\x28"
 	out.append(0xC0 | ((destination & 7) << 3) | (source & 7))
 	return bytes(out)
+
+
+def encode_movdqa(destination, source):
+	"""movdqa source,destination -- 66 0F 6F /r, with REX where needed.
+
+	movaps would move the same bits in one byte less. movdqa is used anyway
+	because the instructions that need this are integer ones, and Westmere
+	charges a bypass delay for a value crossing between the integer and
+	floating-point domains.
+	"""
+	out = bytearray(b"\x66")
+	rex = 0x40 | ((destination >> 3) << 2) | (source >> 3)
+	if rex != 0x40:
+		out.append(rex)
+	out += b"\x0f\x6f"
+	out.append(0xC0 | ((destination & 7) << 3) | (source & 7))
+	return bytes(out)
+
+
+def lower_vvvv_shift(vex, encoding, operands):
+	"""The shift-by-immediate forms, whose destination is in vvvv.
+
+	VEX puts the destination in vvvv and uses modrm.reg as an opcode
+	extension, so modrm.rm names the *source*. That is why these were
+	refused outright: dropping the VEX prefix leaves an SSE instruction
+	whose destination is the source, which writes the wrong register while
+	looking entirely reasonable.
+
+	The equal-register case patches in place -- the two encodings are the
+	same length, `c5 f1 72 d1 02` against `66 0f 72 d1 02`. What reaches
+	here is the other one, which needs the source copied first and the
+	shift's rm field pointed at the destination.
+
+	323 sites, and they were invisible: `collect` skipped this whole class
+	without counting it, so they were part of the residue project.md could
+	not account for.
+	"""
+	tail = encoding[vex["length"]:]
+	if len(tail) < 2 or ((tail[1] >> 6) & 3) != 3:
+		return None			# a memory source is not this shape
+	registers = [o for o in inplace.split_operands(operands)
+	             if not o.startswith("$")]
+	if len(registers) != 2:
+		return None
+	destination = vex["vvvv"]
+	source = (vex["B"] << 3) | (tail[1] & 7)
+	if destination == source:
+		return inplace.sse_encoding(vex, tail)
+
+	body = bytearray(encode_movdqa(destination, source))
+	moved = dict(vex, B=destination >> 3)
+	pointed = bytes([tail[0], (tail[1] & 0xF8) | (destination & 7)]) + tail[2:]
+	operation = inplace.sse_encoding(moved, pointed)
+	if operation is None:
+		return None
+	return bytes(body + operation)
 
 
 def encode_rr(prefix, opcode, reg, rm, immediate=None):
@@ -515,7 +572,7 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	# nothing at all and the disassembler desynchronises from there.
 	# Class D, F and H need real sequences and belong in their own tools.
 	if mnemonic in inplace.DESTINATION_IN_VVVV:
-		return None
+		return lower_vvvv_shift(vex, encoding, operands)
 	if not inplace.has_direct_sse_form(mnemonic):
 		if mnemonic in SEQUENCE_MNEMONICS or FMA_PATTERN.match(mnemonic):
 			tail = encoding[vex["length"]:]
@@ -776,6 +833,7 @@ def collect(binary, listing):
 
 	candidates = []
 	skipped = Counter()
+	declined = {}
 	for index, (address, encoding, mnemonic, operands,
 	            _comment) in enumerate(instructions):
 		if not encoding or encoding[0] not in (0xC4, 0xC5):
@@ -783,7 +841,7 @@ def collect(binary, listing):
 		if address in already:
 			continue
 		vex = inplace.decode_vex(encoding)
-		if vex is None or mnemonic in inplace.DESTINATION_IN_VVVV:
+		if vex is None:
 			continue
 		# There was a `mnemonic not in nds` test here, left over from when
 		# this only handled Class C. It quietly excluded every mnemonic
@@ -793,11 +851,13 @@ def collect(binary, listing):
 		                  or FMA_PATTERN.match(mnemonic) is not None)
 		if not inplace.has_direct_sse_form(mnemonic) and not needs_sequence:
 			skipped["no direct SSE form"] += 1
+			declined[address] = "no direct SSE form"
 			continue
 		fields = inplace.split_operands(operands)
 		registers = [o for o in fields if not o.startswith("$")]
 		if not needs_sequence and len(registers) not in (2, 3):
 			skipped["operand shape not A/B/C"] += 1
+			declined[address] = "operand shape not A/B/C"
 			continue
 
 		# A sequence may need somewhere to put an intermediate. Ask the
@@ -807,7 +867,9 @@ def collect(binary, listing):
 		# A Class C site whose src2 IS the destination needs one too, for the
 		# reason spelled out in lower_vex: the movaps that sets up the
 		# destination would destroy src2 first.
-		aliased = (not needs_sequence and len(registers) == 3
+		aliased = (not needs_sequence
+		           and mnemonic not in inplace.DESTINATION_IN_VVVV
+		           and len(registers) == 3
 		           and registers[-1] != registers[-2]
 		           and registers[0] == registers[-1])
 		scratch = None
@@ -818,10 +880,13 @@ def collect(binary, listing):
 			if trial is None:
 				if aliased:
 					skipped["src2 aliases dst, no scratch"] += 1
+					declined[address] = "src2 aliases dst, no scratch"
 				else:
-					skipped["sequence with no usable scratch"
-					        if scratch is None
-					        else "sequence shape not handled"] += 1
+					reason = ("sequence with no usable scratch"
+					          if scratch is None
+					          else "sequence shape not handled")
+					skipped[reason] += 1
+					declined[address] = reason
 				continue
 		displaced = []
 		preceding = []
@@ -889,14 +954,16 @@ def collect(binary, listing):
 
 			if reason is not None:
 				skipped[reason] += 1
+				declined[address] = reason
 				continue
 
 		if not inplace.covered_by(ranges, start, window):
 			skipped["outside .pdata"] += 1
+			declined[address] = "outside .pdata"
 			continue
 		candidates.append((start, encoding, operands, mnemonic, window,
 		                   displaced, scratch, preceding))
-	return patches, candidates, stats, skipped
+	return patches, candidates, stats, skipped, declined
 
 
 def add_section(data, name, payload, flags):
@@ -1063,6 +1130,66 @@ def selftest():
 	return 0
 
 
+def census(binary, listing, patched):
+	"""Reconcile what survives against what the rewriter declined.
+
+	project.md carried this as an open question, and the honest answer turned
+	out not to be a missing counter. **The skip tallies and the survivor
+	count measure different populations**, and subtracting one from the other
+	was the mistake:
+
+	  * a site the collector declines can still be lowered, because a
+	    neighbour's widened window swallows it and the stub lowers it there;
+	  * a site it accepts can still survive, because the stub could not be
+	    built or the window overlapped one already committed;
+	  * and the survivor count comes from a fresh linear sweep of rewritten
+	    bytes, which is authoritative only where the code oracle vouches for
+	    it -- elsewhere the sweep can manufacture or hide a VEX prefix that
+	    was never an instruction.
+
+	So this compares the actual address sets instead of the totals, and
+	prints what falls in each part rather than a single number that hides
+	three effects at once.
+
+	It does not close the question. It narrows it: the first guess, that
+	declined sites were being swallowed by a neighbour and lowered in a
+	stub, is refuted outright -- **not one of them is inside a committed
+	window.** What is left over is stated as unexplained rather than given
+	the nearest plausible story.
+	"""
+	_patches, candidates, _stats, _skipped, declined = collect(binary, listing)
+	placed, _blob, swallowed, overlapped, refused = place_stubs(
+		candidates, stub_base_of(open(binary, "rb").read()))
+	rewritten = {address for address, _window, _at in placed}
+	covered = set()
+	for address, window, _at in placed:
+		covered.update(range(address, address + window))
+
+	survivors = {a for a, e, _m, _o in inplace.parse_listing(patched)
+	             if e[:1] in (b"\xc4", b"\xc5")}
+
+	print(f"declined by the collector      {len(declined):>10,}")
+	print(f"  of those, swallowed anyway   "
+	       f"{len(set(declined) & covered):>10,}")
+	print(f"accepted as candidates         {len(candidates):>10,}")
+	print(f"  detoured                     {len(rewritten):>10,}")
+	print(f"  skipped, window overlapped   {overlapped:>10,}")
+	print(f"  refused, stub not buildable  {refused:>10,}")
+	print(f"instructions swallowed         {len(swallowed):>10,}")
+	print()
+	print(f"VEX in the rewritten .text     {len(survivors):>10,}")
+	explained = survivors & (set(declined) | covered)
+	print(f"  at an address declined or in a window "
+	       f"{len(explained):>7,}")
+	print(f"  at neither                   {len(survivors - explained):>10,}")
+	print("  -- NOT YET EXPLAINED. The likely part is the sweep disagreeing")
+	print("     with itself across two disassemblies, which can only happen")
+	print("     where the oracle does not vouch for the bytes; but that was")
+	print("     measured at 453 and this is larger, so something else is in")
+	print("     here and it has not been found.")
+	return 0
+
+
 def main(argv):
 	if not argv or argv[0] in ("-h", "--help"):
 		print(__doc__.strip())
@@ -1072,8 +1199,12 @@ def main(argv):
 	if mode == "selftest":
 		return selftest()
 
+	if mode == "census":
+		return census(argv[1], argv[2], argv[3])
+
 	if mode == "plan":
-		_patches, candidates, stats, skipped = collect(argv[1], argv[2])
+		_patches, candidates, stats, skipped, _declined = \
+			collect(argv[1], argv[2])
 		print(f"detour candidates (A/B/C) {len(candidates):>10,}")
 		for reason, count in skipped.most_common():
 			print(f"  skipped, {reason:<24} {count:>10,}")
@@ -1164,7 +1295,8 @@ def place_stubs(candidates, stub_base):
 
 
 def apply_all(binary, listing, output):
-	patches, candidates, _stats, _skipped = collect(binary, listing)
+	patches, candidates, _stats, _skipped, _declined = collect(binary,
+	                                                          listing)
 	data = bytearray(open(binary, "rb").read())
 	vaddr, raddr, _size = inplace.text_mapping(binary)
 
@@ -1233,7 +1365,8 @@ def verify(original, patched, listing=None):
 			       "to check they were swallowed deliberately")
 		return 1 if problems else 0
 
-	_patches, candidates, _stats, _skipped = collect(original, listing)
+	_patches, candidates, _stats, _skipped, _declined = collect(original,
+	                                                           listing)
 	# The same call apply makes, so the two cannot drift apart.
 	_placed, _blob, swallowed, _overlapped, _refused = place_stubs(
 		candidates, stub_base_of(open(original, "rb").read()))

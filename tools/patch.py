@@ -256,8 +256,16 @@ def classify(mnemonic, vex, operands, direct, nds):
 	if mnemonic == "vzeroupper":
 		return "Z"
 	# For these the destination lives in vvvv and modrm.reg is an opcode
-	# extension, so dropping vvvv would silently retarget the write.
+	# extension, so modrm.rm names the SOURCE. The SSE form is two-operand
+	# with the destination in rm, which makes it the same instruction only
+	# when destination and source are already the same register -- and then
+	# the two encodings are the same length, so it patches in place. Where
+	# they differ the write would silently move, and the site goes to
+	# detour.py to have the source copied into the destination first.
 	if mnemonic in DESTINATION_IN_VVVV:
+		shift = [o for o in operands if not o.startswith("$")]
+		if len(shift) == 2 and shift[0] == shift[1]:
+			return "V"
 		return None
 	if not has_direct_sse_form(mnemonic):
 		return None

@@ -278,6 +278,63 @@ static __m128i ref_punpckldq(__m128i a, __m128i b)
 	return _mm_unpacklo_epi32(a, b);
 }
 
+/* The shift-by-immediate forms. Only src1 is a register: the count is
+ * the immediate the generator emitted, and it differs per mnemonic so
+ * that one reference covers exactly one entry. */
+static __m128i ref_psrld(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_srli_epi32(a, 2);
+}
+
+static __m128i ref_pslld(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_slli_epi32(a, 3);
+}
+
+static __m128i ref_psrlq(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_srli_epi64(a, 5);
+}
+
+static __m128i ref_psllq(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_slli_epi64(a, 1);
+}
+
+static __m128i ref_psrad(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_srai_epi32(a, 4);
+}
+
+static __m128i ref_psrldq(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_srli_si128(a, 4);
+}
+
+static __m128i ref_pslldq(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_slli_si128(a, 2);
+}
+
+static __m128i ref_psrlw(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_srli_epi16(a, 1);
+}
+
+static __m128i ref_psllw(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_slli_epi16(a, 2);
+}
+
 static const struct {
 	const char *mnemonic;
 	reference_fn reference;
@@ -302,6 +359,11 @@ static const struct {
 	{ "vmovss", ref_movss }, { "vmovsd", ref_movsd },
 	{ "vshufps", ref_shufps },
 	{ "vcmpltps", ref_cmpltps }, { "vcmpless", ref_cmpless },
+	{ "vpsrld", ref_psrld }, { "vpslld", ref_pslld },
+	{ "vpsrlq", ref_psrlq }, { "vpsllq", ref_psllq },
+	{ "vpsrad", ref_psrad }, { "vpsrldq", ref_psrldq },
+	{ "vpslldq", ref_pslldq }, { "vpsrlw", ref_psrlw },
+	{ "vpsllw", ref_psllw },
 };
 
 static reference_fn reference_for(const char *mnemonic)
