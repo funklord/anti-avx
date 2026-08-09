@@ -209,8 +209,26 @@ def decode_vex(encoding):
 
 
 def sse_encoding(vex, tail):
-	"""The SSE bytes equivalent to a VEX prefix plus everything after it."""
-	if vex["map"] not in MAP_ESCAPE:
+	"""The SSE bytes equivalent to a VEX prefix plus everything after it.
+
+	**Refuses VEX.L, and that refusal is the whole point of this guard being
+	here rather than in the callers.** There is no SSE encoding of a 256-bit
+	instruction. Dropping the prefix from one produces a perfectly valid
+	128-bit instruction that assembles, disassembles, carries no VEX, and
+	writes half as many bytes as it should -- `vmovups %ymm0,(%rax)` becomes
+	`movups %xmm0,(%rax)` and stores 16 bytes where the program wrote 32.
+
+	It was reachable, and it was reached: 32,749 sites, 31,829 of them
+	`vmovups`, were being truncated exactly that way. Every structural check
+	passed, because every one of them is about shape. The lowering tests
+	missed it because they only ever generated 128-bit operands.
+
+	A Y strategy will want 128-bit encodings built from a 256-bit source --
+	that is what splitting a ymm into halves means -- and it must say so by
+	passing a vex with L cleared, one half at a time. Silence is not
+	consent here.
+	"""
+	if vex["map"] not in MAP_ESCAPE or vex["L"]:
 		return None
 	out = bytearray()
 	legacy = PP_PREFIX[vex["pp"]]

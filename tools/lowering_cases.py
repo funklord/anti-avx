@@ -91,6 +91,44 @@ SHAPES = [
 ]
 
 
+# **256-bit forms that must be REFUSED, not lowered.** There is no SSE
+# encoding of a 256-bit instruction, and dropping the prefix from one yields
+# a valid 128-bit instruction that writes half the bytes it should. That was
+# happening to 32,749 sites, and nothing caught it -- every generated case
+# here used 128-bit operands, so the tests could not have caught it either.
+#
+# These are checked at generation time: if any of them acquires a lowering,
+# the generator fails rather than emitting a case for it.
+REFUSED = [
+	"vmovups %ymm0,(%rax)", "vmovups (%rax),%ymm1",
+	"vmovaps %ymm2,%ymm1", "vmovdqu %ymm3,(%rdx)",
+	"vaddps %ymm2,%ymm1,%ymm0", "vmulps %ymm0,%ymm0,%ymm0",
+	"vxorps %ymm1,%ymm1,%ymm1", "vpaddd %ymm2,%ymm1,%ymm0",
+	"vpsrld $0x2,%ymm1,%ymm0",
+]
+
+
+def check_refusals():
+	"""Every 256-bit form must have no lowering at all."""
+	lowered = []
+	for site in assemble(REFUSED):
+		address, encoding, mnemonic, operands = site
+		vex = inplace.decode_vex(encoding)
+		if vex is None or not vex["L"]:
+			raise SystemExit(f"lowering_cases: {mnemonic} {operands} is not "
+			                 f"256-bit; the refusal list is wrong")
+		if detour.lower_vex(address, encoding, operands, mnemonic, 0,
+		                    scratch=SCRATCH) is not None:
+			lowered.append(f"{mnemonic} {operands}")
+	if lowered:
+		print("lowering_cases: these 256-bit forms were LOWERED and must not "
+		      "be:", file=sys.stderr)
+		for text in lowered:
+			print(f"  {text}", file=sys.stderr)
+		raise SystemExit(1)
+	return len(REFUSED)
+
+
 def assemble(lines):
 	"""Assemble AT&T source and return objdump's view of each instruction."""
 	with tempfile.TemporaryDirectory() as tmp:
@@ -180,9 +218,11 @@ def main(argv):
 	if argv[0] != "emit":
 		print(f"lowering_cases.py: unknown mode {argv[0]!r}", file=sys.stderr)
 		return 2
+	refused = check_refusals()
 	cases = build()
 	emit(cases, argv[1], argv[2])
-	print(f"lowering_cases: {len(cases)} cases from {len(CASES)} mnemonics")
+	print(f"lowering_cases: {len(cases)} cases from {len(CASES)} mnemonics, "
+	      f"and {refused} 256-bit forms correctly refused")
 	return 0
 
 

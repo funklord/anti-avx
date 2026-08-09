@@ -2019,16 +2019,72 @@ Taking a passenger along now never costs the stub that was going anyway.
 
 ```
 skipped for overlap    1,018 -> 97
-VEX in .text          10,276 -> 9,355
+VEX in .text          10,276 -> 9,355   (before Finding 37 corrected it)
 unaccounted                      0
 ```
+
+### Finding 37 -- every number above was too high: 256-bit was being truncated
+
+**`sse_encoding` never looked at `VEX.L`.** Dropping a VEX prefix from a 256-bit
+instruction leaves a perfectly valid 128-bit one, and the rewriter was doing exactly
+that:
+
+```
+c5 fc 11 00   vmovups %ymm0,(%rax)     stores 32 bytes
+0f 11 00      movups  %xmm0,(%rax)     stores 16, and nothing complains
+```
+
+**32,749 sites in place, and about 2,200 more through the detour path.** Half of
+every one of those writes was being discarded. The upper 128 bits of the source were
+never stored, and where the pattern was a 256-bit load the upper half of the
+destination kept whatever it happened to hold.
+
+Nothing caught it, and the reasons are worth more than the fix:
+
+- **Every structural check passed, because every one of them is about shape.** The
+  bytes assemble, disassemble, carry no VEX, sit at the right addresses, and
+  reconcile perfectly in the census. A truncated store is a correct instruction; it
+  is simply the wrong one.
+- **`check-lowering` executes 1,032 lowerings and could not have caught it**, because
+  the generator only ever emitted 128-bit operands. A test is blind to what its
+  fixtures cannot express, and this one had no ymm in it anywhere.
+- **The census made it *less* visible.** Reconciling every survivor exactly is
+  reassuring about sites that survive and says nothing at all about sites that were
+  rewritten wrongly. It counted these 32,749 as successes.
+
+The guard belongs in `sse_encoding` rather than in its callers, because it is the one
+place every path funnels through, and a caller that wants a 128-bit encoding out of a
+256-bit source -- which is exactly what a Y strategy does -- must now say so by
+clearing `L` and asking for one half at a time. Silence is not consent.
+
+`tools/lowering_cases.py` carries nine 256-bit forms it asserts are *refused*,
+checked when the cases are generated, so the hole the fixtures left is closed by the
+fixtures.
+
+#### The honest number
+
+```
+                        before      after
+VEX in .text             9,355     44,272
+translated                98.8%      94.5%
+```
+
+The 98.8% was never real. 34,917 of those sites were counted as translated while
+being wrong, and the earlier figures in this document -- 97.0%, 97.8%, 98.3%, 98.7%
+-- all carry the same error in the same direction.
+
+**This moves milestone 5 from polish to prerequisite.** The Y1 strategy is not an
+optimisation for the last few percent; it is the only correct handling for 32,749
+sites that are now, correctly, refused. Finding 2 already measured that 94% of ymm
+definitions are consumed in their own basic block and need no shadow state, so the
+work is scoped -- but it is required work, not optional.
 
 ### Final state
 
 ```
 in place                                      581,374
 detoured                                      178,545
-VEX in .text            805,131 ->       9,355   795,776 removed, 98.8%
+VEX in .text            805,131 ->      44,272   760,859 removed, 94.5%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
@@ -2698,8 +2754,8 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **794,513 of 805,131 VEX sites, 98.7%** (Findings 24 to 30), with no Ddisasm and no relocation of existing code. |
-| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **760,859 of 805,131 VEX sites, 94.5%** (Findings 24 to 37), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish** — Finding 37 showed 256-bit sites were being silently truncated and they are refused now, so the 32,749 of them wait on this. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
 **Milestone 3 is the go/no-go.** If Ddisasm cannot round-trip a 102 MB game binary
