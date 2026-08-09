@@ -670,14 +670,115 @@ def moved_instruction(entry, at):
 	return relocate(moved, address, at, rip)
 
 
+YMM_MOVES = frozenset("vmovups vmovaps vmovdqu vmovdqa vmovupd vmovapd".split())
+
+
+def ymm_pair(site, following):
+	"""(load, store) if these two are a 256-bit copy through one ymm.
+
+	The Y1 case Finding 2 measured, and the only 256-bit shape that needs no
+	shadow state: a 32-byte load into a ymm and an immediate 32-byte store
+	out of it. 7,395 adjacent pairs, 7,142 of them vmovups to vmovups.
+	"""
+	(_a, load, load_mnemonic, load_operands, _c) = site
+	(_b, store, store_mnemonic, store_operands, _d) = following
+	if load_mnemonic not in YMM_MOVES or store_mnemonic not in YMM_MOVES:
+		return None
+	load_vex, store_vex = inplace.decode_vex(load), inplace.decode_vex(store)
+	if not load_vex or not store_vex or not load_vex["L"] or not store_vex["L"]:
+		return None
+	# Memory into a ymm, then that same ymm back out to memory.
+	source, _, destination = load_operands.rpartition(",")
+	held, _, target = store_operands.partition(",")
+	if not destination.startswith("%ymm") or destination != held:
+		return None
+	if "(" not in source or "(" not in target:
+		return None
+	return (load_vex, load[load_vex["length"]:],
+	        store_vex, store[store_vex["length"]:])
+
+
+def lower_ymm_pair(pair):
+	"""Four 128-bit moves for one 256-bit copy. **High half first.**
+
+	The order is the whole trick, and it is what makes this need no scratch
+	register. Doing the high half first leaves the ymm's own xmm holding the
+	LOW sixteen bytes when the sequence ends -- which is exactly what the
+	lower half of that ymm holds in the original. So every later 128-bit
+	read of the register is still correct, and only a read of the upper half
+	would differ. That is the Y2 case by definition, and Finding 7 measured
+	it at 574 sites of 13,097.
+
+	Reversing these two pairs of lines would leave the high half in the
+	register and quietly corrupt every later use of it.
+	"""
+	load_vex, load_tail, store_vex, store_tail = pair
+	high_load = inplace.offset_operand(load_tail, 16)
+	high_store = inplace.offset_operand(store_tail, 16)
+	if high_load is None or high_store is None:
+		return None			# RIP-relative, or a displacement that will not fit
+	narrow_load = dict(load_vex, L=0)
+	narrow_store = dict(store_vex, L=0)
+	body = bytearray()
+	for vex, tail in ((narrow_load, high_load), (narrow_store, high_store),
+	                  (narrow_load, load_tail), (narrow_store, store_tail)):
+		piece = inplace.sse_encoding(vex, tail)
+		if piece is None:
+			return None
+		body += piece
+	return bytes(body)
+
+
+def upper_half_read_later(instructions, index, register, limit=40):
+	"""True if anything might still read the ymm's upper half.
+
+	Conservative in the direction that matters: an unresolved answer is
+	"yes, leave it alone". Only a 256-bit instruction can read the upper
+	half, and every one of those is refused today, so in practice this is
+	belt and braces -- but the pair rewrite is only correct where it holds.
+	"""
+	for step in range(1, limit + 1):
+		position = index + step
+		if position >= len(instructions):
+			return True
+		_address, _encoding, mnemonic, operands, _comment = instructions[position]
+		if mnemonic.startswith("ret") or mnemonic in ("call", "callq"):
+			# Nobody can read it after either. **The upper half of every ymm
+			# is volatile under Win64 without exception** -- xmm6 to xmm15
+			# have their LOW halves preserved and their upper halves survive
+			# nothing. That is the whole reason vzeroupper exists, and it is
+			# why a call ends an upper half's life as firmly as a return
+			# does: the callee may not read it, and the caller may not
+			# expect it back.
+			#
+			# Measured: treating a call as opaque instead refused 7,151 of
+			# the 7,395 pairs. Calls are simply too common for a scan that
+			# stops at one to reach anything.
+			return False
+		if mnemonic.startswith(CONTROL_PREFIXES):
+			return True		# following it would need a CFG
+		if register in operands:
+			return True
+	return False
+
+
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
-               stub_address, scratch=None, pool=0, preceding=()):
+               stub_address, scratch=None, pool=0, preceding=(), pair=None):
 	"""The stub body for one window, placed at stub_address.
 
 	`start` is the window's first byte, which is the site's own address
 	unless the window was widened backwards -- in which case `preceding`
 	holds the instructions that come before the site and must execute first.
 	"""
+	if pair is not None:
+		# A 256-bit copy: both instructions become four 128-bit moves, so
+		# neither is lowered on its own.
+		body = lower_ymm_pair(pair)
+		if body is None:
+			return None
+		return bytes(body) + encode_jump(stub_address + len(body) + 5,
+		                                 start + window)
+
 	body = bytearray()
 	for entry in preceding:
 		fixed = moved_instruction(entry, stub_address + len(body))
@@ -843,6 +944,39 @@ def collect(binary, listing):
 		vex = inplace.decode_vex(encoding)
 		if vex is None:
 			continue
+
+		# A 256-bit copy through one ymm, taken as a unit. Both halves of
+		# it are refused individually -- there is no SSE form of either --
+		# so this has to be seen before either is considered alone.
+		if vex["L"] and index + 1 < len(instructions):
+			following = instructions[index + 1]
+			pair = ymm_pair(instructions[index], following)
+			if pair is not None:
+				window = len(encoding) + len(following[1])
+				held = operands.rpartition(",")[2]
+				if following[0] != address + len(encoding):
+					skipped["ymm pair not adjacent"] += 1
+					declined[address] = "ymm pair not adjacent"
+					continue
+				if following[0] in blocked:
+					skipped["ymm store is a branch target"] += 1
+					declined[address] = "ymm store is a branch target"
+					continue
+				if upper_half_read_later(instructions, index + 1, held):
+					skipped["ymm upper half read later"] += 1
+					declined[address] = "ymm upper half read later"
+					continue
+				if not inplace.covered_by(ranges, address, window):
+					skipped["outside .pdata"] += 1
+					declined[address] = "outside .pdata"
+					continue
+				if lower_ymm_pair(pair) is None:
+					skipped["ymm operand cannot be offset"] += 1
+					declined[address] = "ymm operand cannot be offset"
+					continue
+				candidates.append((address, encoding, operands, mnemonic,
+				                   window, [], None, [], pair))
+				continue
 		# There was a `mnemonic not in nds` test here, left over from when
 		# this only handled Class C. It quietly excluded every mnemonic
 		# that is DIRECT-only -- vcomiss and the rest -- as well as the
@@ -962,7 +1096,7 @@ def collect(binary, listing):
 			declined[address] = "outside .pdata"
 			continue
 		candidates.append((start, encoding, operands, mnemonic, window,
-		                   displaced, scratch, preceding))
+		                   displaced, scratch, preceding, None))
 	return patches, candidates, stats, skipped, declined
 
 
@@ -1191,7 +1325,7 @@ def census(binary, listing, patched):
 	# of these look unaccounted when they were plainly refused.
 	def spread(starts):
 		out = set()
-		for start, _e, _o, _m, window, _d, _s, _p in candidates:
+		for start, _e, _o, _m, window, _d, _s, _p, _pair in candidates:
 			if start in starts:
 				out.update(range(start, start + window))
 		return out
@@ -1304,7 +1438,7 @@ def place_stubs(candidates, stub_base):
 	rescued = set()
 	for i, entry in enumerate(entries):
 		start, encoding, operands, mnemonic, window, displaced, \
-			scratch, preceding = entry
+			scratch, preceding, pair = entry
 		if i in rescued:
 			continue		# already taken along by an earlier stub
 		if start < committed_to:
@@ -1334,6 +1468,8 @@ def place_stubs(candidates, stub_base):
 			if other[0] >= start + window:
 				break
 			following = other[7]
+			if other[8] is not None:
+				continue		# a ymm pair is taken whole or not at all
 			if not following or other[1][:1] not in (b"\xc4", b"\xc5"):
 				continue
 			site = other[0] + sum(len(e[1]) for e in following)
@@ -1349,7 +1485,7 @@ def place_stubs(candidates, stub_base):
 			j, extra, grew = extension
 			body = build_stub(start, encoding, operands, mnemonic,
 			                  window + grew, list(displaced) + extra,
-			                  stub_address, scratch, pool, preceding)
+			                  stub_address, scratch, pool, preceding, pair)
 			if body is None:
 				# The extended stub would not build. Fall back to the plain
 				# one rather than lose both -- taking a passenger along must
@@ -1362,7 +1498,7 @@ def place_stubs(candidates, stub_base):
 		if body is None:
 			body = build_stub(start, encoding, operands, mnemonic, window,
 			                  displaced, stub_address, scratch, pool,
-			                  preceding)
+			                  preceding, pair)
 		if body is None:
 			refused.add(start)
 			continue
@@ -1380,6 +1516,11 @@ def place_stubs(candidates, stub_base):
 			swallowed.add(start + offset)	# the site, now inside the window
 		for entry in displaced:
 			swallowed.add(entry[0])
+		if pair is not None:
+			# A ymm pair carries no `displaced` list -- both instructions
+			# are lowered together -- but the store's boundary disappears
+			# just the same, and the verifier is right to want it named.
+			swallowed.add(start + len(encoding))
 	return placed, blob, swallowed, overlapped, refused
 
 

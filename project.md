@@ -2079,12 +2079,66 @@ sites that are now, correctly, refused. Finding 2 already measured that 94% of y
 definitions are consumed in their own basic block and need no shadow state, so the
 work is scoped -- but it is required work, not optional.
 
+### Finding 38 -- Y1, and the order that removes the scratch register
+
+The 256-bit copy: a 32-byte load into a ymm and an immediate 32-byte store out of it.
+7,395 adjacent pairs, 7,142 of them `vmovups` to `vmovups`. It becomes four 128-bit
+moves, and **the order of those four is the whole design**:
+
+```
+movups 0x10(%rsi),%xmm0        high half first ...
+movups %xmm0,0x10(%rdi)
+movups (%rsi),%xmm0            ... low half last
+movups %xmm0,(%rdi)
+```
+
+Doing the high half first leaves the ymm's own xmm holding the **low** sixteen bytes
+when the sequence ends -- which is exactly what the lower half of that ymm holds in
+the original. So no scratch register is needed at all, and every later 128-bit read
+of the register is still correct. Only a read of the *upper* half would differ, and
+that is the Y2 case by definition. Reversing the two pairs of lines still copies the
+memory correctly and quietly corrupts every later use of the register.
+
+`patch.offset_operand` does the +16, which is less trivial than it sounds: `(%rax)`
+has no displacement and has to grow one, and a `disp8` of `0x7f` overflows into a
+`disp32` and makes the instruction longer. Free inside a stub. RIP-relative operands
+are refused rather than adjusted -- their displacement is measured from the
+instruction's end, so moving one means combining the +16 with wherever the stub put
+it, and those two corrections are applied by different code.
+
+#### A call ends an upper half's life
+
+The first version scanned forward for a later use of the ymm and treated any control
+transfer as opaque. It refused 7,151 of the 7,395 pairs: calls are simply too common
+for a scan that stops at one to reach anything.
+
+**The upper half of every ymm is volatile under Win64 without exception.** xmm6 to
+xmm15 have their low halves preserved and their upper halves survive nothing -- which
+is the entire reason `vzeroupper` exists. So a call ends an upper half's life as
+firmly as a return does: the callee may not read it, and the caller may not expect it
+back. Conditional branches are still opaque, because following one needs a CFG.
+
+#### What the verifier caught, again
+
+The pair carries no `displaced` list, both instructions being lowered together -- and
+the store's boundary disappears just the same. 267 lost boundaries were reported
+unexplained until the store was named as swallowed. That is the third time the
+structural checks have caught something in the change that produced them.
+
+The PE harness carries a `ymm` program that copies 32 bytes and then reads back from
+**offset 16**, the upper half. Truncated, it returns stack garbage; correct, it
+returns 91.
+
+```
+VEX in .text     44,272 -> 39,880      94.5% -> 95.0%
+```
+
 ### Final state
 
 ```
 in place                                      581,374
 detoured                                      178,545
-VEX in .text            805,131 ->      44,272   760,859 removed, 94.5%
+VEX in .text            805,131 ->      39,880   765,251 removed, 95.0%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub

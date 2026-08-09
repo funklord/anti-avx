@@ -242,6 +242,70 @@ def sse_encoding(vex, tail):
 	return bytes(out)
 
 
+def offset_operand(tail, delta):
+	"""`tail` with its memory displacement moved by `delta` bytes, or None.
+
+	Needed to address the second half of a 256-bit memory operand: the same
+	address plus sixteen. The displacement is not always there to adjust --
+	`(%rax)` has none and has to grow one -- and it is not always wide
+	enough, so a disp8 that overflows becomes a disp32 and the instruction
+	gets longer. That is free here, because everything using this is being
+	emitted into a stub.
+
+	RIP-relative operands are refused rather than adjusted. Their
+	displacement is measured from the end of the instruction, so moving one
+	means accounting both for the +16 and for wherever the stub put it, and
+	the two corrections are applied by different code. 5% of the 256-bit
+	operands, and not worth conflating the two.
+	"""
+	if len(tail) < 2:
+		return None
+	modrm = tail[1]
+	mod, rm = (modrm >> 6) & 3, modrm & 7
+	if mod == 3:
+		return None			# a register operand has no displacement
+	head = bytearray(tail[:2])
+	rest = tail[2:]
+	sib = b""
+	if rm == 4:
+		if not rest:
+			return None
+		sib, rest = rest[:1], rest[1:]
+
+	def rebuilt(width, value):
+		if width == 1 and -128 <= value <= 127:
+			return bytes(head) + sib + struct.pack("<b", value)
+		if not -(1 << 31) <= value < (1 << 31):
+			return None
+		head[1] = (modrm & 0x3F) | 0x80
+		return bytes(head) + sib + struct.pack("<i", value)
+
+	if mod == 0:
+		if rm == 5:
+			return None		# RIP-relative; see the docstring
+		if rm == 4 and (sib[0] & 7) == 5:
+			if len(rest) < 4:
+				return None
+			value = struct.unpack_from("<i", rest, 0)[0] + delta
+			out = rebuilt(4, value)
+			return None if out is None else out + rest[4:]
+		# No displacement at all, so one has to be grown.
+		head[1] = (modrm & 0x3F) | (0x40 if -128 <= delta <= 127 else 0x80)
+		out = rebuilt(1 if -128 <= delta <= 127 else 4, delta)
+		return None if out is None else out + rest
+	if mod == 1:
+		if not rest:
+			return None
+		value = struct.unpack_from("<b", rest, 0)[0] + delta
+		out = rebuilt(1, value)
+		return None if out is None else out + rest[1:]
+	if len(rest) < 4:
+		return None
+	value = struct.unpack_from("<i", rest, 0)[0] + delta
+	out = rebuilt(4, value)
+	return None if out is None else out + rest[4:]
+
+
 def split_operands(text):
 	"""Split an AT&T operand list on top-level commas."""
 	out, depth, start = [], 0, 0

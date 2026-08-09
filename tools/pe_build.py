@@ -155,6 +155,36 @@ ten:	.float 10.0
 """)
 
 
+# 4. A 256-bit copy, and a read back from the UPPER half of it. This is the
+# Y1 case, and the only thing that can prove it: if the pair is lowered as
+# two 128-bit moves the top sixteen bytes are never written, and the read at
+# offset 16 returns whatever was on the stack instead of 91.
+#
+# It also proves the ORDER inside the lowering. Emitting the low half last
+# is what leaves the register holding the low sixteen bytes; get it backwards
+# and this still copies correctly, so the program is deliberately not the
+# whole test -- tests/lowering_test.c cannot reach ymm at all, and the
+# ordering argument is carried by lower_ymm_pair's comment and Finding 38.
+PROGRAMS["ymm"] = (91, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* 32 bytes in ... */
+	vmovups	%ymm0, (%rdi)		/* ... and back out: the Y1 pair */
+	movl	16(%rdi), %eax		/* from the upper half */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 91, 6, 7, 8
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:
