@@ -56,9 +56,14 @@ REPORT     = $(BUILD_DIR)/report.txt
 OBJS       = $(BUILD_DIR)/f16c.o $(BUILD_DIR)/fmaddsub.o \
              $(BUILD_DIR)/permil.o $(BUILD_DIR)/permd.o
 TEST_OBJS  = $(BUILD_DIR)/f16c_test.o $(BUILD_DIR)/fmaddsub_test.o \
-             $(BUILD_DIR)/permil_test.o $(BUILD_DIR)/permd_test.o
+             $(BUILD_DIR)/permil_test.o $(BUILD_DIR)/permd_test.o \
+             $(BUILD_DIR)/lowering_test.o
 TEST_BINS  = $(BUILD_DIR)/f16c_test $(BUILD_DIR)/fmaddsub_test \
-             $(BUILD_DIR)/permil_test $(BUILD_DIR)/permd_test
+             $(BUILD_DIR)/permil_test $(BUILD_DIR)/permd_test \
+             $(BUILD_DIR)/lowering_test
+# Generated from the lowering rules themselves, so the cases cannot drift
+# away from what the rewriter actually emits.
+GENERATED  = $(BUILD_DIR)/lowering_cases.s $(BUILD_DIR)/lowering_cases.inc
 TEST_BIN   = $(BUILD_DIR)/f16c_test
 DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
@@ -67,7 +72,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         check-isa \
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
-        placement check-aliasing scratch-check \
+        placement check-aliasing check-lowering scratch-check \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -76,8 +81,8 @@ all: check
 # `check` is what must pass before committing. There is no test suite yet,
 # so it is the gate alone -- and it deliberately does not depend on `scan`,
 # which needs a binary a fresh clone does not have.
-check: style verify check-aliasing check-isa check-f16c check-f16c-oracle \
-       check-fmaddsub check-permil check-permd
+check: style verify check-aliasing check-lowering check-isa check-f16c \
+       check-f16c-oracle check-fmaddsub check-permil check-permd
 
 style: style-source style-docs
 
@@ -91,6 +96,12 @@ verify:
 # disassembles the result back to simulate the register moves.
 check-aliasing:
 	$(PYTHON) tools/detour.py selftest
+
+# Execute the lowerings and check what they computed, against GCC compiling
+# the equivalent SSE intrinsic. The one test that runs translated code: this
+# machine has no AVX, so it can execute the output but never the input.
+check-lowering: $(BUILD_DIR)/lowering_test
+	$(BUILD_DIR)/lowering_test
 
 # -- the software F16C conversions -------------------------------------------
 
@@ -163,6 +174,26 @@ $(BUILD_DIR)/permil_test: $(BUILD_DIR)/permil_test.o $(BUILD_DIR)/permil.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(BUILD_DIR)/permd_test: $(BUILD_DIR)/permd_test.o $(BUILD_DIR)/permd.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+# Both halves come out of one generator run, so one recipe produces both and
+# the .inc names the .s as its sibling rather than repeating the command.
+$(BUILD_DIR)/lowering_cases.s: tools/lowering_cases.py tools/detour.py \
+                               tools/lower.py tools/patch.py | $(BUILD_DIR)
+	$(PYTHON) tools/lowering_cases.py emit $(BUILD_DIR)/lowering_cases.s \
+	          $(BUILD_DIR)/lowering_cases.inc
+
+$(BUILD_DIR)/lowering_cases.inc: $(BUILD_DIR)/lowering_cases.s
+	@test -f $@
+
+# -I$(BUILD_DIR) so the generated table is found; the .inc is an order-only
+# prerequisite of nothing, so it is named here to force generation first.
+$(BUILD_DIR)/lowering_test.o: tests/lowering_test.c \
+                              $(BUILD_DIR)/lowering_cases.inc | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -I$(BUILD_DIR) $(CFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/lowering_test: $(BUILD_DIR)/lowering_test.o \
+                            $(BUILD_DIR)/lowering_cases.s
 	$(CC) $(CFLAGS) -o $@ $^
 
 # Named explicitly, never bare. A bare `.SECONDARY:` applies to every target
@@ -324,7 +355,7 @@ hooks:
 # Named targets only. No `rm -rf` of a directory and no wildcard sweep: a
 # clean target is the one thing everybody runs without reading.
 clean:
-	rm -f $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) \
+	rm -f $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(GENERATED) \
 	      $(BUILD_DIR)/icache_bench \
 	      $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
@@ -367,6 +398,7 @@ help:
 	@echo '  detour      in-place patches plus Class C detours'
 	@echo '  detour-verify'
 	@echo '              sections, boundaries and the stub section'
+	@echo '  check-lowering  execute every lowering and check the result'
 	@echo '  bench       what a detour costs on this CPU (a timing run)'
 	@echo '  placement   where the detours land: functions and loop bodies'
 	@echo '  outside     the code .pdata does not describe'

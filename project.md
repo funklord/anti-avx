@@ -1722,6 +1722,68 @@ committed window.** So nothing was wrong. But that is an observation about one b
 rather than a property of the rewriter, and the three scans now feed one set, so it
 is a property.
 
+### Finding 31 -- executing the lowerings, on a machine that cannot execute the input
+
+Everything the suite proved about Classes A, B and C was about **shape**: that each
+lowering assembles, and that no VEX prefix survives. The src2-aliasing bug of Finding
+25 satisfied both while computing a constant zero. Nothing had ever run one.
+
+The obstacle looks fatal and is not. There is no AVX here to produce a reference from
+-- but **this machine can execute the output even though it cannot execute the
+input**, which is the whole premise of the project turned into a test. The reference
+comes from GCC compiling the equivalent SSE intrinsic: a different encoder, a
+different register allocator, and no knowledge of what this project believes the
+answer to be.
+
+`tools/lowering_cases.py` generates the cases from `detour.lower_vex` itself, so they
+cannot drift from what the rewriter emits, and `tests/lowering_test.c` runs them.
+37 mnemonics across three operand shapes -- `distinct`, `dst_is_src1` and
+`dst_is_src2`, that last being the Finding 25 case -- give 111 cases and 888
+executions. `make check-lowering`.
+
+Each case loads all sixteen xmm registers, executes the lowered bytes, and stores all
+sixteen back. **Comparing only the destination would not have been enough**: a
+lowering that computes the right answer and clobbers a bystander is still wrong, so
+every register must be unchanged except the scratch, which a lowering is entitled to
+destroy.
+
+#### What the mutants show
+
+A passing test is not evidence until it has been shown to fail. Disabling the
+aliasing fix produces 250 wrong comparisons, every one in the `dst_is_src2` shape,
+with `distinct` and `dst_is_src1` still passing.
+
+The second mutant is the more interesting one, because it re-examines a decision.
+Finding 25 rejected swapping the operands -- the cheap fix for the commutative cases
+-- on the argument that NaN propagation is ordered. That argument is now a
+measurement. Building the swap and running it gives 201 wrong comparisons, and the
+distribution says exactly where it would have mattered:
+
+```
+vaddps, vmulps      wrong only on the all-NaN inputs
+vminps, vmaxps      wrong on ordinary inputs too -- min and max return src2
+                    when either operand is NaN, so they never commuted
+vpand, vpor, vpxor  not wrong at all
+vpaddd, vandps      -- no floating-point semantics, so the swap is harmless
+```
+
+So the rejected fix was wrong, and wrong in a narrower way than the argument
+implied: safe for the bitwise operations, unsafe for the arithmetic ones, and unsafe
+everywhere for min and max.
+
+#### The inputs had to be measured too
+
+The first version of the test put a NaN in only one source at a time, because
+register `r` receives pattern `(p + r)` and the two sources of a case are always a
+fixed distance apart in the table. **With one NaN either operand order returns it**;
+only with two does the choice of which survives become visible. That version caught
+the swap in `vaddps` and missed it in `vmulps`, `vpand`, `vpor`, `vpxor`, `vpaddd`,
+`vandps` and `vxorps` -- and the gap was found by running the mutant, not by reading
+the test. Three consecutive all-NaN rows fixed it.
+
+A generated case with no reference in the C file is a failure, never a skip, so a
+mnemonic added to the generator cannot silently stop being covered.
+
 ### Final state
 
 ```
@@ -2334,11 +2396,11 @@ crash at an unpredictable moment.
 |---|---|---|---|
 | 0 | Full VEX inventory across all 58 MB of `.text` | Scope | **DONE** — see Measurements |
 | 0.5 | Operand-level re-measurement on the unpacked binary (`tools/vex_scan.py`) | Lowering rules can be costed and scoped from measured operand shapes, not a mnemonic histogram | **DONE** — Findings 5-8 |
-| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. The differential harness against an AVX host is not built. |
+| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. Class A/B/C lowerings are now **executed** and checked against GCC's SSE intrinsics (Finding 31), which is the differential harness this row asked for, minus the AVX host: the reference is the compiler rather than the original instruction, because no AVX exists here to run. |
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **781,130 of 805,131 VEX sites, 97.0%** (Finding 19), with no Ddisasm and no relocation of existing code. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **794,513 of 805,131 VEX sites, 98.7%** (Findings 24 to 30), with no Ddisasm and no relocation of existing code. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
