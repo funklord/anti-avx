@@ -807,6 +807,15 @@ def lower_ymm_zero_store(vex, tail, address, length, at):
 	return low_half + high_half
 
 
+def conditional_branch(mnemonic):
+	"""True for a branch that can fall through to the next instruction.
+
+	`loop` and `loopne` qualify too and are left out: they are rare here, and
+	a list that stays short is one that can be checked by reading it.
+	"""
+	return mnemonic.startswith("j") and mnemonic not in ("jmp", "jmpq")
+
+
 def zeroed_ymm(instructions, index, register, blocked, limit=80):
 	"""True if every bit of `register` is zero when `index` executes.
 
@@ -827,14 +836,24 @@ def zeroed_ymm(instructions, index, register, blocked, limit=80):
 
 	  * a **branch target** in between means another path reaches the store
 	    without passing the zeroing;
-	  * a **control transfer** in between means a call may have run, and the
-	    upper half of every ymm is volatile across one -- that is what
-	    `vzeroupper` exists for -- so the zeroing does not survive it;
-	  * an instruction that merely **reads** the register is refused too,
-	    rather than scanned past. It could not have changed the value, but
-	    keeping the rule at "the nearest mention decides" is what makes the
-	    scan easy to be sure of, and the sites it costs are already counted
-	    in the 6,538.
+	  * a **call** in between is opaque, the upper half of every ymm being
+	    volatile across one -- that is what `vzeroupper` exists for -- so the
+	    zeroing does not survive it;
+	An instruction that merely **reads** the register is scanned past, the
+	value being unchanged by it. That was refused when this was written, on
+	the grounds that "the nearest mention decides" is the rule easiest to be
+	sure of; measured afterwards, the simplification was costing 3,299
+	stores, which is more than a simplification is worth. Finding 44.
+
+	**A conditional branch is transparent in this direction, and that is the
+	asymmetry worth understanding.** Going forwards a branch splits the paths
+	and the answer has to hold on both, which is why Finding 42 had to follow
+	the edges. Going backwards there is nothing to split: reaching this store
+	by falling through a `jcc` means the branch was not taken on this
+	execution, so everything before it ran in order. An unconditional jump is
+	not transparent -- the instruction after one is reachable only by a
+	branch, and a branch target has already been refused above, so meeting a
+	`jmp` walking backwards means bytes nothing reaches.
 
 	`vzeroall` would be the one instruction that writes an xmm without naming
 	it. There are none in `.text`, checked rather than assumed.
@@ -847,13 +866,21 @@ def zeroed_ymm(instructions, index, register, blocked, limit=80):
 		address, encoding, mnemonic, operands, _comment = instructions[position]
 		if address in blocked:
 			return False
-		if mnemonic.startswith(CONTROL_PREFIXES):
+		if mnemonic.startswith(CONTROL_PREFIXES) \
+				and not conditional_branch(mnemonic):
 			return False
 		if narrow not in operands and register not in operands:
 			continue
+		fields = inplace.split_operands(operands)
+		if fields and fields[-1] not in (narrow, register):
+			# **A pure source, so the value is unchanged and the walk goes
+			# on.** In AT&T the destination is the last operand, and the one
+			# family that writes a non-last one is `vgather*`, which zeroes
+			# its mask. There are none in `.text`, checked rather than
+			# assumed, so a register named anywhere but last is read-only.
+			continue
 		if mnemonic not in scratch_finder.ZEROING:
 			return False
-		fields = inplace.split_operands(operands)
 		if len(fields) != 3 or set(fields) != {narrow}:
 			return False
 		vex = inplace.decode_vex(encoding)

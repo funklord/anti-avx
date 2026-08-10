@@ -339,6 +339,74 @@ buffer:	.long 0, 0, 0, 0
 """)
 
 
+
+# 9. A zero store with a conditional branch between it and the zeroing, and
+# the branch not taken. Walking back over a `jcc` is sound -- reaching the
+# store by falling through one means it was not taken on this execution --
+# but the scan used to stop at any control transfer in either direction.
+#
+# Refused, the store stays VEX and the program dies of an illegal
+# instruction rather than returning 111.
+PROGRAMS["fallthrough"] = (111, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	movq	%rsp, %rdi
+	movl	$0x5a5a5aa5, 16(%rdi)
+	movl	$0x5a5a5aa5, 20(%rdi)
+	movl	$0x5a5a5aa5, 24(%rdi)
+	movl	$0x5a5a5aa5, 28(%rdi)
+	vpxor	%xmm0, %xmm0, %xmm0
+	xorl	%ecx, %ecx
+	testl	%ecx, %ecx
+	jne	other			/* not taken, and walked back over */
+	vmovups	%ymm0, (%rdi)		/* the zero store */
+	movl	16(%rdi), %eax		/* upper half, which must be zero */
+	addl	$111, %eax
+	addq	$72, %rsp
+	ret
+other:
+	movl	$1, %eax
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+""")
+
+
+
+# 10. A zero store with an instruction between it and the zeroing that READS
+# the register. A read cannot have changed the value, so the walk goes past
+# it -- but "the nearest mention decides" used to stop there.
+#
+# Refused, the store stays VEX and the program dies of an illegal
+# instruction rather than returning 123.
+PROGRAMS["pastread"] = (123, """
+	.text
+	.globl _start
+_start:
+	subq	$88, %rsp
+	vzeroupper
+	movq	%rsp, %rdi
+	movl	$0x5a5a5aa5, 16(%rdi)
+	movl	$0x5a5a5aa5, 20(%rdi)
+	movl	$0x5a5a5aa5, 24(%rdi)
+	movl	$0x5a5a5aa5, 28(%rdi)
+	vpxor	%xmm0, %xmm0, %xmm0
+	vmovups	%xmm0, 32(%rdi)		/* reads xmm0, writes memory */
+	vmovups	%ymm0, (%rdi)		/* the zero store, past that read */
+	movl	16(%rdi), %eax		/* upper half, which must be zero */
+	orl	32(%rdi), %eax
+	addl	$123, %eax
+	addq	$88, %rsp
+	ret
+func_end:
+	.p2align 5
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

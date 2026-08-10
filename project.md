@@ -2481,19 +2481,79 @@ All 649 land: 493 pairs at two instructions each plus 156 single stores is 1,142
 the survivor count fell by exactly that. **Both counters are gone from the refusal list
 entirely**, which is the first time a category has closed rather than shrunk.
 
+### Finding 44 -- a wrong guess, and the question it should have asked
+
+Finding 42 followed the edges forwards, so the obvious next move was to follow them
+backwards. **Going backwards a conditional branch needs no following at all**, and the
+asymmetry is worth understanding rather than just using: forwards a branch splits the
+paths and the answer has to hold on both; backwards there is nothing to split, because
+reaching this store by falling through a `jcc` means it was not taken on this execution
+and everything before it ran in order.
+
+Sound, cheap, and **worth five sites.** Built, measured, and it moved 15,835 to 15,830.
+
+The measurement that should have come first asks what the walk actually meets:
+
+```
+what the backward walk meets first, over all 22,347 stores
+  a definition that is not a zeroing idiom          9,733
+  resolved: the register is zero                    6,543
+  an instruction that reads it                      4,485
+  a branch target                                   1,568
+  an unconditional transfer                            18
+```
+
+**Only 1,586 stores are blocked by control flow at all.** Everything else is blocked
+because the register genuinely holds a value that came from somewhere -- 13,342 of the
+stopping instructions are `vmovups`, which is the copy idiom -- and no amount of
+cleverness in the scan reaches those. That closes the whole "make the walk smarter"
+avenue rather than opening it, and it is the sharpest statement yet that the remaining
+work is register allocation and not analysis.
+
+#### Except for one, and it was in the docstring all along
+
+The 4,485 stopping at an instruction that only **reads** the register were refused by a
+simplification Finding 40 wrote down deliberately: "keeping the rule at *the nearest
+mention decides* is what makes the scan easy to be sure of, and the sites it costs are
+already counted." Counting them says the simplification was costing **3,299 stores**,
+which is more than a simplification is worth.
+
+A read cannot have changed the value, so the walk goes past it. In AT&T the destination
+is the last operand, and the one family that writes a non-last one is `vgather*`, which
+zeroes its mask register -- **there are none in `.text`**, checked rather than assumed,
+so a register named anywhere but last is read-only and the rule is complete.
+
+```
+ymm value has no known upper half   15,835 -> 12,552
+VEX in .text                        26,320 -> 23,042      96.7% -> 97.1%
+```
+
+#### Two programs, and what they cost to learn
+
+`make check-pe` gains a ninth and a tenth: a zero store with a not-taken `jcc` between
+it and the zeroing, and one with a read between. Both die of an illegal instruction
+without their rule, both return their number with it, and both were checked by
+disabling the rule and watching it happen.
+
+The five-site rule is kept rather than reverted, because it is three lines and the
+walk's rules read as one set. But the lesson is the ordering: **the guess cost a build
+and the diagnostic cost one query**, and the diagnostic would have said which of the two
+to build. Finding 39 recorded exactly this lesson about the gapped pair, and it was
+still not applied here.
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      189,903
+detoured                                      193,181
 skipped for overlap                            34,519
-refused, stub not buildable                     7,660
-VEX in .text            805,131 ->      26,320   778,811 removed, 96.7%
+refused, stub not buildable                     7,665
+VEX in .text            805,131 ->      23,042   782,089 removed, 97.1%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 70,615 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 73,471
+section, every section after `.text` is byte-identical, all 70,619 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 73,475
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -2506,7 +2566,7 @@ counting truncated 256-bit sites as successes.
 What remains:
 
 ```
-ymm value has no known upper half     15,835     needs a register model
+ymm value has no known upper half     12,552     needs a register model
 src2 aliases dst, no scratch           3,729     needs a register
 ymm upper half read later              1,766     what the edges could not resolve
 sequence with no usable scratch          780     needs a register
@@ -2535,11 +2595,13 @@ code quickly.
    has no `.pdata`, so `RtlVirtualUnwind` treats a stub as a leaf and reads the frame
    from an `rsp` that has moved, and anything walking the stack mid-stub gets a wrong
    answer. Reopening that is the copyright holder's call, not a refactor.
-2. **Build the Y1 register model?** 15,835 `vmovups` stores and 11,226 loads are
+2. **Build the Y1 register model?** 12,552 `vmovups` stores and 11,226 loads are
    neither copies nor zero fills, and need a ymm represented as two xmm registers
    across a basic block -- register allocation, the largest single remaining win, and
-   a different kind of work from anything done so far. Findings 39 and 40 have the
-   measurements, and Finding 40 also names what the model must repair: the in-place
+   a different kind of work from anything done so far. Findings 39, 40 and 44 have
+   the measurements, and Finding 44 is the one that closes the alternatives: only
+   1,586 of the unresolved stores are blocked by control flow, the rest holding real
+   256-bit values that no scan can reason away, and Finding 40 also names what the model must repair: the in-place
    lowerings have already destroyed the [255:128] zeroing that VEX.128 writes perform.
 
 ### What each tool is for
@@ -2778,7 +2840,7 @@ later instruction that overwrites all 256 bits without reading any of them**, wh
 what an unrolled copy does to its own predecessor. A branch is followed rather than
 stopped at, both successors having to agree. Findings 38, 41 and 42; 5,388 sites.
 
-**Y1-zero — the zero fill (6,352 sites).** A 256-bit store of a register a VEX.128
+**Y1-zero — the zero fill (9,806 sites).** A 256-bit store of a register a VEX.128
 zeroing idiom emptied. `vpxor %xmm0,%xmm0,%xmm0` zeroes bits [255:128] as well, so both
 halves are zero and the same xmm stores each:
 
@@ -2790,7 +2852,9 @@ vmovups %ymm0,m               movups %xmm0,m
 
 No scratch, no shadow, and no coordination with the definition -- the low half is the
 only half the lowering reads, so it does not matter whether the `vpxor` was lowered.
-Finding 40 has the measurement and the scan's refusals.
+Findings 40 and 44 have the measurements and the scan's refusals: it walks back to
+the nearest **write**, passing over anything that only reads the register and over a
+conditional branch it fell through, and refusing a branch target or a call.
 
 **Y2 — shadow fallback (rare, and now counted: 574 sites).** When a ymm value's halves
 are separated across basic blocks, maintain a 16 × 16-byte shadow area for upper
@@ -3207,7 +3271,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 37 mnemonics x 3 operand shapes executed on this CPU, every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | memory-operand forms, 256-bit, and the helper classes |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | eight PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | ten PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity | **semantics -- every one of these is about shape** |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
@@ -3215,7 +3279,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and eight PEs built for the purpose.
+things: the lowerings executed in isolation, and ten PEs built for the purpose.
 
 ### What is still not verified
 
@@ -3267,8 +3331,8 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **778,811 of 805,131 VEX sites, 96.7%** (Findings 24 to 43), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
-| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Finding 40, 6,352 sites) are done and need no register model; the 15,835 stores and 11,226 loads that remain do. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **782,089 of 805,131 VEX sites, 97.1%** (Findings 24 to 44), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
 **Milestone 3 is the go/no-go.** If Ddisasm cannot round-trip a 102 MB game binary
