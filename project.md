@@ -2179,8 +2179,21 @@ Two ways out, neither free:
 
 - **Load both halves before storing either**, which needs a second register and
   brings back the scratch problem Finding 38's ordering was designed to avoid.
-- **Restrict to intervening instructions that touch no memory**, which is checkable
-  and narrows 1,654 pairs to some smaller number nobody has counted yet.
+- **Restrict to intervening instructions that cannot interfere**, which is checkable
+  -- and has now been checked. It is **68 pairs**, and that closes the option rather
+  than opening it.
+
+The full condition turned out to need more clauses than "touches no memory". An
+intervening instruction must also not write any register used in either address, or
+the store lands somewhere else; and it must not mention the ymm's own **xmm**, since
+after the lowering that register holds the low half, and an instruction writing it
+between the original load and store would have had its result stored. Of 1,654
+gapped pairs, 68 satisfy all of it -- 136 instructions out of 39,880 remaining, which
+is not worth a feature.
+
+**This is the measurement earning its keep in the negative direction.** The gapped
+pair looked like the obvious next increment, being a variation on something that
+already worked, and counting it first cost one query and saved building it.
 
 ### Final state
 
