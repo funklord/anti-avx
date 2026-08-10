@@ -407,6 +407,35 @@ func_end:
 """)
 
 
+
+# 11. A four-byte site whose window widens forward over a neighbour that
+# needs a scratch of its own. The swallowed `vsubss` has dst == src2, the
+# Finding 25 shape, so lowering it takes a register to preserve src2 in --
+# and nothing was asking for one, so the whole window was refused.
+#
+# Refused, both instructions stay VEX and the program dies of an illegal
+# instruction rather than returning 20.
+PROGRAMS["swallowed"] = (20, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	ten(%rip), %xmm1
+	vmovss	three(%rip), %xmm0
+	vaddss	%xmm0, %xmm1, %xmm2	/* the site: four bytes, 10 + 3 = 13 */
+	vsubss	%xmm0, %xmm1, %xmm0	/* swallowed, dst == src2: 10 - 3 = 7 */
+	vaddss	%xmm2, %xmm0, %xmm3	/* 7 + 13 = 20 */
+	vcvttss2si %xmm3, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

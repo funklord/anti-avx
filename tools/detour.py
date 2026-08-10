@@ -656,13 +656,48 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	return bytes(body)
 
 
-def moved_instruction(entry, at):
-	"""One swallowed instruction, re-encoded to execute at `at`."""
-	address, moved, comment, moved_operands, moved_mnemonic = entry
+def swallowed_scratch(plain, position, address, encoding, operands, mnemonic,
+                      scope):
+	"""A scratch for an instruction a window is about to swallow, or None.
+
+	The trial lowering comes first and the liveness scan only if it fails, so
+	the cost lands on the ~2,400 neighbours that need one rather than on
+	every neighbour a window ever takes. `find_scratch` is a path-enumerating
+	scan and is far and away the expensive half.
+	"""
+	if encoding[:1] not in (b"\xc4", b"\xc5"):
+		return None
+	if lower_vex(address, encoding, operands, mnemonic, address) is not None:
+		return None			# lowers without one
+	return scratch_finder.find_scratch(plain, position, scope=scope)
+
+
+def moved_instruction(entry, at, pool=0):
+	"""One swallowed instruction, re-encoded to execute at `at`.
+
+	The sixth field is a scratch register for the swallowed instruction, and
+	it is there because leaving it out refused 2,437 stubs. **A swallowed
+	instruction is a lowering like any other and can need a scratch of its
+	own** -- a `vblendvps`, an FMA, a Class C whose src2 is its destination
+	-- and this asked for none, so the whole window was refused whenever the
+	neighbour it swallowed happened to be one of those. The refusal was
+	invisible: `build_stub` returns None with no reason, so no counter ever
+	named it, and it took walking the three steps by hand to see which one
+	failed.
+
+	Its scratch is dead at ITS position rather than at the site's, which is
+	the right question and is also what makes two lowerings in one stub safe.
+	The site's scratch is dead at the site, so nothing after it -- including
+	this instruction -- reads it; this one's is dead here, so nothing after
+	reads it either.
+	"""
+	address, moved, comment, moved_operands, moved_mnemonic = entry[:5]
+	scratch = entry[5] if len(entry) > 5 else None
 	if moved and moved[0] in (0xC4, 0xC5):
 		# The swallowed instruction is VEX as well. Lower it here rather
 		# than carry it across.
-		return lower_vex(address, moved, moved_operands, moved_mnemonic, at)
+		return lower_vex(address, moved, moved_operands, moved_mnemonic, at,
+		                 scratch, pool)
 	# objdump comments a resolved target for several shapes, so the comment
 	# only means a RIP displacement when the operand says (%rip). Anything
 	# else copies across untouched.
@@ -1011,7 +1046,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 
 	body = bytearray()
 	for entry in preceding:
-		fixed = moved_instruction(entry, stub_address + len(body))
+		fixed = moved_instruction(entry, stub_address + len(body), pool)
 		if fixed is None:
 			return None
 		body += fixed
@@ -1029,7 +1064,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	body += lowered
 
 	for entry in displaced:
-		fixed = moved_instruction(entry, stub_address + len(body))
+		fixed = moved_instruction(entry, stub_address + len(body), pool)
 		if fixed is None:
 			return None
 		body += fixed
@@ -1315,7 +1350,11 @@ def collect(binary, listing):
 					reason = "still too short"
 				else:
 					displaced.append((nxt_address, nxt_encoding, nxt_comment,
-					                  nxt_operands, nxt_mnemonic))
+					                  nxt_operands, nxt_mnemonic,
+					                  swallowed_scratch(
+						                  plain, index + 1, nxt_address,
+						                  nxt_encoding, nxt_operands,
+						                  nxt_mnemonic, scope)))
 					window += len(nxt_encoding)
 
 			if reason is not None:
@@ -1348,7 +1387,11 @@ def collect(binary, listing):
 					pass
 				else:
 					preceding.append((previous[0], previous[1], previous[4],
-					                  previous[3], previous[2]))
+					                  previous[3], previous[2],
+					                  swallowed_scratch(
+						                  plain, index - 1, previous[0],
+						                  previous[1], previous[3],
+						                  previous[2], scope)))
 					start = previous[0]
 					window = len(previous[1]) + len(encoding)
 					reason = None
@@ -1746,8 +1789,11 @@ def place_stubs(candidates, stub_base):
 			site = other[0] + sum(len(e[1]) for e in following)
 			if site != start + window:
 				continue
-			extension = (j, [(site, other[1], None, other[2], other[3])],
-			             len(other[1]))
+			# The passenger carries the scratch its own candidate was given:
+			# it is being lowered here rather than in a stub of its own, and
+			# the register it may destroy does not change with the address.
+			extension = (j, [(site, other[1], None, other[2], other[3],
+			                  other[6])], len(other[1]))
 			break
 
 		stub_address = stub_base + len(blob)

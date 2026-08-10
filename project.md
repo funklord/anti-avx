@@ -2541,19 +2541,102 @@ and the diagnostic cost one query**, and the diagnostic would have said which of
 to build. Finding 39 recorded exactly this lesson about the gapped pair, and it was
 still not applied here.
 
+### Finding 45 -- the bucket nobody had looked inside
+
+Two questions this time, and the one that was not the plan produced the result.
+
+#### The aliased sites, and an alternative that is worth 249
+
+`vsubss %xmm1,%xmm2,%xmm1` needs a scratch because the `movaps %xmm2,%xmm1` that sets
+up the destination destroys src2 first. But there is a second lowering that needs none:
+
+```
+subss  %xmm1,%xmm2        src1 -= src2, and its upper lanes are already right
+movaps %xmm2,%xmm1        which is exactly what the destination should hold
+```
+
+Two instructions instead of three, and it destroys **src1** rather than borrowing a
+third register -- so the question is not "is a register free" but "is src1 dead after
+this site", which `scratch.dies_here` already answers and which `find_scratch`
+structurally *cannot*, the site's own operands being excluded from its search.
+
+```
+aliased sites                                8,919
+  has a scratch already                      5,271
+  no scratch                                 3,648
+    src1 is live                             3,399
+    src1 is dead -- RECOVERABLE                249
+```
+
+**249.** The two questions turn out to be strongly correlated after all: a function with
+no dead xmm register at a point is one where everything is live, src1 included. Not
+worth a feature, and the measurement cost one query. The option is closed rather than
+opened, and preferring the shorter form at the 5,271 sites that *do* have a scratch is
+left as an optimisation nobody has needed.
+
+#### `refused, stub not buildable` was never characterised
+
+7,665 sites, the second largest bucket in the census, and nothing had ever asked what
+they were. Finding 35's lesson about buckets, unapplied for ten findings:
+
+```
+256-bit load into a ymm              3,690      register model
+128-bit, no scratch                  2,194      <- not 256-bit at all
+256-bit, another shape               1,145      register model
+256-bit store from a ymm               334      register model
+128-bit, with a scratch                302      <- nor these
+```
+
+**2,496 of them are 128-bit.** `build_stub` returns None with no reason, so no counter
+anywhere names them, and finding out meant walking its three steps by hand:
+
+```
+a displaced instruction will not move      2,437
+a preceding instruction will not move         38
+the site itself will not lower                21
+```
+
+#### A swallowed instruction is a lowering like any other
+
+`moved_instruction` lowered a swallowed VEX neighbour by calling `lower_vex` **with no
+scratch**. A `vblendvps`, an FMA, or a Class C whose src2 is its destination cannot
+lower without one, so the whole window was refused whenever the neighbour it swallowed
+happened to be one of those -- 522 `vblendvps`, then a long tail of aliased scalar
+arithmetic.
+
+The scratch a swallowed instruction needs is dead at **its** position rather than at the
+site's, and that is also what makes two lowerings in one stub safe: the site's scratch is
+dead at the site, so nothing after it -- including this instruction -- reads it; this
+one's is dead here, so nothing after reads it either.
+
+The trial lowering runs first and the liveness scan only when it fails, so the cost lands
+on the ~2,400 neighbours that need one rather than on every neighbour any window ever
+takes. `make detour` went from 2m47s to 2m57s.
+
+```
+VEX in .text                    23,042 -> 21,657      97.1% -> 97.3%
+refused, stub not buildable      7,665 ->  6,383
+skipped for overlap in census       97 ->      0
+```
+
+That last row is the incidental one and the most satisfying: with those windows now
+committing, every surviving VEX site in the binary is accounted for by exactly three
+causes -- declined by the collector, refused for want of a lowering, or bytes objdump
+could not decode.
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      193,181
-skipped for overlap                            34,519
-refused, stub not buildable                     7,665
-VEX in .text            805,131 ->      23,042   782,089 removed, 97.1%
+detoured                                      193,485
+skipped for overlap                            35,454
+refused, stub not buildable                     6,383
+VEX in .text            805,131 ->      21,657   783,474 removed, 97.3%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 70,619 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 73,475
+section, every section after `.text` is byte-identical, all 71,497 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 74,380
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -2567,7 +2650,7 @@ What remains:
 
 ```
 ymm value has no known upper half     12,552     needs a register model
-src2 aliases dst, no scratch           3,729     needs a register
+src2 aliases dst, no scratch           3,729     needs a register; 249 do not
 ymm upper half read later              1,766     what the edges could not resolve
 sequence with no usable scratch          780     needs a register
 no direct SSE form                       710     mostly vextractf128/vinsertf128
@@ -2594,7 +2677,9 @@ code quickly.
    `tools/scratch.py` for a stated reason -- Win64 has no red zone, the stub section
    has no `.pdata`, so `RtlVirtualUnwind` treats a stub as a leaf and reads the frame
    from an `rsp` that has moved, and anything walking the stack mid-stub gets a wrong
-   answer. Reopening that is the copyright holder's call, not a refactor.
+   answer. Reopening that is the copyright holder's call, not a refactor. Finding 45
+   closed the one alternative that needed no spill: computing into src1 and moving the
+   result out is worth 249 of them and no more.
 2. **Build the Y1 register model?** 12,552 `vmovups` stores and 11,226 loads are
    neither copies nor zero fills, and need a ymm represented as two xmm registers
    across a basic block -- register allocation, the largest single remaining win, and
@@ -3271,7 +3356,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 37 mnemonics x 3 operand shapes executed on this CPU, every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | memory-operand forms, 256-bit, and the helper classes |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | ten PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | eleven PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity | **semantics -- every one of these is about shape** |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
@@ -3279,7 +3364,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and ten PEs built for the purpose.
+things: the lowerings executed in isolation, and eleven PEs built for the purpose.
 
 ### What is still not verified
 
@@ -3331,7 +3416,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **782,089 of 805,131 VEX sites, 97.1%** (Findings 24 to 44), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **783,474 of 805,131 VEX sites, 97.3%** (Findings 24 to 45), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
