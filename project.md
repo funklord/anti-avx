@@ -2419,19 +2419,81 @@ the pair, leaves the load VEX, and the rewritten binary dies of an illegal instr
 returning 29 instead of 55. Checked by disabling the edge following and watching it
 happen.
 
+### Finding 43 -- two corrections on the same four bytes
+
+Finding 38 refused a RIP-relative 256-bit operand rather than adjusting one, and said
+why: its displacement is measured from the end of the instruction, so moving it means
+accounting both for the `+16` and for wherever the stub put it, and the two corrections
+were applied by different code. Finding 40 inherited the refusal for the zero store.
+
+Splitting the counter first, because "cannot be offset" was two different pieces of
+work wearing one name:
+
+```
+ymm pair operand cannot be offset      493
+ymm store operand cannot be offset     156
+```
+
+**They are the same arithmetic, and the reason they can be combined is that the target
+is computable from the original encoding.** `mod` 00 with `rm` 101 is RIP+disp32 and
+carries no SIB byte, so the displacement is the last four bytes and the absolute target
+is `address + length + disp`. Objdump's comment says the same thing, and is deliberately
+not used: one source for the arithmetic rather than two that can disagree.
+
+Each piece then computes its own displacement from where *it* lands:
+
+```
+value = (target + delta) - (at + len(piece))
+```
+
+`len(piece)` is knowable before the value it needs, because a RIP operand is always
+disp32 -- the encoding's length does not depend on the displacement's value. So the
+pieces are emitted one at a time, each told where it starts, rather than built as a
+batch and placed afterwards.
+
+`narrow_piece` is now the one place that turns half of a 256-bit memory operand into a
+128-bit instruction, and both the copy pair and the zero store go through it. **Which of
+the two corrections applies is a property of the operand rather than a choice**: an
+ordinary displacement is adjusted in place by `offset_operand`, a RIP-relative one is
+recomputed. That is what made this a small change rather than a second implementation.
+
+#### Executing both sides
+
+`make check-pe` gains an eighth program, with a RIP-relative operand on each side of the
+work: a zero store whose destination is RIP-relative, and a pair whose load reads
+RIP-relatively and whose store writes RIP-relatively. Dropping the `+ delta` from the
+RIP path returns 165 instead of 88, which was predicted from the poison before it was
+run.
+
+**`.text` is writable in the test PEs now**, and that is a real trade rather than an
+oversight. A program's data sits after `func_end` in `.text`, because
+`objcopy --only-section=.text` is what extracts the assembled program and a symbol in
+another section has no address at assembly time -- so without WRITE there is nowhere a
+RIP-relative store can legally land, and the case cannot be tested at all. Starfield's
+own targets are in `.data` and its `.text` is not writable; the displacement arithmetic
+does not depend on which section the target is in.
+
+```
+VEX in .text     27,462 -> 26,320      96.6% -> 96.7%
+```
+
+All 649 land: 493 pairs at two instructions each plus 156 single stores is 1,142, and
+the survivor count fell by exactly that. **Both counters are gone from the refusal list
+entirely**, which is the first time a category has closed rather than shrunk.
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      189,254
+detoured                                      189,903
 skipped for overlap                            34,519
 refused, stub not buildable                     7,660
-VEX in .text            805,131 ->      27,462   777,669 removed, 96.6%
+VEX in .text            805,131 ->      26,320   778,811 removed, 96.7%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 70,132 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 72,978
+section, every section after `.text` is byte-identical, all 70,615 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 73,471
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -2449,7 +2511,6 @@ src2 aliases dst, no scratch           3,729     needs a register
 ymm upper half read later              1,766     what the edges could not resolve
 sequence with no usable scratch          780     needs a register
 no direct SSE form                       710     mostly vextractf128/vinsertf128
-ymm operand cannot be offset             649     RIP-relative, refused deliberately
 next instruction is a branch target      511
 next instruction transfers control       424
 outside .pdata                           403
@@ -3146,7 +3207,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 37 mnemonics x 3 operand shapes executed on this CPU, every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | memory-operand forms, 256-bit, and the helper classes |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | seven PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | eight PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity | **semantics -- every one of these is about shape** |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
@@ -3154,7 +3215,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and seven PEs built for the purpose.
+things: the lowerings executed in isolation, and eight PEs built for the purpose.
 
 ### What is still not verified
 
@@ -3206,8 +3267,8 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **777,669 of 805,131 VEX sites, 96.6%** (Findings 24 to 42), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
-| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41 and 42, 5,388 sites) and the zero fill (Finding 40, 6,352 sites) are done and need no register model; the 15,835 stores and 11,226 loads that remain do. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **778,811 of 805,131 VEX sites, 96.7%** (Findings 24 to 43), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Finding 40, 6,352 sites) are done and need no register model; the 15,835 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
 **Milestone 3 is the go/no-go.** If Ddisasm cannot round-trip a 102 MB game binary

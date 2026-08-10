@@ -252,11 +252,12 @@ def offset_operand(tail, delta):
 	gets longer. That is free here, because everything using this is being
 	emitted into a stub.
 
-	RIP-relative operands are refused rather than adjusted. Their
-	displacement is measured from the end of the instruction, so moving one
-	means accounting both for the +16 and for wherever the stub put it, and
-	the two corrections are applied by different code. 5% of the 256-bit
-	operands, and not worth conflating the two.
+	RIP-relative operands are refused here rather than adjusted, and that is
+	a division of labour rather than a limitation. Their displacement is
+	measured from the end of the instruction, so moving one has to account
+	both for the +16 and for wherever the stub put it -- and this function is
+	not told where the stub put it. `detour.narrow_piece` is, and does both
+	corrections together; it reaches this one first and falls back.
 	"""
 	if len(tail) < 2:
 		return None

@@ -673,15 +673,78 @@ def moved_instruction(entry, at):
 YMM_MOVES = frozenset("vmovups vmovaps vmovdqu vmovdqa vmovupd vmovapd".split())
 
 
+def rip_operand(tail):
+	"""True if this memory operand is RIP-relative.
+
+	`mod` 00 with `rm` 101 is RIP+disp32 in 64-bit mode, and there is no SIB
+	byte in that form -- which is what makes the displacement findable
+	without decoding the rest of the instruction.
+	"""
+	return len(tail) >= 2 and not ((tail[1] >> 6) & 3) and (tail[1] & 7) == 5
+
+
+def rip_target(tail, address, length):
+	"""The absolute address a RIP-relative operand names, or None.
+
+	Read off the encoding rather than off objdump's comment, so the
+	arithmetic has one source rather than two that can disagree. The
+	displacement is measured from the END of the instruction, which is the
+	whole reason moving one is not the same problem as adjusting a
+	displacement in place.
+	"""
+	if not rip_operand(tail) or len(tail) != 6:
+		return None		# an immediate would follow the displacement
+	return address + length + struct.unpack_from("<i", tail, 2)[0]
+
+
+def narrow_piece(vex, tail, delta, address, length, at):
+	"""One 128-bit half of a 256-bit memory operand, `delta` bytes along.
+
+	**There are two ways to move an operand, and which applies is a property
+	of the operand rather than a choice.** An ordinary displacement is
+	adjusted in place by `patch.offset_operand`. A RIP-relative one cannot
+	be: its displacement is measured from the end of the instruction, so it
+	has to absorb both the `+delta` and the move into the stub -- and that
+	second correction depends on where inside the stub this piece lands,
+	which is what `at` is for.
+
+	Finding 38 refused these rather than conflating the two corrections, and
+	Finding 43 combines them. It is possible because the target is
+	computable from the original encoding, and it is worth 649 sites.
+	"""
+	narrow = dict(vex, L=0)
+	if not rip_operand(tail):
+		moved = tail if delta == 0 else inplace.offset_operand(tail, delta)
+		if moved is None:
+			return None
+		return inplace.sse_encoding(narrow, moved)
+	target = rip_target(tail, address, length)
+	if target is None:
+		return None
+	# The encoding's length does not depend on the displacement's value -- a
+	# RIP operand is always disp32 -- so it can be measured before the
+	# displacement that needs it has been worked out.
+	probe = inplace.sse_encoding(narrow, tail)
+	if probe is None:
+		return None
+	value = (target + delta) - (at + len(probe))
+	if not -(1 << 31) <= value < (1 << 31):
+		return None
+	return inplace.sse_encoding(narrow, tail[:2] + struct.pack("<i", value))
+
+
 def ymm_pair(site, following):
 	"""(load, store) if these two are a 256-bit copy through one ymm.
 
 	The Y1 case Finding 2 measured, and the only 256-bit shape that needs no
 	shadow state: a 32-byte load into a ymm and an immediate 32-byte store
 	out of it. 7,395 adjacent pairs, 7,142 of them vmovups to vmovups.
+
+	Each half is returned with its own address and length, because a
+	RIP-relative operand's displacement can only be recomputed from those.
 	"""
-	(_a, load, load_mnemonic, load_operands, _c) = site
-	(_b, store, store_mnemonic, store_operands, _d) = following
+	(load_address, load, load_mnemonic, load_operands, _c) = site
+	(store_address, store, store_mnemonic, store_operands, _d) = following
 	if load_mnemonic not in YMM_MOVES or store_mnemonic not in YMM_MOVES:
 		return None
 	load_vex, store_vex = inplace.decode_vex(load), inplace.decode_vex(store)
@@ -694,11 +757,11 @@ def ymm_pair(site, following):
 		return None
 	if "(" not in source or "(" not in target:
 		return None
-	return (load_vex, load[load_vex["length"]:],
-	        store_vex, store[store_vex["length"]:])
+	return ((load_vex, load[load_vex["length"]:], load_address, len(load)),
+	        (store_vex, store[store_vex["length"]:], store_address, len(store)))
 
 
-def lower_ymm_pair(pair):
+def lower_ymm_pair(pair, at):
 	"""Four 128-bit moves for one 256-bit copy. **High half first.**
 
 	The order is the whole trick, and it is what makes this need no scratch
@@ -711,39 +774,35 @@ def lower_ymm_pair(pair):
 
 	Reversing these two pairs of lines would leave the high half in the
 	register and quietly corrupt every later use of it.
+
+	`at` is where the first of the four will execute, which only a
+	RIP-relative operand needs -- each piece's displacement is measured from
+	its own end, so they are emitted one at a time rather than in a batch.
 	"""
-	load_vex, load_tail, store_vex, store_tail = pair
-	high_load = inplace.offset_operand(load_tail, 16)
-	high_store = inplace.offset_operand(store_tail, 16)
-	if high_load is None or high_store is None:
-		return None			# RIP-relative, or a displacement that will not fit
-	narrow_load = dict(load_vex, L=0)
-	narrow_store = dict(store_vex, L=0)
+	load, store = pair
 	body = bytearray()
-	for vex, tail in ((narrow_load, high_load), (narrow_store, high_store),
-	                  (narrow_load, load_tail), (narrow_store, store_tail)):
-		piece = inplace.sse_encoding(vex, tail)
+	for half, delta in ((load, 16), (store, 16), (load, 0), (store, 0)):
+		vex, tail, address, length = half
+		piece = narrow_piece(vex, tail, delta, address, length,
+		                     at + len(body))
 		if piece is None:
 			return None
 		body += piece
 	return bytes(body)
 
 
-def lower_ymm_zero_store(vex, tail):
+def lower_ymm_zero_store(vex, tail, address, length, at):
 	"""Two 128-bit stores for one 256-bit store of an all-zero register.
 
 	No scratch, no shadow, and no second register: the value being stored is
-	zero in both halves, so the same xmm serves for each. The only thing that
-	can refuse this is an operand `offset_operand` cannot move -- a
-	RIP-relative one, or a displacement that will not grow.
+	zero in both halves, so the same xmm serves for each.
 	"""
-	high = inplace.offset_operand(tail, 16)
-	if high is None:
+	low_half = narrow_piece(vex, tail, 0, address, length, at)
+	if low_half is None:
 		return None
-	narrow = dict(vex, L=0)
-	low_half = inplace.sse_encoding(narrow, tail)
-	high_half = inplace.sse_encoding(narrow, high)
-	if low_half is None or high_half is None:
+	high_half = narrow_piece(vex, tail, 16, address, length,
+	                         at + len(low_half))
+	if high_half is None:
 		return None
 	return low_half + high_half
 
@@ -917,7 +976,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	if kind == "pair":
 		# A 256-bit copy: both instructions become four 128-bit moves, so
 		# neither is lowered on its own.
-		body = lower_ymm_pair(strategy[1])
+		body = lower_ymm_pair(strategy[1], stub_address)
 		if body is None:
 			return None
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
@@ -933,7 +992,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	site = start + sum(len(entry[1]) for entry in preceding)
 	if kind == "zero":
 		vex = inplace.decode_vex(encoding)
-		lowered = lower_ymm_zero_store(vex, encoding[vex["length"]:])
+		lowered = lower_ymm_zero_store(vex, encoding[vex["length"]:], site,
+		                               len(encoding), stub_address + len(body))
 	else:
 		lowered = lower_vex(site, encoding, operands, mnemonic,
 		                    stub_address + len(body), scratch, pool)
@@ -1126,9 +1186,12 @@ def collect(binary, listing):
 					skipped["outside .pdata"] += 1
 					declined[address] = "outside .pdata"
 					continue
-				if lower_ymm_pair(pair) is None:
-					skipped["ymm operand cannot be offset"] += 1
-					declined[address] = "ymm operand cannot be offset"
+				# The stub's address decides a RIP displacement, and it is not
+				# known yet; the site's own address stands in, which is what
+				# the Class C probe below does for the same reason.
+				if lower_ymm_pair(pair, address) is None:
+					skipped["ymm pair operand cannot be offset"] += 1
+					declined[address] = "ymm pair operand cannot be offset"
 					continue
 				candidates.append((address, encoding, operands, mnemonic,
 				                   window, [], None, [], ("pair", pair)))
@@ -1143,10 +1206,11 @@ def collect(binary, listing):
 			if (len(fields) == 2 and fields[0].startswith("%ymm")
 					and "(" in fields[1]):
 				if zeroed_ymm(instructions, index, fields[0], blocked):
-					if lower_ymm_zero_store(vex, encoding[vex["length"]:]) \
-							is None:
-						skipped["ymm operand cannot be offset"] += 1
-						declined[address] = "ymm operand cannot be offset"
+					if lower_ymm_zero_store(vex, encoding[vex["length"]:],
+					                        address, len(encoding),
+					                        address) is None:
+						skipped["ymm store operand cannot be offset"] += 1
+						declined[address] = "ymm store operand cannot be offset"
 						continue
 					strategy = ("zero", None)
 				else:

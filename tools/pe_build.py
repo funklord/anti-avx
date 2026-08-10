@@ -51,7 +51,14 @@ SECTION_ALIGNMENT = 0x1000
 FILE_ALIGNMENT = 0x200
 HEADER_SIZE = 0x400
 
-CODE = 0x60000020		# CODE | EXECUTE | READ
+# WRITE is here so that a program can store into its own data, which sits
+# after `func_end` in `.text` because `objcopy --only-section=.text` is what
+# extracts the assembled program and a symbol in another section would have
+# no address at assembly time. A RIP-relative 256-bit store cannot be tested
+# at all without somewhere legal to land, and the displacement arithmetic
+# does not care which section the target is in -- Starfield's own are into
+# `.data`, and its `.text` is not writable.
+CODE = 0xE0000020		# CODE | EXECUTE | READ | WRITE
 DATA = 0x40000040		# INITIALIZED_DATA | READ
 
 # The programs. Each exists to exercise a piece of the REWRITER, not to
@@ -289,6 +296,46 @@ func_end:
 	.p2align 5
 source:	.long 1, 2, 3, 4
 	.long 55, 6, 7, 8
+""")
+
+
+
+# 8. RIP-relative operands on both sides of the 256-bit work. A pair whose
+# load reads a RIP-relative source, and a zero store whose destination is
+# RIP-relative -- the two shapes Finding 38 refused rather than combining
+# the +16 with the move into the stub.
+#
+# Both corrections land on the same four displacement bytes, and getting
+# either wrong reads or writes sixteen bytes away from where it should. The
+# buffer is poisoned first so that a store to the wrong place leaves the
+# poison behind rather than a plausible zero. Its low byte is 0xa5 so that
+# a failure lands at 165 rather than next door to 88 -- exit codes here
+# are far apart on purpose.
+PROGRAMS["riprel"] = (88, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vpxor	%xmm0, %xmm0, %xmm0
+	vmovups	%ymm0, scratch(%rip)	/* zero store, RIP-relative */
+	vmovups	source(%rip), %ymm1	/* the pair: RIP-relative load ... */
+	vmovups	%ymm1, buffer(%rip)	/* ... and a RIP-relative store */
+	movl	buffer+16(%rip), %eax	/* upper half of the copy: 88 */
+	orl	scratch(%rip), %eax	/* both halves of the zeroed store */
+	orl	scratch+16(%rip), %eax
+	orl	scratch+28(%rip), %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 88, 6, 7, 8
+scratch:
+	.long 0x5a5a5aa5, 0x5a5a5aa5, 0x5a5a5aa5, 0x5a5a5aa5
+	.long 0x5a5a5aa5, 0x5a5a5aa5, 0x5a5a5aa5, 0x5a5a5aa5
+buffer:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
 """)
 
 
