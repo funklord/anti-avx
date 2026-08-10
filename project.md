@@ -2133,6 +2133,55 @@ returns 91.
 VEX in .text     44,272 -> 39,880      94.5% -> 95.0%
 ```
 
+### Finding 39 -- what the rest of the 256-bit work actually needs
+
+Measured after Y1 landed, so the next step is chosen from numbers rather than from
+the order the mnemonics happen to appear in:
+
+```
+256-bit sites                35,894
+  vmovups                    32,858      vextractf128    383
+  vmovdqu                       496      vinsertf128     157
+  vmovaps                       249      vmulps          230
+```
+
+```
+load -> store of the same ymm, by distance
+  adjacent                    7,395      done, Finding 38
+  one instruction apart         842
+  two apart                     523
+  three apart                   289
+```
+
+So the copy idiom accounts for about 9,000 pairs, 7,395 of them already taken. **The
+remaining ~14,700 `vmovups` are not copies at all** -- they are loads consumed by
+arithmetic, stores of computed values, or halves of a copy whose other half is too
+far away to pair locally. Those need a ymm to be *represented* across a stretch of
+code as two xmm registers, which is register allocation over a basic block and a
+different piece of work from anything here so far.
+
+#### The gapped pair is not a small extension of the adjacent one
+
+It looks like one and is not, and the reason is worth writing down before someone
+tries it. The four-move lowering **interleaves the load and the store**:
+
+```
+load high ; store high ; load low ; store low
+```
+
+With the two instructions adjacent that is safe, because nothing runs between them.
+With anything in between, that instruction gets reordered relative to one half or the
+other -- put it before the four moves and it moves ahead of the load, put it after
+and it moves behind the store. Either is wrong the moment it touches the same memory,
+and proving it does not needs alias analysis.
+
+Two ways out, neither free:
+
+- **Load both halves before storing either**, which needs a second register and
+  brings back the scratch problem Finding 38's ordering was designed to avoid.
+- **Restrict to intervening instructions that touch no memory**, which is checkable
+  and narrows 1,654 pairs to some smaller number nobody has counted yet.
+
 ### Final state
 
 ```
