@@ -223,6 +223,41 @@ func_end:
 """)
 
 
+
+# 6. An unrolled copy: two 256-bit pairs through the same ymm. The first
+# pair's upper half is dead, because the second pair's load replaces all 256
+# bits of the register without reading any of them -- but the scan used to
+# see the mention and refuse.
+#
+# Refused, the first load stays VEX and the program dies of an illegal
+# instruction rather than returning a wrong number, so this is a test of
+# whether the rule fires at all. Both upper halves are read back, which is
+# what makes it a test of the lowering as well: 40 + 30.
+PROGRAMS["unrolled"] = (70, """
+	.text
+	.globl _start
+_start:
+	subq	$104, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* the first pair ... */
+	vmovups	%ymm0, (%rdi)
+	vmovups	32(%rsi), %ymm0		/* ... whole-register overwrite ... */
+	vmovups	%ymm0, 32(%rdi)		/* ... and the second */
+	movl	16(%rdi), %eax		/* upper half of the first copy: 40 */
+	addl	48(%rdi), %eax		/* upper half of the second: 30 */
+	addq	$104, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 40, 6, 7, 8
+	.long 9, 10, 11, 12
+	.long 30, 14, 15, 16
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

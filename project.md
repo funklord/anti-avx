@@ -2310,19 +2310,87 @@ Two leads, both small and both real:
   passenger with `moved_instruction`, which knows only the plain rules, so both
   strategies are excluded from riding along.
 
+### Finding 41 -- a write is not a read
+
+Finding 38 built the pair rule and Finding 40 left its refusal counter untouched at
+5,184, which is 68% of every adjacent 256-bit copy in the binary. Asking what each
+refusal actually stopped on says most of them were not reads at all:
+
+```
+adjacent pairs                                   7,672
+  accepted                                       2,472
+  refused                                        5,200
+    stopped at a branch, which needs a CFG       2,617
+    overwritten whole by a 256-bit move          1,531
+    genuinely read                               1,052
+```
+
+`upper_half_read_later` returned True on **any** later mention of the ymm, and the
+mention it kept finding was the next pair's own load. An unrolled copy -- one 32-byte
+copy through a ymm, then another through the same one -- refuses its first pair because
+of its second:
+
+```
+vmovups (%rsi),%ymm0        the first pair ...
+vmovups %ymm0,(%rdi)
+vmovups 0x20(%rsi),%ymm0    ... refused because this names %ymm0 ...
+vmovups %ymm0,0x20(%rdi)    ... and this one is accepted
+```
+
+**A write that does not read it ends its life as firmly as a call does.** The lowering
+leaves the upper half stale, and nothing can observe that if the next instruction to
+mention the register replaces all 256 bits without consulting them. Between the store
+and that instruction nothing named the register and no control transfer ran, so no
+other code executed at all.
+
+The mnemonics are restricted to the moves, for the reason `scratch.py`'s `FULL_WRITE`
+list is deliberately short: one missing from it costs a pair that was available, and one
+wrongly on it costs correctness. `vmovups %ymm1,%ymm0` qualifies and
+`vinsertf128 $1,%xmm1,%ymm0,%ymm0` does not, because the register is among its sources.
+
+#### The one thing that reads an upper half without naming it
+
+A scan over operand text is complete only if nothing reads a ymm implicitly.
+`xsave`/`xrstor` do -- they carry the whole extended state, upper halves included.
+**There are none in `.text`**, nor `fxsave`, checked rather than assumed, and that is
+what licenses reading the refusal question off the operand strings.
+
+#### Executing the unrolled copy
+
+`make check-pe` gains a sixth program: the unrolled copy above, reading back the upper
+half of **both** copies, 40 + 30 = 70. Without the rule the first load stays VEX and the
+rewritten binary dies of an illegal instruction returning 29 -- so this one discriminates
+on whether the rule fires at all, as well as on what it computes.
+
+```
+VEX in .text     33,848 -> 31,014      95.8% -> 96.1%
+ymm upper half read later   5,184 -> 3,654
+```
+
+1,417 pairs of the 1,531 available survive to the binary; the rest lose their window to
+an overlap or to an operand that cannot be offset, which is why that counter went from
+424 to 537.
+
+**2,617 pairs still stop at a branch**, and that is now the largest single bucket in the
+pair rule. `tools/scratch.py` already follows edges without building a CFG -- an
+unconditional jump has one successor, a conditional has two and the answer is the
+intersection -- and the same traversal answers this question. It is the obvious next
+increment on Class Y, and it is a bigger change than this one because the walker is
+written around register sets rather than around a single yes/no.
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      186,061
+detoured                                      187,478
 skipped for overlap                            34,519
 refused, stub not buildable                     7,660
-VEX in .text            805,131 ->      33,848   771,283 removed, 95.8%
+VEX in .text            805,131 ->      31,014   774,117 removed, 96.1%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 68,336 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 69,785
+section, every section after `.text` is byte-identical, all 69,031 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 71,202
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -2336,13 +2404,13 @@ What remains:
 
 ```
 ymm value has no known upper half     15,835     needs a register model
-ymm upper half read later              5,184     Y1 could not prove it dead
 src2 aliases dst, no scratch           3,729     needs a register
+ymm upper half read later              3,654     2,617 of them stop at a branch
 sequence with no usable scratch          780     needs a register
 no direct SSE form                       710     mostly vextractf128/vinsertf128
+ymm operand cannot be offset             537     RIP-relative, refused deliberately
 next instruction is a branch target      511
 next instruction transfers control       424
-ymm operand cannot be offset             424     RIP-relative, refused deliberately
 outside .pdata                           403
 sequence shape not handled               164
 ymm store is a branch target              25
@@ -2601,6 +2669,11 @@ vmovups %ymm0,m2           movups %xmm0,m2
 ```
 
 No shadow state needed. The upper half never becomes architecturally visible.
+
+Whether it stays invisible is the whole of the rule, and three things end its life:
+a `ret`, a `call` -- the upper half of every ymm is volatile under Win64 -- and **a
+later instruction that overwrites all 256 bits without reading any of them**, which is
+what an unrolled copy does to its own predecessor. Findings 38 and 41; 3,612 sites.
 
 **Y1-zero — the zero fill (6,352 sites).** A 256-bit store of a register a VEX.128
 zeroing idiom emptied. `vpxor %xmm0,%xmm0,%xmm0` zeroes bits [255:128] as well, so both
@@ -3031,7 +3104,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 37 mnemonics x 3 operand shapes executed on this CPU, every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | memory-operand forms, 256-bit, and the helper classes |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | five PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | six PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity | **semantics -- every one of these is about shape** |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
@@ -3039,7 +3112,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and five PEs built for the purpose.
+things: the lowerings executed in isolation, and six PEs built for the purpose.
 
 ### What is still not verified
 
@@ -3091,8 +3164,8 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **771,283 of 805,131 VEX sites, 95.8%** (Findings 24 to 40), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
-| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Finding 38, 2,195 sites) and the zero fill (Finding 40, 6,352 sites) are done and need no register model; the 15,835 stores and 11,226 loads that remain do. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **774,117 of 805,131 VEX sites, 96.1%** (Findings 24 to 41), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38 and 41, 3,612 sites) and the zero fill (Finding 40, 6,352 sites) are done and need no register model; the 15,835 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
 **Milestone 3 is the go/no-go.** If Ddisasm cannot round-trip a 102 MB game binary

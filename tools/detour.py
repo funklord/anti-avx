@@ -809,12 +809,16 @@ def upper_half_read_later(instructions, index, register, limit=40):
 	"yes, leave it alone". Only a 256-bit instruction can read the upper
 	half, and every one of those is refused today, so in practice this is
 	belt and braces -- but the pair rewrite is only correct where it holds.
+
+	**`xsave` and `xrstor` are the one thing that would read an upper half
+	without naming it.** There are none in `.text`, checked rather than
+	assumed, which is what lets a scan over operand text be complete.
 	"""
 	for step in range(1, limit + 1):
 		position = index + step
 		if position >= len(instructions):
 			return True
-		_address, _encoding, mnemonic, operands, _comment = instructions[position]
+		_address, encoding, mnemonic, operands, _comment = instructions[position]
 		if mnemonic.startswith("ret") or mnemonic in ("call", "callq"):
 			# Nobody can read it after either. **The upper half of every ymm
 			# is volatile under Win64 without exception** -- xmm6 to xmm15
@@ -830,8 +834,29 @@ def upper_half_read_later(instructions, index, register, limit=40):
 			return False
 		if mnemonic.startswith(CONTROL_PREFIXES):
 			return True		# following it would need a CFG
-		if register in operands:
-			return True
+		if register not in operands:
+			continue
+		# **A write that does not read it ends its life as firmly as a call
+		# does.** The lowering leaves the upper half stale, and nothing can
+		# observe that if the next instruction to mention the register
+		# replaces all 256 bits of it without consulting them. An unrolled
+		# copy is exactly this shape -- one 32-byte copy through a ymm, then
+		# another through the same one -- and the first pair was being
+		# refused because the second pair's load mentions the register.
+		#
+		# Measured: 1,531 of the 5,200 refused pairs stop here, against 1,052
+		# that genuinely read it and 2,617 that stop at a branch first.
+		#
+		# The mnemonics are restricted to the moves for the reason
+		# scratch.py's FULL_WRITE is: one missing from the list costs a pair
+		# that was available, and one wrongly on it costs correctness.
+		fields = inplace.split_operands(operands)
+		if mnemonic in YMM_MOVES and fields[-1] == register \
+				and register not in fields[:-1]:
+			vex = inplace.decode_vex(encoding)
+			if vex is not None and vex["L"]:
+				return False
+		return True
 	return False
 
 
