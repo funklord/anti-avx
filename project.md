@@ -2198,34 +2198,114 @@ already worked, and counting it first cost one query and saved building it.
 ### Final state
 
 ```
-in place                                      581,374
-detoured                                      178,545
+in place                                      547,613
+detoured                                      180,027
+skipped for overlap                            36,714
+refused, stub not buildable                    27,457
 VEX in .text            805,131 ->      39,880   765,251 removed, 95.0%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 66,108 lost boundaries
-are instructions a widened window swallowed deliberately, none of them is reachable
-by any branch, and the stub section carries 0 VEX instructions with exactly one jump
-back per detour.
+section, every section after `.text` is byte-identical, all 67,661 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 69,110
+swallowed is reachable by any branch, and the stub section carries 0 VEX with
+exactly one jump back per detour. `make census` reconciles every survivor to a named
+cause with nothing unaccounted.
 
-What remains, in order of size:
+**The 95.0% is honest in a way the earlier figures were not.** Findings 25 and 37 both
+found silent wrongness that every structural check had passed, and the numbers before
+them were inflated. Anything in this document above Finding 37 that reads higher is
+counting truncated 256-bit sites as successes.
+
+What remains:
 
 ```
-src2 aliases dst, no scratch           3,718
-sequence with no usable scratch          780
-no direct SSE form                       710
-next instruction is a branch target      509
-next instruction transfers control       423
-outside .pdata                           397
+ymm upper half read later              5,184     Y1 could not prove it dead
+src2 aliases dst, no scratch           3,729     needs a register
+no direct SSE form                       710     mostly vextractf128/vinsertf128
+sequence with no usable scratch          780     needs a register
+next instruction is a branch target      513
+next instruction transfers control       424
+outside .pdata                           411
+ymm operand cannot be offset             268     RIP-relative, refused deliberately
 sequence shape not handled               164
+ymm store is a branch target              25
+operand shape not A/B/C                    9
 ```
 
-The two scratch categories are still the largest, and the cause underneath them is
-now a function in which xmm4 and xmm5 are both genuinely used. Getting past that needs
-either interprocedural knowledge or somewhere to spill -- and spilling was rejected
-deliberately, because the stubs have no `.pdata` and a moved `rsp` breaks stack
-walking. Reopening it is a design decision rather than an incremental fix.
+Those categories account for the *collector's* refusals. The 39,880 survivors also
+include the sites whose stub could not be built, which `make census` breaks out.
+
+## Picking this up again
+
+Everything below is what a fresh start needs and none of it is derivable from the
+code quickly.
+
+### The two decisions that are not the implementer's
+
+1. **May a stub spill to the stack?** About 4,500 sites need a scratch register in a
+   function where xmm4 and xmm5 are both genuinely used. Spilling was rejected in
+   `tools/scratch.py` for a stated reason -- Win64 has no red zone, the stub section
+   has no `.pdata`, so `RtlVirtualUnwind` treats a stub as a leaf and reads the frame
+   from an `rsp` that has moved, and anything walking the stack mid-stub gets a wrong
+   answer. Reopening that is the copyright holder's call, not a refactor.
+2. **Build the Y1 register model?** ~14,700 `vmovups` are not copies and need a ymm
+   represented as two xmm registers across a basic block -- register allocation, the
+   largest single remaining win, and a different kind of work from anything done so
+   far. Finding 39 has the measurements.
+
+### What each tool is for
+
+```
+vex_scan.py       the inventory: every VEX site by mnemonic
+lower.py          the lowering RULES, and `verify` proves they assemble
+patch.py          in-place patching; also the encoding primitives everything
+                  else uses -- decode_vex, sse_encoding, offset_operand
+detour.py         the rewriter proper: collect, place_stubs, build_stub,
+                  lower_vex, apply, verify, census, selftest
+targets.py        branch targets from .reloc, .pdata, .xdata, switch tables
+outside.py        the code .pdata does not describe, plus lea_targets
+scratch.py        liveness: find_scratch, and `check` proves its claims
+lowering_cases.py generates the executable test cases from the real rules
+pe_build.py       builds AVX PEs so the rewriter has a target it owns
+placement.py      where detours land; icache_bench.c what they cost
+```
+
+### Practical things that cost time to learn
+
+- **`build/text.asm` is the input to almost everything** and `make clean` removes it.
+  Regenerating is `objdump -d -j .text Starfield-unpacked.exe > build/text.asm`,
+  about 30 seconds and 0.9 GB.
+- **`apply` takes about ten minutes** on the real binary, `census` and `verify`
+  similar. Run them in the background and do not poll them tightly.
+- **Never compare a disassembly against a binary rebuilt after it.** That cost half
+  an hour once. The same rule as `build-and-commit.md`'s about stale test binaries,
+  and it applies to `objdump` output too. Delete the output before a run so a crash
+  cannot leave a stale artifact for the next step to bless.
+- **objdump wraps encodings longer than seven bytes** onto a continuation line with
+  no mnemonic. `parse_listing` joins them; anything else reading a listing must too.
+- The style gate treats a `#define` body as file-scope text, so **multi-line macros
+  will be flagged**. Write the functions out.
+- `wine` needs `WINEDLLOVERRIDES=winedbg.exe=d` or an expected crash hangs for the
+  full timeout instead of returning immediately.
+- `.SECONDARY` **expands its prerequisites where it is read**, so a variable defined
+  later expands to nothing and protects nothing.
+
+### The lesson worth keeping
+
+Two bugs in this project produced silently wrong arithmetic while passing every
+structural check: the `src2` alias that computed a constant zero, and the `VEX.L`
+truncation that stored half of every 256-bit write. **Every structural check here is
+about shape, and neither bug had the wrong shape.** What caught them was asking what
+the code computes -- `make check-lowering` against a compiler oracle, and `make
+check-pe` running real binaries on a CPU that can execute the output but not the
+input. Add to those two when adding anything; a new lowering with no executable case
+is untested however many other checks pass.
+
+The corollary is that measuring first has repeatedly changed the plan, and twice
+saved building the wrong thing: the scratch scan needed branch following rather than
+a wider window (Finding 27), and the gapped ymm pair looked like the obvious next
+increment and is worth 68 sites (Finding 39).
 
 ### Estimated cost of a translated binary
 
