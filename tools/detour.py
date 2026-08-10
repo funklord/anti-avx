@@ -802,7 +802,11 @@ def zeroed_ymm(instructions, index, register, blocked, limit=80):
 	return False
 
 
-def upper_half_read_later(instructions, index, register, limit=40):
+PATH_BUDGET = 400
+
+
+def upper_half_read_later(instructions, index, register, limit=40,
+                          positions=None, budget=None, visiting=frozenset()):
 	"""True if anything might still read the ymm's upper half.
 
 	Conservative in the direction that matters: an unresolved answer is
@@ -813,11 +817,19 @@ def upper_half_read_later(instructions, index, register, limit=40):
 	**`xsave` and `xrstor` are the one thing that would read an upper half
 	without naming it.** There are none in `.text`, checked rather than
 	assumed, which is what lets a scan over operand text be complete.
+
+	`positions` is `{address: index}`; without it a branch is opaque and the
+	answer is "read", which is what this did before the edges were followed.
 	"""
+	if budget is None:
+		budget = [PATH_BUDGET]
 	for step in range(1, limit + 1):
 		position = index + step
-		if position >= len(instructions):
+		if position >= len(instructions) or position in visiting:
+			return True		# off the end, or a back edge
+		if budget[0] <= 0:
 			return True
+		budget[0] -= 1
 		_address, encoding, mnemonic, operands, _comment = instructions[position]
 		if mnemonic.startswith("ret") or mnemonic in ("call", "callq"):
 			# Nobody can read it after either. **The upper half of every ymm
@@ -833,7 +845,32 @@ def upper_half_read_later(instructions, index, register, limit=40):
 			# stops at one to reach anything.
 			return False
 		if mnemonic.startswith(CONTROL_PREFIXES):
-			return True		# following it would need a CFG
+			# **Follow the edges, exactly as tools/scratch.py does, and for
+			# the same reason: stopping here was the largest single bucket.**
+			# 2,617 of the 5,200 refused pairs stopped at a branch, against
+			# 1,052 that genuinely read the register.
+			#
+			# This builds no CFG. An unconditional jump has one successor and
+			# the scan simply continues there; a conditional has two, and the
+			# upper half is dead only if it is dead on BOTH. Anything that
+			# cannot be resolved -- an indirect jump, a target outside the
+			# listing, a back edge, an exhausted budget -- answers "read",
+			# which is the conservative direction by construction.
+			if positions is None:
+				return True
+			target = scratch_finder.branch_target(operands)
+			if target is None or target not in positions:
+				return True
+			successors = [positions[target]]
+			if not mnemonic.startswith(("jmp", "jmpq")):
+				successors.append(position + 1)		# the branch not taken
+			inside = visiting | {position}
+			for successor in successors:
+				if upper_half_read_later(instructions, successor - 1,
+				                         register, limit, positions, budget,
+				                         inside):
+					return True
+			return False
 		if register not in operands:
 			continue
 		# **A write that does not read it ends its life as firmly as a call
@@ -1031,6 +1068,12 @@ def collect(binary, listing):
 	# What each function never touches, for the sites the forward scan
 	# cannot get past. Computed once; it is a pass over the whole listing.
 	scope = scratch_finder.function_scope(plain, ranges)
+	# {address: index}, for following a branch rather than stopping at one.
+	# Built from `plain` because that is the list the liveness scan already
+	# indexes, and the two lists are the same instructions in the same order
+	# -- `plain` is a comprehension over `instructions` -- so one mapping
+	# serves both.
+	positions = scratch_finder.address_index(plain)
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
 
 	# Anything already rewritten in place needs nothing further. Everything
@@ -1074,7 +1117,8 @@ def collect(binary, listing):
 					skipped["ymm store is a branch target"] += 1
 					declined[address] = "ymm store is a branch target"
 					continue
-				if upper_half_read_later(instructions, index + 1, held):
+				if upper_half_read_later(instructions, index + 1, held,
+				                         positions=positions):
 					skipped["ymm upper half read later"] += 1
 					declined[address] = "ymm upper half read later"
 					continue

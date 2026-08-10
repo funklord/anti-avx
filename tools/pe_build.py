@@ -258,6 +258,40 @@ source:	.long 1, 2, 3, 4
 """)
 
 
+
+# 7. A pair whose use is on the far side of a conditional branch. Both
+# successors reach a `ret` without naming the ymm, so the upper half is dead
+# on every path -- but only a scan that follows the edges can say so.
+#
+# Stopping at the branch refuses the pair, the load stays VEX, and the
+# program dies of an illegal instruction rather than returning 55.
+PROGRAMS["crossblock"] = (55, """
+	.text
+	.globl _start
+_start:
+	subq	$104, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* the pair ... */
+	vmovups	%ymm0, (%rdi)
+	xorl	%ecx, %ecx
+	testl	%ecx, %ecx
+	jne	other			/* ... and a branch before its use */
+	movl	16(%rdi), %eax		/* upper half of the copy: 55 */
+	addq	$104, %rsp
+	ret
+other:
+	movl	$1, %eax
+	addq	$104, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 55, 6, 7, 8
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:
