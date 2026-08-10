@@ -185,6 +185,44 @@ source:	.long 1, 2, 3, 4
 """)
 
 
+
+# 5. A 256-bit store of a register a VEX.128 zeroing idiom emptied, over a
+# buffer poisoned first. `vpxor %xmm0,%xmm0,%xmm0` zeroes bits [255:128] of
+# ymm0 as well -- that is what VEX.128 does -- so the store writes 32 zero
+# bytes without any 256-bit value ever being produced.
+#
+# The poison is the whole test. Read back the low half, the high half, and
+# the LAST dword of the high half, and or them together: a truncated store
+# leaves 0x5a5a5a5a in the top sixteen bytes, and an off-by-sixteen leaves it
+# in the last four. Only 32 bytes of zeroes give 77.
+PROGRAMS["zerofill"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	movq	%rsp, %rdi
+	movl	$0x5a5a5a5a, (%rdi)
+	movl	$0x5a5a5a5a, 4(%rdi)
+	movl	$0x5a5a5a5a, 8(%rdi)
+	movl	$0x5a5a5a5a, 12(%rdi)
+	movl	$0x5a5a5a5a, 16(%rdi)
+	movl	$0x5a5a5a5a, 20(%rdi)
+	movl	$0x5a5a5a5a, 24(%rdi)
+	movl	$0x5a5a5a5a, 28(%rdi)
+	vpxor	%xmm0, %xmm0, %xmm0	/* all 256 bits of ymm0, not the low half */
+	vmovups	%ymm0, (%rdi)		/* 32 zero bytes over the poison */
+	movl	(%rdi), %eax
+	orl	16(%rdi), %eax
+	orl	28(%rdi), %eax
+	addl	$77, %eax
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

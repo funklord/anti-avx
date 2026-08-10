@@ -729,6 +729,79 @@ def lower_ymm_pair(pair):
 	return bytes(body)
 
 
+def lower_ymm_zero_store(vex, tail):
+	"""Two 128-bit stores for one 256-bit store of an all-zero register.
+
+	No scratch, no shadow, and no second register: the value being stored is
+	zero in both halves, so the same xmm serves for each. The only thing that
+	can refuse this is an operand `offset_operand` cannot move -- a
+	RIP-relative one, or a displacement that will not grow.
+	"""
+	high = inplace.offset_operand(tail, 16)
+	if high is None:
+		return None
+	narrow = dict(vex, L=0)
+	low_half = inplace.sse_encoding(narrow, tail)
+	high_half = inplace.sse_encoding(narrow, high)
+	if low_half is None or high_half is None:
+		return None
+	return low_half + high_half
+
+
+def zeroed_ymm(instructions, index, register, blocked, limit=80):
+	"""True if every bit of `register` is zero when `index` executes.
+
+	**A VEX.128 instruction zeroes bits [255:128] of its destination**, which
+	is architecture rather than an idiom: `vpxor %xmm0,%xmm0,%xmm0` leaves the
+	whole of ymm0 zero, upper half included. So a 256-bit store of that
+	register has no 256-bit producer anywhere and needs none -- both halves
+	are zero and one xmm stores both.
+
+	Measured before it was written: 6,538 of the 22,347 surviving 256-bit
+	stores, against 9,447 whose register was last written by a 256-bit load
+	(the copy idiom, and the gapped case Finding 39 closed) and 6,095 where
+	this scan reaches no definition at all.
+
+	Sound because it walks back to the NEAREST write, so nothing between that
+	write and the store can have changed the register. Everything unresolved
+	is refused:
+
+	  * a **branch target** in between means another path reaches the store
+	    without passing the zeroing;
+	  * a **control transfer** in between means a call may have run, and the
+	    upper half of every ymm is volatile across one -- that is what
+	    `vzeroupper` exists for -- so the zeroing does not survive it;
+	  * an instruction that merely **reads** the register is refused too,
+	    rather than scanned past. It could not have changed the value, but
+	    keeping the rule at "the nearest mention decides" is what makes the
+	    scan easy to be sure of, and the sites it costs are already counted
+	    in the 6,538.
+
+	`vzeroall` would be the one instruction that writes an xmm without naming
+	it. There are none in `.text`, checked rather than assumed.
+	"""
+	narrow = "%xmm" + register[len("%ymm"):]
+	for step in range(1, limit + 1):
+		position = index - step
+		if position < 0:
+			return False
+		address, encoding, mnemonic, operands, _comment = instructions[position]
+		if address in blocked:
+			return False
+		if mnemonic.startswith(CONTROL_PREFIXES):
+			return False
+		if narrow not in operands and register not in operands:
+			continue
+		if mnemonic not in scratch_finder.ZEROING:
+			return False
+		fields = inplace.split_operands(operands)
+		if len(fields) != 3 or set(fields) != {narrow}:
+			return False
+		vex = inplace.decode_vex(encoding)
+		return vex is not None and not vex["L"]
+	return False
+
+
 def upper_half_read_later(instructions, index, register, limit=40):
 	"""True if anything might still read the ymm's upper half.
 
@@ -763,17 +836,26 @@ def upper_half_read_later(instructions, index, register, limit=40):
 
 
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
-               stub_address, scratch=None, pool=0, preceding=(), pair=None):
+               stub_address, scratch=None, pool=0, preceding=(),
+               strategy=None):
 	"""The stub body for one window, placed at stub_address.
 
 	`start` is the window's first byte, which is the site's own address
 	unless the window was widened backwards -- in which case `preceding`
 	holds the instructions that come before the site and must execute first.
+
+	`strategy` names a lowering the plain rules cannot express, because it
+	rests on something the collector proved about the surrounding code rather
+	than on the instruction alone. `("pair", ...)` is a 256-bit copy and takes
+	the whole window; `("zero", None)` is a 256-bit store of a register a
+	VEX.128 zeroing idiom emptied, and is an ordinary one-site window in every
+	other respect.
 	"""
-	if pair is not None:
+	kind = strategy[0] if strategy is not None else None
+	if kind == "pair":
 		# A 256-bit copy: both instructions become four 128-bit moves, so
 		# neither is lowered on its own.
-		body = lower_ymm_pair(pair)
+		body = lower_ymm_pair(strategy[1])
 		if body is None:
 			return None
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
@@ -787,8 +869,12 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		body += fixed
 
 	site = start + sum(len(entry[1]) for entry in preceding)
-	lowered = lower_vex(site, encoding, operands, mnemonic,
-	                    stub_address + len(body), scratch, pool)
+	if kind == "zero":
+		vex = inplace.decode_vex(encoding)
+		lowered = lower_ymm_zero_store(vex, encoding[vex["length"]:])
+	else:
+		lowered = lower_vex(site, encoding, operands, mnemonic,
+		                    stub_address + len(body), scratch, pool)
 	if lowered is None:
 		return None
 	body += lowered
@@ -945,6 +1031,7 @@ def collect(binary, listing):
 		if vex is None:
 			continue
 
+		strategy = None
 		# A 256-bit copy through one ymm, taken as a unit. Both halves of
 		# it are refused individually -- there is no SSE form of either --
 		# so this has to be seen before either is considered alone.
@@ -975,8 +1062,28 @@ def collect(binary, listing):
 					declined[address] = "ymm operand cannot be offset"
 					continue
 				candidates.append((address, encoding, operands, mnemonic,
-				                   window, [], None, [], pair))
+				                   window, [], None, [], ("pair", pair)))
 				continue
+
+		# A 256-bit store of a register a VEX.128 zeroing idiom emptied.
+		# Both halves are zero, so it is two 128-bit stores of the same
+		# register -- and unlike the copy it is one instruction, so it takes
+		# the ordinary path below and may widen its window like any other.
+		if vex["L"] and mnemonic in YMM_MOVES:
+			fields = inplace.split_operands(operands)
+			if (len(fields) == 2 and fields[0].startswith("%ymm")
+					and "(" in fields[1]):
+				if zeroed_ymm(instructions, index, fields[0], blocked):
+					if lower_ymm_zero_store(vex, encoding[vex["length"]:]) \
+							is None:
+						skipped["ymm operand cannot be offset"] += 1
+						declined[address] = "ymm operand cannot be offset"
+						continue
+					strategy = ("zero", None)
+				else:
+					skipped["ymm value has no known upper half"] += 1
+					declined[address] = "ymm value has no known upper half"
+					continue
 		# There was a `mnemonic not in nds` test here, left over from when
 		# this only handled Class C. It quietly excluded every mnemonic
 		# that is DIRECT-only -- vcomiss and the rest -- as well as the
@@ -1096,7 +1203,7 @@ def collect(binary, listing):
 			declined[address] = "outside .pdata"
 			continue
 		candidates.append((start, encoding, operands, mnemonic, window,
-		                   displaced, scratch, preceding, None))
+		                   displaced, scratch, preceding, strategy))
 	return patches, candidates, stats, skipped, declined
 
 
@@ -1325,7 +1432,7 @@ def census(binary, listing, patched):
 	# of these look unaccounted when they were plainly refused.
 	def spread(starts):
 		out = set()
-		for start, _e, _o, _m, window, _d, _s, _p, _pair in candidates:
+		for start, _e, _o, _m, window, _d, _s, _p, _strategy in candidates:
 			if start in starts:
 				out.update(range(start, start + window))
 		return out
@@ -1438,7 +1545,7 @@ def place_stubs(candidates, stub_base):
 	rescued = set()
 	for i, entry in enumerate(entries):
 		start, encoding, operands, mnemonic, window, displaced, \
-			scratch, preceding, pair = entry
+			scratch, preceding, strategy = entry
 		if i in rescued:
 			continue		# already taken along by an earlier stub
 		if start < committed_to:
@@ -1469,7 +1576,11 @@ def place_stubs(candidates, stub_base):
 				break
 			following = other[7]
 			if other[8] is not None:
-				continue		# a ymm pair is taken whole or not at all
+				# A site with a strategy of its own cannot ride along:
+				# a passenger is lowered by `moved_instruction`, which
+				# knows only the plain rules and would refuse a 256-bit
+				# one -- costing the stub that was going anyway.
+				continue
 			if not following or other[1][:1] not in (b"\xc4", b"\xc5"):
 				continue
 			site = other[0] + sum(len(e[1]) for e in following)
@@ -1485,7 +1596,7 @@ def place_stubs(candidates, stub_base):
 			j, extra, grew = extension
 			body = build_stub(start, encoding, operands, mnemonic,
 			                  window + grew, list(displaced) + extra,
-			                  stub_address, scratch, pool, preceding, pair)
+			                  stub_address, scratch, pool, preceding, strategy)
 			if body is None:
 				# The extended stub would not build. Fall back to the plain
 				# one rather than lose both -- taking a passenger along must
@@ -1498,7 +1609,7 @@ def place_stubs(candidates, stub_base):
 		if body is None:
 			body = build_stub(start, encoding, operands, mnemonic, window,
 			                  displaced, stub_address, scratch, pool,
-			                  preceding, pair)
+			                  preceding, strategy)
 		if body is None:
 			refused.add(start)
 			continue
@@ -1516,10 +1627,11 @@ def place_stubs(candidates, stub_base):
 			swallowed.add(start + offset)	# the site, now inside the window
 		for entry in displaced:
 			swallowed.add(entry[0])
-		if pair is not None:
+		if strategy is not None and strategy[0] == "pair":
 			# A ymm pair carries no `displaced` list -- both instructions
 			# are lowered together -- but the store's boundary disappears
 			# just the same, and the verifier is right to want it named.
+			# A zero store is one instruction and loses no extra boundary.
 			swallowed.add(start + len(encoding))
 	return placed, blob, swallowed, overlapped, refused
 

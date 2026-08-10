@@ -2195,19 +2195,134 @@ is not worth a feature.
 pair looked like the obvious next increment, being a variation on something that
 already worked, and counting it first cost one query and saved building it.
 
+### Finding 40 -- the upper half nothing ever produced
+
+Finding 39 concluded that the rest of the 256-bit work is register allocation. That
+holds for most of it and not for a sixth of it, and the number that says so was sitting
+in the shapes rather than the mnemonics:
+
+```
+256-bit moves, by shape
+  store                    22,347
+  load                     11,226
+  register to register         75
+```
+
+**Two stores for every load.** A copy idiom is one of each, so eleven thousand stores
+have no 256-bit load behind them and something else defines the register. Walking back
+from each store to the nearest write of it says what:
+
+```
+what last wrote the register
+  256-bit load (a gapped copy)                   9,447
+  128-bit zeroing idiom -- both halves zero      6,538
+  no definition found                            6,095
+  256-bit, some other producer                     265
+  128-bit VEX -- upper half is zero                  2
+```
+
+The 6,538 are `vpxor %xmm0,%xmm0,%xmm0` (6,427) and `vxorps` (110), and they matter
+because of an architectural fact the design had recorded only as a cost: **every VEX
+instruction with `L` clear writes zero to bits [255:128] of its destination.** A
+128-bit zeroing idiom therefore leaves the *whole* ymm zero, and a 256-bit store of it
+is storing thirty-two bytes that no 256-bit value was ever built to hold. In the real
+binary it is MSVC's zero-initialiser, and it looks like this everywhere:
+
+```
+14073090b:  vpxor   %xmm0,%xmm0,%xmm0
+            vmovups %ymm0,0x20(%rsp)
+            vmovups %ymm0,0x40(%rsp)
+```
+
+So the lowering is two 128-bit stores of the same register, and it needs **no scratch,
+no shadow and no second register** -- the value is zero in both halves, so one xmm
+serves for each:
+
+```
+movups %xmm0,0x20(%rsp)
+movups %xmm0,0x30(%rsp)
+```
+
+**The definition needs no coordination, which is what keeps this a one-site change.**
+`vpxor %xmm0,%xmm0,%xmm0` is patched in place to `pxor %xmm0,%xmm0`, which zeroes only
+the low half -- and that is fine, because the low half is the only half the lowering
+reads. Whether the definition was lowered, detoured or refused, `%xmm0` holds zero when
+the store runs. Nothing has to be rewritten as a group.
+
+#### The scan, and what it refuses
+
+`detour.zeroed_ymm` walks back to the **nearest** write, so nothing between that write
+and the store can have changed the register. Everything it cannot resolve is refused:
+a **branch target** in between, because another path could reach the store without
+passing the zeroing; a **control transfer**, because the upper half of every ymm is
+volatile across a call, which is the same rule Finding 38 relies on pointing the other
+way; and an instruction that merely **reads** the register, which could not have
+changed it but is refused anyway to keep the rule at "the nearest mention decides".
+The 6,538 is measured with those refusals already applied.
+
+`vzeroall` is the one instruction that would write an xmm without naming it. There are
+**none in `.text`**, checked rather than assumed.
+
+#### The same fact, pointing the other way
+
+Class Y records this zeroing as **Y3**, a cost to be paid inside Y2 regions. It is also
+information, and for these 6,538 sites it is the entire lowering. But the third reading
+is the one to carry forward: **lowering a VEX.128 write to SSE destroys the zeroing**,
+and `movups` leaves bits [255:128] holding whatever was there. That is harmless today
+only because every 256-bit read is either refused, or part of a pair that produced its
+own upper half, or one of these stores whose register is zero. **It stops being
+harmless the moment the register model lands**, and it applies to all 547,613 in-place
+sites rather than to a Y2 region.
+
+#### The test
+
+`make check-pe` gains a fifth program. It poisons thirty-two bytes of stack with
+`0x5a5a5a5a`, zeroes `%xmm0` with `vpxor`, stores `%ymm0` over the poison, and reads
+back the low half, the high half **and the last dword of the high half** -- or-ing the
+three together, so only thirty-two bytes of zeroes give 77.
+
+Changing the lowering's `+16` to `+0` makes it return 167, which is what the poison
+becomes. Recorded because a test that has not been shown to fail is not yet evidence:
+every structural check in this project passed the two bugs that computed wrong answers.
+
+#### What it moved
+
+```
+VEX in .text     39,880 -> 33,848      95.0% -> 95.8%
+```
+
+6,352 sites are accepted as candidates and 6,032 survive to the binary; the difference
+is windows lost to overlap and to operands that cannot be offset.
+
+The accounting moved further than the translation did. **19,797 sites left "refused,
+stub not buildable" for a named decline**, because a 256-bit store used to become a
+candidate and fail in `build_stub` where it now declines in the collector with a reason.
+Same population, better name -- and `make census` still reconciles every survivor with
+nothing unaccounted.
+
+Two leads, both small and both real:
+
+- **156 zero stores are refused for a RIP-relative operand**, which is why that counter
+  went from 268 to 424. Unlike the pair case, a zero store's two corrections -- the
+  stub's displacement and the `+16` -- could be combined, because objdump's comment
+  gives the absolute target.
+- **A site with a strategy cannot be a passenger.** The Finding 36 extension lowers its
+  passenger with `moved_instruction`, which knows only the plain rules, so both
+  strategies are excluded from riding along.
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      180,027
-skipped for overlap                            36,714
-refused, stub not buildable                    27,457
-VEX in .text            805,131 ->      39,880   765,251 removed, 95.0%
+detoured                                      186,061
+skipped for overlap                            34,519
+refused, stub not buildable                     7,660
+VEX in .text            805,131 ->      33,848   771,283 removed, 95.8%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 67,661 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 69,110
+section, every section after `.text` is byte-identical, all 68,336 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 69,785
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -2220,14 +2335,15 @@ counting truncated 256-bit sites as successes.
 What remains:
 
 ```
+ymm value has no known upper half     15,835     needs a register model
 ymm upper half read later              5,184     Y1 could not prove it dead
 src2 aliases dst, no scratch           3,729     needs a register
-no direct SSE form                       710     mostly vextractf128/vinsertf128
 sequence with no usable scratch          780     needs a register
-next instruction is a branch target      513
+no direct SSE form                       710     mostly vextractf128/vinsertf128
+next instruction is a branch target      511
 next instruction transfers control       424
-outside .pdata                           411
-ymm operand cannot be offset             268     RIP-relative, refused deliberately
+ymm operand cannot be offset             424     RIP-relative, refused deliberately
+outside .pdata                           403
 sequence shape not handled               164
 ymm store is a branch target              25
 operand shape not A/B/C                    9
@@ -2249,10 +2365,12 @@ code quickly.
    has no `.pdata`, so `RtlVirtualUnwind` treats a stub as a leaf and reads the frame
    from an `rsp` that has moved, and anything walking the stack mid-stub gets a wrong
    answer. Reopening that is the copyright holder's call, not a refactor.
-2. **Build the Y1 register model?** ~14,700 `vmovups` are not copies and need a ymm
-   represented as two xmm registers across a basic block -- register allocation, the
-   largest single remaining win, and a different kind of work from anything done so
-   far. Finding 39 has the measurements.
+2. **Build the Y1 register model?** 15,835 `vmovups` stores and 11,226 loads are
+   neither copies nor zero fills, and need a ymm represented as two xmm registers
+   across a basic block -- register allocation, the largest single remaining win, and
+   a different kind of work from anything done so far. Findings 39 and 40 have the
+   measurements, and Finding 40 also names what the model must repair: the in-place
+   lowerings have already destroyed the [255:128] zeroing that VEX.128 writes perform.
 
 ### What each tool is for
 
@@ -2484,6 +2602,20 @@ vmovups %ymm0,m2           movups %xmm0,m2
 
 No shadow state needed. The upper half never becomes architecturally visible.
 
+**Y1-zero — the zero fill (6,352 sites).** A 256-bit store of a register a VEX.128
+zeroing idiom emptied. `vpxor %xmm0,%xmm0,%xmm0` zeroes bits [255:128] as well, so both
+halves are zero and the same xmm stores each:
+
+```
+vpxor   %xmm0,%xmm0,%xmm0   →  pxor   %xmm0,%xmm0      (in place)
+vmovups %ymm0,m               movups %xmm0,m
+                              movups %xmm0,m+16
+```
+
+No scratch, no shadow, and no coordination with the definition -- the low half is the
+only half the lowering reads, so it does not matter whether the `vpxor` was lowered.
+Finding 40 has the measurement and the scan's refusals.
+
 **Y2 — shadow fallback (rare, and now counted: 574 sites).** When a ymm value's halves
 are separated across basic blocks, maintain a 16 × 16-byte shadow area for upper
 halves, addressed via a reserved register or TLS slot. Each 256-bit op becomes a pair
@@ -2499,6 +2631,12 @@ carry everywhere.
 Where a shadow exists (Y2 regions only), a translated 128-bit op must also zero its
 shadow slot. **Confine this to Y2 liveness regions**, or the cost lands on ~769,000
 128-bit sites instead of a handful.
+
+Finding 40 turned this from a cost into two other things as well. It is **information**
+-- for the 6,352 Y1-zero sites it is the entire lowering -- and it is a **debt**: a
+lowered VEX.128 write no longer zeroes the upper half, so every register the model
+comes to represent arrives with an upper half that is stale rather than zero. That is
+harmless while every 256-bit read is refused and will not be afterwards.
 
 ### Class Z — `vzeroupper` (19,253 sites)
 
@@ -2893,7 +3031,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 37 mnemonics x 3 operand shapes executed on this CPU, every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | memory-operand forms, 256-bit, and the helper classes |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | three PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | five PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity | **semantics -- every one of these is about shape** |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
@@ -2901,7 +3039,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and three PEs built for the purpose.
+things: the lowerings executed in isolation, and five PEs built for the purpose.
 
 ### What is still not verified
 
@@ -2913,7 +3051,10 @@ Named rather than left implicit, because an absent gap gets guessed at:
   lowering is a prefix strip, so the risk is low, but low is not measured.
 - **The helper classes are not wired in.** `f16c`, `fmaddsub`, `permil` and `permd`
   are exhaustively tested and unreachable from the rewriter.
-- **256-bit.** The Y1/Y2 representations are milestones 5 and 6 and do not exist.
+- **256-bit.** Two shapes are lowered without one -- the adjacent copy pair and the
+  zero fill -- but the Y1 register representation and the Y2 shadow do not exist, and
+  Finding 40 names a consequence that will have to be repaired when they do: the
+  in-place lowerings destroy the [255:128] zeroing every VEX.128 write performs.
 - **Exception paths.** `.xdata` is carried through untouched and never exercised.
   Rung 4 exists to find what that misses.
 - ~~Surviving VEX sites are unaccounted for.~~ **Closed** by Finding 35: `make
@@ -2950,8 +3091,8 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **760,859 of 805,131 VEX sites, 94.5%** (Findings 24 to 37), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
-| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish** — Finding 37 showed 256-bit sites were being silently truncated and they are refused now, so the 32,749 of them wait on this. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **771,283 of 805,131 VEX sites, 95.8%** (Findings 24 to 40), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Finding 38, 2,195 sites) and the zero fill (Finding 40, 6,352 sites) are done and need no register model; the 15,835 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
 **Milestone 3 is the go/no-go.** If Ddisasm cannot round-trip a 102 MB game binary
