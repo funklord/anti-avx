@@ -2506,6 +2506,14 @@ def verify(original, patched, listing=None):
 		print(f"verify: {len(lost):,} boundaries lost, every one an "
 		      f"instruction a widened window swallowed deliberately")
 
+	# **This one could never fail, and saying so is the point.** `reachable`
+	# is `targets.collect` and the collector refuses to swallow anything in a
+	# SUPERSET of it -- that set plus the listing's own direct branches plus
+	# the lea targets -- so the intersection is empty by construction. It is
+	# the same fault as Finding 52 in a different place: a decision checked
+	# against the data that made it. Kept because it costs nothing and would
+	# catch `targets.collect` returning different answers on two calls, and
+	# reported as what it is.
 	dangerous = swallowed & reachable
 	if dangerous:
 		print(f"verify: FAILED -- {len(dangerous):,} swallowed instructions "
@@ -2513,7 +2521,55 @@ def verify(original, patched, listing=None):
 		problems += 1
 	else:
 		print(f"verify: none of the {len(swallowed):,} swallowed instructions "
-		      f"is reachable by any branch")
+		      f"is in the target set (weak: the collector used it too)")
+
+	# The independent form of the same question, which reads the two
+	# disassemblies and nothing else. **Every address a direct branch names
+	# in the original must still begin an instruction in the rewritten
+	# binary** -- if a window swallowed one, that branch now lands in the
+	# middle of the jump that replaced it. `targets.py` has no say here, and
+	# neither does the collector: this is the output being asked whether it
+	# is well formed, rather than the model being asked whether it agrees
+	# with itself.
+	#
+	# It cannot speak for indirect targets -- switch tables, relocations,
+	# addresses taken by lea -- for which `targets.py` remains the only
+	# source and the check above remains the only check. That gap is real
+	# and named rather than papered over.
+	named = set()
+	for address, encoding, mnemonic, operands in inplace.parse_listing(listing):
+		del address, encoding
+		if not mnemonic.startswith(("j", "call", "loop")) or not operands:
+			continue
+		first = operands.split()[0]
+		if not first.startswith("0x"):
+			continue
+		try:
+			named.add(int(first, 16))
+		except ValueError:
+			pass
+	# **A branch inside data names an address that was never an instruction.**
+	# Finding 8 counted 11,892 bytes of `.text` that do not disassemble, and
+	# a linear sweep through them manufactures branches: a repeating
+	# `7d e9 2c 00` after an `int3` decodes as a row of `jge`s whose targets
+	# land in the middle of the function above. The first run of this check
+	# reported exactly one failure and it was one of those.
+	#
+	# The filter needs no oracle and keeps the check independent: a target
+	# that was not an instruction boundary in the ORIGINAL cannot have been a
+	# real one, and a real target always was.
+	inside = {a for a in named
+	          if vaddr <= a < vaddr + size and a in before_bounds}
+	broken = inside - after_bounds
+	if broken:
+		print(f"verify: FAILED -- {len(broken):,} direct branch targets no "
+		      f"longer begin an instruction", file=sys.stderr)
+		for address in sorted(broken)[:8]:
+			print(f"    0x{address:x}", file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: all {len(inside):,} direct branch targets still begin "
+		      f"an instruction")
 
 	done = subprocess.run(["objdump", "-d", "-j", ".avxsse", patched],
 	                      capture_output=True, text=True, errors="replace")

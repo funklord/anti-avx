@@ -3004,6 +3004,66 @@ With the fix the same check reports 28,003 claims and **0 read on any path**, an
 binary keeps 241 more VEX sites than it did before -- the price of not claiming registers
 that were never free.
 
+### Finding 53 -- the audit Finding 52 asked for, and what it found
+
+Finding 52 was a checker and its subject calling one function. The obvious question is
+whether anything else has that shape, and `detour-verify` does -- worse, and provably.
+
+```
+the collector refuses to swallow anything in `blocked`
+    blocked = targets.collect  +  the listing's direct branches  +  lea targets
+verify then checks that nothing swallowed is in `reachable`
+    reachable = targets.collect
+```
+
+`reachable` is a **subset** of the set the decision was made from, so the intersection is
+empty by construction. The check has never been able to fail, and no amount of running it
+was ever going to reveal that -- it is visible only by reading what each side is made of.
+
+Demonstrated rather than argued: disabling the collector's branch-target guard and
+rewriting a program whose branch is genuinely taken makes the new check below fail and
+leaves the old one reporting success.
+
+#### The independent form of the same question
+
+**Every address a direct branch names in the original must still begin an instruction in
+the rewritten binary.** If a window swallowed one, that branch now lands in the middle of
+the jump that replaced it. It reads the two disassemblies and nothing else -- no
+`targets.py`, no collector, no model. It is the output being asked whether it is well
+formed rather than the model being asked whether it agrees with itself.
+
+```
+all 1,191,070 direct branch targets still begin an instruction
+```
+
+A million addresses inspected, which is also the answer to "did it check anything" -- the
+question `evidence.md` says to ask of every green result.
+
+#### The false positive was the interesting part
+
+The first run reported exactly one failure, `0x1402ceb07`, and it was not a bug. After an
+`int3` at the end of a function sits a repeating `7d e9 2c 00`, which a linear sweep
+decodes as a row of `jge`s whose targets land in the middle of the function above:
+
+```
+1402ceb15:  c3              ret
+1402ceb16:  cc              int3
+1402ceb18:  7d e9           jge 0x1402ceb03      <- data, read as code
+1402ceb1c:  7d e9           jge 0x1402ceb07      <- and its "target"
+```
+
+Finding 8 counted 11,892 bytes of `.text` that do not disassemble, and this is what they
+do to anything that trusts the sweep. **The filter needs no oracle**: a target that was
+not an instruction boundary in the *original* cannot have been a real one, and a real
+target always was. That keeps the check made of two disassemblies and nothing else.
+
+#### What it still cannot say
+
+Indirect targets -- switch tables, relocations, addresses taken by `lea` -- have no
+witness but `targets.py`, so for those the weak check above remains the only check. That
+is a real gap and it is named rather than papered over: the strengthened half covers
+every branch the code writes down, and nothing covers the ones it computes.
+
 ### Final state
 
 ```
@@ -3768,7 +3828,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
 | `make check-pe` | thirteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
-| `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity, and that the rebuilt function table is sorted and covers every stub byte | **semantics -- every one of these is about shape** |
+| `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53 |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
 | `make check-unwind` | that a handler registered through `.pdata` is reached from `.text` and from inside a stub, and that a stub which moved `rsp` still hands it a frame 16 bytes wrong | whether the shipping Windows unwinder agrees with wine's |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
