@@ -918,47 +918,57 @@ def retarget(vex, tail, register):
 	        + tail[2:])
 
 
-def ymm_gapped(instructions, index, blocked, limit=40):
-	"""A 256-bit load and a later store of the same ymm, with the whole span.
+def wide_move(encoding, mnemonic, operands):
+	"""("load"|"store", %ymmN) if this is a 256-bit move to or from memory."""
+	vex = inplace.decode_vex(encoding)
+	if vex is None or not vex["L"] or mnemonic not in YMM_MOVES:
+		return None
+	fields = inplace.split_operands(operands)
+	if len(fields) != 2:
+		return None
+	if fields[1].startswith("%ymm") and "(" in fields[0]:
+		return ("load", fields[1])
+	if fields[0].startswith("%ymm") and "(" in fields[1]:
+		return ("store", fields[0])
+	return None
 
-	The copy idiom with something in between. Finding 39 refused it because
-	the four-move lowering interleaves the load and the store, so anything
-	between them gets reordered across one half or the other and proving that
-	safe needs alias analysis.
 
-	**Holding the upper half in a second register dissolves that.** Both
-	loads happen where the load was and both stores where the store was, so
-	nothing between them moves at all:
+def ymm_run(instructions, index, blocked, limit=48):
+	"""A stretch of 256-bit copies whose halves all lie inside it.
+
+	Finding 39 refused the gapped copy because the four-move lowering
+	**interleaves** the load and the store, so anything between them is
+	reordered across one half or the other and proving that safe needs alias
+	analysis. It named the way out -- load both halves before storing either,
+	which needs a second register -- and stopped there.
+
+	Holding the upper half in a second register does not merely make it
+	possible; it makes the problem go away. Both loads happen where the load
+	was and both stores where the store was, so **nothing in between moves at
+	all**:
 
 	    movups (%rsi),%xmm0        movups 0x10(%rsi),%xmm7
 	    ... untouched ...
 	    movups %xmm0,(%rdi)        movups %xmm7,0x10(%rdi)
 
-	And the whole span goes into ONE stub, which is what keeps this an
-	ordinary window rather than two windows that must both commit or
-	neither. Measured before it was written: of 2,718 gapped copies, 2,279
-	have a register free across the span and 2,223 of those fit in a single
-	window. The design was chosen from that second number.
+	A run generalises that to the interleaved case, which is what MSVC emits
+	for a block bigger than 32 bytes: load, load, store, store. Each open ymm
+	gets a helper of its own, which is register allocation on a very small
+	scale. Measured: 9,577 runs, of which 9,200 hold a single pair and 377
+	hold between two and ten.
 
-	Returns (store position, the instructions between), or None. The span
-	must be contiguous, free of branch targets and control transfers -- a
-	widened window may swallow neither -- and must not mention the register,
-	since after the lowering its upper half lives somewhere else entirely.
+	Returns (members, last position), members being (kind, position, register)
+	with kind one of `load`, `store`, `plain`. The whole run goes into ONE
+	stub, which is what keeps it an ordinary window rather than several that
+	must all commit or none -- 98% of the single-pair spans fitted in one
+	window, and that number chose the design.
 	"""
 	address, encoding, mnemonic, operands, _comment = instructions[index]
-	if mnemonic not in YMM_MOVES:
+	first = wide_move(encoding, mnemonic, operands)
+	if first is None or first[0] != "load":
 		return None
-	vex = inplace.decode_vex(encoding)
-	if vex is None or not vex["L"]:
-		return None
-	fields = inplace.split_operands(operands)
-	if len(fields) != 2 or not fields[1].startswith("%ymm"):
-		return None
-	if "(" not in fields[0]:
-		return None
-	register = fields[1]
-	narrow = "%xmm" + register[len("%ymm"):]
-	span, at = [], address + len(encoding)
+	open_now = {first[1]}
+	members, at = [], address + len(encoding)
 	for step in range(1, limit + 1):
 		position = index + step
 		if position >= len(instructions):
@@ -968,68 +978,99 @@ def ymm_gapped(instructions, index, blocked, limit=40):
 			return None
 		if name.startswith(CONTROL_PREFIXES):
 			return None
-		pieces = inplace.split_operands(text)
-		wide = inplace.decode_vex(bits)
-		if (name in YMM_MOVES and wide is not None and wide["L"]
-				and len(pieces) == 2 and pieces[0] == register
-				and "(" in pieces[1]):
-			return (position, span) if span else None
-		if narrow in text or register in text:
-			return None
-		span.append(instructions[position])
+		what = wide_move(bits, name, text)
+		vex = inplace.decode_vex(bits)
+		if what is not None and what[0] == "store" and what[1] in open_now:
+			members.append(("store", position, what[1]))
+			open_now.discard(what[1])
+			at = next_address + len(bits)
+			if not open_now:
+				return (members, position) if members else None
+			continue
+		if what is not None and what[0] == "load" and what[1] not in open_now:
+			open_now.add(what[1])
+			members.append(("load", position, what[1]))
+			at = next_address + len(bits)
+			continue
+		if vex is not None and vex["L"]:
+			return None		# a 256-bit instruction that is not a copy half
+		if any(r in text or "%xmm" + r[len("%ymm"):] in text
+		       for r in open_now):
+			return None		# the value is touched before its store
+		members.append(("plain", position, None))
 		at = next_address + len(bits)
 	return None
 
 
 def free_across(plain, positions, definition, until, site_registers):
-	"""A register dead at `definition` that nothing touches before `until`.
+	"""Registers dead at `definition` that nothing touches before `until`.
 
 	Two questions and both have to hold. `dead_from` answers the first, the
 	same way `find_scratch` asks it. The second is what makes this different
 	from a scratch: a scratch may be clobbered the moment the stub ends,
 	while this one has to carry a value across everything in between.
 	"""
-	free = scratch_finder.dead_from(plain, definition + 1,
-	                                frozenset(site_registers), 60, positions,
-	                                set(), [scratch_finder.BUDGET])
-	usable = set(free)
+	usable = set(scratch_finder.dead_from(plain, definition + 1,
+	                                      frozenset(site_registers), 60,
+	                                      positions, set(),
+	                                      [scratch_finder.BUDGET]))
 	for position in range(definition + 1, until):
 		text = plain[position][3]
 		for number in list(usable):
 			if f"%xmm{number}" in text or f"%ymm{number}" in text:
 				usable.discard(number)
 		if not usable:
+			break
+	return usable
+
+
+def assign_helpers(plain, positions, index, members):
+	"""One helper register per pair in the run, all distinct, or None.
+
+	Greedy over the pairs in load order, which is enough here: a run holds
+	ten pairs at the very most and the candidate sets are large. Distinctness
+	has to be enforced rather than assumed -- two pairs' helpers are both
+	invisible to the original code, so nothing else keeps them apart.
+	"""
+	loads = {register: position for kind, position, register in members
+	         if kind == "load"}
+	stores = {register: position for kind, position, register in members
+	          if kind == "store"}
+	loads[wide_move(*plain[index][1:4])[1]] = index
+	taken, out = set(), {}
+	for register, load_at in sorted(loads.items(), key=lambda kv: kv[1]):
+		store_at = stores.get(register)
+		if store_at is None:
 			return None
-	return min(usable) if usable else None
+		own = scratch_finder.xmm_numbers(plain[load_at][3])
+		free = free_across(plain, positions, load_at, store_at, own) - taken
+		if not free:
+			return None
+		chosen = min(free)
+		taken.add(chosen)
+		out[register] = chosen
+	return out
 
 
-def lower_ymm_gapped(strategy, at):
-	"""Two 128-bit loads, the span, then two 128-bit stores."""
-	helper, load, store, span_bodies = strategy
-	load_vex, load_tail, load_address, load_length = load
-	high_vex, high_tail = retarget(load_vex, load_tail, helper)
+def lower_ymm_run(strategy, at, pool):
+	"""The run, with every 256-bit copy split and everything else moved."""
+	helpers, entries = strategy
 	body = bytearray()
-	for vex, tail, delta in ((load_vex, load_tail, 0),
-	                         (high_vex, high_tail, 16)):
-		piece = narrow_piece(vex, tail, delta, load_address, load_length,
-		                     at + len(body))
-		if piece is None:
-			return None
-		body += piece
-	for entry in span_bodies:
-		fixed = moved_instruction(entry, at + len(body))
-		if fixed is None:
-			return None
-		body += fixed
-	store_vex, store_tail, store_address, store_length = store
-	out_vex, out_tail = retarget(store_vex, store_tail, helper)
-	for vex, tail, delta in ((store_vex, store_tail, 0),
-	                         (out_vex, out_tail, 16)):
-		piece = narrow_piece(vex, tail, delta, store_address, store_length,
-		                     at + len(body))
-		if piece is None:
-			return None
-		body += piece
+	for kind, register, vex, tail, address, length, moved in entries:
+		if kind == "plain":
+			fixed = moved_instruction(moved, at + len(body), pool)
+			if fixed is None:
+				return None
+			body += fixed
+			continue
+		high_vex, high_tail = retarget(vex, tail, helpers[register])
+		for one_vex, one_tail, delta in ((vex, tail, 0),
+		                                 (high_vex, high_tail, 16)):
+			piece = narrow_piece(one_vex, one_tail, delta, address, length,
+			                     at + len(body))
+			if piece is None:
+				return None
+			body += piece
 	return bytes(body)
 
 
@@ -1218,12 +1259,12 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	borrowing register n and giving it back.
 	"""
 	kind = strategy[0] if strategy is not None else None
-	if kind == "gapped":
-		# The load, everything between, and the store, all in one stub. The
-		# span carries its own instructions rather than using `displaced`,
-		# because they have to land BETWEEN the two halves rather than after
-		# the site.
-		body = lower_ymm_gapped(strategy[1], stub_address)
+	if kind == "run":
+		# A run of 256-bit copies and whatever lies between them, all in one
+		# stub. It carries its own instruction list rather than using
+		# `displaced`, because they have to land BETWEEN the halves of the
+		# copies rather than after a site.
+		body = lower_ymm_run(strategy[1], stub_address, pool)
 		if body is None:
 			return None, 0
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
@@ -1487,39 +1528,44 @@ def collect(binary, listing):
 		# so that nothing between the two halves has to move. The whole span
 		# goes into one stub, which is what keeps it an ordinary window.
 		if vex["L"]:
-			found = ymm_gapped(instructions, index, blocked)
+			found = ymm_run(instructions, index, blocked)
 			if found is not None:
-				store_at, span = found
-				store = instructions[store_at]
-				window = store[0] + len(store[1]) - address
-				helper = free_across(plain, positions, index, store_at,
-				                     scratch_finder.xmm_numbers(operands))
-				if helper is None:
-					skipped["no register free across the ymm span"] += 1
-					declined[address] = "no register free across the ymm span"
+				members, last = found
+				tail_entry = instructions[last]
+				window = tail_entry[0] + len(tail_entry[1]) - address
+				helpers = assign_helpers(plain, positions, index, members)
+				if helpers is None:
+					skipped["no register free across the ymm run"] += 1
+					declined[address] = "no register free across the ymm run"
 					continue
 				if not inplace.covered_by(ranges, address, window):
 					skipped["outside .pdata"] += 1
 					declined[address] = "outside .pdata"
 					continue
-				store_vex = inplace.decode_vex(store[1])
-				bodies = [(entry[0], entry[1], entry[4], entry[3], entry[2],
-				           swallowed_scratch(plain, index + 1 + i, entry[0],
-				                             entry[1], entry[3], entry[2],
-				                             scope))
-				          for i, entry in enumerate(span)]
-				gapped = (helper,
-				          (vex, encoding[vex["length"]:], address,
-				           len(encoding)),
-				          (store_vex, store[1][store_vex["length"]:],
-				           store[0], len(store[1])),
-				          bodies)
-				if lower_ymm_gapped(gapped, address) is None:
-					skipped["ymm span operand cannot be offset"] += 1
-					declined[address] = "ymm span operand cannot be offset"
+				entries = [("load", operands.rpartition(",")[2], vex,
+				            encoding[vex["length"]:], address, len(encoding),
+				            None)]
+				for kind, position, register in members:
+					entry = instructions[position]
+					if kind == "plain":
+						entries.append((
+							"plain", None, None, None, entry[0], len(entry[1]),
+							(entry[0], entry[1], entry[4], entry[3], entry[2],
+							 swallowed_scratch(plain, position, entry[0],
+							                   entry[1], entry[3], entry[2],
+							                   scope))))
+						continue
+					one = inplace.decode_vex(entry[1])
+					entries.append((kind, register, one,
+					                entry[1][one["length"]:], entry[0],
+					                len(entry[1]), None))
+				run = (helpers, entries)
+				if lower_ymm_run(run, address, address) is None:
+					skipped["ymm run operand cannot be moved"] += 1
+					declined[address] = "ymm run operand cannot be moved"
 					continue
 				candidates.append((address, encoding, operands, mnemonic,
-				                   window, [], None, [], ("gapped", gapped)))
+				                   window, [], None, [], ("run", run)))
 				continue
 
 		# A 256-bit store of a register a VEX.128 zeroing idiom emptied.
@@ -2268,14 +2314,12 @@ def place_stubs(candidates, stub_base, spill_base=0):
 			# just the same, and the verifier is right to want it named.
 			# A zero store is one instruction and loses no extra boundary.
 			swallowed.add(start + len(encoding))
-		if strategy is not None and strategy[0] == "gapped":
-			# Same again, over a longer span: every boundary from the one
-			# after the load to the store's own disappears into the stub.
-			helper, _load, gap_store, span_bodies = strategy[1]
-			del helper
-			for entry in span_bodies:
-				swallowed.add(entry[0])
-			swallowed.add(gap_store[2])
+		if strategy is not None and strategy[0] == "run":
+			# Same again over a longer stretch: every boundary from the one
+			# after the first load to the last store's own disappears.
+			_helpers, entries = strategy[1]
+			for entry in entries[1:]:
+				swallowed.add(entry[4])
 	return placed, blob, swallowed, overlapped, refused
 
 

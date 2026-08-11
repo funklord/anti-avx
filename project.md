@@ -2919,19 +2919,104 @@ operands and the failures are in `moved_instruction` on the span instead.
 `rsp` and without an unwind question. That was not the plan; it is worth recording
 because the two roads were costed against each other and only one of them was safe.
 
+### Finding 51 -- interleaved copies, and a small register allocator
+
+The 652 spans Finding 50 could not take were all one thing: **a `vmovups` inside the
+span that will not move**, because it is itself 256-bit. That is what MSVC emits for a
+block bigger than 32 bytes:
+
+```
+vmovups (%rsi),%ymm0        the load
+vmovups 0x20(%rsi),%ymm1    inside its span, and 256-bit
+vmovups %ymm0,(%rdi)        the store
+vmovups %ymm1,0x20(%rdi)
+```
+
+A span holds one pair. A **run** holds as many as are open at once: every 256-bit move
+inside it is one half of a copy whose other half is also inside. Each open ymm gets a
+helper of its own, which is register allocation on a very small scale -- greedy over the
+pairs in load order, which is enough when a run holds ten pairs at the very most.
+
+```
+runs                    9,577
+  one pair              9,200
+  two to ten              377
+```
+
+The run subsumes the span rather than adding to it: the single-pair case is a run with
+one pair, and `ymm_gapped` is gone.
+
+```
+VEX in .text     18,516 -> 18,757
+```
+
+**That number went the wrong way, and the reason is Finding 52.** The run itself is worth
+about 2,000 sites; the liveness fix found alongside it costs more than that, and costs it
+correctly.
+
+#### The test that was too weak, and what it hid
+
+The first interleaved run assembled, disassembled, reconciled, and returned the right
+answer -- and was wrong:
+
+```
+movups 0x20(%rsi),%xmm1
+movups 0x30(%rsi),%xmm1     the second copy's helper is its OWN register
+```
+
+Both halves landed in `%xmm1`, so the low half was overwritten before it was stored. The
+program still answered 77 because **it only read back the upper halves**, which happened
+to be the half that survived. Reading the low halves as well turns it into 112 against a
+wanted 77.
+
+That is Finding 37's lesson arriving again in a new costume: a test is blind to what its
+fixtures cannot express, and this one had been written to prove the upper half made the
+trip. It proved exactly that and nothing else.
+
+### Finding 52 -- the checker and the checked called the same function
+
+`scratch.xmm_numbers` matched `%xmm` and nothing else. **`%xmm5`, `%ymm5` and `%zmm5` are
+one register**, so every 256-bit operand was invisible to the liveness scan: `find_scratch`
+would hand out a register that a neighbouring `vmovups %ymm5,(%rdi)` was using.
+
+`make scratch-check` exists to catch precisely that, by enumerating paths rather than
+intersecting sets -- and it reported zero violations, because `scratch.walk` calls the
+same `xmm_numbers`. **Two witnesses, one pair of eyes.** `evidence.md` says corroboration
+has to be independent and names the shape: two documents agreeing are one witness if the
+same hand wrote both. This is that, in code.
+
+Asking the register-claiming code the old way and walking the answer the new way is the
+independent pair the check was supposed to be:
+
+```
+claimed the old way    28,160
+  killed               27,316
+  unknown                 611
+  read                    233     wrongly claimed
+```
+
+**233 sites.** Not a tightened checker -- a live defect in what the rewriter shipped,
+where a stub destroyed a register something still wanted. `vextractf128` and `vmulss`
+dominate the examples, which is exactly the mix expected: a Class D or aliased site
+sitting next to 256-bit code.
+
+With the fix the same check reports 28,003 claims and **0 read on any path**, and the
+binary keeps 241 more VEX sites than it did before -- the price of not claiming registers
+that were never free.
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      194,800
-skipped for overlap                            35,722
-refused, stub not buildable                     3,707
-VEX in .text            805,131 ->      18,516   786,615 removed, 97.7%
+detoured                                      194,788
+skipped for overlap                            36,593
+refused, stub not buildable                     3,954
+VEX in .text            805,131 ->      18,757   786,374 removed, 97.7%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 77,824 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 82,037
+section, every section after `.text` is byte-identical, all 78,041 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 82,181
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -2949,9 +3034,8 @@ src2 aliases dst, no scratch           3,729     needs a register; 249 do not
 ymm upper half read later              1,766     what the edges could not resolve
 sequence with no usable scratch          780     needs a register
 no direct SSE form                       710     mostly vextractf128/vinsertf128
-ymm span operand cannot be offset        652     a lead, in moved_instruction
 next instruction is a branch target      511
-no register free across the ymm span     441
+no register free across the ymm run      446
 next instruction transfers control       424
 outside .pdata                           403
 sequence shape not handled               164
@@ -3256,9 +3340,10 @@ Findings 40 and 44 have the measurements and the scan's refusals: it walks back 
 the nearest **write**, passing over anything that only reads the register and over a
 conditional branch it fell through, and refusing a branch target or a call.
 
-**Y1-span — the gapped copy (Finding 50).** Load and store separated by instructions
-that must not move. The upper half rides in a second register, dead at the load and
-untouched until the store, and the whole span goes into one stub:
+**Y1-run — the gapped and interleaved copy (Findings 50 and 51).** Load and store
+separated by instructions that must not move, and any number of such copies open at
+once. Each upper half rides in a second register, dead at its load and untouched until
+its store, and the whole run goes into one stub:
 
 ```
 vmovups m1,%ymm0        →  movups m1,%xmm0 ; movups m1+16,%xmm7
@@ -3681,8 +3766,8 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 37 mnemonics x 3 operand shapes executed on this CPU, every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | memory-operand forms, 256-bit, and the helper classes |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | twelve PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
-| `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
+| `make check-pe` | thirteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity, and that the rebuilt function table is sorted and covers every stub byte | **semantics -- every one of these is about shape** |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
 | `make check-unwind` | that a handler registered through `.pdata` is reached from `.text` and from inside a stub, and that a stub which moved `rsp` still hands it a frame 16 bytes wrong | whether the shipping Windows unwinder agrees with wine's |
@@ -3691,7 +3776,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and twelve PEs built for the purpose.
+things: the lowerings executed in isolation, and thirteen PEs built for the purpose.
 
 ### What is still not verified
 
@@ -3748,7 +3833,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **786,615 of 805,131 VEX sites, 97.7%** (Findings 24 to 50), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **786,374 of 805,131 VEX sites, 97.7%** (Findings 24 to 52), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 

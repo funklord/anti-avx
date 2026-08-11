@@ -84,22 +84,33 @@ DEAD_AT_CALL = (4, 5)
 ARGUMENT_REGISTERS = (0, 1, 2, 3)
 
 
+# xmm0, ymm0 and zmm0 are one register seen through three widths, so a
+# scan for live registers has to answer to all three names. Matching only
+# `%xmm` made every 256-bit operand invisible: `find_scratch` would hand out
+# a register that a neighbouring `vmovups %ymm5,(%rdi)` was using, and
+# `scratch.walk` -- the check written to catch exactly that -- called this
+# same function and so could never see it. Finding 52.
+REGISTER_NAMES = ("%xmm", "%ymm", "%zmm")
+
+
 def xmm_numbers(text):
-	"""The xmm registers named in an operand string."""
+	"""The vector registers named in an operand string, by number."""
 	out = []
-	start = 0
-	while True:
-		at = text.find("%xmm", start)
-		if at < 0:
-			return out
-		digits = ""
-		i = at + 4
-		while i < len(text) and text[i].isdigit():
-			digits += text[i]
-			i += 1
-		if digits:
-			out.append(int(digits))
-		start = i
+	for name in REGISTER_NAMES:
+		start = 0
+		while True:
+			at = text.find(name, start)
+			if at < 0:
+				break
+			digits = ""
+			i = at + len(name)
+			while i < len(text) and text[i].isdigit():
+				digits += text[i]
+				i += 1
+			if digits:
+				out.append(int(digits))
+			start = i if digits else at + len(name)
+	return out
 
 
 # Volatile under Win64 and not the return register, so a `ret` ends their

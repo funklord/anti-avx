@@ -627,6 +627,43 @@ source:	.long 1, 2, 3, 4
 """)
 
 
+
+# 17. Two 256-bit copies interleaved -- load, load, store, store -- which is
+# what MSVC emits for a block bigger than 32 bytes and what a single-pair
+# span cannot take: the second load sits inside the first pair's span, is
+# itself 256-bit, and will not move.
+#
+# Each copy gets a helper of its own, and both upper halves are read back so
+# that a shared or transposed helper shows up as a wrong number rather than
+# as nothing.
+PROGRAMS["interleaved"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$136, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* two copies, interleaved */
+	vmovups	32(%rsi), %ymm1
+	vmovups	%ymm0, (%rdi)
+	vmovups	%ymm1, 32(%rdi)
+	movl	16(%rdi), %eax		/* upper half of the first: 33 */
+	addl	48(%rdi), %eax		/* upper half of the second: 44 */
+	addl	(%rdi), %eax		/* and both LOW halves, which a shared */
+	addl	32(%rdi), %eax		/* helper silently loses: 1 + 9 */
+	subl	$10, %eax
+	addq	$136, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 33, 6, 7, 8
+	.long 9, 10, 11, 12
+	.long 44, 14, 15, 16
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:
