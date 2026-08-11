@@ -524,10 +524,7 @@ _start:
 	ret
 """ + _UNWIND_TAIL)
 
-# **The 5 is the defect, not the answer.** 0xC0000005 truncated: the
-# dispatcher never found the handler. When stubs carry unwind data this
-# becomes 42 and this comment goes with it.
-PROGRAMS["unwindstub"] = (5, """
+PROGRAMS["unwindstub"] = (42, """
 	.text
 	.globl _start
 _start:

@@ -2744,6 +2744,78 @@ resumes through funclets which have `.pdata` entries of their own, and continuat
 addresses inside them are materialised by `lea` -- both of which the target set already
 covers, by Finding 30.
 
+### Finding 48 -- a stub is a piece of a function, and now says so
+
+Finding 46 measured the defect and named the shape of the fix. This is the fix.
+
+**A stub is not a function.** It is a few instructions cut out of one and moved, entered
+by a jump, sharing its frame -- so what it needs is not an unwind description of its own
+but a pointer back to the one it belongs to. That is what `UNW_FLAG_CHAININFO` is for: an
+`UNWIND_INFO` that ends with the primary's own `RUNTIME_FUNCTION`, telling the unwinder
+to compute the frame from that function's prologue.
+
+```
+function table entries    429,912       236,427 original + 193,485 stubs
+unwind info               295,652 bytes
+file                  102,242,144 -> 110,759,424   (+8,517,280)
+```
+
+Three things make that cheap. **Stubs in the same function share a block**, since the
+chain is all a block holds -- 193,485 stubs need 295,652 bytes rather than 3.1 MB. **The
+`.xdata` is laid down before the `.pdata`**, because a `RUNTIME_FUNCTION` names its
+unwind block by address and that address has to exist first; both sizes are known before
+either is placed, a block holding only a `.text` address. And **the old `.pdata` stays
+exactly where it is** and simply stops being pointed at, so every section after `.text`
+is still byte-identical and the exception directory is the only field that moves.
+
+#### The stubs with nothing to chain to are the ones that need no chain
+
+A stub whose site sits in a range `.pdata` does not describe -- the leaf functions
+`outside.py` recovers -- gets a plain empty `UNWIND_INFO` instead. That is not a
+fallback. The x64 ABI lets a function omit unwind data **only** when it is a leaf that
+neither moves `rsp` nor calls anything, so for exactly those the unwinder's leaf
+assumption is right and `[rsp]` really is the return address. The two cases need
+opposite treatment and the reason each is correct is the same fact.
+
+#### It answers 42
+
+```
+fault inside a stub        5 -> 42
+```
+
+`make check-unwind` was written in Finding 46 to assert the defect. It asserts the fix
+now, and it is the only check in the tree that exercises the exception path at all.
+
+`make detour-verify` gained the structural half: the exception directory must point at
+the rebuilt table, the table must still be sorted -- `RtlLookupFunctionEntry` binary
+searches it -- and **every byte of the stub section past the constant pool must be inside
+an entry**, exactly rather than approximately. A stub the unwinder cannot find is a stub
+an exception cannot be dispatched from, which is the whole defect returning by the back
+door.
+
+#### The transposition that read an empty table
+
+The first build emitted one function table entry where there were plainly two. The
+section header stores `VirtualSize` **before** `VirtualAddress`, and the new section
+walker unpacked them the other way round -- so every RVA lookup missed, the exception
+directory resolved to nothing, and the original 236,427 entries were silently dropped.
+Nothing crashed; the output was simply a table with the stubs in it and nothing else.
+
+It was caught by a count that should have been 2 being 1, on a program small enough to
+hold in the head. `patch.function_ranges` has had the field order right since Finding
+14, three feet away in another file.
+
+#### What it does not fix, and what it does not prove
+
+A `__try` scope table is keyed on the faulting address, and a stub's address is inside no
+scope. So an exception raised in a stub now propagates correctly to outer frames instead
+of killing the process -- but the `__try` that should have caught it still will not.
+Fixing that means widening scope ranges to cover the stubs their bodies were cut into,
+which is a different piece of work and needs the C++ EH format Finding 47 did not decode.
+
+And `wine` is not Windows. The 42 is strong evidence about the mechanism and not proof
+about the shipping loader.
+
 ### Final state
 
 ```
@@ -2792,8 +2864,9 @@ code quickly.
 
 ### The two decisions that are not the implementer's
 
-1. **Give the stub section unwind data, and then may a stub spill?** These were two
-   questions until Finding 46 measured them and they became one.
+1. **May a stub spill, now that the unwind data exists?** This was two questions until
+   Finding 46 measured them and they became one, and Finding 48 answered the half that
+   was not a decision at all.
 
    Spilling was rejected in `tools/scratch.py` because the stub section has no
    `.pdata`, so `RtlVirtualUnwind` treats a stub as a leaf and reads the frame from an
@@ -2803,12 +2876,11 @@ code quickly.
    anywhere**. The defect belongs to detouring and every one of the 193,485 detours
    already has it.
 
-   So the work to do is the same either way -- a `RUNTIME_FUNCTION` per stub chained
-   back to its enclosing function -- and it fixes a live defect before it enables
-   anything. What the holder still decides is whether to spill once it is there:
-   `--spill=stack` is built and measured at 3,537 sites for 107 KB, `--spill=pool` buys
-   the identical sites and cannot be made thread-safe, and Finding 45 closed the one
-   alternative needing no spill at all, at 249 sites.
+   **The unwind data is built** -- Finding 48, and it fixed the live defect. What the
+   holder still decides is whether to spill now that it is there: `--spill=stack` is
+   built and measured at 3,537 sites for 107 KB, `--spill=pool` buys the identical
+   sites and cannot be made thread-safe, and Finding 45 closed the one alternative
+   needing no spill at all, at 249 sites.
 2. **Build the Y1 register model?** 12,552 `vmovups` stores and 11,226 loads are
    neither copies nor zero fills, and need a ymm represented as two xmm registers
    across a basic block -- register allocation, the largest single remaining win, and
@@ -3487,7 +3559,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
 | `make check-pe` | eleven PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
-| `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity | **semantics -- every one of these is about shape** |
+| `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity, and that the rebuilt function table is sorted and covers every stub byte | **semantics -- every one of these is about shape** |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
 | `make check-unwind` | that a handler registered through `.pdata` is reached from `.text` and **not** from a stub | whether the shipping Windows unwinder agrees with wine's |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
@@ -3511,12 +3583,13 @@ Named rather than left implicit, because an absent gap gets guessed at:
   zero fill -- but the Y1 register representation and the Y2 shadow do not exist, and
   Finding 40 names a consequence that will have to be repaired when they do: the
   in-place lowerings destroy the [255:128] zeroing every VEX.128 write performs.
-- **Exception paths.** `.xdata` is carried through untouched, and Finding 46 measured
-  what that costs: **an exception raised inside a stub is never dispatched**, because
-  the stub section has no `.pdata` and a stub is entered by a jump, so the unwinder
-  reads a return address that was never one. That is a live defect in all 193,485
-  detours rather than a gap in the testing, and it is the strongest argument for
-  giving the stub section unwind data.
+- **Exception paths.** Finding 46 measured that an exception raised inside a stub was
+  never dispatched at all, and Finding 48 fixed it: every stub now has a
+  `RUNTIME_FUNCTION` chained back to the function it was cut out of, and
+  `make check-unwind` reaches a handler from inside one. What remains is narrower and
+  named -- a `__try` scope table is keyed on the faulting address and a stub's address
+  is inside no scope, so such an exception propagates correctly to outer frames rather
+  than being caught where it should be.
 - ~~Surviving VEX sites are unaccounted for.~~ **Closed** by Finding 35: `make
   census` reconciles all 10,276 exactly, and the residue was an error in the
   accounting rather than anything the rewriter did. What it left behind is a real

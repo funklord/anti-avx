@@ -468,16 +468,14 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm
 # on purpose, both registering a handler through .pdata -- which is how a PE
 # with no imports gets SEH at all.
 #
-# The control faults on a plain `mov` and its handler runs. The other faults
-# on a lowered instruction inside a stub, WITH NO SPILL ANYWHERE, and its
-# handler does not: a stub is entered by a jump and has no .pdata, so the
-# dispatcher reads a return address that was never one.
+# The control faults on a plain `mov`. The other faults on a lowered
+# instruction inside a stub, which answered 5 -- an unhandled 0xC0000005 --
+# until the stubs were given unwind data, because a stub is entered by a jump
+# and the dispatcher was reading a return address that was never one.
 #
-# **This asserts the defect rather than the fix**, deliberately. It is what
-# `scratch.py` assumed about spilling and what turns out to be true of every
-# detour, and a target that goes green the day somebody gives stubs their
-# unwind data is worth more than a paragraph saying so. Change the 5 to 42
-# on that day. Finding 46.
+# **Both answer 42 now, and the second one is the whole point of Finding 48.**
+# It is the only check here that exercises the exception path at all, so if it
+# ever goes back to 5 something has stopped emitting `.avxpdat`.
 #
 # Termination: one wine invocation per program, each under a timeout.
 check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe
@@ -497,7 +495,7 @@ check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe
 			echo "check-unwind: $$name changed behaviour"; exit 1; \
 		fi; \
 	done; \
-	echo "check-unwind: a handler is reached from .text and not from a stub"
+	echo "check-unwind: a handler is reached from .text and from inside a stub"
 
 # Prove every register the liveness scan claims as scratch is really dead,
 # by enumerating paths rather than intersecting sets. Needs the listing, so

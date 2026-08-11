@@ -44,6 +44,7 @@ Two details are easy to get wrong and both are fatal.
   census  <binary> <listing> <patched>  what survives, and why
 """
 
+import bisect
 import re
 import struct
 import subprocess
@@ -1095,15 +1096,16 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# neither is lowered on its own.
 		body = lower_ymm_pair(strategy[1], stub_address)
 		if body is None:
-			return None
+			return None, 0
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
-		                                 start + window)
+		                                 start + window), 0
 
 	body = bytearray()
+	prologue = 0
 	for entry in preceding:
 		fixed = moved_instruction(entry, stub_address + len(body), pool)
 		if fixed is None:
-			return None
+			return None, 0
 		body += fixed
 
 	site = start + sum(len(entry[1]) for entry in preceding)
@@ -1114,20 +1116,25 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		borrowed = strategy[1]
 		if SPILL == SPILL_STACK:
 			body += STACK_OPEN
+			# Where the allocation is complete, which is what the unwind
+			# code's offset means and why it is measured rather than assumed
+			# to be zero: a backward-widened window emits its swallowed
+			# instructions first.
+			prologue = len(body)
 		saved = encode_spill(borrowed, True, stub_address + len(body),
 		                     spill_base)
 		if saved is None:
-			return None
+			return None, 0
 		body += saved
 		lowered = lower_vex(site, encoding, operands, mnemonic,
 		                    stub_address + len(body), borrowed, pool)
 		if lowered is None:
-			return None
+			return None, 0
 		body += lowered
 		restored = encode_spill(borrowed, False, stub_address + len(body),
 		                        spill_base)
 		if restored is None:
-			return None
+			return None, 0
 		body += restored
 		if SPILL == SPILL_STACK:
 			body += STACK_CLOSE
@@ -1140,19 +1147,19 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		lowered = lower_vex(site, encoding, operands, mnemonic,
 		                    stub_address + len(body), scratch, pool)
 	if lowered is None:
-		return None
+		return None, 0
 	body += lowered
 
 	for entry in displaced:
 		fixed = moved_instruction(entry, stub_address + len(body), pool)
 		if fixed is None:
-			return None
+			return None, 0
 		body += fixed
 
 	# Back to the instruction after the WINDOW, which is not the instruction
 	# after the original once the window has been widened.
 	body += encode_jump(stub_address + len(body) + 5, start + window)
-	return bytes(body)
+	return bytes(body), prologue
 
 
 CONTROL_PREFIXES = ("j", "call", "ret", "loop", "iret", "syscall", "sysret",
@@ -1500,6 +1507,147 @@ def collect(binary, listing):
 	return patches, candidates, stats, skipped, declined
 
 
+EXCEPTION_DIRECTORY = 3			# index into the data directory
+UNW_FLAG_CHAININFO = 4
+UWOP_ALLOC_SMALL = 2
+PDATA_NAME = b".avxpdat"
+XDATA_NAME = b".avxxdat"
+# INITIALIZED_DATA | READ.
+UNWIND_FLAGS = 0x40000040
+
+
+def sections_of(data):
+	"""(vaddr, vsize, raddr, rsize) for every section, in table order.
+
+	The header stores VirtualSize BEFORE VirtualAddress, which is the
+	opposite of how they are useful and exactly the transposition that made
+	the first version of this read an empty function table.
+	"""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	count = struct.unpack_from("<H", data, pe + 6)[0]
+	opt_size = struct.unpack_from("<H", data, pe + 20)[0]
+	table = pe + 24 + opt_size
+	out = []
+	for i in range(count):
+		vsize, vaddr, rsize, raddr = struct.unpack_from("<IIII", data,
+		                                               table + i * 40 + 8)
+		out.append((vaddr, vsize, raddr, rsize))
+	return out
+
+
+def section_named(data, name):
+	"""(vaddr, vsize, raddr, rsize) for a section, by name, or None."""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	count = struct.unpack_from("<H", data, pe + 6)[0]
+	table = pe + 24 + struct.unpack_from("<H", data, pe + 20)[0]
+	for i in range(count):
+		off = table + i * 40
+		if data[off:off + 8].rstrip(b"\0") == name.rstrip(b"\0"):
+			return sections_of(data)[i]
+	return None
+
+
+def rva_to_offset(data, rva):
+	"""Where an RVA's bytes live in the file, or None if nowhere."""
+	for vaddr, vsize, raddr, rsize in sections_of(data):
+		if raddr and vaddr <= rva < vaddr + max(vsize, rsize):
+			at = raddr + (rva - vaddr)
+			return at if at < len(data) else None
+	return None
+
+
+def existing_pdata(data):
+	"""Sorted (begin, end, unwind) for every RUNTIME_FUNCTION in the image.
+
+	Read through the exception directory rather than by section name,
+	because that is what the loader reads and what this replaces.
+	"""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	rva, size = struct.unpack_from("<II", data,
+	                               pe + 24 + 112 + EXCEPTION_DIRECTORY * 8)
+	at = rva_to_offset(data, rva) if rva and size else None
+	if at is None:
+		return []
+	out = []
+	for i in range(size // 12):
+		begin, end, unwind = struct.unpack_from("<III", data, at + i * 12)
+		if end > begin:
+			out.append((begin, end, unwind))
+	out.sort()
+	return out
+
+
+def stub_unwind(extents, prologues, image_base, existing, xdata_rva):
+	"""Unwind data for every stub. Returns (xdata bytes, pdata bytes).
+
+	**A stub is a piece of the function it was cut out of, not a function.**
+	So its `UNWIND_INFO` carries `UNW_FLAG_CHAININFO` and ends with the
+	primary's own `RUNTIME_FUNCTION`, which is what tells the unwinder to
+	compute the frame from that function's prologue. Without it the stub has
+	no entry at all, the unwinder assumes a leaf, and reads a return address
+	out of `[rsp]` that was never one -- measured, and it is why an exception
+	raised inside a stub is never dispatched (Finding 46).
+
+	Stubs in the same function share one block, since the chain is all a
+	block holds. On Starfield that is the difference between 3.1 MB of
+	`.xdata` and a few hundred kilobytes.
+
+	A stub whose site sits in a range `.pdata` does not describe gets a plain
+	empty `UNWIND_INFO` instead of a chain. That is not a fallback: the x64
+	ABI lets a function omit unwind data only when it is a leaf that neither
+	moves `rsp` nor calls anything, so for those the unwinder's leaf
+	assumption is exactly right and `[rsp]` really is the return address.
+
+	Where the stub spilled, the block also carries a `UWOP_ALLOC_SMALL` at
+	the offset the `sub` ends, so the sixteen bytes are described rather than
+	silently missing.
+	"""
+	starts = [begin for begin, _e, _u in existing]
+	blocks, xdata, pdata = {}, bytearray(), []
+	for (stub_rva, stub_end, site_rva), prologue in zip(extents, prologues):
+		position = bisect.bisect_right(starts, site_rva) - 1
+		primary = None
+		if position >= 0 and site_rva < existing[position][1]:
+			primary = existing[position]
+		key = (primary, prologue)
+		offset = blocks.get(key)
+		if offset is None:
+			offset = len(xdata)
+			blocks[key] = offset
+			codes = bytearray()
+			if prologue:
+				# UWOP_ALLOC_SMALL encodes size = info * 8 + 8, so sixteen
+				# bytes is info 1. The offset is the END of the instruction
+				# that did it, which is what makes the allocation apply only
+				# to the part of the stub that is past it.
+				codes += struct.pack("<BB", prologue,
+				                     UWOP_ALLOC_SMALL | (1 << 4))
+			count = len(codes) // 2
+			flags = UNW_FLAG_CHAININFO if primary is not None else 0
+			xdata += struct.pack("<BBBB", 1 | (flags << 3), prologue, count, 0)
+			xdata += codes
+			if count & 1:
+				xdata += b"\0\0"	# the code array is padded to an even count
+			if primary is not None:
+				xdata += struct.pack("<III", *primary)
+		pdata.append((stub_rva, stub_end, xdata_rva + offset))
+	merged = sorted(existing + pdata)
+	out = bytearray()
+	for entry in merged:
+		out += struct.pack("<III", *entry)
+	return bytes(xdata), bytes(out)
+
+
+def next_section_rva(data):
+	"""Where `add_section` would put the next one."""
+	alignment = struct.unpack_from(
+		"<I", data, struct.unpack_from("<I", data, 0x3C)[0] + 24 + 32)[0]
+	highest = 0
+	for vaddr, vsize, _raddr, _rsize in sections_of(data):
+		highest = max(highest, vaddr + vsize)
+	return (highest + alignment - 1) // alignment * alignment
+
+
 def add_section(data, name, payload, flags):
 	"""Append a section to a PE image. Returns (new image, virtual address)."""
 	pe = struct.unpack_from("<I", data, 0x3C)[0]
@@ -1700,9 +1848,9 @@ def census(binary, listing, patched):
 	_patches, candidates, _stats, _skipped, declined = collect(binary, listing)
 	placed, _blob, swallowed, overlapped, refused = place_stubs(
 		candidates, stub_base_of(open(binary, "rb").read()))
-	rewritten = {address for address, _window, _at in placed}
+	rewritten = {address for address, _window, *_rest in placed}
 	covered = set()
-	for address, window, _at in placed:
+	for address, window, *_rest in placed:
 		covered.update(range(address, address + window))
 
 	survivors = {a for a, e, _m, _o in inplace.parse_listing(patched)
@@ -1901,13 +2049,13 @@ def place_stubs(candidates, stub_base, spill_base=0):
 			break
 
 		stub_address = stub_base + len(blob)
-		body = None
+		body, prologue = None, 0
 		if extension:
 			j, extra, grew = extension
-			body = build_stub(start, encoding, operands, mnemonic,
-			                  window + grew, list(displaced) + extra,
-			                  stub_address, scratch, pool, preceding, strategy,
-			                  spill_base)
+			body, prologue = build_stub(
+				start, encoding, operands, mnemonic, window + grew,
+				list(displaced) + extra, stub_address, scratch, pool,
+				preceding, strategy, spill_base)
 			if body is None:
 				# The extended stub would not build. Fall back to the plain
 				# one rather than lose both -- taking a passenger along must
@@ -1918,13 +2066,13 @@ def place_stubs(candidates, stub_base, spill_base=0):
 				displaced = list(displaced) + extra
 				rescued.add(j)
 		if body is None:
-			body = build_stub(start, encoding, operands, mnemonic, window,
-			                  displaced, stub_address, scratch, pool,
-			                  preceding, strategy, spill_base)
+			body, prologue = build_stub(
+				start, encoding, operands, mnemonic, window, displaced,
+				stub_address, scratch, pool, preceding, strategy, spill_base)
 		if body is None:
 			refused.add(start)
 			continue
-		placed.append((start, window, stub_address))
+		placed.append((start, window, stub_address, len(body), prologue))
 		committed_to = start + window
 		blob += body
 		# Every boundary strictly inside the window disappears. The window's
@@ -1978,7 +2126,7 @@ def apply_all(binary, listing, output):
 	placed, blob, _swallowed, overlapped, refused = place_stubs(
 		candidates, stub_base, spill_base)
 
-	for site, window, stub_address in placed:
+	for site, window, stub_address, _length, _prologue in placed:
 		offset = raddr + (site - vaddr)
 		jump = encode_jump(site + 5, stub_address)
 		pad = window - 5
@@ -1993,11 +2141,43 @@ def apply_all(binary, listing, output):
 	image, section_va = add_section(staged, SECTION_NAME, bytes(blob),
 	                                SECTION_FLAGS)
 	assert section_va == stub_base - image_base, "stub section moved"
-	open(output, "wb").write(image)
+
+	# **Unwind data for the stubs.** Without it an exception raised inside
+	# one is never dispatched: the section has no entry, the unwinder assumes
+	# a leaf, and reads a return address out of an `[rsp]` that never held
+	# one. Measured in Finding 46, fixed here.
+	#
+	# The `.xdata` goes down before the `.pdata` because a RUNTIME_FUNCTION
+	# names its unwind block by address, so that address has to exist first.
+	# Both sizes are known before either is placed -- the blocks hold only
+	# the primary's own entry, which is a `.text` address.
+	extents, prologues = [], []
+	ordered = sorted(placed, key=lambda item: item[2])
+	for site, _window, stub_address, length, prologue in ordered:
+		extents.append((stub_address - image_base,
+		                stub_address + length - image_base,
+		                site - image_base))
+		prologues.append(prologue)
+	xdata_rva = next_section_rva(image)
+	xdata, pdata = stub_unwind(extents, prologues, image_base,
+	                           existing_pdata(image), xdata_rva)
+	image, got = add_section(image, XDATA_NAME, xdata, UNWIND_FLAGS)
+	assert got == xdata_rva, "unwind section moved"
+	pdata_rva = next_section_rva(image)
+	image, got = add_section(image, PDATA_NAME, pdata, UNWIND_FLAGS)
+	assert got == pdata_rva, "function table moved"
+	image = bytearray(image)
+	pe = struct.unpack_from("<I", bytes(image), 0x3C)[0]
+	struct.pack_into("<II", image, pe + 24 + 112 + EXCEPTION_DIRECTORY * 8,
+	                 pdata_rva, len(pdata))
+
+	open(output, "wb").write(bytes(image))
 	print(f"apply: {len(patches):,} in-place patches, {len(placed):,} detours, "
 	      f"{len(overlapped):,} skipped for overlap, {len(refused):,} refused")
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "
 	      f"{len(blob):,} bytes")
+	print(f"apply: {len(pdata) // 12:,} function table entries "
+	      f"({len(xdata):,} bytes of unwind info) at 0x{pdata_rva + image_base:x}")
 	return 0
 
 
@@ -2006,7 +2186,52 @@ def verify(original, patched, listing=None):
 	b = open(patched, "rb").read()
 	problems = 0
 	print(f"verify: {len(a):,} -> {len(b):,} bytes "
-	      f"(+{len(b) - len(a):,} for the stub section)")
+	      f"(+{len(b) - len(a):,} for the appended sections)")
+
+	# **Every stub has to be findable by the unwinder.** The exception
+	# directory must point at the rebuilt function table, that table must
+	# still be sorted -- `RtlLookupFunctionEntry` binary-searches it -- and
+	# every stub address must fall inside an entry. Finding 46 measured what
+	# the absence of this costs: an exception raised in a stub is never
+	# dispatched at all.
+	pe = struct.unpack_from("<I", b, 0x3C)[0]
+	rva, size = struct.unpack_from("<II", b,
+	                               pe + 24 + 112 + EXCEPTION_DIRECTORY * 8)
+	at = rva_to_offset(b, rva) if rva and size else None
+	table = []
+	if at is not None:
+		for i in range(size // 12):
+			table.append(struct.unpack_from("<III", b, at + i * 12))
+	stubs = section_named(b, SECTION_NAME)
+	if not table:
+		print("verify: FAILED -- no function table", file=sys.stderr)
+		problems += 1
+	elif sorted(table) != table:
+		print("verify: FAILED -- the function table is not sorted",
+		      file=sys.stderr)
+		problems += 1
+	elif stubs is None:
+		print("verify: FAILED -- no stub section", file=sys.stderr)
+		problems += 1
+	else:
+		svaddr, svsize, _sraddr, _srsize = stubs
+		described = 0
+		for begin, end, _unwind in table:
+			if svaddr <= begin < svaddr + svsize:
+				described += end - begin
+		# The section is the constant pool followed by nothing but stubs,
+		# so every byte past the pool must be inside an entry -- exactly,
+		# not approximately. A stub the unwinder cannot find is a stub an
+		# exception cannot be dispatched from.
+		gap = svsize - len(PERMIL_POOL) - described
+		if gap:
+			print(f"verify: FAILED -- {gap:,} bytes of stub outside every "
+			      f"function table entry", file=sys.stderr)
+			problems += 1
+		else:
+			print(f"verify: function table has {len(table):,} entries, "
+			      f"sorted, and covers every byte of stub past the "
+			      f"{len(PERMIL_POOL)}-byte pool")
 
 	vaddr, raddr, size = inplace.text_mapping(original)
 	if a[raddr + size:] != b[raddr + size:len(a)]:
