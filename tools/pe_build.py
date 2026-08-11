@@ -493,9 +493,19 @@ hundred:	.float 100.0
 # `unwind` faults on a plain `mov` that no rewriting touches: the control.
 # `unwindstub` faults on the lowered `addss` inside a stub. If the two
 # disagree, the stub is the reason.
+# Three outcomes rather than two, because "the handler ran" and "the frame it
+# was given was right" are different claims and the second is the one a spill
+# puts at risk. `_start` records its own post-prologue `rsp`, the handler
+# compares that against the establisher frame the unwinder computed, and
+# resumption always uses the recorded value -- so an answer comes back either
+# way and says which.
+#
+#   42  the handler ran and the establisher frame was correct
+#   99  the handler ran and the frame was wrong
+#    5  the handler was never reached at all
 _UNWIND_TAIL = """
 recover:
-	movl	$42, %eax
+	movl	verdict(%rip), %eax
 	addq	$40, %rsp
 	ret
 func_end:
@@ -504,9 +514,18 @@ handler:
 	/* rcx record, rdx establisher frame, r8 context, r9 dispatcher */
 	leaq	recover(%rip), %rax
 	movq	%rax, 0xf8(%r8)		/* CONTEXT.Rip */
-	movq	%rdx, 0x98(%r8)		/* CONTEXT.Rsp */
+	movq	frame(%rip), %rax
+	movq	%rax, 0x98(%r8)		/* CONTEXT.Rsp, from the recorded value */
+	movl	$99, %eax
+	movl	$42, %ecx
+	cmpq	frame(%rip), %rdx	/* did the unwinder agree? */
+	cmovel	%ecx, %eax
+	movl	%eax, verdict(%rip)
 	xorl	%eax, %eax		/* ExceptionContinueExecution */
 	ret
+	.p2align 4
+frame:	.quad 0
+verdict:	.long 0
 ten:	.float 10.0
 """
 
@@ -515,6 +534,7 @@ PROGRAMS["unwind"] = (42, """
 	.globl _start
 _start:
 	subq	$40, %rsp
+	movq	%rsp, frame(%rip)
 	vzeroupper
 	vmovss	ten(%rip), %xmm1
 	xorl	%eax, %eax
@@ -529,11 +549,46 @@ PROGRAMS["unwindstub"] = (42, """
 	.globl _start
 _start:
 	subq	$40, %rsp
+	movq	%rsp, frame(%rip)
 	vzeroupper
 	vmovss	ten(%rip), %xmm1
 	xorl	%eax, %eax
 	vaddss	(%rax), %xmm1, %xmm0	/* faults INSIDE the stub */
 	nop
+	movl	$7, %eax
+	addq	$40, %rsp
+	ret
+""" + _UNWIND_TAIL)
+
+
+
+# 15. A fault inside a stub that has MOVED RSP, which is the case the unwind
+# data has to describe rather than merely be present for.
+#
+# The FMA needs a scratch and no register is dead -- the indirect jump sees
+# to that -- so under `--spill=stack` the stub allocates sixteen bytes. It
+# then faults on its own memory operand, in the middle of that allocation.
+#
+# **It answers 99, and that is the finding.** The handler is reached -- the
+# chain does its job -- but the establisher frame is sixteen bytes out,
+# because the chained fragment's own `UWOP_ALLOC_SMALL` is not applied.
+# Measured at exactly -16, and unchaining to get the code applied loses the
+# handler instead. Finding 49: a stub that moves `rsp` cannot be described,
+# which is why `--spill=none` is the default on evidence rather than caution.
+PROGRAMS["unwindspill"] = (99, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	movq	%rsp, frame(%rip)
+	vzeroupper
+	vmovss	ten(%rip), %xmm1
+	vmovss	ten(%rip), %xmm2	/* a register worth borrowing */
+	xorl	%eax, %eax
+	vfmadd213ss (%rax), %xmm1, %xmm0	/* needs a scratch, and faults */
+	leaq	skip(%rip), %rcx
+	jmp	*%rcx			/* indirect: nothing is provably dead */
+skip:
 	movl	$7, %eax
 	addq	$40, %rsp
 	ret

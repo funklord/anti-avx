@@ -2816,6 +2816,54 @@ which is a different piece of work and needs the C++ EH format Finding 47 did no
 And `wine` is not Windows. The 42 is strong evidence about the mechanism and not proof
 about the shipping loader.
 
+### Finding 49 -- the spill question, answered rather than asked
+
+Finding 46 said the objection to spilling was misattributed and Finding 48 removed it, so
+enabling `--spill=stack` looked like a decision waiting on a preference. **It was not a
+decision. It was an untested case**, and testing it says no.
+
+`make check-unwind` now reports three outcomes rather than two, because "the handler ran"
+and "the frame it was handed was right" are different claims and only the second is at
+risk here. `_start` records its own post-prologue `rsp`, the handler compares that against
+the establisher frame the unwinder computed, and resumption always uses the recorded
+value -- so an answer comes back either way and says which.
+
+```
+fault in .text                              42   handler ran, frame correct
+fault in a stub                             42   handler ran, frame correct
+fault in a stub that spilled                99   handler ran, frame WRONG
+```
+
+Measured rather than inferred: the error is **exactly -16**, the spill's own allocation,
+not applied. The encoding is not the problem -- the block reads
+`21 04 01 00 | 04 12 | 0000 | chain`, which is version 1 with `UNW_FLAG_CHAININFO`, a
+four-byte prologue, one `UWOP_ALLOC_SMALL` of sixteen bytes at offset 4, and the primary's
+entry. **A chained fragment's own unwind codes are not applied.**
+
+And they cannot be got applied by dropping the chain, because the chain is what reaches
+the handler at all:
+
+```
+chained, no codes          handler reached, frame correct
+chained + alloc code       handler reached, frame wrong by 16
+unchained + alloc code     no dispatch at all
+```
+
+So a stub that moves `rsp` cannot be described with what is available. The defect
+`scratch.py` predicted is real after all -- not for the reason it recorded, and not
+fixable by the unwind data that fixed the other half.
+
+**`--spill=none` stays the default, and now it is a measurement rather than a caution.**
+The pool variant keeps `rsp` still, so its frames would be right, and it remains
+unusable for the reason Finding 46 gave: one slot shared by every stub, and no
+per-thread storage within reach. 3,537 sites stay VEX.
+
+`wine` is not Windows, and this is the one place in the project where that matters most:
+if the shipping unwinder does apply a chained fragment's codes, the spill is safe there
+and this is a wine limitation rather than an ABI one. **That is the single check worth
+re-running the day a Windows host exists**, and it is a fifteen-second check -- run
+`sse-unwindspill.exe` and see whether it answers 42 or 99.
+
 ### Final state
 
 ```
@@ -2864,9 +2912,15 @@ code quickly.
 
 ### The two decisions that are not the implementer's
 
-1. **May a stub spill, now that the unwind data exists?** This was two questions until
-   Finding 46 measured them and they became one, and Finding 48 answered the half that
-   was not a decision at all.
+1. ~~**May a stub spill?**~~ **Answered: no, and it was never a decision.** Finding 46
+   showed the recorded objection was misattributed, Finding 48 removed it, and Finding
+   49 tested what was left: a stub that moves `rsp` hands the unwinder a frame sixteen
+   bytes wrong, because a chained fragment's own unwind codes are not applied and
+   dropping the chain loses the handler entirely. `--spill=none` stays the default on
+   evidence. **Re-run `sse-unwindspill.exe` on a Windows host** -- if it answers 42
+   rather than 99, the limitation is wine's and 3,537 sites come back.
+
+   What follows is kept because it is what was decided against and why.
 
    Spilling was rejected in `tools/scratch.py` because the stub section has no
    `.pdata`, so `RtlVirtualUnwind` treats a stub as a leaf and reads the frame from an
@@ -2876,11 +2930,12 @@ code quickly.
    anywhere**. The defect belongs to detouring and every one of the 193,485 detours
    already has it.
 
-   **The unwind data is built** -- Finding 48, and it fixed the live defect. What the
-   holder still decides is whether to spill now that it is there: `--spill=stack` is
-   built and measured at 3,537 sites for 107 KB, `--spill=pool` buys the identical
-   sites and cannot be made thread-safe, and Finding 45 closed the one alternative
-   needing no spill at all, at 249 sites.
+   **The unwind data is built** -- Finding 48, and it fixed the live defect.
+   `--spill=stack` is built and measured at 3,537 sites for 107 KB but hands the
+   unwinder a wrong frame; `--spill=pool` buys the identical sites, keeps `rsp` still,
+   and cannot be made thread-safe; and Finding 45 closed the one alternative needing no
+   spill at all, at 249 sites. All three are built, so the day any of those facts
+   changes the flag is already there.
 2. **Build the Y1 register model?** 12,552 `vmovups` stores and 11,226 loads are
    neither copies nor zero fills, and need a ymm represented as two xmm registers
    across a basic block -- register allocation, the largest single remaining win, and
@@ -3561,7 +3616,7 @@ than compiling with MSVC or a cross-compiler.
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity, and that the rebuilt function table is sorted and covers every stub byte | **semantics -- every one of these is about shape** |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
-| `make check-unwind` | that a handler registered through `.pdata` is reached from `.text` and **not** from a stub | whether the shipping Windows unwinder agrees with wine's |
+| `make check-unwind` | that a handler registered through `.pdata` is reached from `.text` and from inside a stub, and that a stub which moved `rsp` still hands it a frame 16 bytes wrong | whether the shipping Windows unwinder agrees with wine's |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
 
 The row to keep in mind is `detour-verify`. It is the only check that runs against

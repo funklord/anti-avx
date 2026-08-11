@@ -370,7 +370,8 @@ WINE_ENV   = WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe
 # object files included, and then declines to rebuild a missing one.
 EXTRA_PES  = $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
              $(BUILD_DIR)/pe-unwind.exe $(BUILD_DIR)/pe-unwind.asm \
-             $(BUILD_DIR)/pe-unwindstub.exe $(BUILD_DIR)/pe-unwindstub.asm
+             $(BUILD_DIR)/pe-unwindstub.exe $(BUILD_DIR)/pe-unwindstub.asm \
+             $(BUILD_DIR)/pe-unwindspill.exe $(BUILD_DIR)/pe-unwindspill.asm
 .SECONDARY: $(PE_LISTINGS) $(EXTRA_PES)
 
 $(BUILD_DIR)/pe-%.exe: tools/pe_build.py | $(BUILD_DIR)
@@ -478,7 +479,8 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm
 # ever goes back to 5 something has stopped emitting `.avxpdat`.
 #
 # Termination: one wine invocation per program, each under a timeout.
-check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe
+check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe \
+              $(BUILD_DIR)/pe-unwindspill.exe $(BUILD_DIR)/pe-unwindspill.asm
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-unwind: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
@@ -495,7 +497,19 @@ check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe
 			echo "check-unwind: $$name changed behaviour"; exit 1; \
 		fi; \
 	done; \
-	echo "check-unwind: a handler is reached from .text and from inside a stub"
+	$(PYTHON) tools/detour.py --spill=stack apply \
+		$(BUILD_DIR)/pe-unwindspill.exe $(BUILD_DIR)/pe-unwindspill.asm \
+		$(BUILD_DIR)/sse-unwindspill.exe >/dev/null; \
+	want=`$(PYTHON) tools/pe_build.py names | \
+	      awk '$$1 == "unwindspill" { print $$2 }'`; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-unwindspill.exe \
+		>/dev/null 2>&1 && got=0 || got=$$?; \
+	echo "check-unwind: unwindspill returned $$got, want $$want"; \
+	if [ "$$got" != "$$want" ]; then \
+		echo "check-unwind: unwindspill changed behaviour"; exit 1; \
+	fi; \
+	echo "check-unwind: a handler is reached from inside a stub, and a stub"; \
+	echo "              that moved rsp still hands it the wrong frame"
 
 # Prove every register the liveness scan claims as scratch is really dead,
 # by enumerating paths rather than intersecting sets. Needs the listing, so
@@ -521,6 +535,7 @@ clean:
 	rm -f $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(GENERATED) \
 	      $(PE_SOURCES) $(PE_LISTINGS) $(PE_FIXED) $(EXTRA_PES) \
 	      $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe \
+	      $(BUILD_DIR)/sse-unwindspill.exe \
 	      $(BUILD_DIR)/sse-spill-none.exe $(BUILD_DIR)/sse-spill-stack.exe \
 	      $(BUILD_DIR)/sse-spill-pool.exe \
 	      $(BUILD_DIR)/icache_bench \
