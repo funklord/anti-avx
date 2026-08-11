@@ -135,8 +135,58 @@ def from_pdata(data, sections, base, text):
 						handler = base + struct.unpack_from("<I", data, after)[0]
 						if in_text(handler, text):
 							handlers.add(handler)
+						handlers |= scope_targets(data, after + 4, base, text)
 				break
 	return starts, handlers
+
+
+def scope_targets(data, at, base, text):
+	"""Addresses named by a `__C_specific_handler` SCOPE_TABLE.
+
+	What follows the handler RVA depends on which handler it is, and for
+	MSVC's `__try`/`__except` it is:
+
+	    DWORD Count
+	    { DWORD Begin, End, Handler, JumpTarget } * Count
+
+	`JumpTarget` is where execution resumes once the `__except` body has run
+	and `Handler` is a filter funclet. **Both are code the unwinder enters,
+	no branch instruction names either, and no relocation records them** --
+	so without this a window is free to swallow one, which is the hazard
+	Finding 16 exists to prevent for switch tables.
+
+	Measured on Starfield: 23 targets, 8 of which nothing else knew about,
+	and none swallowed. A latent hazard rather than a live bug, closed
+	because it costs nothing to close.
+
+	**Parsing is permissive and validated rather than trusted.** A C++ EH
+	function carries a `FuncInfo` here instead, which this will read as
+	nonsense -- so every field is checked to be a plausible `.text` address
+	before any of it is believed. Getting that wrong in the generous
+	direction costs a refused site; getting it wrong in the other direction
+	costs correctness.
+	"""
+	if at + 4 > len(data):
+		return set()
+	count = struct.unpack_from("<I", data, at)[0]
+	if not 1 <= count <= 64 or at + 4 + count * 16 > len(data):
+		return set()
+	found = set()
+	for i in range(count):
+		begin, end, handler, jump = struct.unpack_from("<IIII", data,
+		                                              at + 4 + i * 16)
+		if not (0 < begin < end and in_text(base + begin, text)
+		        and in_text(base + end, text)):
+			return set()		# not a scope table; believe none of it
+		if handler not in (0, 1) and not in_text(base + handler, text):
+			return set()
+		if jump and not in_text(base + jump, text):
+			return set()
+		if jump:
+			found.add(base + jump)
+		if handler not in (0, 1):
+			found.add(base + handler)
+	return found
 
 
 def from_switch_tables(data, sections, base, text):

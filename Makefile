@@ -73,7 +73,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census \
+        census check-spill check-unwind \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -364,7 +364,14 @@ WINE_ENV   = WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe
 # as intermediates, and a missing secondary is not rebuilt when the thing
 # depending on it already exists, which is how a stale rewrite would go
 # unnoticed.
-.SECONDARY: $(PE_LISTINGS)
+# The two extra harnesses build PEs that PE_NAMES does not list, so make
+# would treat them as intermediates and delete them after every run.
+# Named, never bare: a bare .SECONDARY protects every pattern target,
+# object files included, and then declines to rebuild a missing one.
+EXTRA_PES  = $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
+             $(BUILD_DIR)/pe-unwind.exe $(BUILD_DIR)/pe-unwind.asm \
+             $(BUILD_DIR)/pe-unwindstub.exe $(BUILD_DIR)/pe-unwindstub.asm
+.SECONDARY: $(PE_LISTINGS) $(EXTRA_PES)
 
 $(BUILD_DIR)/pe-%.exe: tools/pe_build.py | $(BUILD_DIR)
 	$(PYTHON) tools/pe_build.py sample $* $@
@@ -415,6 +422,83 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 	done; \
 	echo "check-pe: AVX in, SSE out, and the answers survived the trip"
 
+# The three ways a stub can get a scratch register when none is dead, all
+# built and all run. `none` is the default and must REFUSE the site, so the
+# rewritten binary still dies of an illegal instruction -- that assertion is
+# what stops the other two passing for the wrong reason, since a site that
+# was never the hard case would run under all three.
+#
+# What this proves is that each mechanism round-trips the borrowed register.
+# What it cannot prove is what happens when a thread is inside the stub:
+# see check-unwind for the stack case, and Finding 46 for the pool's race,
+# which no single-threaded test can reach.
+#
+# Termination: one wine invocation per mode, each under a timeout.
+check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-spill: wine is not installed"; exit 1; }
+	@mkdir -p $(PE_PREFIX)
+	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
+	@set -e; \
+	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	want=`$(PYTHON) tools/pe_build.py names | \
+	      awk '$$1 == "spill" { print $$2 }'`; \
+	for mode in none stack pool; do \
+		$(PYTHON) tools/detour.py --spill=$$mode apply \
+			$(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
+			$(BUILD_DIR)/sse-spill-$$mode.exe >/dev/null; \
+		$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-spill-$$mode.exe \
+			>/dev/null 2>&1 && got=0 || got=$$?; \
+		echo "check-spill: --spill=$$mode returned $$got, want $$want"; \
+		if [ "$$mode" = "none" ]; then \
+			if [ "$$got" = "$$want" ]; then \
+				echo "check-spill: --spill=none answered $$want, so the"; \
+				echo "             site was never the hard case and the"; \
+				echo "             other two prove nothing"; \
+				exit 1; \
+			fi; \
+		elif [ "$$got" != "$$want" ]; then \
+			echo "check-spill: --spill=$$mode did not round-trip"; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "check-spill: none refuses; stack and pool both give the register back"
+
+# Can an exception be dispatched from inside a stub? Two programs that fault
+# on purpose, both registering a handler through .pdata -- which is how a PE
+# with no imports gets SEH at all.
+#
+# The control faults on a plain `mov` and its handler runs. The other faults
+# on a lowered instruction inside a stub, WITH NO SPILL ANYWHERE, and its
+# handler does not: a stub is entered by a jump and has no .pdata, so the
+# dispatcher reads a return address that was never one.
+#
+# **This asserts the defect rather than the fix**, deliberately. It is what
+# `scratch.py` assumed about spilling and what turns out to be true of every
+# detour, and a target that goes green the day somebody gives stubs their
+# unwind data is worth more than a paragraph saying so. Change the 5 to 42
+# on that day. Finding 46.
+#
+# Termination: one wine invocation per program, each under a timeout.
+check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-unwind: wine is not installed"; exit 1; }
+	@mkdir -p $(PE_PREFIX)
+	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
+	@set -e; \
+	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	for name in unwind unwindstub; do \
+		want=`$(PYTHON) tools/pe_build.py names | \
+		      awk -v n=$$name '$$1 == n { print $$2 }'`; \
+		$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-$$name.exe \
+			>/dev/null 2>&1 && got=0 || got=$$?; \
+		echo "check-unwind: $$name returned $$got, want $$want"; \
+		if [ "$$got" != "$$want" ]; then \
+			echo "check-unwind: $$name changed behaviour"; exit 1; \
+		fi; \
+	done; \
+	echo "check-unwind: a handler is reached from .text and not from a stub"
+
 # Prove every register the liveness scan claims as scratch is really dead,
 # by enumerating paths rather than intersecting sets. Needs the listing, so
 # it cannot live in `check`.
@@ -437,7 +521,10 @@ hooks:
 # clean target is the one thing everybody runs without reading.
 clean:
 	rm -f $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(GENERATED) \
-	      $(PE_SOURCES) $(PE_LISTINGS) $(PE_FIXED) \
+	      $(PE_SOURCES) $(PE_LISTINGS) $(PE_FIXED) $(EXTRA_PES) \
+	      $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe \
+	      $(BUILD_DIR)/sse-spill-none.exe $(BUILD_DIR)/sse-spill-stack.exe \
+	      $(BUILD_DIR)/sse-spill-pool.exe \
 	      $(BUILD_DIR)/icache_bench \
 	      $(BUILD_DIR)/after.asm $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"

@@ -2624,6 +2624,126 @@ committing, every surviving VEX site in the binary is accounted for by exactly t
 causes -- declined by the collector, refused for want of a lowering, or bytes objdump
 could not decode.
 
+### Finding 46 -- three ways to get a register, and the objection to all of them
+
+`scratch.py` rejected spilling for a stated reason and the decision has sat there since
+Finding 18. Building the alternatives rather than arguing about them turned the question
+inside out.
+
+`tools/detour.py --spill=none|stack|pool` selects where a borrowed register is saved.
+It is an evaluation switch and not a tuning knob: **the default refuses the site, as it
+always has**, and the other two exist so that all three can be built and run.
+
+#### What each one costs
+
+```
+                         none        stack         pool
+VEX in .text           21,657       18,120       18,120
+translated              97.3%        97.7%        97.7%
+detours               193,485      195,946      195,946
+stub bytes          3,061,515    3,168,708    3,161,930
+instructions per spill      -            4            2
+extra sections              0            0     1, writable
+```
+
+**Both recover exactly the same 3,537 sites**, for within 7 KB of the same size, on a
+105 MB image. So the choice has nothing to do with coverage or cost and everything to do
+with what can go wrong.
+
+`make check-spill` builds and runs all three. `none` must refuse the site and leave the
+binary dying at 29 -- that assertion is what stops the other two passing for the wrong
+reason, since a site that was never the hard case would run under all of them.
+
+#### The pool wants a writable code section, and cannot be made thread-safe
+
+The first build of the pool spill stored into the stub section and every run died at
+`0xC0000005`. Code sections are not writable, and making the stub section writable would
+make it W+X. It has a section of its own now -- one page, writable, deliberately not
+executable -- which is the option at its best and still costs an extra section.
+
+What it cannot be given is thread safety. One slot is shared by every stub, so two
+threads inside any two spilling stubs corrupt each other. A slot per stub is 4,509 x 16
+bytes and still races when one hot stub is entered twice at once. **The only fix is
+per-thread storage**, and that is worse than it sounds here: a static TLS slot means
+extending the TLS directory's raw data, and reaching one costs a load from `gs:[0x58]`,
+an index, and a pointer chase -- three or four instructions and a general-purpose
+register the site has not got.
+
+#### The experiment that moved the question
+
+The recorded objection is that a stub has no `.pdata`, so `RtlVirtualUnwind` treats it as
+a leaf and reads the frame from an `rsp` the spill has moved. **A stub is entered by a
+jump**, so `[rsp]` was never a return address, and that reasoning holds whether or not
+anything moved it.
+
+`make check-unwind` settles it. Two programs, each faulting on purpose and each
+registering a handler through `.pdata` -- which is how a PE with no imports and no CRT
+gets SEH at all, the dispatcher finding the handler in the unwind info rather than
+through anything registered at run time. The handler points `CONTEXT.Rip` at a recovery
+label and returns `ExceptionContinueExecution`, so a dispatch that reaches it answers 42.
+
+```
+fault on a plain mov in .text        42    the handler ran
+fault inside a stub                   5    0xC0000005, unhandled
+```
+
+**With no spill anywhere.** So exception dispatch from a stub is already broken, for all
+193,485 of them, and has been since Finding 15. The objection in `scratch.py` is real and
+it is misattributed: it is an objection to detouring, not to spilling, and spilling
+neither creates it nor measurably worsens it.
+
+That makes the two questions one question. **Giving the stub section unwind data fixes a
+live defect and removes the only stated objection to the stack spill at the same time.**
+The shape is already known: a `RUNTIME_FUNCTION` per stub whose `UNWIND_INFO` carries
+`UNW_FLAG_CHAININFO` back to the enclosing function, plus a `UWOP_ALLOC_SMALL` where the
+stub spills, in a `.pdata` copied to a new section with the exception directory
+repointed. Every section after `.text` stays byte-identical, because the old `.pdata`
+stays where it is and simply stops being pointed at.
+
+One limitation to know before building it: a `__try` scope table is keyed on the
+faulting address, and a stub's address is inside no scope. So chaining turns "the process
+dies" into "the exception propagates correctly to outer frames" rather than into "the
+`__try` that should have caught it does".
+
+#### What this could not test
+
+`wine` is not Windows and its unwinder is a reimplementation, so the 5 is strong evidence
+about the mechanism and not proof about the shipping loader. Nothing here ran more than
+one thread, so the pool's race is argued rather than measured. Both are named because an
+absent gap gets guessed at.
+
+### Finding 47 -- the SEH scope table, found while looking at something else
+
+`targets.py` reads the handler RVA out of an `UNWIND_INFO` and stopped there. For a
+function MSVC compiled with `__try`/`__except` the handler is `__C_specific_handler`, and
+what follows that RVA is a `SCOPE_TABLE` whose records carry a filter funclet and a
+`JumpTarget` -- **the address execution resumes at once the `__except` body has run**.
+Both are code the unwinder enters, no branch instruction names either, and no relocation
+records them. Nothing was stopping a window swallowing one, which is exactly the hazard
+Finding 16 exists to prevent for switch tables.
+
+```
+functions with a handler            85,878
+  handler data is a scope table         21
+scope targets                           23
+  already in the target set             15
+  not in the target set                  8
+  swallowed by a committed window        0
+```
+
+**A latent hazard rather than a live bug**, and closed because it costs nothing to close.
+The parse is permissive and then validated rather than trusted: a C++ EH function carries
+a `FuncInfo` there instead, which reads as nonsense, so every field is checked to be a
+plausible `.text` address before any of it is believed. Wrong in the generous direction
+costs a refused site; wrong the other way costs correctness.
+
+The 21 is low for a 102 MB C++ binary and the reason is worth recording: modern MSVC
+folds `__try` into `__CxxFrameHandler4`'s own state machine rather than emitting a
+separate scope table, and that format is not decoded here. What saves it is that C++ EH
+resumes through funclets which have `.pdata` entries of their own, and continuation
+addresses inside them are materialised by `lea` -- both of which the target set already
+covers, by Finding 30.
+
 ### Final state
 
 ```
@@ -2672,14 +2792,23 @@ code quickly.
 
 ### The two decisions that are not the implementer's
 
-1. **May a stub spill to the stack?** About 4,500 sites need a scratch register in a
-   function where xmm4 and xmm5 are both genuinely used. Spilling was rejected in
-   `tools/scratch.py` for a stated reason -- Win64 has no red zone, the stub section
-   has no `.pdata`, so `RtlVirtualUnwind` treats a stub as a leaf and reads the frame
-   from an `rsp` that has moved, and anything walking the stack mid-stub gets a wrong
-   answer. Reopening that is the copyright holder's call, not a refactor. Finding 45
-   closed the one alternative that needed no spill: computing into src1 and moving the
-   result out is worth 249 of them and no more.
+1. **Give the stub section unwind data, and then may a stub spill?** These were two
+   questions until Finding 46 measured them and they became one.
+
+   Spilling was rejected in `tools/scratch.py` because the stub section has no
+   `.pdata`, so `RtlVirtualUnwind` treats a stub as a leaf and reads the frame from an
+   `rsp` the spill has moved. **That is true and it is misattributed**: a stub is
+   entered by a jump, so `[rsp]` was never a return address, and `make check-unwind`
+   shows an exception raised inside a stub going undispatched **with no spill
+   anywhere**. The defect belongs to detouring and every one of the 193,485 detours
+   already has it.
+
+   So the work to do is the same either way -- a `RUNTIME_FUNCTION` per stub chained
+   back to its enclosing function -- and it fixes a live defect before it enables
+   anything. What the holder still decides is whether to spill once it is there:
+   `--spill=stack` is built and measured at 3,537 sites for 107 KB, `--spill=pool` buys
+   the identical sites and cannot be made thread-safe, and Finding 45 closed the one
+   alternative needing no spill at all, at 249 sites.
 2. **Build the Y1 register model?** 12,552 `vmovups` stores and 11,226 loads are
    neither copies nor zero fills, and need a ymm represented as two xmm registers
    across a basic block -- register allocation, the largest single remaining win, and
@@ -3359,6 +3488,8 @@ than compiling with MSVC or a cross-compiler.
 | `make check-pe` | eleven PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity | **semantics -- every one of these is about shape** |
+| `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
+| `make check-unwind` | that a handler registered through `.pdata` is reached from `.text` and **not** from a stub | whether the shipping Windows unwinder agrees with wine's |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
 
 The row to keep in mind is `detour-verify`. It is the only check that runs against
@@ -3380,8 +3511,12 @@ Named rather than left implicit, because an absent gap gets guessed at:
   zero fill -- but the Y1 register representation and the Y2 shadow do not exist, and
   Finding 40 names a consequence that will have to be repaired when they do: the
   in-place lowerings destroy the [255:128] zeroing every VEX.128 write performs.
-- **Exception paths.** `.xdata` is carried through untouched and never exercised.
-  Rung 4 exists to find what that misses.
+- **Exception paths.** `.xdata` is carried through untouched, and Finding 46 measured
+  what that costs: **an exception raised inside a stub is never dispatched**, because
+  the stub section has no `.pdata` and a stub is entered by a jump, so the unwinder
+  reads a return address that was never one. That is a live defect in all 193,485
+  detours rather than a gap in the testing, and it is the strongest argument for
+  giving the stub section unwind data.
 - ~~Surviving VEX sites are unaccounted for.~~ **Closed** by Finding 35: `make
   census` reconciles all 10,276 exactly, and the residue was an error in the
   accounting rather than anything the rewriter did. What it left behind is a real

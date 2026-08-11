@@ -61,6 +61,10 @@ JMP_REL32 = 0xE9
 SECTION_NAME = b".avxsse\0"
 # CODE | EXECUTE | READ
 SECTION_FLAGS = 0x60000020
+DATA_NAME = b".avxdata\0"[:8]
+# INITIALIZED_DATA | READ | WRITE, and deliberately not EXECUTE.
+DATA_FLAGS = 0xC0000040
+SECTION_ALIGNMENT = 0x1000
 
 
 def registers_of(vex, tail):
@@ -404,6 +408,15 @@ PERMIL_POOL = (
 POOL_MASK3, POOL_BCAST, POOL_STEP = 0, 16, 32
 
 
+# How a stub gets a scratch register when the liveness scan finds none dead.
+# **The default is `none`, which refuses the site**, and that is the state to
+# leave this in until the copyright holder decides otherwise: the two
+# alternatives each buy the same sites and each pay for them in a different
+# currency. Finding 46 measures all three.
+SPILL_NONE, SPILL_STACK, SPILL_POOL = "none", "stack", "pool"
+SPILL = SPILL_NONE
+
+
 def encode_rip(prefix, opcode, reg, target, at):
 	"""An SSE instruction whose memory operand is RIP-relative."""
 	out = bytearray()
@@ -419,6 +432,47 @@ def encode_rip(prefix, opcode, reg, target, at):
 		return None
 	out += struct.pack("<i", displacement)
 	return bytes(out)
+
+
+def spill_register(registers):
+	"""A register the site does not name, to borrow and give back.
+
+	Always available: a site has at most four operands and there are sixteen
+	registers. This is not `find_scratch` -- nothing is claimed about the
+	register being dead, which is exactly why it has to be saved first.
+	"""
+	used = set()
+	for operand in registers:
+		used.update(scratch_finder.xmm_numbers(operand))
+	for number in range(16):
+		if number not in used:
+			return number
+	return None
+
+
+def encode_spill(borrowed, save, at, spill_base):
+	"""Save or restore a borrowed register. `save` picks the direction.
+
+	**`movups`, not `movaps`.** Win64 guarantees `rsp` is 16-byte aligned at
+	a call boundary and says nothing about an arbitrary instruction in the
+	middle of a function, so an aligned move here would fault on exactly the
+	sites that are hardest to reproduce.
+	"""
+	opcode = b"\x0f\x11" if save else b"\x0f\x10"
+	if SPILL == SPILL_POOL:
+		return encode_rip(None, opcode, borrowed, spill_base, at)
+	out = bytearray()
+	if borrowed >= 8:
+		out.append(0x44)			# REX.R
+	out += opcode
+	out.append(((borrowed & 7) << 3) | 4)	# mod 00, rm 100 -- SIB follows
+	out.append(0x24)			# base rsp, no index
+	return bytes(out)
+
+
+# sub $16,%rsp and add $16,%rsp, which the pool spill does not need.
+STACK_OPEN = bytes([0x48, 0x83, 0xEC, 0x10])
+STACK_CLOSE = bytes([0x48, 0x83, 0xC4, 0x10])
 
 
 def encode_pslld_immediate(destination, amount):
@@ -1020,7 +1074,7 @@ def upper_half_read_later(instructions, index, register, limit=40,
 
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
                stub_address, scratch=None, pool=0, preceding=(),
-               strategy=None):
+               strategy=None, spill_base=0):
 	"""The stub body for one window, placed at stub_address.
 
 	`start` is the window's first byte, which is the site's own address
@@ -1032,7 +1086,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	than on the instruction alone. `("pair", ...)` is a 256-bit copy and takes
 	the whole window; `("zero", None)` is a 256-bit store of a register a
 	VEX.128 zeroing idiom emptied, and is an ordinary one-site window in every
-	other respect.
+	other respect. `("spill", n)` is a site with no dead register, lowered by
+	borrowing register n and giving it back.
 	"""
 	kind = strategy[0] if strategy is not None else None
 	if kind == "pair":
@@ -1052,7 +1107,32 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		body += fixed
 
 	site = start + sum(len(entry[1]) for entry in preceding)
-	if kind == "zero":
+	if kind == "spill":
+		# Borrow a register the site does not name, and give it back. The
+		# save has to come before the lowering and the restore after it, so
+		# neither can live inside lower_vex.
+		borrowed = strategy[1]
+		if SPILL == SPILL_STACK:
+			body += STACK_OPEN
+		saved = encode_spill(borrowed, True, stub_address + len(body),
+		                     spill_base)
+		if saved is None:
+			return None
+		body += saved
+		lowered = lower_vex(site, encoding, operands, mnemonic,
+		                    stub_address + len(body), borrowed, pool)
+		if lowered is None:
+			return None
+		body += lowered
+		restored = encode_spill(borrowed, False, stub_address + len(body),
+		                        spill_base)
+		if restored is None:
+			return None
+		body += restored
+		if SPILL == SPILL_STACK:
+			body += STACK_CLOSE
+		lowered = b""
+	elif kind == "zero":
 		vex = inplace.decode_vex(encoding)
 		lowered = lower_ymm_zero_store(vex, encoding[vex["length"]:], site,
 		                               len(encoding), stub_address + len(body))
@@ -1313,6 +1393,16 @@ def collect(binary, listing):
 			scratch = scratch_finder.find_scratch(plain, index, scope=scope)
 			trial = lower_vex(address, encoding, operands, mnemonic,
 			                  address, scratch, address)
+			if trial is None and SPILL != SPILL_NONE:
+				# No register is dead here, so borrow one that is live and
+				# give it back. Which backing store the save uses is the
+				# whole of the question Finding 46 measures.
+				borrowed = spill_register(registers)
+				if borrowed is not None and lower_vex(
+						address, encoding, operands, mnemonic, address,
+						borrowed, address) is not None:
+					strategy = ("spill", borrowed)
+					trial = True
 			if trial is None:
 				if aliased:
 					skipped["src2 aliases dst, no scratch"] += 1
@@ -1670,6 +1760,20 @@ def main(argv):
 	if not argv or argv[0] in ("-h", "--help"):
 		print(__doc__.strip())
 		return 0
+	# `--spill=` selects where a borrowed register is saved, and it is an
+	# evaluation switch rather than a tuning knob: the default refuses the
+	# site, as it always has, and the other two exist so that all three can
+	# be built and compared. See Finding 46.
+	global SPILL
+	argv = list(argv)
+	for i, item in enumerate(argv):
+		if item.startswith("--spill="):
+			SPILL = item.split("=", 1)[1]
+			if SPILL not in (SPILL_NONE, SPILL_STACK, SPILL_POOL):
+				print(f"detour.py: unknown spill {SPILL!r}", file=sys.stderr)
+				return 2
+			del argv[i]
+			break
 	mode = argv[0]
 
 	if mode == "selftest":
@@ -1714,7 +1818,7 @@ def stub_base_of(data):
 	return image_base + (highest + alignment - 1) // alignment * alignment
 
 
-def place_stubs(candidates, stub_base):
+def place_stubs(candidates, stub_base, spill_base=0):
 	"""Choose and build the stubs. (placed, blob, swallowed, overlap, refused)
 
 	**One selection rule, executed once and used by both apply and verify.**
@@ -1802,7 +1906,8 @@ def place_stubs(candidates, stub_base):
 			j, extra, grew = extension
 			body = build_stub(start, encoding, operands, mnemonic,
 			                  window + grew, list(displaced) + extra,
-			                  stub_address, scratch, pool, preceding, strategy)
+			                  stub_address, scratch, pool, preceding, strategy,
+			                  spill_base)
 			if body is None:
 				# The extended stub would not build. Fall back to the plain
 				# one rather than lose both -- taking a passenger along must
@@ -1815,7 +1920,7 @@ def place_stubs(candidates, stub_base):
 		if body is None:
 			body = build_stub(start, encoding, operands, mnemonic, window,
 			                  displaced, stub_address, scratch, pool,
-			                  preceding, strategy)
+			                  preceding, strategy, spill_base)
 		if body is None:
 			refused.add(start)
 			continue
@@ -1860,8 +1965,18 @@ def apply_all(binary, listing, output):
 	# is, and the size depends on the stubs, which depend on the address --
 	# so measure with a placeholder address first, then build for real.
 	stub_base = stub_base_of(bytes(data))
-	placed, blob, _swallowed, overlapped, refused = place_stubs(candidates,
-	                                                            stub_base)
+	# **A pool spill writes, and code sections are not writable.** The first
+	# build of it stored into the stub section and every run died at
+	# 0xC0000005. Making the stub section writable would work and would make
+	# it W+X, so the slot goes in a section of its own -- one page of
+	# writable data, laid down FIRST so that both addresses are known before
+	# a single displacement is computed.
+	spill_base = 0
+	if SPILL == SPILL_POOL:
+		spill_base = stub_base
+		stub_base += SECTION_ALIGNMENT
+	placed, blob, _swallowed, overlapped, refused = place_stubs(
+		candidates, stub_base, spill_base)
 
 	for site, window, stub_address in placed:
 		offset = raddr + (site - vaddr)
@@ -1869,10 +1984,14 @@ def apply_all(binary, listing, output):
 		pad = window - 5
 		data[offset:offset + window] = jump + inplace.nop_padding(pad)
 
-	image, section_va = add_section(bytes(data), SECTION_NAME, bytes(blob),
+	staged = bytes(data)
+	pe = struct.unpack_from("<I", staged, 0x3C)[0]
+	image_base = struct.unpack_from("<Q", staged, pe + 24 + 24)[0]
+	if SPILL == SPILL_POOL:
+		staged, data_va = add_section(staged, DATA_NAME, bytes(16), DATA_FLAGS)
+		assert data_va == spill_base - image_base, "spill section moved"
+	image, section_va = add_section(staged, SECTION_NAME, bytes(blob),
 	                                SECTION_FLAGS)
-	pe = struct.unpack_from("<I", bytes(data), 0x3C)[0]
-	image_base = struct.unpack_from("<Q", bytes(data), pe + 24 + 24)[0]
 	assert section_va == stub_base - image_base, "stub section moved"
 	open(output, "wb").write(image)
 	print(f"apply: {len(patches):,} in-place patches, {len(placed):,} detours, "

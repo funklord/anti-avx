@@ -436,6 +436,113 @@ ten:	.float 10.0
 """)
 
 
+
+# 12. A site with no dead register anywhere, for comparing the ways a stub
+# can get one. The indirect jump is what makes the liveness scan give up:
+# it cannot be followed, so nothing forward is provable, and a function
+# containing one is disqualified from the whole-function fallback too.
+#
+# `%xmm2` is the register `spill_register` will borrow, and it is loaded
+# before the site and read after it -- so a save or restore that does not
+# round-trip returns something other than 107. Under `--spill=none` the site
+# is refused, stays VEX, and the program dies at 29.
+#
+# Not in PE_NAMES: `make check-pe` runs the default rewriter, which refuses
+# this by design. `make check-spill` is where it belongs.
+PROGRAMS["spill"] = (107, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	ten(%rip), %xmm1
+	vmovss	three(%rip), %xmm0
+	vmovss	hundred(%rip), %xmm2	/* the register the spill will borrow */
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, and no register is dead */
+	leaq	after(%rip), %rax
+	jmp	*%rax			/* indirect: nothing forward is provable */
+after:
+	vaddss	%xmm2, %xmm0, %xmm0	/* 7 + 100, only if xmm2 came back */
+	vcvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+hundred:	.float 100.0
+""")
+
+
+
+# 13 and 14. Can an exception be dispatched from inside a stub?
+#
+# `scratch.py` rejects spilling because a stub has no `.pdata`, so
+# `RtlVirtualUnwind` treats it as a leaf and reads the frame from an `rsp`
+# the spill has moved. That reasoning has a hole worth testing: a stub is
+# entered by a JUMP, so `[rsp]` was never a return address, and the unwind is
+# wrong whether or not anything moved it.
+#
+# Both programs fault deliberately and both register a handler through
+# `.pdata` -- which is how a PE with no imports and no CRT gets SEH at all,
+# the dispatcher finding the handler in the unwind info rather than through
+# anything registered at run time. The handler points `CONTEXT.Rip` at
+# `recover` and `CONTEXT.Rsp` at the establisher frame, so a dispatch that
+# reaches it returns 42.
+#
+# `unwind` faults on a plain `mov` that no rewriting touches: the control.
+# `unwindstub` faults on the lowered `addss` inside a stub. If the two
+# disagree, the stub is the reason.
+_UNWIND_TAIL = """
+recover:
+	movl	$42, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+handler:
+	/* rcx record, rdx establisher frame, r8 context, r9 dispatcher */
+	leaq	recover(%rip), %rax
+	movq	%rax, 0xf8(%r8)		/* CONTEXT.Rip */
+	movq	%rdx, 0x98(%r8)		/* CONTEXT.Rsp */
+	xorl	%eax, %eax		/* ExceptionContinueExecution */
+	ret
+ten:	.float 10.0
+"""
+
+PROGRAMS["unwind"] = (42, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	ten(%rip), %xmm1
+	xorl	%eax, %eax
+	movl	(%rax), %ecx		/* faults, and nothing rewrites it */
+	movl	$7, %eax
+	addq	$40, %rsp
+	ret
+""" + _UNWIND_TAIL)
+
+# **The 5 is the defect, not the answer.** 0xC0000005 truncated: the
+# dispatcher never found the handler. When stubs carry unwind data this
+# becomes 42 and this comment goes with it.
+PROGRAMS["unwindstub"] = (5, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	ten(%rip), %xmm1
+	xorl	%eax, %eax
+	vaddss	(%rax), %xmm1, %xmm0	/* faults INSIDE the stub */
+	nop
+	movl	$7, %eax
+	addq	$40, %rsp
+	ret
+""" + _UNWIND_TAIL)
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:
@@ -448,28 +555,43 @@ def assemble(source):
 			raise SystemExit(1)
 		subprocess.run(["objcopy", "-O", "binary", "--only-section=.text",
 		                str(obj), str(bin_)], check=True)
-		symbols = subprocess.run(["objdump", "-t", str(obj)],
+		listing = subprocess.run(["objdump", "-t", str(obj)],
 		                         capture_output=True, text=True).stdout
-		end = None
-		for line in symbols.splitlines():
-			if line.endswith(" func_end"):
-				end = int(line.split()[0], 16)
-		if end is None:
+		symbols = {}
+		for line in listing.splitlines():
+			fields = line.split()
+			if len(fields) >= 2 and ".text" in line:
+				try:
+					symbols[fields[-1]] = int(fields[0], 16)
+				except ValueError:
+					pass
+		if "func_end" not in symbols:
 			raise SystemExit("pe_build: func_end not found")
-		return bin_.read_bytes(), end
+		return bin_.read_bytes(), symbols
 
 
 def align(value, to):
 	return (value + to - 1) // to * to
 
 
-def build(path, text, code_size):
+def build(path, text, code_size, handler=None):
 	"""Write a PE whose entry point is the start of `text`."""
 	# .xdata first, because .pdata points into it. A minimal UNWIND_INFO:
 	# version 1, no flags, no prolog, no unwind codes. Nothing here ever
 	# unwinds; it exists so the function HAS unwind data, which is what
 	# puts it in .pdata and therefore in the rewriter's code oracle.
-	xdata = struct.pack("<BBBB", 1, 0, 0, 0)
+	#
+	# **Unless the program has a `handler` symbol**, in which case the flags
+	# byte carries UNW_FLAG_EHANDLER and a handler RVA follows the (empty,
+	# and therefore already even) unwind-code array. That is how a program
+	# with no imports and no CRT gets structured exception handling: the
+	# dispatcher finds the handler through `.pdata` rather than through
+	# anything the program registers at run time.
+	if handler is None:
+		xdata = struct.pack("<BBBB", 1, 0, 0, 0)
+	else:
+		xdata = struct.pack("<BBBBI", 1 | (1 << 3), 0, 0, 0,
+		                    SECTION_ALIGNMENT + handler)
 
 	sections = []
 	rva = SECTION_ALIGNMENT
@@ -561,8 +683,9 @@ def main(argv):
 		print(f"pe_build.py: no program {name!r}", file=sys.stderr)
 		return 2
 	expected, source = PROGRAMS[name]
-	text, code_size = assemble(source)
-	sections = build(output, text, code_size)
+	text, symbols = assemble(source)
+	code_size = symbols["func_end"]
+	sections = build(output, text, code_size, symbols.get("handler"))
 	print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
 	      f"function is {code_size} of them, expected exit code {expected}")
 	return 0
