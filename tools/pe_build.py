@@ -595,6 +595,38 @@ skip:
 """ + _UNWIND_TAIL)
 
 
+
+# 16. A 256-bit copy with instructions between the load and the store, which
+# is what Finding 39 refused and Finding 50 takes by holding the upper half
+# in a second register.
+#
+# The instructions in between are the point. They compute the destination
+# address, so they cannot be moved after the store and they cannot be moved
+# before the load -- which is exactly why interleaving the four moves does
+# not work and why the register does. Reading back offset 16 proves the
+# upper half made the trip.
+PROGRAMS["gapped"] = (64, """
+	.text
+	.globl _start
+_start:
+	subq	$104, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	vmovups	(%rsi), %ymm0		/* the load ... */
+	movq	%rsp, %rdi
+	addq	$8, %rdi
+	subq	$8, %rdi		/* ... a gap that decides where ... */
+	vmovups	%ymm0, (%rdi)		/* ... the store goes */
+	movl	16(%rdi), %eax		/* upper half of the copy: 64 */
+	addq	$104, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 64, 6, 7, 8
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

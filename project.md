@@ -2864,19 +2864,74 @@ and this is a wine limitation rather than an ABI one. **That is the single check
 re-running the day a Windows host exists**, and it is a fifteen-second check -- run
 `sse-unwindspill.exe` and see whether it answers 42 or 99.
 
+### Finding 50 -- the register model, and the measurement that picked its shape
+
+Finding 39 refused the gapped copy and gave the reason: the four-move lowering
+**interleaves** the load and the store, so anything between them is reordered across one
+half or the other, and proving that safe needs alias analysis. It named the way out --
+load both halves before storing either, which needs a second register -- and stopped.
+
+Holding the upper half in a second register does not merely make it possible. It makes
+the whole problem go away:
+
+```
+movups (%rsi),%xmm0        movups 0x10(%rsi),%xmm1
+... untouched ...
+movups %xmm0,(%rdi)        movups %xmm1,0x10(%rdi)
+```
+
+Both loads happen where the load was and both stores where the store was, so **nothing
+in between moves at all** and there is nothing to alias-analyse.
+
+#### Two measurements, and the second chose the design
+
+```
+gapped copies                                  2,718
+  a register is free across the span           2,279     84%
+    one window would cover the whole span      2,223     98% of those
+```
+
+The first says the model works at all: a register dead at the load and untouched until
+the store exists in five cases out of six. The second decided how to build it.
+
+**Two windows that must both commit or neither is atomicity across the placement loop**,
+which nothing here has ever needed -- a reservation set, a look-ahead, and a new way for
+`census` to be wrong. One window covering the load, the span and the store is an
+*ordinary* window: it widens, it swallows, it reconciles, and every existing invariant
+applies unchanged. It costs the 2% where a branch target, a control transfer or a
+function boundary falls inside the span.
+
+Counting that second number first is what made this a small change. **The measurement
+cost one query and saved building the hard design for a 2% return.**
+
+```
+VEX in .text     21,657 -> 18,516      97.3% -> 97.7%
+refused, stub not buildable      6,383 -> 3,707
+```
+
+1,315 spans are taken, against the 2,223 the measurement offered. The gap is the
+implementation being stricter than the measurement was: it refuses any mention of the
+register inside the span, where the measurement allowed a pure read, and 652 spans hold
+an operand that cannot be moved -- a lead, since `narrow_piece` handles RIP-relative
+operands and the failures are in `moved_instruction` on the span instead.
+
+**97.7% is the figure `--spill=stack` would have reached**, arrived at without moving
+`rsp` and without an unwind question. That was not the plan; it is worth recording
+because the two roads were costed against each other and only one of them was safe.
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      193,485
-skipped for overlap                            35,454
-refused, stub not buildable                     6,383
-VEX in .text            805,131 ->      21,657   783,474 removed, 97.3%
+detoured                                      194,800
+skipped for overlap                            35,722
+refused, stub not buildable                     3,707
+VEX in .text            805,131 ->      18,516   786,615 removed, 97.7%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 71,497 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 74,380
+section, every section after `.text` is byte-identical, all 77,824 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 82,037
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -2894,7 +2949,9 @@ src2 aliases dst, no scratch           3,729     needs a register; 249 do not
 ymm upper half read later              1,766     what the edges could not resolve
 sequence with no usable scratch          780     needs a register
 no direct SSE form                       710     mostly vextractf128/vinsertf128
+ymm span operand cannot be offset        652     a lead, in moved_instruction
 next instruction is a branch target      511
+no register free across the ymm span     441
 next instruction transfers control       424
 outside .pdata                           403
 sequence shape not handled               164
@@ -2936,7 +2993,9 @@ code quickly.
    and cannot be made thread-safe; and Finding 45 closed the one alternative needing no
    spill at all, at 249 sites. All three are built, so the day any of those facts
    changes the flag is already there.
-2. **Build the Y1 register model?** 12,552 `vmovups` stores and 11,226 loads are
+2. **How much further should the Y1 register model go?** Finding 50 built its first
+   piece -- the gapped copy, holding an upper half in a second register across a span --
+   and it works. 12,552 `vmovups` stores and 11,226 loads are
    neither copies nor zero fills, and need a ymm represented as two xmm registers
    across a basic block -- register allocation, the largest single remaining win, and
    a different kind of work from anything done so far. Findings 39, 40 and 44 have
@@ -3196,6 +3255,16 @@ only half the lowering reads, so it does not matter whether the `vpxor` was lowe
 Findings 40 and 44 have the measurements and the scan's refusals: it walks back to
 the nearest **write**, passing over anything that only reads the register and over a
 conditional branch it fell through, and refusing a branch target or a call.
+
+**Y1-span — the gapped copy (Finding 50).** Load and store separated by instructions
+that must not move. The upper half rides in a second register, dead at the load and
+untouched until the store, and the whole span goes into one stub:
+
+```
+vmovups m1,%ymm0        →  movups m1,%xmm0 ; movups m1+16,%xmm7
+... in between ...         ... in between, untouched ...
+vmovups %ymm0,m2           movups %xmm0,m2 ; movups %xmm7,m2+16
+```
 
 **Y2 — shadow fallback (rare, and now counted: 574 sites).** When a ymm value's halves
 are separated across basic blocks, maintain a 16 × 16-byte shadow area for upper
@@ -3612,7 +3681,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 37 mnemonics x 3 operand shapes executed on this CPU, every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | memory-operand forms, 256-bit, and the helper classes |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | eleven PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | twelve PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, branch reachability, stub integrity, and that the rebuilt function table is sorted and covers every stub byte | **semantics -- every one of these is about shape** |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
@@ -3622,7 +3691,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and eleven PEs built for the purpose.
+things: the lowerings executed in isolation, and twelve PEs built for the purpose.
 
 ### What is still not verified
 
@@ -3679,7 +3748,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **783,474 of 805,131 VEX sites, 97.3%** (Findings 24 to 45), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **786,615 of 805,131 VEX sites, 97.7%** (Findings 24 to 50), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
