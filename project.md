@@ -3260,6 +3260,48 @@ rather than left to be rediscovered. Closing it means either a harness that asse
 lowering from text rather than bytes, or a PE program of the kind `tools/pe_build.py`
 already builds -- the second is cheaper and is where the 256-bit strategies are tested.
 
+### Finding 58 -- the remaining stores are copies, not computations
+
+Stated here twice that the residue needs the model to track a computed value. **Measured,
+it does not.** Asking what defines each of the 12,552 stores the collector still declines:
+
+```
+a 256-bit load -- the copy idiom            9,742
+a branch target reaches the store           2,186
+256-bit arithmetic: the value is computed     316
+nothing within 80 instructions                286
+a call or jump in between                      19
+a 128-bit write: upper half is zero             3
+```
+
+Arithmetic is **2.5%** of it. Nine tenths are the copy idiom the run strategy already
+lowers, declined for a reason that has nothing to do with what the value is.
+
+The reason is control flow. `ymm_run` requires its whole span to be contiguous, free of
+branch targets and free of control transfers, because the span goes into one stub and a
+stub may swallow neither. The backward walk that produced the table above is laxer: it
+walks over a conditional branch, since falling through one means it was not taken. So the
+9,742 are overwhelmingly **copies whose load and store are in different basic blocks** --
+which is Class Y2's case, and the first measurement of it since Finding 7 counted 574 ymm
+definitions by a different method.
+
+That changes what to build next, and it is the third time in this project that counting
+first has redirected the work: the scratch scan wanted branch following rather than a
+wider window (Finding 27), the gapped pair looked obvious and was worth 68 sites (Finding
+39), and the register model turned out to be needed for control flow rather than for
+arithmetic. **The plan stated in this document before this finding was wrong**, and it was
+wrong in the direction of building something larger than the problem.
+
+Two routes, neither costed yet:
+
+- **A run that spans basic blocks.** The halves stay where they are and the upper half
+  rides a register across the branch, which needs the register to be free on every path
+  rather than over a straight line -- `scratch.py` already answers that shape of question
+  by intersecting over successors.
+- **The Y2 shadow.** Sixteen 16-byte slots, which the design has carried since the
+  beginning and which Finding 46 gave a home: the writable section the pool spill needed
+  exists, and its thread-safety objection applies here unchanged.
+
 ### Final state
 
 ```
