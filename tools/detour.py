@@ -58,6 +58,12 @@ import patch as inplace
 import scratch as scratch_finder
 import targets as target_set
 
+# A memory operand based on rsp; group 1 is its displacement if it has one.
+RSP_MEMORY = re.compile(r"(-?0x[0-9a-f]+)?\(%rsp\)")
+# `rsp` copied into another register, after which any access through
+# that register could reach the home space unseen.
+RSP_COPY = re.compile(r"%rsp,\s*%r[a-z0-9]+$")
+
 JMP_REL32 = 0xE9
 SECTION_NAME = b".avxsse\0"
 # CODE | EXECUTE | READ
@@ -415,7 +421,18 @@ POOL_MASK3, POOL_BCAST, POOL_STEP = 0, 16, 32
 # alternatives each buy the same sites and each pay for them in a different
 # currency. Finding 46 measures all three.
 SPILL_NONE, SPILL_STACK, SPILL_POOL = "none", "stack", "pool"
+# **The callee home space.** Win64 makes a caller reserve 32 bytes at the
+# bottom of its frame for its callees to spill their register arguments into,
+# and between calls nobody owns it: the caller does not write it -- the fifth
+# argument onward goes at [rsp+32] and up -- and no callee exists yet.
+#
+# It walks through all three objections at once. Nothing moves `rsp`, so
+# there is nothing to describe to an unwinder and Finding 68 does not apply.
+# It is the thread's own stack, so Finding 46's race does not apply. And
+# `(%rsp)` needs no register to address, so Finding 69 does not apply.
+SPILL_HOME = "home"
 SPILL = SPILL_NONE
+HOME_SPACE = 32
 
 
 def encode_rip(prefix, opcode, reg, target, at):
@@ -462,6 +479,9 @@ def encode_spill(borrowed, save, at, spill_base):
 	opcode = b"\x0f\x11" if save else b"\x0f\x10"
 	if SPILL == SPILL_POOL:
 		return encode_rip(None, opcode, borrowed, spill_base, at)
+	# The home space and the stack spill address the same place -- `(%rsp)`
+	# -- and differ only in whether `rsp` was moved to make room first. The
+	# home space needs no room made.
 	out = bytearray()
 	if borrowed >= 8:
 		out.append(0x44)			# REX.R
@@ -709,6 +729,80 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 		             + operation[offset + 4:])
 	body += operation
 	return bytes(body)
+
+
+def home_space_map(binary, plain, ranges):
+	"""Which functions can lend their callee home space to a stub.
+
+	Three conditions, and each is read off the binary rather than assumed:
+
+	  * the function **contains a call**, so the 32 bytes exist at all;
+	  * it **never addresses `[rsp+0..31]` itself**, so no local of its own
+	    lives there -- true of all but 295 of the starved sites, the region
+	    really is dead;
+	  * its unwind info sets **no frame register**, which is what says `rsp`
+	    is constant through the body. A function with a dynamic allocation
+	    uses a frame pointer and is marked `UWOP_SET_FPREG`; there are 127
+	    such functions in the whole binary.
+
+	An exception does not disturb it: the kernel pushes its context record
+	BELOW `rsp`, and `[rsp+0..31]` is at and above it.
+	"""
+	data = open(binary, "rb").read()
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	base = struct.unpack_from("<Q", data, pe + 24 + 24)[0]
+	rva, size = struct.unpack_from("<II", data, pe + 24 + 112 + 3 * 8)
+	at = rva_to_offset(data, rva) if rva and size else None
+	fixed_frame = set()
+	if at is not None:
+		for i in range(size // 12):
+			begin, end, unwind = struct.unpack_from("<III", data, at + i * 12)
+			if end <= begin:
+				continue
+			off = rva_to_offset(data, unwind)
+			if off is None or off + 4 > len(data):
+				continue
+			if not data[off + 3] & 0xF:		# no frame register
+				fixed_frame.add(base + begin)
+
+	starts = [start for start, _end in ranges]
+	calls = [False] * len(ranges)
+	touches = [False] * len(ranges)
+	for address, _encoding, mnemonic, operands in plain:
+		i = bisect.bisect_right(starts, address) - 1
+		if i < 0 or address >= ranges[i][1]:
+			continue
+		if mnemonic in ("call", "callq"):
+			calls[i] = True
+		for match in RSP_MEMORY.finditer(operands):
+			text = match.group(1)
+			if 0 <= (int(text, 16) if text else 0) < HOME_SPACE:
+				touches[i] = True
+		# **A direct operand is not the only way to reach it.** A function
+		# that computes the address of its own frame bottom can write there
+		# through the result, and the scan above would see nothing. Both
+		# shapes are refused: taking the address of anything in the region,
+		# and copying `rsp` into another register at all.
+		if mnemonic == "lea" and RSP_MEMORY.search(operands):
+			text = RSP_MEMORY.search(operands).group(1)
+			if 0 <= (int(text, 16) if text else 0) < HOME_SPACE:
+				touches[i] = True
+		if RSP_COPY.search(operands):
+			touches[i] = True
+	return (starts, ranges,
+	        [calls[i] and not touches[i] and ranges[i][0] in fixed_frame
+	         for i in range(len(ranges))])
+
+
+def home_space_free(home, address):
+	"""True if the function containing `address` can lend its home space."""
+	if home is None:
+		return False
+	starts, ranges, usable = home
+	i = bisect.bisect_right(starts, address) - 1
+	if i < 0 or address >= ranges[i][1]:
+		return False
+	return usable[i]
 
 
 def swallowed_scratch(plain, position, address, encoding, operands, mnemonic,
@@ -1479,6 +1573,9 @@ def collect(binary, listing):
 	# -- `plain` is a comprehension over `instructions` -- so one mapping
 	# serves both.
 	positions = scratch_finder.address_index(plain)
+	# Which functions can lend their callee home space, if asked to.
+	home = home_space_map(binary, plain, ranges) if SPILL == SPILL_HOME \
+		else None
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
 
 	# Anything already rewritten in place needs nothing further. Everything
@@ -1659,7 +1756,14 @@ def collect(binary, listing):
 			if trial is None and SPILL != SPILL_NONE:
 				# No register is dead here, so borrow one that is live and
 				# give it back. Which backing store the save uses is the
-				# whole of the question Finding 46 measures.
+				# whole of the question Finding 46 measures -- and the home
+				# space is the one that has to ask permission, because it
+				# belongs to the function rather than to the rewriter.
+				if SPILL == SPILL_HOME \
+						and not home_space_free(home, address):
+					skipped["no home space to borrow"] += 1
+					declined[address] = "no home space to borrow"
+					continue
 				borrowed = spill_register(registers)
 				if borrowed is not None and lower_vex(
 						address, encoding, operands, mnemonic, address,
@@ -2239,7 +2343,8 @@ def main(argv):
 	for i, item in enumerate(argv):
 		if item.startswith("--spill="):
 			SPILL = item.split("=", 1)[1]
-			if SPILL not in (SPILL_NONE, SPILL_STACK, SPILL_POOL):
+			if SPILL not in (SPILL_NONE, SPILL_STACK, SPILL_POOL,
+			                 SPILL_HOME):
 				print(f"detour.py: unknown spill {SPILL!r}", file=sys.stderr)
 				return 2
 			del argv[i]

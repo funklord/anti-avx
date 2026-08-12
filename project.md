@@ -3757,6 +3757,81 @@ per-thread memory needs a register that is absent at 70% of the sites that need 
 of them is a way through**, and that is a property of the code being translated rather
 than of any tool.
 
+### Finding 70 -- the callee home space, which walks through all three walls
+
+Findings 46, 68 and 69 closed every way of giving a stub somewhere to put a value: the
+stack cannot be described to the unwinder, a static pool cannot be made thread-safe, and a
+general-purpose register is absent at 70% of the sites that need one. The conclusion drawn
+was that the residue has no route. **That conclusion assumed a stub must create space, and
+Win64 has already created some.**
+
+The ABI makes a *caller* reserve 32 bytes at the bottom of its frame for its callees to
+spill their first four register arguments into. Between calls nobody owns it: the caller
+does not write it -- the fifth argument onward goes at `[rsp+32]` and up -- and no callee
+exists yet.
+
+**It walks through all three objections at once.** Nothing moves `rsp`, so there is nothing
+to describe and Finding 68 does not apply. It is the thread's own stack, so Finding 46's
+race does not apply. `(%rsp)` needs no register to address, so Finding 69 does not apply.
+An exception does not disturb it either: the kernel pushes its context record **below**
+`rsp`, and the home space is at and above it.
+
+```
+movups %xmm2,(%rsp)        save into the home space
+movaps %xmm0,%xmm2         ... the lowering ...
+movaps %xmm1,%xmm0
+subss  %xmm2,%xmm0
+movups (%rsp),%xmm2        restore
+```
+
+Two instructions, the same as the pool and half the stack, with neither one's problem.
+
+#### What the corpus says about whether it is really free
+
+```
+functions                                    273,902
+  containing a call, so the space exists     194,904
+sites with no xmm scratch                      5,699
+  the function uses that region itself             1
+```
+
+**One function in 273,902** keeps something of its own at `[rsp+0..31]`. The region is dead
+in practice as well as by the ABI, and the collector checks it per function rather than
+relying on that.
+
+#### The honest yield, after closing the hole the first version left
+
+A direct `(%rsp)` operand is not the only way to reach the region: a function that computes
+the address of its own frame bottom can write there through the result. Refusing that --
+any `lea` into the region, and any copy of `rsp` into another register at all -- costs
+1,655 sites.
+
+```
+--spill=none      18,994    97.6%
+--spill=home      17,972    97.8%     1,022 sites
+    before closing the aliasing hole   2,677 sites
+```
+
+The refusal is broader than it needs to be: most copies of `rsp` are followed by bounded
+uses, and narrowing it needs dataflow rather than a scan. **1,022 is the number that is
+safe to claim today.**
+
+#### Why the default stays `none`, and what would change it
+
+This writes into the translated program's own stack frame, on the strength of a textual
+scan proving nothing else uses it. That is a different kind of risk from the rest of this
+project: five defects here have produced silently wrong output while passing every
+structural check, and a missed aliasing path would join them. No test on this machine can
+rule one out -- only running the program can.
+
+So `--spill=home` is built, executed by `make check-spill`, and **off by default**. It is
+the only mechanism of the four that survives its own objections, and turning it on is a
+risk the copyright holder should take deliberately rather than inherit from a default.
+
+**And the walls were not walls.** Three findings concluded "no route" from three correct
+measurements, and all three were answering "can the rewriter make space" when the question
+was "is there space already". That is worth more than the 1,022 sites.
+
 ### Final state
 
 ```
@@ -3813,8 +3888,13 @@ code quickly.
    dropping the chain loses the handler entirely. `--spill=none` stays the default on
    evidence, and **Finding 68 closed it for good**: MSVC never allocates stack inside a
    chained fragment -- not once in 65,255 fragment unwind codes -- because a fragment
-   shares its primary's frame rather than having one of its own. No operating system,
-   host or measurement will reopen this; a stub that moves `rsp` cannot be described.
+   shares its primary's frame rather than having one of its own. A stub that moves `rsp`
+   cannot be described.
+
+   **The live question is now `--spill=home`** (Finding 70), which moves nothing: it
+   borrows the callee home space Win64 already reserves, is worth 1,022 sites, and is off
+   by default because it writes into the program's own frame on the strength of a scan.
+   Turning it on is a risk to take deliberately.
 
    What follows is kept because it is what was decided against and why.
 

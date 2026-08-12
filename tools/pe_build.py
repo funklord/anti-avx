@@ -728,6 +728,47 @@ source:	.long 1, 2, 3, 4
 """)
 
 
+
+# 20. The same starved site, in a function that CALLS something -- which is
+# what reserves the 32 bytes of callee home space at the bottom of its frame.
+#
+# `--spill=home` writes the borrowed register there and reads it back, moving
+# nothing and needing no register to address it. `%xmm2` is loaded before the
+# site and read after, so a save or restore that does not round-trip returns
+# something other than 107; under `--spill=none` the site is refused and the
+# program dies at 29.
+#
+# The `call` is not decoration. Without it the function is a leaf, no home
+# space exists, and the collector refuses -- which is the case the plain
+# `spill` program covers.
+PROGRAMS["homespill"] = (107, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp		/* 32 of home space, and alignment */
+	vzeroupper
+	call	helper			/* makes the home space real */
+	vmovss	ten(%rip), %xmm1
+	vmovss	three(%rip), %xmm0
+	vmovss	hundred(%rip), %xmm2	/* the register the spill will borrow */
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, and no register is dead */
+	leaq	after(%rip), %rax
+	jmp	*%rax			/* indirect: nothing forward is provable */
+after:
+	vaddss	%xmm2, %xmm0, %xmm0	/* 7 + 100, only if xmm2 came back */
+	vcvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+helper:
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+hundred:	.float 100.0
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

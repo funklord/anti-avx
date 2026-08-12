@@ -370,6 +370,7 @@ WINE_ENV   = WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe
 # Named, never bare: a bare .SECONDARY protects every pattern target,
 # object files included, and then declines to rebuild a missing one.
 EXTRA_PES  = $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
+             $(BUILD_DIR)/pe-homespill.exe $(BUILD_DIR)/pe-homespill.asm \
              $(BUILD_DIR)/pe-unwind.exe $(BUILD_DIR)/pe-unwind.asm \
              $(BUILD_DIR)/pe-unwindstub.exe $(BUILD_DIR)/pe-unwindstub.asm \
              $(BUILD_DIR)/pe-unwindspill.exe $(BUILD_DIR)/pe-unwindspill.asm
@@ -436,7 +437,8 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 # which no single-threaded test can reach.
 #
 # Termination: one wine invocation per mode, each under a timeout.
-check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm
+check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
+             $(BUILD_DIR)/pe-homespill.exe $(BUILD_DIR)/pe-homespill.asm
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-spill: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
@@ -464,7 +466,27 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm
 			exit 1; \
 		fi; \
 	done; \
-	echo "check-spill: none refuses; stack and pool both give the register back"
+	echo "check-spill: none refuses; stack and pool both give the register back"; \
+	want=`$(PYTHON) tools/pe_build.py names | \
+	      awk '$$1 == "homespill" { print $$2 }'`; \
+	for mode in none home; do \
+		$(PYTHON) tools/detour.py --spill=$$mode apply \
+			$(BUILD_DIR)/pe-homespill.exe $(BUILD_DIR)/pe-homespill.asm \
+			$(BUILD_DIR)/sse-homespill-$$mode.exe >/dev/null; \
+		$(WINE_ENV) timeout 120 wine \
+			$(BUILD_DIR)/sse-homespill-$$mode.exe \
+			>/dev/null 2>&1 && got=0 || got=$$?; \
+		echo "check-spill: homespill --spill=$$mode returned $$got, want $$want"; \
+		if [ "$$mode" = "none" ]; then \
+			if [ "$$got" = "$$want" ]; then \
+				echo "check-spill: --spill=none answered $$want, so the"; \
+				echo "             site was never the hard case"; exit 1; \
+			fi; \
+		elif [ "$$got" != "$$want" ]; then \
+			echo "check-spill: the home space did not round-trip"; exit 1; \
+		fi; \
+	done; \
+	echo "check-spill: and the callee home space lends a register with no rsp"
 
 # Can an exception be dispatched from inside a stub? Two programs that fault
 # on purpose, both registering a handler through .pdata -- which is how a PE
