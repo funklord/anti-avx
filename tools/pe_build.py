@@ -664,6 +664,41 @@ source:	.long 1, 2, 3, 4
 """)
 
 
+
+# 18. The variable-control vpermilps, inlined rather than called.
+#
+# The last lowering with no executable case, and the reason is structural:
+# it reads its permute constants from the stub section's pool through a
+# RIP-relative displacement, so tools/lowering_cases.py cannot generate it --
+# that generator emits `.byte` and cannot know where the assembler will put
+# them. A whole PE can, because the rewriter lays the pool down itself.
+#
+# make check-permil is exhaustive over all 256 controls and tests
+# src/permil.c, the reference implementation. This tests the bytes the
+# rewriter actually emits, which is a different claim.
+#
+# Only bits [1:0] of each control element are read, so {3,2,1,0} reverses
+# the vector and lane 0 comes back holding what lane 3 held.
+PROGRAMS["permilps"] = (88, """
+	.text
+	.globl _start
+_start:
+	subq	$56, %rsp
+	vzeroupper
+	vmovups	source(%rip), %xmm2
+	vmovups	control(%rip), %xmm1
+	vpermilps %xmm1, %xmm2, %xmm0	/* control, data, dst */
+	vmovups	%xmm0, (%rsp)
+	movl	(%rsp), %eax		/* lane 0 = source[3] = 88 */
+	addq	$56, %rsp
+	ret
+func_end:
+	.p2align 4
+source:	.long 1, 2, 3, 88
+control:	.long 3, 2, 1, 0
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

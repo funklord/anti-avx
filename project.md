@@ -3350,6 +3350,42 @@ free across the gap and both halves sit inside a described function. **456, not 
 and the two-stub machinery is the atomicity Finding 50 chose the single-window design to
 avoid. That is the honest price of the last large-looking bucket.
 
+### Finding 60 -- the last lowering nothing had executed
+
+`vpermilps` with a variable control, inlined rather than called (Finding 20). Finding 57
+named it as the one sequence `tools/lowering_cases.py` cannot reach, and the reason is
+structural rather than awkward: the lowering reads its permute constants from the stub
+section's pool through a RIP-relative displacement, and that generator emits `.byte` --
+it cannot know where the assembler will place them, so it cannot compute the
+displacement.
+
+**A whole PE can, because the rewriter lays the pool down itself.** The stub reads all
+three constants and computes the permute:
+
+```
+pand   -0x3b(%rip),%xmm3     # 0x140004000, the two-bit mask
+pslld  $0x2,%xmm3            # element index to byte index
+pshufb -0x39(%rip),%xmm3     # 0x140004010, broadcast within each element
+paddb  -0x31(%rip),%xmm3     # 0x140004020, step through the bytes
+movaps %xmm2,%xmm0
+pshufb %xmm3,%xmm0
+```
+
+Only bits [1:0] of each control element are read, so a control of `{3,2,1,0}` reverses the
+vector and lane 0 comes back holding what lane 3 held. Changing the `pslld` from 2 to 1 --
+scaling an element index by two bytes instead of four -- returns 1 instead of 88.
+
+`make check-permil` remains, and tests something else: it is exhaustive over all 256
+controls against `src/permil.c`, the reference implementation. This tests the bytes the
+rewriter emits. **Both are worth having and they are not the same claim**, which is the
+distinction Findings 54 to 57 exist to draw.
+
+Every lowering the rewriter emits now has an executable case, with two exceptions, both
+named: 256-bit, whose strategies are covered by PE programs of their own, and lowerings
+whose destination is a general-purpose register -- `vpextrq` at 780 sites and
+`vcvttss2si` at 376 -- which need a harness that compares general-purpose registers
+rather than a different reference.
+
 ### Final state
 
 ```
@@ -4117,7 +4153,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 51 mnemonics over four operand shapes, one with src2 in memory; `vblendvps`/`vblendvpd` across all five register arrangements their lowering branches on; ten FMA orderings; and the broadcasts through memory. Every one of 16 registers matching GCC's SSE intrinsic over 8 input patterns including three all-NaN | 256-bit, `vpermilps`, and any lowering whose destination is a general-purpose register -- Findings 54 to 57 count them |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | thirteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | fourteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
 | `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53 |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
@@ -4127,7 +4163,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and thirteen PEs built for the purpose.
+things: the lowerings executed in isolation, and fourteen PEs built for the purpose.
 
 ### What is still not verified
 
