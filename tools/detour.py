@@ -1860,6 +1860,72 @@ def stub_unwind(extents, prologues, image_base, existing, xdata_rva):
 	return bytes(xdata), bytes(out)
 
 
+def header_problems(data):
+	"""Everything wrong with this PE's headers, as a list of strings.
+
+	Three sections are appended and a data directory repointed, and until
+	now nothing checked the result was still a loadable image. `add_section`
+	writes `SizeOfImage` and refuses when the header has no room for another
+	entry, but writing a field is not the same as the field being right, and
+	the only evidence was that wine loads the small PEs -- which have three
+	sections where Starfield has ten, and a header with room to spare.
+
+	Cheap, and it is the one check that would catch a malformed image
+	before a loader does.
+	"""
+	out = []
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	count = struct.unpack_from("<H", data, pe + 6)[0]
+	opt_size = struct.unpack_from("<H", data, pe + 20)[0]
+	opt = pe + 24
+	alignment = struct.unpack_from("<I", data, opt + 32)[0]
+	file_alignment = struct.unpack_from("<I", data, opt + 36)[0]
+	image_size = struct.unpack_from("<I", data, opt + 56)[0]
+	headers_size = struct.unpack_from("<I", data, opt + 60)[0]
+	entry = struct.unpack_from("<I", data, opt + 16)[0]
+	table = opt + opt_size
+	if table + count * 40 > headers_size:
+		out.append(f"the section table ends past SizeOfHeaders "
+		           f"({table + count * 40:#x} > {headers_size:#x})")
+
+	sections, highest = [], 0
+	for i in range(count):
+		off = table + i * 40
+		name = data[off:off + 8].rstrip(b"\0").decode("latin-1", "replace")
+		vsize, vaddr, rsize, raddr = struct.unpack_from("<IIII", data, off + 8)
+		sections.append((vaddr, vsize, raddr, rsize, name))
+		if raddr and raddr + rsize > len(data):
+			out.append(f"{name}: raw data runs past the end of the file")
+		if vaddr % alignment:
+			out.append(f"{name}: virtual address is not section-aligned")
+		if raddr % file_alignment:
+			out.append(f"{name}: raw pointer is not file-aligned")
+		highest = max(highest, vaddr + vsize)
+
+	ordered = sorted(sections)
+	if ordered != sections:
+		out.append("sections are not in ascending virtual-address order")
+	for (va, vs, _r, _s, name), (nva, _nvs, _nr, _ns, nxt) in zip(ordered,
+	                                                              ordered[1:]):
+		if va + vs > nva:
+			out.append(f"{name} overlaps {nxt} in virtual space")
+	if image_size < highest:
+		out.append(f"SizeOfImage {image_size:#x} does not cover the highest "
+		           f"section end {highest:#x}")
+
+	def inside(rva):
+		return any(va <= rva < va + max(vs, rs)
+		           for va, vs, _r, rs, _n in sections)
+
+	if entry and not inside(entry):
+		out.append("the entry point is not inside any section")
+	for i in range(struct.unpack_from("<I", data, opt + 108)[0]):
+		rva, size = struct.unpack_from("<II", data, opt + 112 + i * 8)
+		if rva and size and not inside(rva):
+			out.append(f"data directory {i} points outside every section")
+	return out
+
+
 def next_section_rva(data):
 	"""Where `add_section` would put the next one."""
 	alignment = struct.unpack_from(
@@ -2436,6 +2502,14 @@ def verify(original, patched, listing=None):
 	problems = 0
 	print(f"verify: {len(a):,} -> {len(b):,} bytes "
 	      f"(+{len(b) - len(a):,} for the appended sections)")
+
+	faults = header_problems(b)
+	if faults:
+		for fault in faults:
+			print(f"verify: FAILED -- {fault}", file=sys.stderr)
+		problems += len(faults)
+	else:
+		print("verify: the image headers are self-consistent")
 
 	# **Every stub has to be findable by the unwinder.** The exception
 	# directory must point at the rebuilt function table, that table must

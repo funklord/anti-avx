@@ -3454,6 +3454,29 @@ here produced silently wrong output while passing every structural check, and tw
 checks that should have caught them could not -- one shared a function with the code it
 checked (Finding 52), and one was empty by construction (Finding 53).
 
+### Finding 63 -- nothing was checking the image was still loadable
+
+Three sections are appended and a data directory repointed, and until now nothing verified
+the result was a well-formed PE. `add_section` writes `SizeOfImage` and refuses when the
+header has no room for another entry -- but **writing a field is not the same as the field
+being right**, and the only evidence was that wine loads the small PEs, which have three
+sections where Starfield has ten and a header with room to spare.
+
+`make detour-verify` now checks the image against itself: every section's raw data inside
+the file, virtual addresses section-aligned and raw pointers file-aligned, sections in
+ascending order and not overlapping in virtual space, `SizeOfImage` covering the highest
+section end, the section table inside `SizeOfHeaders`, the entry point inside a section,
+and every data directory pointing inside one.
+
+It passes on Starfield and on all fourteen PEs, and it fails when told to: clipping
+`SizeOfImage` to `0x2000` reports that it does not cover the highest section end at
+`0x6018`.
+
+**This is the check that would catch a malformed image before a loader does**, and it is
+worth having for the reason the rest of `verify` is: everything else it proves is about
+the code, and an image whose headers are wrong never reaches the code at all. Cheap, and
+found by asking what the rewriter writes that nothing reads back.
+
 ### Final state
 
 ```
@@ -4223,7 +4246,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
 | `make check-pe` | fourteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
-| `make detour-verify` | on Starfield: size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53 |
+| `make detour-verify` | on Starfield: header self-consistency, size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53 |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
 | `make check-unwind` | that a handler registered through `.pdata` is reached from `.text` and from inside a stub, and that a stub which moved `rsp` still hands it a frame 16 bytes wrong | whether the shipping Windows unwinder agrees with wine's |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
