@@ -3477,19 +3477,59 @@ worth having for the reason the rest of `verify` is: everything else it proves i
 the code, and an image whose headers are wrong never reaches the code at all. Cheap, and
 found by asking what the rewriter writes that nothing reads back.
 
+### Finding 64 -- the run had the pair's bug, and the harness cannot see it
+
+`lower_ymm_run` leaves every ymm in the run with **the low half in its own xmm and the
+upper half in a helper register the original code knows nothing about**. That is the same
+state the pair lowering leaves behind, and the pair has guarded it since Finding 38:
+`upper_half_read_later` refuses whenever a later 256-bit instruction could read the upper
+half.
+
+The run never called it. For as long as runs have existed, **108 of them were producing
+wrong code** -- a later 256-bit read of any register in the run would take whatever was
+left in its upper half, and every structural check passed, because a stale upper half is
+a correct instruction reading the wrong bytes.
+
+```
+VEX in .text     18,757 -> 19,015      97.7% -> 97.6%
+ymm run upper half read later     108
+```
+
+258 sites go back to VEX. That is the third time here that the honest number has moved the
+wrong way and been right to.
+
+#### What found it, and what could not
+
+Not a test. **Comparing the new strategy against the older one that solves the same
+problem** -- the run and the pair leave identical state behind, so any guard one needs the
+other needs, and only one had it. The question that surfaced it was asking why
+`upper_half_read_later` had exactly one call site.
+
+`make check-pe` cannot reach this class at all, and the reason is worth recording rather
+than filing as a gap to close later. Triggering it requires a **surviving** 256-bit
+instruction to read the stale register -- and a surviving 256-bit instruction is one this
+CPU faults on, so the program dies before it can compute a wrong answer. Putting the read
+behind an untaken branch makes the program return the same value whether the run was taken
+or refused. The harness's whole power is that this machine can execute the output and not
+the input; here that is exactly what puts the case out of reach.
+
+So the guard rests on the argument rather than on an execution, and the argument is the
+one Finding 38 wrote down: only a 256-bit instruction can read an upper half, a call and a
+return both end its life, and anything unresolved is refused.
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      194,788
-skipped for overlap                            36,593
-refused, stub not buildable                     3,954
-VEX in .text            805,131 ->      18,757   786,374 removed, 97.7%
+detoured                                      194,691
+skipped for overlap                            36,563
+refused, stub not buildable                     3,973
+VEX in .text            805,131 ->      19,015   786,116 removed, 97.6%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 78,041 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 82,181
+section, every section after `.text` is byte-identical, all 77,688 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 81,798
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -4311,7 +4351,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **786,374 of 805,131 VEX sites, 97.7%** (Findings 24 to 52), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **786,116 of 805,131 VEX sites, 97.6%** (Findings 24 to 64), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 

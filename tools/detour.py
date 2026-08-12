@@ -1538,6 +1538,20 @@ def collect(binary, listing):
 					skipped["no register free across the ymm run"] += 1
 					declined[address] = "no register free across the ymm run"
 					continue
+				# **A run leaves every one of its ymms with a stale upper
+				# half**, exactly as a pair does: the low half is in the
+				# register's own xmm and the high half is in a helper the
+				# original code knows nothing about. The pair strategy has
+				# guarded that since Finding 38 and the run did not, which
+				# was a live defect for as long as runs have existed --
+				# a later 256-bit read of any register in the run would take
+				# whatever was left in its upper half. Finding 64.
+				if any(upper_half_read_later(instructions, last, register,
+				                             positions=positions)
+				       for register in helpers):
+					skipped["ymm run upper half read later"] += 1
+					declined[address] = "ymm run upper half read later"
+					continue
 				if not inplace.covered_by(ranges, address, window):
 					skipped["outside .pdata"] += 1
 					declined[address] = "outside .pdata"
