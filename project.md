@@ -3127,6 +3127,50 @@ would be wrong -- that path is covered end to end by the `memory` PE program ins
   lower -- an in-place patch is a prefix strip, and `make verify` checks the encoding --
   but "lower" is not "none" and the count belongs somewhere.
 
+### Finding 55 -- the blend, executed at last
+
+Finding 54 named the sequences as the largest hole in the executable evidence and
+`vblendvps` as the biggest of them: 3,054 sites, lowered by a function with four branches,
+checked only for shape. `make check-aliasing` proves it does not read a register it has
+already written, which is a real property and is not arithmetic.
+
+The obstacle was the harness, not the reference. **A blend names four registers where SSE
+has room for three** -- SSE takes the mask in an implicit `%xmm0` -- so the mask is an
+input in its own right and the destination is not always `%xmm0`. Both were assumptions
+built into the case table. It carries `source3` and a per-case `destination` now, and a
+second reference table for the three-input form.
+
+Five shapes, one per branch of `lower_blendv`:
+
+```
+mask_in_xmm0   the mask is already where SSE wants it; no scratch at all
+dst_is_xmm0    xmm0's value is dead but cannot hold mask and result at once,
+               so the blend runs in the scratch and moves back
+xmm0_live      xmm0 is saved, the mask moved in, and xmm0 restored
+src2_is_xmm0   the same, and an operand naming xmm0 must be renamed to the
+src1_is_xmm0   scratch before the mask overwrites it
+```
+
+The last two are what Finding 9 is about. Disabling the renaming -- the exact mistake that
+finding records -- makes `src2_is_xmm0` fail on every input pattern, which is the
+difference between a test that covers the code and a test that covers the branch that can
+go wrong.
+
+```
+211 cases, 49 mnemonics, 1,688 executions
+221 cases, 49 mnemonics, 1,768 executions
+```
+
+#### What is left, and why the hard part is done
+
+`vbroadcastss` and friends at 698 sites, the FMA orderings at 421, and `vpermilps` still
+have no executable case. **The machinery they need now exists**: a three-input reference
+is what an FMA wants -- `dst = src1 * src2 + dst` for the 213 ordering and a different
+arrangement for each of 132 and 231 -- and getting those arrangements wrong is precisely
+the kind of mistake that survives a shape check. Class F is deliberately not
+semantics-preserving, so the reference is `a * b + c` compiled without FMA, which tests
+the ordering and the register handling rather than the fusion.
+
 ### Final state
 
 ```
@@ -3887,7 +3931,7 @@ than compiling with MSVC or a cross-compiler.
 | `make style` | tabs, alignment, ASCII, and that documents name no missing file | anything about behaviour |
 | `make verify` | every lowering rule assembles, and no VEX or EVEX prefix survives | what any of them computes |
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
-| `make check-lowering` | 49 mnemonics over four operand shapes, one of them with src2 in memory, executed on this CPU with every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | 256-bit, the sequence classes, and any lowering whose destination is a general-purpose register -- Finding 54 counts them |
+| `make check-lowering` | 49 mnemonics over four operand shapes, one with src2 in memory, plus `vblendvps`/`vblendvpd` across all five register arrangements their lowering branches on; every one of 16 registers matching GCC's SSE intrinsic over 8 input patterns including three all-NaN | 256-bit, the FMA and broadcast sequences, and any lowering whose destination is a general-purpose register -- Findings 54 and 55 count them |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
 | `make check-pe` | thirteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |

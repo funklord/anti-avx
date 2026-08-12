@@ -123,6 +123,31 @@ MEMORY_SHAPE = ("src2_in_memory", 2, 1)
 # reference cannot describe both.
 MEMORY_EXEMPT = frozenset(("vmovss", "vmovsd", "vinsertps"))
 
+# **The blend, which had only ever been checked for shape.** 3,054 sites in
+# Starfield, and `lower_blendv` has four branches because SSE takes the mask
+# in an implicit %xmm0 and VEX names four registers where three fit. Each
+# shape below reaches a different one:
+#
+#   mask_in_xmm0   the mask is already where SSE wants it; no scratch
+#   dst_is_xmm0    xmm0's value is dead but cannot hold mask and result at
+#                  once, so the blend runs in the scratch and moves back
+#   xmm0_live      xmm0 must be saved, the mask moved in, and xmm0 restored
+#   src2_is_xmm0   the same, and an operand naming xmm0 has to be renamed to
+#   src1_is_xmm0   the scratch before the mask overwrites it
+#
+# The last two are the ones Finding 9 is about: get the order wrong and the
+# mask destroys the operand, or the result destroys the mask.
+BLENDS = ["vblendvps", "vblendvpd"]
+
+# (name, mask, src2, src1, destination)
+BLEND_SHAPES = [
+	("mask_in_xmm0", 0, 2, 1, 3),
+	("dst_is_xmm0", 3, 2, 1, 0),
+	("xmm0_live", 3, 2, 1, 4),
+	("src2_is_xmm0", 3, 0, 1, 4),
+	("src1_is_xmm0", 3, 2, 0, 4),
+]
+
 
 # **256-bit forms that must be REFUSED, not lowered.** There is no SSE
 # encoding of a 256-bit instruction, and dropping the prefix from one yields
@@ -186,40 +211,52 @@ def build():
 		for shape, source2, source1 in SHAPES:
 			operands = f"%xmm{source2},%xmm{source1},%xmm{DESTINATION}"
 			text = f"{mnemonic} {immediate + ',' if immediate else ''}{operands}"
-			wanted.append((mnemonic, shape, source1, source2, text))
+			wanted.append((mnemonic, shape, source1, source2, text,
+			               -1, DESTINATION))
 		if mnemonic in MEMORY_EXEMPT:
 			continue
 		shape, source2, source1 = MEMORY_SHAPE
 		operands = f"{source2 * 16}(%rdi),%xmm{source1},%xmm{DESTINATION}"
 		text = f"{mnemonic} {immediate + ',' if immediate else ''}{operands}"
-		wanted.append((mnemonic, shape, source1, source2, text))
+		wanted.append((mnemonic, shape, source1, source2, text,
+		               -1, DESTINATION))
 
 	for mnemonic, immediate in SHIFTS:
 		for shape, source in SHIFT_SHAPES:
 			text = f"{mnemonic} {immediate},%xmm{source},%xmm{DESTINATION}"
 			# Both source slots name the same register: a shift has one.
-			wanted.append((mnemonic, shape, source, source, text))
+			wanted.append((mnemonic, shape, source, source, text,
+			               -1, DESTINATION))
 
-	assembled = assemble([text for *_rest, text in wanted])
+	for mnemonic in BLENDS:
+		for shape, mask, source2, source1, destination in BLEND_SHAPES:
+			text = (f"{mnemonic} %xmm{mask},%xmm{source2},%xmm{source1},"
+			        f"%xmm{destination}")
+			wanted.append((mnemonic, shape, source1, source2, text,
+			               mask, destination))
+
+	assembled = assemble([case[4] for case in wanted])
 	if len(assembled) != len(wanted):
 		raise SystemExit(f"assembled {len(assembled)} of {len(wanted)} cases")
 
 	out = []
-	for (mnemonic, shape, source1, source2, _text), site in zip(wanted,
-	                                                            assembled):
+	for case, site in zip(wanted, assembled):
+		mnemonic, shape, source1, source2, _text, source3, destination = case
 		address, encoding, printed, operands = site
 		body = detour.lower_vex(address, encoding, operands, printed, 0,
 		                        scratch=SCRATCH)
 		if body is None:
 			raise SystemExit(f"no lowering for {printed} {operands} "
 			                 f"({shape}) -- the generator must not skip")
-		out.append((mnemonic, shape, source1, source2, body))
+		out.append((mnemonic, shape, source1, source2, source3, destination,
+		            body))
 	return out
 
 
 def emit(cases, asm_path, table_path):
 	asm = [".text"]
-	for i, (_m, _s, _a, _b, body) in enumerate(cases):
+	for i, case in enumerate(cases):
+		body = case[-1]
 		asm.append(f".globl case_{i}")
 		asm.append(f".type case_{i}, @function")
 		asm.append(f"case_{i}:")
@@ -243,9 +280,10 @@ def emit(cases, asm_path, table_path):
 		table.append(f"void case_{i}(const void *in, void *out);")
 	table.append("")
 	table.append("static const struct lowering_case lowering_table[] = {")
-	for i, (mnemonic, shape, source1, source2, body) in enumerate(cases):
+	for i, case in enumerate(cases):
+		mnemonic, shape, source1, source2, source3, destination, body = case
 		table.append(f'\t{{ "{mnemonic}", "{shape}", {source1}, {source2}, '
-		             f'{len(body)}, case_{i} }},')
+		             f'{source3}, {destination}, {len(body)}, case_{i} }},')
 	table.append("};")
 	Path(table_path).write_text("\n".join(table) + "\n")
 
