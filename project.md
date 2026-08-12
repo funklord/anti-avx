@@ -3701,6 +3701,62 @@ carries is what a future reader will want, and its default stays `none`.
 it needed another operating system was answered by counting bytes in a file that was here
 all along -- twice, in Findings 67 and 68.
 
+### Finding 69 -- the general-purpose register is scarce in the same places
+
+Per-thread memory was the one untried mechanism for the sites with no scratch register, and
+reaching a TLS slot costs a general-purpose register: `mov %gs:0x58,%r`, an index, a
+pointer chase. So the question that governs it is whether such a register exists **where
+an xmm does not**.
+
+The TLS directory is there to hang a slot on -- rva `0x4f07480`, 40 bytes -- so the
+mechanism is not blocked by the file format. The register is the problem:
+
+```
+functions                                  273,902
+  with r10 or r11 provably free            154,053     56%
+
+sites wanting a scratch
+  an xmm is free                            28,003
+  no xmm                                     5,699
+    a GPR is free                            1,728     30%
+    no GPR either                            3,971
+```
+
+**Thirty per cent**, and it makes sense in hindsight: a site with no free xmm is in a
+register-starved region, and starvation is not independent across register files. The
+places that have run out of one have usually run out of the other.
+
+So per-thread memory would recover on the order of a thousand of the surviving
+scratch-starved sites, for a new mechanism with real weight -- extending the TLS raw-data
+template so the loader allocates more per thread, getting the index right, three or four
+instructions and a clobbered register at every site -- and it does **nothing cheaper** for
+the 256-bit representation, which needs a value held rather than a register borrowed and
+would want the same scarce GPR at far more sites.
+
+#### The bound, and what would move it
+
+The 30% is a **lower bound**, and honestly labelled: it is the whole-function argument
+`scratch.function_scope` makes for xmm4 and xmm5 -- the register is named nowhere in the
+function, so nothing in it reads one -- and that argument is much weaker than the forward
+scan `find_scratch` uses, which reaches 83% for xmm. A forward GPR liveness scan would
+find more.
+
+It would also be the hardest analysis in this project to make sound. The xmm file has
+almost no implicit operands; the general-purpose file is full of them -- a `call` reads
+four argument registers and clobbers four more, `div` reads and writes `rdx:rax`, a
+variable shift reads `cl`, the string operations read `rsi`, `rdi` and `rcx`. **Every one
+missed is a register claimed while live**, which is the failure mode Finding 52 cost 233
+sites to. The cheap version of that analysis is the dangerous one.
+
+#### What this settles
+
+The residue is about ten thousand sites of "nowhere to put a value", and the three
+mechanisms that could provide one are now all measured: the stack cannot be described to
+the unwinder (Finding 68), a static pool cannot be made thread-safe (Finding 46), and
+per-thread memory needs a register that is absent at 70% of the sites that need it. **None
+of them is a way through**, and that is a property of the code being translated rather
+than of any tool.
+
 ### Final state
 
 ```
