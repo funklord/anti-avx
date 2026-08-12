@@ -11,53 +11,95 @@ statically, once, offline, so the result runs natively rather than under
 emulation.
 
 The driving case is Starfield on a Xeon X5675 (Westmere, SSE4.2, no AVX). The
-measured instruction mix says a translated binary should cost about **+1.3%
+measured instruction mix says a translated binary should cost about **+1.34%
 in instruction count** and run within a few percent of native -- the
 performance argument against this approach does not hold.
 
-**Status: design and measurement. Nothing is translated yet.**
+**Status: it rewrites. 97.7% of 805,131 VEX sites, and that is not enough.**
+
+A translated binary that is 99.99% correct is worthless: the remaining 0.01%
+is a crash at an unpredictable moment. So the number to watch is not how much
+is translated but how much is left, and 18,757 sites are left. Starfield has
+never been run.
+
+Nothing here is Starfield-specific except a Makefile default. The tools take
+the binary as an argument, read its PE headers, `.pdata` and relocations, and
+have been exercised end to end on eighteen small PEs this project builds
+itself. Starfield is the corpus, not the target.
 
 Read [`project.md`](project.md). It is the authoritative record of intent and
-wins over the code.
+wins over the code, and its "Picking this up again" section is written for
+someone starting cold.
 
 ## What exists
 
 ```
-project.md            the design, the measurements, and every open question
-code-style.md         style rules, copied from the global source
-tools/vex_scan.py     the operand-level scanner behind the figures in project.md
-tools/lower.py        the VEX to SSE lowering rules; 100% of sites covered
-tools/f16c_oracle.py  the reference checked against CPython's binary16
-src/f16c.c            software half-precision conversion, since Westmere has
-                      no F16C -- the only compiled code in the tree
-tests/f16c_test.c     exhaustive in both directions
+project.md              the design, the measurements, and every open question
+code-style.md           style rules, copied from the global source
+
+tools/vex_scan.py       the inventory: every VEX site by mnemonic
+tools/lower.py          the lowering RULES; `verify` proves they assemble
+tools/patch.py          in-place patching, and the encoding primitives
+                        everything else uses
+tools/detour.py         the rewriter: collect, place_stubs, build_stub,
+                        lower_vex, apply, verify, census, selftest
+tools/targets.py        branch targets from .reloc, .pdata, .xdata, switch
+                        tables and SEH scope tables
+tools/outside.py        the code .pdata does not describe
+tools/scratch.py        liveness: find_scratch, and `check` proves its claims
+tools/lowering_cases.py generates the executable cases from the real rules
+tools/pe_build.py       builds AVX PEs so the rewriter has a target it owns
+tools/placement.py      where detours land; icache_bench.c what they cost
+
+src/f16c.c              software half-precision conversion, since Westmere
+                        has no F16C
+src/fmaddsub.c          alternating-lane FMA, src/permil.c, src/permd.c
+tests/                  the C tests for those, and lowering_test.c, which
+                        executes the rewriter's own lowerings
 ```
 
-## Reproducing the measurements
+## Rewriting a binary
 
-`make scan` needs the Steamless-unpacked game binary, which is **not** in this
-repository -- it is a copyrighted 102 MB artifact obtained through Steam, and
-an input to the project rather than a part of it. See `project.md`, "The hard
-parts", for how the unpack is reproduced on Linux.
+```sh
+make detour          # rewrite $(TARGET) into $(BUILD_DIR)
+make detour-verify   # the structural invariants, on the result
+make census          # reconcile every surviving VEX site to a named cause
+make detour-plan     # what would be rewritten, and what is refused, and why
+```
+
+`make scan` and everything above need the Steamless-unpacked game binary,
+which is **not** in this repository -- it is a copyrighted 102 MB artifact
+obtained through Steam, and an input to the project rather than a part of it.
+See `project.md`, "The hard parts", for how the unpack is reproduced on Linux.
 
 ```sh
 make scan                      # objdump + vex_scan into $(BUILD_DIR)
 make scan TARGET=other.exe     # any /arch:AVX2 PE, not just the driving case
 ```
 
-It writes about 0.9 GB and takes a little under two minutes. `make clean`
-removes both files by name.
+The listing is about 0.9 GB and `apply` takes roughly ten minutes on the real
+binary. `make clean` removes what it wrote, by name.
 
 ## Development
 
 ```sh
-make check      style gate, lowering proof, and the F16C tests
-make hooks      install the commit-msg hook into .git/hooks
-make help       every target
+make check        the gate: style, the lowering proof, and the C tests
+make check-pe     fourteen PEs built here, rewritten, and run under wine
+make check-spill  the three ways a stub can get a scratch register
+make check-unwind whether an exception can be dispatched from inside a stub
+make hooks        install the commit-msg hook into .git/hooks
+make help         every target
 ```
 
-`make check` needs no game binary. `make coverage` does, and exits non-zero while
-any VEX site lacks a lowering rule -- it is a gate rather than a report.
+`make check` needs no game binary; the others under `check-` need only `wine`.
+`make coverage`, `make scratch-check` and the `detour` targets need the binary.
+`make coverage` exits non-zero while any VEX site lacks a lowering rule -- it
+is a gate rather than a report.
+
+**The machine is part of the method.** This is a Westmere: it cannot execute
+the input and can execute the output, so "the original must crash and the
+rewritten one must work" is a real experiment rather than a wish. Every
+`check-pe` program asserts both halves.
 
 ## Licence
 
