@@ -3595,6 +3595,64 @@ value's life was wrong, and a strategy pre-empting a better one was wrong. The a
 is more honest too -- 1,766 sites that read as "the upper half is live" were really "a run
 would hold it, and something later still wants it".
 
+### Finding 67 -- the Windows host was never needed, and the GPU was already here
+
+Finding 49 measured that a chained fragment's own unwind codes are not applied, and
+concluded that only a Windows host could say whether that is wine's limitation or the
+ABI's. **Two assumptions in that sentence were wrong**, and the evidence against both was
+already on this machine.
+
+#### The binary is a better witness than a second operating system
+
+If shipping Windows binaries carry chained `UNWIND_INFO` with its own unwind codes, the
+real unwinder must handle it. Counting them in the 102 MB of MSVC output sitting in this
+directory:
+
+```
+function table entries                        236,427
+  chained                                      56,269
+    with their own unwind codes                31,634
+      and a nonzero SizeOfProlog               25,680
+```
+
+The header byte MSVC writes is `21` -- version 1, `UNW_FLAG_CHAININFO` -- which is byte
+for byte what this project emits. **31,634 times in one binary.** If Windows ignored a
+chained fragment's codes, Starfield's own exception handling would be broken across tens
+of thousands of its own functions.
+
+So the pattern is standard and the encoding is the one the toolchain uses. Asking for a
+Windows host was asking the wrong witness a question the corpus could answer.
+
+#### Which leaves a contradiction, and that is progress
+
+Starfield is played on Linux under Proton, so those same 31,634 chained entries are
+already being unwound by wine every day. If wine ignored their codes the game would be
+visibly broken. So `check-unwind`'s establisher frame being **exactly 16 bytes out** is not
+simply "wine does not support this": either wine handles MSVC's shape and not the one this
+project emits -- which would mean a fault in the encoding that reading it has not found --
+or the difference is somewhere else entirely, in the epilogue detection or the placement.
+
+That is a question this machine can settle: build a PE whose chained unwind info mimics
+MSVC's shape exactly, and bisect against the one that fails. **It is no longer blocked on
+anything.**
+
+#### And the machine can run the result
+
+The other assumption was that validating a translated Starfield needs hardware not present.
+
+```
+GeForce RTX 3060, Vulkan 1.4.309, wine 10.0
+```
+
+The CPU is a Westmere with no AVX, which is the entire point; the GPU is capable and
+Vulkan works. Starfield runs on Linux under Proton. **The validation path is this machine**
+-- finish the translation, run it under Proton here -- and what is missing is the last
+18,994 sites and a Steam licence, not an operating system.
+
+It also means wine is not the test instrument standing in for the real one: **for the
+driving case wine IS the real one**, which raises the stakes on the contradiction above
+rather than lowering them.
+
 ### Final state
 
 ```
@@ -3649,8 +3707,8 @@ code quickly.
    49 tested what was left: a stub that moves `rsp` hands the unwinder a frame sixteen
    bytes wrong, because a chained fragment's own unwind codes are not applied and
    dropping the chain loses the handler entirely. `--spill=none` stays the default on
-   evidence. **Re-run `sse-unwindspill.exe` on a Windows host** -- if it answers 42
-   rather than 99, the limitation is wine's and 3,537 sites come back.
+   evidence. **The Windows host is not needed** -- Finding 67 found the answer in the corpus,
+   and turned this into a contradiction to bisect on this machine.
 
    What follows is kept because it is what was decided against and why.
 
