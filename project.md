@@ -3171,6 +3171,58 @@ the kind of mistake that survives a shape check. Class F is deliberately not
 semantics-preserving, so the reference is `a * b + c` compiled without FMA, which tests
 the ordering and the register handling rather than the fusion.
 
+### Finding 56 -- the FMA orderings, and a stale artifact that nearly won
+
+Ten mnemonics, chosen by counting what the binary uses rather than enumerating what
+exists -- there are 48 spellings of a fused multiply-add and Starfield emits these:
+
+```
+vfmadd231ps  143    vfmadd231ss   94    vfmadd213ps   25
+vfmadd132ss   24    vfmsub231ss   23    vfnmadd231ss  20
+vfmadd213pd   17    vfmadd213ss   16    vfmsub231ps    7
+vfnmadd231ps   6
+```
+
+They need the three-input reference Finding 55 built, because **the destination's incoming
+value is an operand**: `132` is `dst*src2 + src1`, `213` is `src1*dst + src2`, `231` is
+`src1*src2 + dst`. Twelve mnemonics differing only in which operand goes where is exactly
+the shape of mistake a structural check cannot see, and giving `132` the `231` ordering
+now produces `-inf` where `+inf` is wanted -- an ordinary number, not a NaN.
+
+```
+221 cases, 1,768 executions
+231 cases, 1,848 executions
+```
+
+#### The NaN payloads are GCC's to choose, so they are not counted
+
+Class F is already not bit-exact -- two roundings replace one. Worse for a C reference:
+the compiler decides which operand of a commutative multiply becomes the destination, and
+SSE returns the **destination's** NaN when both are NaN. That choice cannot be pinned from
+the source, so a lane where both sides are NaN is not evidence and is reported rather than
+failed. Eleven of them. Every other lane is still compared exactly, which is what keeps
+the ordering under test. `tools/f16c_oracle.py` and `tests/fmaddsub_test.c` already draw
+the line in the same place.
+
+#### The stale artifact, which is a new shape of an old lesson
+
+Between writing the references and believing them, `vfmadd132ss` disagreed with its
+reference on ordinary numbers. Every check said the lowering was right: the source matched
+`HEAD`, `git diff` was empty, `inspect.getsource` printed the correct branch, the operands
+decoded correctly by hand, and disassembling the lowering **by hand** gave the right four
+instructions -- while the generated case held three.
+
+The mutation used to test the check had been reverted from a backup, and the edit
+`(destination, source2), source1` to `(source1, source2), destination` is **exactly the
+same number of characters**. Python validates a `.pyc` on the source's size and mtime, the
+size was unchanged, and the restore landed in the same second. **The stale bytecode was
+still being executed**, and `inspect.getsource` reads the file rather than the code object,
+so it corroborated the wrong thing.
+
+`project.md` already says never to compare a disassembly against a binary rebuilt after
+it. This is that rule in a language that caches compilation invisibly, and `git diff`
+being empty is not evidence that what ran was what the file says.
+
 ### Final state
 
 ```
@@ -3274,6 +3326,11 @@ placement.py      where detours land; icache_bench.c what they cost
 
 ### Practical things that cost time to learn
 
+- **Delete `tools/__pycache__` before trusting a source revert.** Python validates a
+  cached `.pyc` on the source file's size and mtime, so a same-length edit reverted
+  within the same second keeps executing the old bytecode -- and `git diff` is empty,
+  and `inspect.getsource` reads the file rather than the code object, so both corroborate
+  the wrong thing. Finding 56 lost an hour to it.
 - **`build/text.asm` is the input to almost everything** and `make clean` removes it.
   Regenerating is `objdump -d -j .text Starfield-unpacked.exe > build/text.asm`,
   about 30 seconds and 0.9 GB.

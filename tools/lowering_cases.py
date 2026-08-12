@@ -139,6 +139,15 @@ MEMORY_EXEMPT = frozenset(("vmovss", "vmovsd", "vinsertps"))
 # mask destroys the operand, or the result destroys the mask.
 BLENDS = ["vblendvps", "vblendvpd"]
 
+# The fused multiply-adds the binary actually uses, counted rather than
+# enumerated: there are 48 possible spellings and Starfield emits these.
+# vfmaddsub and vfmsubadd are left out on purpose -- the first needs
+# `addsubps` and a prefix the case shape cannot carry, the second needs a
+# second scratch and lower_fma refuses it.
+FMAS = ["vfmadd231ps", "vfmadd231ss", "vfmadd213ps", "vfmadd213pd",
+        "vfmadd213ss", "vfmadd132ss", "vfmsub231ps", "vfmsub231ss",
+        "vfnmadd231ps", "vfnmadd231ss"]
+
 # (name, mask, src2, src1, destination)
 BLEND_SHAPES = [
 	("mask_in_xmm0", 0, 2, 1, 3),
@@ -212,28 +221,38 @@ def build():
 			operands = f"%xmm{source2},%xmm{source1},%xmm{DESTINATION}"
 			text = f"{mnemonic} {immediate + ',' if immediate else ''}{operands}"
 			wanted.append((mnemonic, shape, source1, source2, text,
-			               -1, DESTINATION))
+			               -1, DESTINATION, 0))
 		if mnemonic in MEMORY_EXEMPT:
 			continue
 		shape, source2, source1 = MEMORY_SHAPE
 		operands = f"{source2 * 16}(%rdi),%xmm{source1},%xmm{DESTINATION}"
 		text = f"{mnemonic} {immediate + ',' if immediate else ''}{operands}"
 		wanted.append((mnemonic, shape, source1, source2, text,
-		               -1, DESTINATION))
+		               -1, DESTINATION, 0))
 
 	for mnemonic, immediate in SHIFTS:
 		for shape, source in SHIFT_SHAPES:
 			text = f"{mnemonic} {immediate},%xmm{source},%xmm{DESTINATION}"
 			# Both source slots name the same register: a shift has one.
 			wanted.append((mnemonic, shape, source, source, text,
-			               -1, DESTINATION))
+			               -1, DESTINATION, 0))
+
+	for mnemonic in FMAS:
+		# dst is xmm0 and its INCOMING value is an operand, so it is the
+		# first of the three inputs the reference takes. The lane width is
+		# what a both-sides-NaN difference is forgiven at, and Class F is
+		# the only class that needs forgiving.
+		text = f"{mnemonic} %xmm2,%xmm1,%xmm{DESTINATION}"
+		lane = 8 if mnemonic.endswith(("sd", "pd")) else 4
+		wanted.append((mnemonic, "distinct", DESTINATION, 1, text, 2,
+		               DESTINATION, lane))
 
 	for mnemonic in BLENDS:
 		for shape, mask, source2, source1, destination in BLEND_SHAPES:
 			text = (f"{mnemonic} %xmm{mask},%xmm{source2},%xmm{source1},"
 			        f"%xmm{destination}")
 			wanted.append((mnemonic, shape, source1, source2, text,
-			               mask, destination))
+			               mask, destination, 0))
 
 	assembled = assemble([case[4] for case in wanted])
 	if len(assembled) != len(wanted):
@@ -241,7 +260,8 @@ def build():
 
 	out = []
 	for case, site in zip(wanted, assembled):
-		mnemonic, shape, source1, source2, _text, source3, destination = case
+		mnemonic, shape, source1, source2, _text, source3, destination, \
+			lane = case
 		address, encoding, printed, operands = site
 		body = detour.lower_vex(address, encoding, operands, printed, 0,
 		                        scratch=SCRATCH)
@@ -249,7 +269,7 @@ def build():
 			raise SystemExit(f"no lowering for {printed} {operands} "
 			                 f"({shape}) -- the generator must not skip")
 		out.append((mnemonic, shape, source1, source2, source3, destination,
-		            body))
+		            lane, body))
 	return out
 
 
@@ -281,9 +301,11 @@ def emit(cases, asm_path, table_path):
 	table.append("")
 	table.append("static const struct lowering_case lowering_table[] = {")
 	for i, case in enumerate(cases):
-		mnemonic, shape, source1, source2, source3, destination, body = case
+		mnemonic, shape, source1, source2, source3, destination, lane, \
+			body = case
 		table.append(f'\t{{ "{mnemonic}", "{shape}", {source1}, {source2}, '
-		             f'{source3}, {destination}, {len(body)}, case_{i} }},')
+		             f'{source3}, {destination}, {lane}, {len(body)}, '
+		             f'case_{i} }},')
 	table.append("};")
 	Path(table_path).write_text("\n".join(table) + "\n")
 

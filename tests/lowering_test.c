@@ -48,6 +48,10 @@ struct lowering_case {
 	 * its own right and the destination is not always xmm0. */
 	int source3;
 	int destination;
+	/* 0 for an exact comparison. 4 or 8 means the lane width at which a
+	 * both-sides-NaN difference is tolerated, which Class F needs and
+	 * nothing else does -- see the comment on the FMA references. */
+	int nan_lane;
 	int length;
 	void (*run)(const void *in, void *out);
 };
@@ -438,11 +442,175 @@ static __m128i ref_blendvpd(__m128i a, __m128i b, __m128i mask)
 	                            _mm_castsi128_pd(mask)));
 }
 
+/* The fused multiply-adds, whose suffix says which operand is the addend:
+ *
+ *     132   dst = dst  * src2 + src1
+ *     213   dst = src1 * dst  + src2
+ *     231   dst = src1 * src2 + dst
+ *
+ * so the three inputs here are (dst, src1, src2) -- the destination's
+ * INCOMING value is an operand, which is what makes these need the
+ * three-input form even though they name only three registers.
+ *
+ * Class F is deliberately not bit-exact: two roundings replace one, and
+ * these references are mul-then-add for that reason. What they check is the
+ * ORDERING, which is where a mistake would live -- twelve mnemonics
+ * differing only in which operand goes where.
+ *
+ * **The operand order inside each is not cosmetic.** When both inputs are
+ * NaN, SSE returns the destination operand, so `_mm_add_ps(d, product)` and
+ * `_mm_add_ps(product, d)` differ on exactly the patterns this suite feeds
+ * them. Each reference is written to match the register lower_fma actually
+ * targets, not the algebra.
+ */
+
+static __m128i ref_fmadd231ps(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_add_ps(_mm_castsi128_ps(d),
+	                            _mm_mul_ps(_mm_castsi128_ps(a),
+	                                       _mm_castsi128_ps(b))));
+}
+
+static __m128i ref_fmadd231ss(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_add_ss(_mm_castsi128_ps(d),
+	                            _mm_mul_ss(_mm_castsi128_ps(a),
+	                                       _mm_castsi128_ps(b))));
+}
+
+static __m128i ref_fmadd213ps(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_add_ps(
+	                            _mm_mul_ps(_mm_castsi128_ps(a),
+	                                       _mm_castsi128_ps(d)),
+	                            _mm_castsi128_ps(b)));
+}
+
+static __m128i ref_fmadd213pd(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castpd_si128(_mm_add_pd(
+	                            _mm_mul_pd(_mm_castsi128_pd(a),
+	                                       _mm_castsi128_pd(d)),
+	                            _mm_castsi128_pd(b)));
+}
+
+/* Scalar, so the result is moved back with movss and the upper lanes stay
+ * the destination's. _mm_move_ss says exactly that. */
+static __m128i ref_fmadd213ss(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_move_ss(_mm_castsi128_ps(d),
+	                            _mm_add_ss(
+	                                _mm_mul_ss(_mm_castsi128_ps(a),
+	                                           _mm_castsi128_ps(d)),
+	                                _mm_castsi128_ps(b))));
+}
+
+static __m128i ref_fmadd132ss(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_move_ss(_mm_castsi128_ps(d),
+	                            _mm_add_ss(
+	                                _mm_mul_ss(_mm_castsi128_ps(d),
+	                                           _mm_castsi128_ps(b)),
+	                                _mm_castsi128_ps(a))));
+}
+
+static __m128i ref_fmsub231ps(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_sub_ps(
+	                            _mm_mul_ps(_mm_castsi128_ps(a),
+	                                       _mm_castsi128_ps(b)),
+	                            _mm_castsi128_ps(d)));
+}
+
+static __m128i ref_fmsub231ss(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_move_ss(_mm_castsi128_ps(d),
+	                            _mm_sub_ss(
+	                                _mm_mul_ss(_mm_castsi128_ps(a),
+	                                           _mm_castsi128_ps(b)),
+	                                _mm_castsi128_ps(d))));
+}
+
+/* Negated: the lowering computes addend - product, and for the 231 ordering
+ * the addend IS the destination, so nothing is moved first. */
+static __m128i ref_fnmadd231ps(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_sub_ps(_mm_castsi128_ps(d),
+	                            _mm_mul_ps(_mm_castsi128_ps(a),
+	                                       _mm_castsi128_ps(b))));
+}
+
+static __m128i ref_fnmadd231ss(__m128i d, __m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_sub_ss(_mm_castsi128_ps(d),
+	                            _mm_mul_ss(_mm_castsi128_ps(a),
+	                                       _mm_castsi128_ps(b))));
+}
+
+/* True if every lane that differs holds a NaN on both sides.
+ *
+ * **Class F is not bit-exact and its NaN payloads are not reproducible.**
+ * Two roundings replace one, and worse for this purpose: the reference is C,
+ * so the compiler chooses which operand of a commutative multiply ends up as
+ * the destination -- and SSE returns the DESTINATION's NaN when both are
+ * NaN. That choice is GCC's to make and cannot be pinned from the source.
+ *
+ * So a lane where both sides are NaN is not evidence of anything, and is not
+ * counted. Every other lane is still compared exactly, which is what keeps
+ * the ordering under test: get 132 and 231 the wrong way round and ordinary
+ * numbers disagree at once. tools/f16c_oracle.py and tests/fmaddsub_test.c
+ * already draw the line in the same place.
+ */
+static int nan_equivalent(const __m128i *got, const __m128i *want, int lane)
+{
+	int i;
+
+	if (lane == 8) {
+		const uint64_t *g = (const uint64_t *)got;
+		const uint64_t *w = (const uint64_t *)want;
+
+		for (i = 0; i < 2; i++) {
+			if (g[i] == w[i])
+				continue;
+			if (((g[i] & 0x7ff0000000000000ull) != 0x7ff0000000000000ull)
+			    || (g[i] & 0x000fffffffffffffull) == 0)
+				return 0;
+			if (((w[i] & 0x7ff0000000000000ull) != 0x7ff0000000000000ull)
+			    || (w[i] & 0x000fffffffffffffull) == 0)
+				return 0;
+		}
+		return 1;
+	}
+
+	{
+		const uint32_t *g = (const uint32_t *)got;
+		const uint32_t *w = (const uint32_t *)want;
+
+		for (i = 0; i < 4; i++) {
+			if (g[i] == w[i])
+				continue;
+			if ((g[i] & 0x7f800000u) != 0x7f800000u
+			    || (g[i] & 0x007fffffu) == 0)
+				return 0;
+			if ((w[i] & 0x7f800000u) != 0x7f800000u
+			    || (w[i] & 0x007fffffu) == 0)
+				return 0;
+		}
+		return 1;
+	}
+}
+
 static const struct {
 	const char *mnemonic;
 	reference3_fn reference;
 } references3[] = {
 	{ "vblendvps", ref_blendvps }, { "vblendvpd", ref_blendvpd },
+	{ "vfmadd231ps", ref_fmadd231ps }, { "vfmadd231ss", ref_fmadd231ss },
+	{ "vfmadd213ps", ref_fmadd213ps }, { "vfmadd213pd", ref_fmadd213pd },
+	{ "vfmadd213ss", ref_fmadd213ss }, { "vfmadd132ss", ref_fmadd132ss },
+	{ "vfmsub231ps", ref_fmsub231ps }, { "vfmsub231ss", ref_fmsub231ss },
+	{ "vfnmadd231ps", ref_fnmadd231ps },
+	{ "vfnmadd231ss", ref_fnmadd231ss },
 };
 
 static reference3_fn reference3_for(const char *mnemonic)
@@ -533,7 +701,7 @@ static const uint32_t PATTERNS[][4] = {
 int main(void)
 {
 	__m128i in[16], out[16];
-	unsigned failures = 0, checked = 0, missing = 0;
+	unsigned failures = 0, checked = 0, missing = 0, tolerated = 0;
 	size_t c;
 
 	for (c = 0; c < LOWERING_CASES; c++) {
@@ -586,6 +754,11 @@ int main(void)
 					want = &expected;
 				if (memcmp(&out[r], want, 16) == 0)
 					continue;
+				if (entry->nan_lane && r == entry->destination
+				    && nan_equivalent(&out[r], want, entry->nan_lane)) {
+					tolerated++;
+					continue;
+				}
 				failures++;
 				if (failures <= 8) {
 					const uint32_t *got = (const uint32_t *)&out[r];
@@ -615,5 +788,9 @@ int main(void)
 	}
 	printf("lowering: %u lowerings executed over %d cases, every register "
 	       "as the compiler computed it\n", checked, LOWERING_CASES);
+	if (tolerated)
+		printf("lowering: %u NaN payload difference(s) in Class F, not "
+		       "counted -- both sides are NaN and the order is GCC's\n",
+		       tolerated);
 	return 0;
 }
