@@ -2707,10 +2707,12 @@ dies" into "the exception propagates correctly to outer frames" rather than into
 
 #### What this could not test
 
-`wine` is not Windows and its unwinder is a reimplementation, so the 5 is strong evidence
-about the mechanism and not proof about the shipping loader. Nothing here ran more than
-one thread, so the pool's race is argued rather than measured. Both are named because an
-absent gap gets guessed at.
+`wine` is not Windows and its unwinder is a reimplementation, so the 5 was read at the
+time as evidence about the mechanism rather than proof about the shipping loader.
+**Finding 68 settled it the other way**: the toolchain never allocates stack inside a
+chained fragment, so wine's behaviour costs MSVC nothing and this project's pattern is
+unexercised rather than unsupported. Nothing here ran more than one thread, so the pool's
+race is argued rather than measured; that gap is still open.
 
 ### Finding 47 -- the SEH scope table, found while looking at something else
 
@@ -3653,6 +3655,52 @@ It also means wine is not the test instrument standing in for the real one: **fo
 driving case wine IS the real one**, which raises the stakes on the contradiction above
 rather than lowering them.
 
+### Finding 68 -- the contradiction resolved: nobody allocates in a fragment
+
+Finding 67 left a contradiction. Wine gives an establisher frame sixteen bytes out for a
+spilling stub, yet MSVC emits chained unwind info 31,634 times in this binary and Starfield
+is played under Proton every day. Both cannot be true of the same mechanism.
+
+They are true of different mechanisms. Counting which unwind **operations** appear inside a
+chained fragment, against those in a primary:
+
+```
+inside chained fragments        inside primaries
+  SAVE_NONVOL     49,868          PUSH_NONVOL    177,280
+  SAVE_XMM128     15,387          SAVE_NONVOL     72,295
+                                  ALLOC_SMALL     45,903
+  no allocation, ever             ALLOC_LARGE     14,159
+```
+
+**Sixty-five thousand unwind codes in fragments and not one of them allocates stack.** The
+toolchain puts register saves in a fragment and never a frame adjustment, and the frame
+register field is zero in all 55,070 of them.
+
+That explains everything at once. Wine ignoring a fragment's codes costs MSVC almost
+nothing, because a `SAVE_*` says where a register is restored *from* and not how big the
+frame is -- the unwind chain still walks correctly and only restored register values would
+be wrong. So Starfield is unaffected, and this project's pattern -- an `ALLOC_SMALL` inside
+a fragment -- is one **nothing in the corpus exercises**. It is unexercised because the
+toolchain does not do it, and the ABI's own wording, that a chained entry's frame register
+and fixed-stack allocation must match the primary's, says why: **a fragment shares its
+primary's frame rather than having one of its own.**
+
+#### So the spill question is closed, and for a better reason
+
+Finding 49 concluded `--spill=none` on the evidence and hoped a Windows host might reopen
+it. It will not. A stub that moves `rsp` cannot be described as a chained fragment, and
+the alternative -- an unchained entry with a complete frame of its own -- was measured in
+Finding 49 to lose the handler entirely, because the chain is what reaches it.
+
+The three ways a stub can get a scratch register are now all closed on evidence rather
+than on caution: the stack cannot be described, the pool cannot be made thread-safe, and
+`src1` is dead at only 249 sites. The `--spill` switch stays, because the measurement it
+carries is what a future reader will want, and its default stays `none`.
+
+**And no external resource would have changed any of this.** The question that looked like
+it needed another operating system was answered by counting bytes in a file that was here
+all along -- twice, in Findings 67 and 68.
+
 ### Final state
 
 ```
@@ -3707,8 +3755,10 @@ code quickly.
    49 tested what was left: a stub that moves `rsp` hands the unwinder a frame sixteen
    bytes wrong, because a chained fragment's own unwind codes are not applied and
    dropping the chain loses the handler entirely. `--spill=none` stays the default on
-   evidence. **The Windows host is not needed** -- Finding 67 found the answer in the corpus,
-   and turned this into a contradiction to bisect on this machine.
+   evidence, and **Finding 68 closed it for good**: MSVC never allocates stack inside a
+   chained fragment -- not once in 65,255 fragment unwind codes -- because a fragment
+   shares its primary's frame rather than having one of its own. No operating system,
+   host or measurement will reopen this; a stub that moves `rsp` cannot be described.
 
    What follows is kept because it is what was decided against and why.
 
