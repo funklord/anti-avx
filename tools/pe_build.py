@@ -699,6 +699,35 @@ control:	.long 3, 2, 1, 0
 """)
 
 
+
+# 19. One source copied to TWO destinations, which stores the same ymm twice.
+#
+# The second store reads an upper half the first store did not consume, so
+# closing the run on the first store refused the whole thing -- 1,019 pairs
+# in Starfield. A register stays tracked across as many stores as follow,
+# and both upper halves are read back so that losing either shows.
+PROGRAMS["twostore"] = (90, """
+	.text
+	.globl _start
+_start:
+	subq	$136, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* one load ... */
+	vmovups	%ymm0, (%rdi)		/* ... and two stores */
+	vmovups	%ymm0, 64(%rdi)
+	movl	16(%rdi), %eax		/* upper half of the first: 45 */
+	addl	80(%rdi), %eax		/* upper half of the second: 45 */
+	addq	$136, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 45, 6, 7, 8
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

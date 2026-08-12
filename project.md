@@ -3553,19 +3553,61 @@ obligations without inheriting its guard. **That is the shape to look for**, and
 cheaper to look for than to test for -- Finding 64 records why `check-pe` cannot reach the
 case at all.
 
+### Finding 66 -- the next blocker was right behind the first
+
+1,766 adjacent pairs were refused for `ymm upper half read later`, and asking what does the
+reading says **1,019 of them are another store of the same register** -- one source copied
+to two destinations. The run closed a register on its first store, so the second store
+looked like a read of an upper half that was in fact sitting in a helper.
+
+Two things were wrong and both are fixed. A store does not end a value's life, so a
+register now stays tracked across as many stores as follow; and the pair was pre-empting
+the run, declining and moving on where the run solves the same problem differently, so a
+pair's failure now falls through and its reason is recorded only if the run declines too.
+
+Both are right independently of what they buy. What they buy is **21 sites.**
+
+```
+VEX in .text     19,015 -> 18,994
+
+ymm upper half read later      1,766 -> 0        folded into the run
+ymm run upper half read later    108 -> 1,190
+no register free across a run    446 -> 911
+```
+
+The 1,019 became longer runs, and then the Finding 64 guard refused most of them anyway --
+because something reads the upper half after the *extended* run too -- while 465 more ran
+out of free registers across the now longer span.
+
+#### The lesson, which is the second time
+
+**Measuring what blocks a site is not measuring what unblocking it would gain.** The next
+blocker is usually right behind, and a counter of first refusals reads like an
+opportunity. Finding 59 was the same shape: 9,742 stores declined for "no known upper
+half", of which 9,100 were already being lowered by a run anchored elsewhere.
+
+The honest form of the question is not "why is this refused" but "what happens if I stop
+refusing it", and the only way to answer that is to build the change and count -- which is
+cheap when the change is small and is exactly why this one was worth making anyway.
+
+The change is kept because it is correct and free, not because of the 21: a store ending a
+value's life was wrong, and a strategy pre-empting a better one was wrong. The accounting
+is more honest too -- 1,766 sites that read as "the upper half is live" were really "a run
+would hold it, and something later still wants it".
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      194,691
-skipped for overlap                            36,563
-refused, stub not buildable                     3,973
-VEX in .text            805,131 ->      19,015   786,116 removed, 97.6%
+detoured                                      194,844
+skipped for overlap                            36,322
+refused, stub not buildable                     4,276
+VEX in .text            805,131 ->      18,994   786,137 removed, 97.6%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 77,688 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 81,798
+section, every section after `.text` is byte-identical, all 77,214 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 81,434
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -4320,7 +4362,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 51 mnemonics over four operand shapes, one with src2 in memory; `vblendvps`/`vblendvpd` across all five register arrangements their lowering branches on; ten FMA orderings; and the broadcasts through memory. Every one of 16 registers matching GCC's SSE intrinsic over 8 input patterns including three all-NaN | 256-bit, `vpermilps`, and any lowering whose destination is a general-purpose register -- Findings 54 to 57 count them |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | fourteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | fifteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
 | `make detour-verify` | on Starfield: header self-consistency, size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53 |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
@@ -4330,7 +4372,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and fourteen PEs built for the purpose.
+things: the lowerings executed in isolation, and fifteen PEs built for the purpose.
 
 ### What is still not verified
 
@@ -4387,7 +4429,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **786,116 of 805,131 VEX sites, 97.6%** (Findings 24 to 64), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **786,137 of 805,131 VEX sites, 97.6%** (Findings 24 to 66), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 

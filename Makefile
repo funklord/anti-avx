@@ -344,7 +344,8 @@ outside: $(LISTING)
 # -- the end-to-end test, on PEs this project builds itself ------------------
 
 PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
-             fallthrough pastread swallowed gapped interleaved permilps
+             fallthrough pastread swallowed gapped interleaved permilps \
+             twostore
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)

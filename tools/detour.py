@@ -957,6 +957,11 @@ def ymm_run(instructions, index, blocked, limit=48):
 	scale. Measured: 9,577 runs, of which 9,200 hold a single pair and 377
 	hold between two and ten.
 
+	A register stays tracked across as many stores as follow, since one
+	source copied to two destinations stores the same ymm twice and the
+	upper half is in a helper either way. `assign_helpers` already keys on
+	the LAST store per register, so it needed no change for that.
+
 	Returns (members, last position), members being (kind, position, register)
 	with kind one of `load`, `store`, `plain`. The whole run goes into ONE
 	stub, which is what keeps it an ordinary window rather than several that
@@ -967,39 +972,52 @@ def ymm_run(instructions, index, blocked, limit=48):
 	first = wide_move(encoding, mnemonic, operands)
 	if first is None or first[0] != "load":
 		return None
-	open_now = {first[1]}
-	members, at = [], address + len(encoding)
+	tracked = {first[1]}
+	members, at, last_store = [], address + len(encoding), None
 	for step in range(1, limit + 1):
 		position = index + step
 		if position >= len(instructions):
-			return None
+			break
 		next_address, bits, name, text, _c = instructions[position]
 		if next_address != at or next_address in blocked:
-			return None
+			break
 		if name.startswith(CONTROL_PREFIXES):
-			return None
+			break
 		what = wide_move(bits, name, text)
 		vex = inplace.decode_vex(bits)
-		if what is not None and what[0] == "store" and what[1] in open_now:
+		if what is not None and what[0] == "store" and what[1] in tracked:
+			# **A store does not end the value's life.** One source copied
+			# to two destinations stores the same ymm twice, and closing on
+			# the first store refused 1,019 pairs for reading an upper half
+			# that is sitting in a helper register. The register stays
+			# tracked and the run simply grows.
 			members.append(("store", position, what[1]))
-			open_now.discard(what[1])
+			last_store = len(members)
 			at = next_address + len(bits)
-			if not open_now:
-				return (members, position) if members else None
 			continue
-		if what is not None and what[0] == "load" and what[1] not in open_now:
-			open_now.add(what[1])
+		if what is not None and what[0] == "load" and what[1] not in tracked:
+			tracked.add(what[1])
 			members.append(("load", position, what[1]))
 			at = next_address + len(bits)
 			continue
 		if vex is not None and vex["L"]:
-			return None		# a 256-bit instruction that is not a copy half
+			break			# a 256-bit instruction that is not a copy half
 		if any(r in text or "%xmm" + r[len("%ymm"):] in text
-		       for r in open_now):
-			return None		# the value is touched before its store
+		       for r in tracked):
+			break			# the value is touched other than by a store
 		members.append(("plain", position, None))
 		at = next_address + len(bits)
-	return None
+
+	if last_store is None:
+		return None
+	# Trim whatever followed the last store: it is not part of the copy and
+	# carrying it would only widen the window.
+	members = members[:last_store]
+	loaded = {first[1]} | {r for kind, _p, r in members if kind == "load"}
+	stored = {r for kind, _p, r in members if kind == "store"}
+	if loaded - stored:
+		return None		# a register loaded and never stored has no use
+	return members, members[-1][1]
 
 
 def free_across(plain, positions, definition, until, site_registers):
@@ -1490,6 +1508,13 @@ def collect(binary, listing):
 		# A 256-bit copy through one ymm, taken as a unit. Both halves of
 		# it are refused individually -- there is no SSE form of either --
 		# so this has to be seen before either is considered alone.
+		# **The pair is tried first because it needs no helper register**,
+		# and a failure here is not a refusal: the run below solves the same
+		# problem differently and can take what the pair cannot. Its reason
+		# is held back and only recorded if the run declines too -- one
+		# source copied to two destinations was being refused for reading an
+		# upper half that a run would have kept in a register.
+		pair_reason = None
 		if vex["L"] and index + 1 < len(instructions):
 			following = instructions[index + 1]
 			pair = ymm_pair(instructions[index], following)
@@ -1497,32 +1522,23 @@ def collect(binary, listing):
 				window = len(encoding) + len(following[1])
 				held = operands.rpartition(",")[2]
 				if following[0] != address + len(encoding):
-					skipped["ymm pair not adjacent"] += 1
-					declined[address] = "ymm pair not adjacent"
+					pair_reason = "ymm pair not adjacent"
+				elif following[0] in blocked:
+					pair_reason = "ymm store is a branch target"
+				elif upper_half_read_later(instructions, index + 1, held,
+				                           positions=positions):
+					pair_reason = "ymm upper half read later"
+				elif not inplace.covered_by(ranges, address, window):
+					pair_reason = "outside .pdata"
+				# The stub's address decides a RIP displacement, and it is
+				# not known yet; the site's own address stands in, which is
+				# what the Class C probe below does for the same reason.
+				elif lower_ymm_pair(pair, address) is None:
+					pair_reason = "ymm pair operand cannot be offset"
+				else:
+					candidates.append((address, encoding, operands, mnemonic,
+					                   window, [], None, [], ("pair", pair)))
 					continue
-				if following[0] in blocked:
-					skipped["ymm store is a branch target"] += 1
-					declined[address] = "ymm store is a branch target"
-					continue
-				if upper_half_read_later(instructions, index + 1, held,
-				                         positions=positions):
-					skipped["ymm upper half read later"] += 1
-					declined[address] = "ymm upper half read later"
-					continue
-				if not inplace.covered_by(ranges, address, window):
-					skipped["outside .pdata"] += 1
-					declined[address] = "outside .pdata"
-					continue
-				# The stub's address decides a RIP displacement, and it is not
-				# known yet; the site's own address stands in, which is what
-				# the Class C probe below does for the same reason.
-				if lower_ymm_pair(pair, address) is None:
-					skipped["ymm pair operand cannot be offset"] += 1
-					declined[address] = "ymm pair operand cannot be offset"
-					continue
-				candidates.append((address, encoding, operands, mnemonic,
-				                   window, [], None, [], ("pair", pair)))
-				continue
 
 		# The same copy with something in between, held in a second register
 		# so that nothing between the two halves has to move. The whole span
@@ -1581,6 +1597,10 @@ def collect(binary, listing):
 				candidates.append((address, encoding, operands, mnemonic,
 				                   window, [], None, [], ("run", run)))
 				continue
+		if pair_reason is not None:
+			skipped[pair_reason] += 1
+			declined[address] = pair_reason
+			continue
 
 		# A 256-bit store of a register a VEX.128 zeroing idiom emptied.
 		# Both halves are zero, so it is two 128-bit stores of the same
