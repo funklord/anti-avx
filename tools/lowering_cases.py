@@ -148,6 +148,20 @@ FMAS = ["vfmadd231ps", "vfmadd231ss", "vfmadd213ps", "vfmadd213pd",
         "vfmadd213ss", "vfmadd132ss", "vfmsub231ps", "vfmsub231ss",
         "vfnmadd231ps", "vfnmadd231ss"]
 
+# The broadcasts, which load one element and spread it. 753 vbroadcastss in
+# Starfield, 18 vpbroadcastd and one vbroadcastsd, all reached through a
+# memory operand -- and the load width is the point of the lowering, so a
+# case has to go through memory to exercise it at all.
+#
+# The source slot is xmm2's, deliberately not the destination's: a lowering
+# that read the wrong address would otherwise be reading the right answer by
+# accident.
+# vbroadcastsd is absent because it has no 128-bit form at all -- its
+# destination is a ymm by definition -- which is also why the binary
+# holds exactly one and why lower_broadcast refuses it on VEX.L.
+BROADCAST_CASES = ["vbroadcastss", "vpbroadcastd"]
+BROADCAST_SOURCE = 2
+
 # (name, mask, src2, src1, destination)
 BLEND_SHAPES = [
 	("mask_in_xmm0", 0, 2, 1, 3),
@@ -246,6 +260,12 @@ def build():
 		lane = 8 if mnemonic.endswith(("sd", "pd")) else 4
 		wanted.append((mnemonic, "distinct", DESTINATION, 1, text, 2,
 		               DESTINATION, lane))
+
+	for mnemonic in BROADCAST_CASES:
+		text = (f"{mnemonic} {BROADCAST_SOURCE * 16}(%rdi),"
+		        f"%xmm{DESTINATION}")
+		wanted.append((mnemonic, "from_memory", BROADCAST_SOURCE,
+		               BROADCAST_SOURCE, text, -1, DESTINATION, 0))
 
 	for mnemonic in BLENDS:
 		for shape, mask, source2, source1, destination in BLEND_SHAPES:

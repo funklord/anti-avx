@@ -623,6 +623,26 @@ static reference3_fn reference3_for(const char *mnemonic)
 	return NULL;
 }
 
+/* The broadcasts read ONE element and spread it, and the narrow load is the
+ * whole point of the lowering -- a single pshufd would read 128 bits where
+ * vbroadcastss reads 32, so a source four bytes from the end of a mapped
+ * page would fault where the original did not. The reference says only what
+ * the result must be; tools/detour.py's comment carries the argument for
+ * why it is reached the way it is. */
+
+static __m128i ref_broadcastss(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_castps_si128(_mm_set1_ps(_mm_cvtss_f32(
+	                            _mm_castsi128_ps(a))));
+}
+
+static __m128i ref_pbroadcastd(__m128i a, __m128i b)
+{
+	(void)b;
+	return _mm_set1_epi32(_mm_cvtsi128_si32(a));
+}
+
 static const struct {
 	const char *mnemonic;
 	reference_fn reference;
@@ -653,6 +673,8 @@ static const struct {
 	{ "vpackssdw", ref_packssdw }, { "vpackuswb", ref_packuswb },
 	{ "vinsertps", ref_insertps }, { "vdpps", ref_dpps },
 	{ "vcmpltps", ref_cmpltps }, { "vcmpless", ref_cmpless },
+	{ "vbroadcastss", ref_broadcastss },
+	{ "vpbroadcastd", ref_pbroadcastd },
 	{ "vpsrld", ref_psrld }, { "vpslld", ref_pslld },
 	{ "vpsrlq", ref_psrlq }, { "vpsllq", ref_psllq },
 	{ "vpsrad", ref_psrad }, { "vpsrldq", ref_psrldq },

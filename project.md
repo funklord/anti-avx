@@ -3223,6 +3223,43 @@ so it corroborated the wrong thing.
 it. This is that rule in a language that caches compilation invisibly, and `git diff`
 being empty is not evidence that what ran was what the file says.
 
+### Finding 57 -- the broadcasts, and the one that cannot be reached this way
+
+`vbroadcastss` at 753 sites and `vpbroadcastd` at 18, both through a memory operand --
+and **the load width is the whole point of the lowering**, so a case that did not go
+through memory would not exercise it at all. `lower_broadcast`'s own comment makes the
+argument: a single `pshufd` would read 128 bits where `vbroadcastss` reads 32, so a source
+four bytes from the end of a mapped page would fault where the original did not.
+
+The source slot is deliberately not the destination's. A lowering that read the wrong
+address would otherwise be reading the right answer by accident. Changing the spread's
+control from lane 0 to lane 1 leaves the low lane zero and fails on every pattern.
+
+```
+231 cases, 1,848 executions
+233 cases, 1,864 executions
+```
+
+`vbroadcastsd` is absent because **it has no 128-bit form at all** -- its destination is a
+ymm by definition -- which is also why the binary holds exactly one of them and why
+`lower_broadcast` refuses it on `VEX.L`. The generator failing to assemble it is how that
+was learned.
+
+#### `vpermilps` needs a different harness, not a different reference
+
+It is the last sequence with no executable case, and the obstacle is structural. The
+inline lowering reads its permute constants from the stub section's pool through a
+RIP-relative displacement, and the generator emits its cases as `.byte` -- it cannot know
+where the assembler will place them, so it cannot compute the displacement. Exactly the
+reason a RIP-relative memory operand is not generated either.
+
+What exists instead is `make check-permil`, which is exhaustive over all 256 controls --
+but it tests `src/permil.c`, the reference implementation, **not the bytes the rewriter
+emits**. That distinction is the whole subject of Findings 54 to 57, so it is written down
+rather than left to be rediscovered. Closing it means either a harness that assembles the
+lowering from text rather than bytes, or a PE program of the kind `tools/pe_build.py`
+already builds -- the second is cheaper and is where the 256-bit strategies are tested.
+
 ### Final state
 
 ```
@@ -3988,7 +4025,7 @@ than compiling with MSVC or a cross-compiler.
 | `make style` | tabs, alignment, ASCII, and that documents name no missing file | anything about behaviour |
 | `make verify` | every lowering rule assembles, and no VEX or EVEX prefix survives | what any of them computes |
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
-| `make check-lowering` | 49 mnemonics over four operand shapes, one with src2 in memory, plus `vblendvps`/`vblendvpd` across all five register arrangements their lowering branches on; every one of 16 registers matching GCC's SSE intrinsic over 8 input patterns including three all-NaN | 256-bit, the FMA and broadcast sequences, and any lowering whose destination is a general-purpose register -- Findings 54 and 55 count them |
+| `make check-lowering` | 51 mnemonics over four operand shapes, one with src2 in memory; `vblendvps`/`vblendvpd` across all five register arrangements their lowering branches on; ten FMA orderings; and the broadcasts through memory. Every one of 16 registers matching GCC's SSE intrinsic over 8 input patterns including three all-NaN | 256-bit, `vpermilps`, and any lowering whose destination is a general-purpose register -- Findings 54 to 57 count them |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
 | `make check-pe` | thirteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
