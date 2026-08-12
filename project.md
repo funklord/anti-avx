@@ -3424,6 +3424,36 @@ near enough.
 site that cannot widen, including those already refused for another reason. The reach
 fraction is what decides it and applies to both.)
 
+### Finding 62 -- what milestone 3 would still be worth
+
+`project.md` called milestone 3 the go/no-go: if Ddisasm could not round-trip a 102 MB
+binary, nothing downstream mattered and the project stopped. That was right for the design
+it was written for, in which every rewrite went through a reassembleable IR. Milestone 4
+was then reached **without it**, by patching in place and detouring, and the sentence was
+never revisited.
+
+Revisiting it by counting rather than by argument. Sorting the 18,757 survivors by whether
+being able to move code freely would help:
+
+```
+positional  ~2,000    can't widen (935), overlap (1,041), store is a target (25)
+semantic   ~11,100    256-bit representation (6,800), no scratch (3,344),
+                      no direct SSE form (592), oracle (403)
+```
+
+with the refused-stub bucket, mixed and mostly 256-bit, making up the rest.
+
+**About 11% is positional.** Full reassembly dissolves the window shapes -- no five-byte
+minimum, no widening, no overlap -- and does nothing whatever about register pressure or
+about representing a 256-bit value in 128-bit registers. So milestone 3 is worth roughly
+two thousand sites, not everything, and it is demoted in the table accordingly.
+
+That also revises the "Honest assessment", which said the risk was concentrated in
+milestone 3 and in verification. Verification kept its half and then some: four defects
+here produced silently wrong output while passing every structural check, and two of the
+checks that should have caught them could not -- one shared a function with the code it
+checked (Finding 52), and one was empty by construction (Finding 53).
+
 ### Final state
 
 ```
@@ -4257,13 +4287,42 @@ crash at an unpredictable moment.
 | 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. Class A/B/C lowerings are now **executed** and checked against GCC's SSE intrinsics (Finding 31), which is the differential harness this row asked for, minus the AVX host: the reference is the compiler rather than the original instruction, because no AVX exists here to run. |
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
-| 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — the biggest single risk | **BLOCKED on memory, not on PGO.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning was evaluated separately and is a caution rather than a blocker (Finding 13). |
+| 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
 | 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **786,374 of 805,131 VEX sites, 97.7%** (Findings 24 to 52), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
-**Milestone 3 is the go/no-go.** If Ddisasm cannot round-trip a 102 MB game binary
-unmodified, nothing downstream matters and the project stops there.
+**Milestone 3 was the go/no-go, and the project routed around it.** That sentence stood
+for a design in which every rewrite went through a reassembleable IR, and it was right for
+that design: if Ddisasm could not round-trip a 102 MB binary, nothing downstream mattered.
+Milestone 4 was then reached **with no Ddisasm and no relocation of existing code**, by
+patching in place where the SSE form fits and detouring where it does not.
+
+So the question is no longer whether the project can proceed without it, but what it would
+still be worth -- and the residue says less than it looks. Counting the surviving 18,757
+sites by whether full reassembly would help:
+
+```
+positional -- would be dissolved by being able to move code
+  next instruction is a branch target        511
+  next instruction transfers control         424
+  window overlapped an earlier one         1,041
+  ymm store is a branch target                25
+                                          ~2,000
+
+semantic -- would survive any rewriting approach
+  256-bit needing a register representation ~6,800
+  no scratch register available             ~3,344
+  no direct SSE form                           592
+  the code oracle cannot vouch for the site    403
+```
+
+The rest is the refused-stub bucket, mixed and mostly 256-bit. **Roughly two thousand of
+the eighteen thousand are positional.** Being able to move code freely removes the window
+shapes and none of the register pressure, so milestone 3 is worth about 11% of what is
+left rather than being the thing everything depends on. It is demoted here from the
+biggest single risk to a measured 2,000 sites, still blocked on memory, and no longer on
+the critical path.
 
 **Milestone 3 now has a ground truth to check against.** Finding 8 enumerates 744
 islands inside `.text` that a linear sweep cannot decode — data the disassembler must
@@ -4347,9 +4406,20 @@ This is a hard but *bounded* engineering project, not a research dead-end. The
 performance argument against it does not hold — the measured instruction mix means a
 translated binary should run at near-native speed.
 
-The risk is concentrated almost entirely in milestone 3 (sound disassembly and
-reassembly of a large stripped PE) and in verification. Both are known-hard rather
-than unknown-hard.
+That was written when the risk looked concentrated in milestone 3 -- sound disassembly
+and reassembly of a large stripped PE -- and in verification. **Half of it has moved.**
+Milestone 3 was routed around rather than solved, and counting the residue puts what it
+would still be worth at about 2,000 of 18,757 sites; the rest is register pressure and the
+256-bit representation, which no rewriting mechanism removes.
+
+Verification is where the risk actually concentrated, and it earned that. Four defects
+here produced silently wrong output while passing every structural check -- the `src2`
+alias computing a constant zero, the `VEX.L` truncation storing half of every 256-bit
+write, a liveness scan that could not see a `%ymm` operand and handed out 233 live
+registers, and an exception that could not be dispatched from inside a stub. Every one was
+caught by asking what the code computes rather than what shape it has, and two of the
+checks that should have caught them earlier could not: one shared a function with the code
+it checked, and one was empty by construction.
 
 Reproduce the measurements with:
 
