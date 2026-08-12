@@ -3386,6 +3386,44 @@ whose destination is a general-purpose register -- `vpextrq` at 780 sites and
 `vcvttss2si` at 376 -- which need a harness that compares general-purpose registers
 rather than a different reference.
 
+### Finding 61 -- the trampoline, closed at 21% reach
+
+511 sites are refused because the next instruction is a branch target and 424 because it
+transfers control, and neither can widen backwards either. A window must be five bytes to
+hold a `jmp rel32`.
+
+**A two-byte `jmp rel8` needs no widening at all.** It fits inside a four-byte site with
+two bytes to spare, and the next instruction keeps its boundary -- which is exactly the
+constraint that refused these. It needs somewhere within reach to land: five bytes for a
+`jmp rel32` on to the stub. MSVC leaves runs of `int3` between functions for alignment, so
+the space plausibly exists.
+
+It does exist, and it is in the wrong places:
+
+```
+padding runs of 5+ int3 outside every function   160,018     1,639,100 bytes
+sites that cannot widen either way                 9,341
+  a padding slot within rel8 reach                 1,929     21%
+  nothing in reach                                 7,412
+```
+
+1.64 MB of padding and four fifths of the sites cannot see any of it, because `rel8`
+reaches 126 bytes back and 129 forward and these sites are in the middle of large
+functions. Against the collector's own 935 declines the same fraction gives about 200
+sites -- for a **new class of write**, into bytes that are not code, with the verification
+that implies: proving each slot lies outside every function, that nothing branches to it,
+and that two sites never claim the same one.
+
+Closed. It is the same trade Finding 39 refused at 68 sites and Finding 45 at 249, and the
+fourth time counting first has saved building something. The measurement is recorded
+because the idea is a good one that will occur to the next reader too, and the reason it
+fails is not obvious from the outside -- there is plenty of padding; it is simply not
+near enough.
+
+(The 9,341 is a broader population than the collector's 935: it counts every short VEX
+site that cannot widen, including those already refused for another reason. The reach
+fraction is what decides it and applies to both.)
+
 ### Final state
 
 ```
