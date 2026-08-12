@@ -3064,6 +3064,69 @@ witness but `targets.py`, so for those the weak check above remains the only che
 is a real gap and it is named rather than papered over: the strengthened half covers
 every branch the code writes down, and nothing covers the ones it computes.
 
+### Finding 54 -- what the executable tests had never run
+
+The second audit Finding 52 asked for. `check-lowering`'s reference is GCC and so is
+genuinely independent, but **the set of cases is chosen by the thing under test** --
+`lowering_cases.py` generates them from `detour.lower_vex`. Finding 37's truncation was
+invisible for exactly that reason: every case used 128-bit operands, so no fixture could
+express the bug.
+
+The question that finds the rest of it is not "does the suite pass" but "of the sites the
+rewriter lowers into Starfield, which kinds has nothing ever run":
+
+```
+direct form, executed                                119,167
+direct form with a memory operand, NEVER EXECUTED     81,656
+sequence: vblendvps                                    3,054
+direct form, NEVER EXECUTED: vsqrtss                   2,544
+                             vinsertps                 1,670
+                             vcvtss2sd                 1,458
+                             vdpps                     1,220
+                             vcmpltss                    851
+                             vpextrq                     780
+                             ... and a long tail
+```
+
+`make check-lowering` reported "37 mnemonics x 3 operand shapes", which reads like broad
+coverage and is, of the shapes it has. It had never executed a single memory operand.
+
+#### The memory shape cost nothing, which is why it is embarrassing
+
+The harness passes the input vectors in `%rdi` and leaves it live, so a case can name the
+slot `%xmm2` was loaded from and compute **exactly what the `distinct` shape computes** --
+same answer, same reference, no new oracle. Pointing it at the wrong slot instead gives
+232 wrong comparisons, so it is executing what it claims to.
+
+`vmovss` and `vmovsd` are exempt because their memory form is a different instruction, a
+load that zeroes the rest of the destination rather than a merge. `vinsertps` is exempt
+for a sharper reason: its memory form takes a 32-bit operand and **ignores the
+source-select half of the immediate**, so it does not compute what the register form
+computes and one reference cannot describe both.
+
+A RIP-relative operand is deliberately not generated. The bytes are emitted as `.byte`
+and the generator cannot know where the assembler will place them, so the displacement
+would be wrong -- that path is covered end to end by the `memory` PE program instead.
+
+```
+129 cases, 37 mnemonics, 1,032 executions
+211 cases, 49 mnemonics, 1,688 executions
+```
+
+#### What is still never executed, named rather than left implicit
+
+- **The sequences.** `vblendvps` at 3,054 sites, the FMA orderings, the broadcasts and
+  `vpermilps` are multi-instruction lowerings with a scratch register, and no case runs
+  any of them. `make check-aliasing` proves they do not read a register they have already
+  written, which is a real property and is about shape. This is the largest remaining
+  hole in the executable evidence.
+- **GPR destinations.** `vpextrq` and `vcvttss2si` write a general-purpose register, and
+  the harness compares the sixteen xmm registers. They need a different harness, not a
+  different reference.
+- **In-place patches.** 242,345 of them involve a mnemonic with no case. The risk is
+  lower -- an in-place patch is a prefix strip, and `make verify` checks the encoding --
+  but "lower" is not "none" and the count belongs somewhere.
+
 ### Final state
 
 ```
@@ -3824,7 +3887,7 @@ than compiling with MSVC or a cross-compiler.
 | `make style` | tabs, alignment, ASCII, and that documents name no missing file | anything about behaviour |
 | `make verify` | every lowering rule assembles, and no VEX or EVEX prefix survives | what any of them computes |
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
-| `make check-lowering` | 37 mnemonics x 3 operand shapes executed on this CPU, every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | memory-operand forms, 256-bit, and the helper classes |
+| `make check-lowering` | 49 mnemonics over four operand shapes, one of them with src2 in memory, executed on this CPU with every one of 16 registers matching GCC's SSE intrinsic, over 8 input patterns including three all-NaN | 256-bit, the sequence classes, and any lowering whose destination is a general-purpose register -- Finding 54 counts them |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
 | `make check-pe` | thirteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |

@@ -227,6 +227,83 @@ static __m128i ref_movsd(__m128i a, __m128i b)
 
 /* The immediate is fixed at 0x1b, which is the value the generator
  * emits; a different one would need a case of its own. */
+/* Added after the coverage audit of Finding 54, which counted how many
+ * sites the rewriter lowers whose mnemonic no case had ever executed.
+ * These twelve were the largest of them. */
+
+static __m128i ref_sqrtss(__m128i a, __m128i b)
+{
+	/* Low element from sqrt(src2), the rest from src1 -- which is what
+	 * the three-operand VEX form does and what one-argument
+	 * _mm_sqrt_ss on its own does not say. */
+	return _mm_castps_si128(_mm_move_ss(_mm_castsi128_ps(a),
+	                            _mm_sqrt_ss(_mm_castsi128_ps(b))));
+}
+
+static __m128i ref_cvtss2sd(__m128i a, __m128i b)
+{
+	return _mm_castpd_si128(_mm_cvtss_sd(_mm_castsi128_pd(a),
+	                            _mm_castsi128_ps(b)));
+}
+
+static __m128i ref_cvtsd2ss(__m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_cvtsd_ss(_mm_castsi128_ps(a),
+	                            _mm_castsi128_pd(b)));
+}
+
+static __m128i ref_mulsd(__m128i a, __m128i b)
+{
+	return _mm_castpd_si128(_mm_mul_sd(_mm_castsi128_pd(a),
+	                            _mm_castsi128_pd(b)));
+}
+
+static __m128i ref_cmpeqps(__m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_cmpeq_ps(_mm_castsi128_ps(a),
+	                            _mm_castsi128_ps(b)));
+}
+
+static __m128i ref_cmpleps(__m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_cmple_ps(_mm_castsi128_ps(a),
+	                            _mm_castsi128_ps(b)));
+}
+
+static __m128i ref_cmpneqps(__m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_cmpneq_ps(_mm_castsi128_ps(a),
+	                            _mm_castsi128_ps(b)));
+}
+
+static __m128i ref_cmpltss(__m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_cmplt_ss(_mm_castsi128_ps(a),
+	                            _mm_castsi128_ps(b)));
+}
+
+static __m128i ref_packssdw(__m128i a, __m128i b)
+{
+	return _mm_packs_epi32(a, b);
+}
+
+static __m128i ref_packuswb(__m128i a, __m128i b)
+{
+	return _mm_packus_epi16(a, b);
+}
+
+static __m128i ref_insertps(__m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_insert_ps(_mm_castsi128_ps(a),
+	                            _mm_castsi128_ps(b), 0x10));
+}
+
+static __m128i ref_dpps(__m128i a, __m128i b)
+{
+	return _mm_castps_si128(_mm_dp_ps(_mm_castsi128_ps(a),
+	                            _mm_castsi128_ps(b), 0x71));
+}
+
 static __m128i ref_shufps(__m128i a, __m128i b)
 {
 	return _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(a),
@@ -358,6 +435,12 @@ static const struct {
 	{ "vpunpckldq", ref_punpckldq },
 	{ "vmovss", ref_movss }, { "vmovsd", ref_movsd },
 	{ "vshufps", ref_shufps },
+	{ "vsqrtss", ref_sqrtss }, { "vcvtss2sd", ref_cvtss2sd },
+	{ "vcvtsd2ss", ref_cvtsd2ss }, { "vmulsd", ref_mulsd },
+	{ "vcmpeqps", ref_cmpeqps }, { "vcmpleps", ref_cmpleps },
+	{ "vcmpneqps", ref_cmpneqps }, { "vcmpltss", ref_cmpltss },
+	{ "vpackssdw", ref_packssdw }, { "vpackuswb", ref_packuswb },
+	{ "vinsertps", ref_insertps }, { "vdpps", ref_dpps },
 	{ "vcmpltps", ref_cmpltps }, { "vcmpless", ref_cmpless },
 	{ "vpsrld", ref_psrld }, { "vpslld", ref_pslld },
 	{ "vpsrlq", ref_psrlq }, { "vpsllq", ref_psllq },

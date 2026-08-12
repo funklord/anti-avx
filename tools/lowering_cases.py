@@ -63,6 +63,11 @@ CASES = [
 	"vpaddd", "vpsubd", "vpcmpeqd", "vpcmpgtd", "vpunpckldq",
 	"vmovss", "vmovsd",
 	"vshufps $0x1b", "vcmpltps", "vcmpless",
+	# The twelve the Finding 54 audit found the rewriter emitting into
+	# Starfield with no case ever executing one.
+	"vsqrtss", "vcvtss2sd", "vcvtsd2ss", "vmulsd",
+	"vcmpeqps", "vcmpleps", "vcmpneqps", "vcmpltss",
+	"vpackssdw", "vpackuswb", "vinsertps $0x10", "vdpps $0x71",
 ]
 
 # The destination is always xmm0, so the harness knows where to look, and
@@ -89,6 +94,34 @@ SHAPES = [
 	("dst_is_src1", 2, 0),
 	("dst_is_src2", 0, 1),
 ]
+
+# **The shape nothing had ever executed.** Every case above is register to
+# register, and 81,656 of the sites the rewriter detours in Starfield have
+# their src2 in memory -- a different path through `lower_vex`, which emits
+# the `movaps` and then an operation whose modrm carries a displacement
+# rather than a register.
+#
+# It needs no new reference, which is what makes it nearly free: the harness
+# passes the input vectors in `%rdi` and leaves it live, so naming the slot
+# xmm2 was loaded from computes exactly what the `distinct` shape computes
+# and compares against exactly the same answer.
+#
+# A RIP-relative operand is deliberately not generated here. The bytes are
+# emitted as `.byte` and the generator cannot know where the assembler will
+# put them, so the displacement would be wrong -- that path is covered
+# end to end by the `memory` program in tools/pe_build.py instead.
+MEMORY_SHAPE = ("src2_in_memory", 2, 1)
+
+# `vmovss` and `vmovsd` with a memory source are a different
+# instruction from the register form -- a load that zeroes the rest of
+# the destination rather than a merge -- so the register form's
+# reference does not describe them and they are left to the shapes
+# above.
+# `vinsertps` joins them for a different reason: its memory form takes a
+# 32-bit operand and IGNORES the source-select half of the immediate,
+# so it does not compute what the register form computes and one
+# reference cannot describe both.
+MEMORY_EXEMPT = frozenset(("vmovss", "vmovsd", "vinsertps"))
 
 
 # **256-bit forms that must be REFUSED, not lowered.** There is no SSE
@@ -154,6 +187,12 @@ def build():
 			operands = f"%xmm{source2},%xmm{source1},%xmm{DESTINATION}"
 			text = f"{mnemonic} {immediate + ',' if immediate else ''}{operands}"
 			wanted.append((mnemonic, shape, source1, source2, text))
+		if mnemonic in MEMORY_EXEMPT:
+			continue
+		shape, source2, source1 = MEMORY_SHAPE
+		operands = f"{source2 * 16}(%rdi),%xmm{source1},%xmm{DESTINATION}"
+		text = f"{mnemonic} {immediate + ',' if immediate else ''}{operands}"
+		wanted.append((mnemonic, shape, source1, source2, text))
 
 	for mnemonic, immediate in SHIFTS:
 		for shape, source in SHIFT_SHAPES:
