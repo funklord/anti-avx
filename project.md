@@ -3262,6 +3262,10 @@ already builds -- the second is cheaper and is where the 256-bit strategies are 
 
 ### Finding 58 -- the remaining stores are copies, not computations
 
+**Half wrong, and corrected by Finding 59: 9,100 of the 9,742 below are copies a run
+already lowers, counted as declined because the collector meets the store again on its
+own account. The table is right about arithmetic and wrong about what the rest needs.**
+
 Stated here twice that the residue needs the model to track a computed value. **Measured,
 it does not.** Asking what defines each of the 12,552 stores the collector still declines:
 
@@ -3302,6 +3306,50 @@ Two routes, neither costed yet:
   beginning and which Finding 46 gave a home: the writable section the pool spill needed
   exists, and its thread-safety objection applies here unchanged.
 
+### Finding 59 -- a counter that measured decisions, not work
+
+Finding 58 read 9,742 declined stores as copies blocked by control flow. Asking whether a
+run would take them says **9,100 of them are already taken**: a run is anchored at its
+load and its window reaches through the store, so the collector's loop meets that store
+again and declines it on its own account. The counter was measuring decisions, and a
+decision made twice about one instruction counts twice.
+
+This is Finding 35 wearing different clothes -- there, a residue was computed by
+subtracting two counts of different populations. The lesson did not transfer because
+nothing looked like a subtraction this time.
+
+#### The residue, read from the output
+
+```
+surviving VEX sites            18,757
+  128-bit                       7,946
+  256-bit store to memory       5,031
+  256-bit load from memory      3,428
+  256-bit, another shape        2,271
+  undecodable                      81
+```
+
+**The 128-bit share is 42%**, which no reading of the skip counters would have suggested,
+and it is dominated by the scratch problem the spill question answered `no` to. The
+256-bit store residue is 5,031 rather than 12,552.
+
+#### Where the subtraction belongs
+
+`make detour-plan` now prints, beside each counter, how many of its sites lie outside
+every accepted window -- 12,176 against a raw sum near 21,500.
+
+Doing it in the collector instead was tried and **cost 409 sites**. A site inside a window
+whose stub later fails to build still deserves its own chance, and taking that away is a
+real loss for a cosmetic gain. So the collector still decides per site and the subtraction
+happens where the question is *what is left* rather than *what was decided*.
+
+#### What the cross-block copy is actually worth
+
+Of the 9,742, only 642 need two stubs, and 456 of those could be placed: a register is
+free across the gap and both halves sit inside a described function. **456, not 9,742**,
+and the two-stub machinery is the atomicity Finding 50 chose the single-window design to
+avoid. That is the honest price of the last large-looking bucket.
+
 ### Final state
 
 ```
@@ -3327,8 +3375,8 @@ counting truncated 256-bit sites as successes.
 What remains:
 
 ```
-ymm value has no known upper half     12,552     needs a register model
-src2 aliases dst, no scratch           3,729     needs a register; 249 do not
+ymm value has no known upper half      4,601     outside any accepted window
+src2 aliases dst, no scratch           2,726     needs a register; 249 do not
 ymm upper half read later              1,766     what the edges could not resolve
 sequence with no usable scratch          780     needs a register
 no direct SSE form                       710     mostly vextractf128/vinsertf128

@@ -2153,12 +2153,33 @@ def main(argv):
 		return census(argv[1], argv[2], argv[3])
 
 	if mode == "plan":
-		_patches, candidates, stats, skipped, _declined = \
+		_patches, candidates, stats, skipped, declined = \
 			collect(argv[1], argv[2])
 		print(f"detour candidates (A/B/C) {len(candidates):>10,}")
+		# **A refusal inside an accepted window is not a residue.** A run is
+		# anchored at its load and its window reaches through the store, so
+		# the loop meets that store again and declines it on its own
+		# account -- 9,100 sites sat in `ymm value has no known upper half`
+		# that a run was about to lower, and the counter read as work
+		# remaining. It is not dropped from the collector, because a site
+		# inside a window whose stub later fails to build still deserves its
+		# own chance and taking that away cost 409 sites when tried. It is
+		# subtracted HERE, where the question is what is left rather than
+		# what was decided.
+		covered = set()
+		for start, _e, _o, _m, window, *_rest in candidates:
+			covered.update(range(start, start + window))
+		outside_windows = Counter()
+		for address, reason in declined.items():
+			if address not in covered:
+				outside_windows[reason] += 1
 		for reason, count in skipped.most_common():
-			print(f"  skipped, {reason:<24} {count:>10,}")
-		print(f"\nstub bytes (estimate)     {len(candidates) * 15:>10,}")
+			left = outside_windows.get(reason, 0)
+			note = "" if left == count else f"   ({left:,} outside any window)"
+			print(f"  skipped, {reason:<24} {count:>10,}{note}")
+		print(f"\nnot inside any accepted window "
+		      f"{sum(outside_windows.values()):>10,}")
+		print(f"stub bytes (estimate)     {len(candidates) * 15:>10,}")
 		return 0
 
 	if mode == "apply":
