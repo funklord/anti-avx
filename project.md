@@ -3517,6 +3517,42 @@ So the guard rests on the argument rather than on an execution, and the argument
 one Finding 38 wrote down: only a 256-bit instruction can read an upper half, a call and a
 return both end its life, and anything unresolved is refused.
 
+### Finding 65 -- what each lowering leaves behind, and what guards it
+
+Finding 64 was found by asking which guards the pair has that the run skipped. That
+question is worth asking of every lowering, and the answer is worth writing down, because
+"the others are probably fine" is not the same as knowing why. **Each row is the state the
+lowering leaves that the original would not have left, and the thing that makes it safe.**
+
+| lowering | what it leaves | what guards it |
+|---|---|---|
+| pair | xmm holds the low half, the ymm's upper half is stale | `upper_half_read_later`, since Finding 38 |
+| run | the same, per register, plus a helper clobbered | `upper_half_read_later` **since Finding 64 and not before**; `free_across` for the helper |
+| zero store | nothing -- it reads the low 128 bits twice and writes only memory | no obligation to discharge |
+| spill | nothing -- the borrowed register is saved and restored | `movups` moves 128 bits and every SSE write leaves [255:128] alone, so the upper half was never at risk |
+| swallowed neighbour | its own scratch clobbered | `find_scratch` at **its** position, not the site's -- Finding 45 |
+| in place | nothing | `classify` returns `B` only when destination equals src1, so the Finding 25 alias cannot reach it |
+| any of them | never a 256-bit instruction | `sse_encoding` refuses `VEX.L` and `narrow_piece` always clears it; `verify` counts zero VEX in the stub section |
+
+Two rows repay reading twice.
+
+**The zero store looks like it should be in trouble and is not.** It stores a register
+whose upper half was zeroed by a `vpxor %xmm0,%xmm0,%xmm0` that the in-place patcher
+lowered to `pxor %xmm0,%xmm0` -- which zeroes the low half only, so the upper half really
+is stale by the time the store runs. It does not matter, because the lowering reads only
+the low 128 bits and writes both halves of memory from it. The hazard is real and the
+lowering never touches it.
+
+**The spill's borrowed register never needed its upper half saving.** Every instruction a
+lowering emits is 128-bit SSE, and an SSE write leaves bits [255:128] unchanged, so 128
+bits saved and 128 restored is the whole of what changes. That is a property of the
+emitted code rather than of the spill, which is why it holds for both backing stores.
+
+One defect in seven rows, and it was the row where a new strategy inherited an old one's
+obligations without inheriting its guard. **That is the shape to look for**, and it is
+cheaper to look for than to test for -- Finding 64 records why `check-pe` cannot reach the
+case at all.
+
 ### Final state
 
 ```
