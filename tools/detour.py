@@ -1540,6 +1540,32 @@ def relocate(encoding, old_address, new_address, rip_target):
 	return encoding[:first] + new + encoding[first + 4:]
 
 
+def held_back(pair_reason, run_reason):
+	"""Which of two refusals to record when the run strategy declines a site.
+
+	The pair is tried first, because it needs no helper register, and the run
+	is the fallback for the pair rather than the other way round. So a site
+	that reaches the run at all has already been refused by the pair, and the
+	pair's reason is the more specific of the two: it names the property of
+	the code that stopped the cheaper lowering, where the run's names only the
+	register pressure that stopped the more expensive one.
+
+	`collect` said above the loop that the pair's reason is "held back and
+	only recorded if the run declines too", and then did not do it -- all four
+	run-decline branches recorded their own and returned to the top of the
+	loop, taking the held-back one with them.
+
+	**It cost no sites, which is why it survived.** Finding 75 measured the
+	fallback it looks like it should have at zero of 2,101: the pair really
+	had been tried, so there was nothing to fall back to. What it cost was the
+	census. 1,587 sites were filed under register pressure when the collector
+	already knew they were blocked on a later 256-bit read of a stale upper
+	half -- pointing a reader at the helper allocator when the work is the Y1
+	register representation. Finding 76.
+	"""
+	return run_reason if pair_reason is None else pair_reason
+
+
 def collect(binary, listing):
 	"""(in-place patches, class C detour candidates, statistics)."""
 	# Everything anything can branch to. A window may not contain one of
@@ -1660,8 +1686,11 @@ def collect(binary, listing):
 				window = tail_entry[0] + len(tail_entry[1]) - address
 				helpers = assign_helpers(plain, positions, index, members)
 				if helpers is None:
-					skipped["no register free across the ymm run"] += 1
-					declined[address] = "no register free across the ymm run"
+					refusal = held_back(
+						pair_reason,
+						"no register free across the ymm run")
+					skipped[refusal] += 1
+					declined[address] = refusal
 					continue
 				# **A run leaves every one of its ymms with a stale upper
 				# half**, exactly as a pair does: the low half is in the
@@ -1674,12 +1703,15 @@ def collect(binary, listing):
 				if any(upper_half_read_later(instructions, last, register,
 				                             positions=positions)
 				       for register in helpers):
-					skipped["ymm run upper half read later"] += 1
-					declined[address] = "ymm run upper half read later"
+					refusal = held_back(pair_reason,
+					                    "ymm run upper half read later")
+					skipped[refusal] += 1
+					declined[address] = refusal
 					continue
 				if not inplace.covered_by(ranges, address, window):
-					skipped["outside .pdata"] += 1
-					declined[address] = "outside .pdata"
+					refusal = held_back(pair_reason, "outside .pdata")
+					skipped[refusal] += 1
+					declined[address] = refusal
 					continue
 				entries = [("load", operands.rpartition(",")[2], vex,
 				            encoding[vex["length"]:], address, len(encoding),
@@ -1700,8 +1732,10 @@ def collect(binary, listing):
 					                len(entry[1]), None))
 				run = (helpers, entries)
 				if lower_ymm_run(run, address, address) is None:
-					skipped["ymm run operand cannot be moved"] += 1
-					declined[address] = "ymm run operand cannot be moved"
+					refusal = held_back(pair_reason,
+					                    "ymm run operand cannot be moved")
+					skipped[refusal] += 1
+					declined[address] = refusal
 					continue
 				candidates.append((address, encoding, operands, mnemonic,
 				                   window, [], None, [], ("run", run)))

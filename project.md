@@ -4008,13 +4008,13 @@ declines under the `--spill=home` default, re-measured for Finding 74:
                                         95.0%    --spill=home
 ymm value has no known upper half        4,601        12,552   outside any accepted window
 no home space to borrow                  2,496         3,426   a leaf, or rsp copied away
-ymm upper half read later                1,766             -   see below
-ymm run upper half read later                -         1,190   what the edges could not resolve
-no register free across the ymm run        446           911   needs a helper
+ymm upper half read later                1,766         1,591   what the edges could not resolve
 no direct SSE form                         710           710   mostly vextractf128/vinsertf128
 next instruction is a branch target        511           524
+no register free across the ymm run        446           424   needs a helper
 next instruction transfers control         424           427
-outside .pdata                             403           407
+outside .pdata                             403           403
+ymm run upper half read later                -            90   the run's own version of it
 sequence with no usable scratch            780            87
 src2 aliases dst, no scratch                31            43   what the home space could not take
 ymm store is a branch target                25            25
@@ -4028,17 +4028,13 @@ Those categories account for the *collector's* refusals, which is a different po
 from the survivors -- `make census` exists because subtracting one from the other is the
 mistake.
 
-**`ymm upper half read later` has gone to zero, and that is not progress.** It is a *pair*
-reason, and the collector computes every pair reason before trying the run strategy but
-records it only if `ymm_run` finds nothing. Where a run is found and then declines, the
-`continue` discards the pair reason with it. So the pair reasons visible above are only
-those on sites the run path never looked at, and the growth of `no register free across
-the ymm run` from 446 to 911 is partly them being relabelled rather than new refusals.
-
-Finding 75 measures how much of it is relabelling: **of the 2,101 sites in the two run
-categories, 1,587 are really `ymm upper half read later`** and the remaining 514 are not
-pairs at all. Read the two run rows above as pointing at the Y1 register representation
-rather than at the helper allocator.
+**That right-hand column is only trustworthy from Finding 76 onwards.** Before it, `ymm
+upper half read later` read as zero and `no register free across the ymm run` as 911,
+because the collector computed the pair's reason, held it back, and then discarded it
+whenever the run strategy declined -- filing 1,591 sites under register pressure when it
+already knew they were blocked on a later 256-bit read of a stale upper half. Findings 75
+and 76 measured that and fixed it, and the column above is post-fix. Any earlier version
+of this table in this document is mislabelled in exactly that way.
 
 ### Finding 74 -- Starfield runs, and the frontier moved 866 bytes
 
@@ -4128,7 +4124,7 @@ because it needs no helper; the run is the fallback for the pair rather than the
 round, and `collect` says as much at `tools/detour.py:1620`. What the run's `continue`
 discards is not the pair strategy -- that has already run and failed -- but the pair's
 **reason**, which the same comment promises to keep: "its reason is held back and only
-recorded if the run declines too". It is not. All three run-decline branches record their
+recorded if the run declines too". It is not. All four run-decline branches record their
 own reason and return to the top of the loop, and the held-back one goes with them.
 
 So for this site both refusals are real and the order was: the pair failed because ymm0's
@@ -4213,7 +4209,7 @@ Recorded here rather than left as an open lead, so it does not get had as an ide
 #### The labelling defect is real, and it is a different change
 
 `collect` states the intended behaviour at `tools/detour.py:1620` -- "its reason is held
-back and only recorded if the run declines too" -- and does not do it. All three
+back and only recorded if the run declines too" -- and does not do it. All four
 run-decline branches record their own reason and `continue`, and the held-back one goes
 with them.
 
@@ -4224,9 +4220,61 @@ allocator; `ymm upper half read later` says the Y1 register representation, whic
 milestone 5 and would take all 1,587 at once. The current categories point at the wrong
 work.
 
-Fixing it is three lines and changes no output byte -- only `skipped` and `declined`.
-**It is not done here**, because it moves numbers this document quotes in several places
-and that is its own increment rather than something to slip into a measurement.
+Fixing it changes no output byte -- only `skipped` and `declined`. **Done in Finding 76**,
+as its own increment, because it moves numbers this document quotes in several places.
+
+### Finding 76 -- record the held-back reason, and let the check find the four
+
+`held_back(pair_reason, run_reason)` returns the pair's reason where there is one, and all
+four run-decline branches route through it. That is the whole change. It carries its
+reasoning in a docstring rather than at the call sites, because which of two refusals is
+the more specific is not obvious from where they are recorded.
+
+#### The proof, and what it caught
+
+A mechanical change carries a proof, so the invariant was stated before the run: `skipped`
+and `declined` feed the census and the plan and nothing else, so **no placement number may
+move**, the same addresses must be declined, and the histogram over them may move in the
+five keys `held_back` can touch and nowhere else, with the deltas summing to zero.
+
+```
+placed        195,510   unchanged
+overlapped     36,677   unchanged
+refused         4,290   unchanged
+declined       20,325   unchanged
+
+no register free across the ymm run     911 ->   424    -487
+ymm run upper half read later         1,190 ->    90  -1,100
+outside .pdata                          407 ->   403      -4
+ymm upper half read later                 0 -> 1,591  +1,591
+                                                       ------
+                                                            0
+```
+
+**The first version of the check failed, and it was the check that was wrong.** It
+predicted 1,587 relabelled sites, from Finding 75, and found 1,591. Finding 75 derived its
+number by suppressing `ymm_run` over the two reasons *only* the run path can produce -- and
+the run path has a fourth decline branch that emits `outside .pdata`, a string the ordinary
+path emits too, so it was deliberately left out as unattributable by name. `held_back`
+reaches it anyway and should: a site whose run window falls outside `.pdata` is still a
+site whose pair was tried and refused for a better reason. Those are the four, and
+`407 -> 403` is where they came from.
+
+That is the shape `evidence.md` names -- a gate disagreeing with code believed correct is
+the first suspect -- and it is worth recording that the gate earned its keep by disagreeing
+rather than by passing. A check that had predicted 1,591 from the start would have proved
+less, because nobody would have had to find out where the four came from.
+
+#### What it does not change
+
+**Nothing executes differently.** No candidate, no window, no stub, no byte of any
+rewritten binary. `make check` and `make check-pe` pass unchanged, and they would pass
+identically with the change reverted, because neither reads a decline reason. The evidence
+that this is correct is the reconciliation above, not a test going green.
+
+What it changes is where the next reader looks. 1,591 sites now say the Y1 register
+representation would take them, and 424 still say the helper allocator would -- which was
+the actual proportion all along.
 
 ## Picking this up again
 
