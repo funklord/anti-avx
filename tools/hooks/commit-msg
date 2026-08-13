@@ -92,14 +92,38 @@ if printf '%s\n' "$prose" | grep -qiE "$TOOLING"; then
 	exit 1
 fi
 
+# Columns, which is not the same as bytes.
+#
+# `${#var}` counts BYTES in dash, which is what /bin/sh is here. That reads
+# the same as a column count for ASCII and stops being one the moment a
+# message uses an em dash or an ellipsis: a 75-column line carrying one `...`
+# measures 77 and was refused. Eight of hydra's commits were rejected that
+# way, every one of them exactly 75 columns and correct -- the limit exists so
+# prose fits a terminal, and a character three bytes wide still occupies one
+# column.
+#
+# Rewrapping prose to satisfy that would be the defect being propagated
+# rather than fixed, so the count is fixed instead. Stripping UTF-8
+# continuation bytes (0x80-0xBF) leaves one byte per character, which is the
+# character count without needing a locale to be set -- `wc -m` would answer
+# correctly only where the environment happens to say UTF-8, and a hook runs
+# in whatever environment git was invoked from.
+#
+# The byte length is kept as a cheap pre-filter: it is never smaller than the
+# column count, so a line within 75 bytes needs no further measuring, and only
+# a suspect line pays for a subprocess.
+columns() {
+	printf '%s' "$1" | LC_ALL=C tr -d '\200-\277' | wc -c
+}
+
 # 2. Subject at 75 columns, the kernel's limit, taken deliberately: it is what
 #    keeps `git log --oneline` and `git shortlog` readable at a terminal width.
 subject=$(sed -n '1p' "$msg")
 case "$subject" in
 	'#'*) exit 0 ;;
 esac
-if [ "${#subject}" -gt 75 ]; then
-	echo "commit-msg: subject is ${#subject} columns, limit is 75." >&2
+if [ "${#subject}" -gt 75 ] && [ "$(columns "$subject")" -gt 75 ]; then
+	echo "commit-msg: subject is $(columns "$subject") columns, limit is 75." >&2
 	echo "commit-msg:   $subject" >&2
 	exit 1
 fi
@@ -109,8 +133,8 @@ fi
 #    it, and only the subject was checked -- so a body line at 76 sailed
 #    through while a subject at 76 was refused.
 #
-# Measured with `${#line}`, exactly as the subject is, so both checks agree on
-# what a column is rather than one counting bytes and the other characters.
+# Measured in columns by `columns()` above, exactly as the subject is, so the
+# two checks cannot disagree about what a column is.
 #
 # **Three kinds of line are exempt, and each is a rule rather than a
 # concession.**
@@ -143,7 +167,7 @@ n=0
 while IFS= read -r line; do
 	n=$((n + 1))
 	[ "$n" -eq 1 ] && continue		# the subject, checked above
-	[ "${#line}" -gt 75 ] || continue
+	[ "${#line}" -gt 75 ] || continue	# bytes: an upper bound on columns
 	case "$line" in
 		' '*|'	'*) continue ;;		# quoted, not prose
 		*://*) continue ;;		# carries a url
@@ -155,8 +179,10 @@ while IFS= read -r line; do
 			*) continue ;;		# `Fixes:`, `Link:`, `Signed-off-by:` ...
 		esac
 	fi
+	width=$(columns "$line")
+	[ "$width" -gt 75 ] || continue
 	long="$long
-commit-msg:   $n: ${#line} columns: $line"
+commit-msg:   $n: $width columns: $line"
 done <<EOF
 $body
 EOF
