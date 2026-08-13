@@ -63,7 +63,14 @@ TOOLING='generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # name cannot be left half-scrubbed by the shorter one if either is edited
 # later. Neither matches the other today; the ordering is a guard, not a
 # fix.
-prose=$(sed -e '/^#.*>8/,$d' -e '/^#/d' "$msg" \
+#
+# Two variables come out of this, and the difference matters. `body` is the
+# message as it will be stored, minus what git discards. `prose` is that with
+# the names above neutralised, which is what the vendor checks read -- and is
+# the wrong thing to measure a column count against, since every substitution
+# here makes the line longer than the one somebody wrote.
+body=$(sed -e '/^#.*>8/,$d' -e '/^#/d' "$msg")
+prose=$(printf '%s\n' "$body" \
 	| sed -E 's#claude-guidelines#tooling-guidelines#g; s#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
 
 # 1. No AI or tooling attribution. The single deviation from kernel practice,
@@ -94,6 +101,71 @@ esac
 if [ "${#subject}" -gt 75 ]; then
 	echo "commit-msg: subject is ${#subject} columns, limit is 75." >&2
 	echo "commit-msg:   $subject" >&2
+	exit 1
+fi
+
+# 3. Body lines at the same 75 columns, for the same reason: the log is read in
+#    a terminal. This was the stated convention long before anything enforced
+#    it, and only the subject was checked -- so a body line at 76 sailed
+#    through while a subject at 76 was refused.
+#
+# Measured with `${#line}`, exactly as the subject is, so both checks agree on
+# what a column is rather than one counting bytes and the other characters.
+#
+# **Three kinds of line are exempt, and each is a rule rather than a
+# concession.**
+#
+#   - A trailer. `Never wrap a trailer, whatever its length`: git parses the
+#     block one line at a time, so a `Link:` broken in two stops being a
+#     trailer at all and every tool that reads them silently misses it. Kernel
+#     `Link:` lines routinely run well past 75 and are left alone.
+#   - A line holding a url. A wrapped link is not clickable, often cannot be
+#     reassembled, and leaves the reader guessing whether the trailing
+#     punctuation belongs to it. The limit exists so prose stays readable, and
+#     a url is not prose.
+#   - An indented line, which is how a message carries something it is
+#     quoting -- a compiler error, a stack trace, a snippet of output.
+#     Reflowing quoted material to fit corrupts it.
+#
+# A trailer is recognised by its name rather than by a list, so one that has
+# not come up yet is exempt on the same terms as `Fixes:` and `Link:`.
+#
+# **The blind spot is named rather than pretended away.** A line of prose
+# opening `Note:` is indistinguishable from a trailer to any rule keyed on the
+# name, and the guidelines settle what a trailer is by asking whether it names
+# a person or an artifact -- which this cannot know. So it forgives that line.
+# That is the right direction to be wrong in: the cost of forgiving one long
+# prose line is a long prose line, while the cost of refusing a legitimate
+# `Link:` is somebody wrapping it, at which point git stops parsing it as a
+# trailer and every tool that reads them misses it silently.
+long=""
+n=0
+while IFS= read -r line; do
+	n=$((n + 1))
+	[ "$n" -eq 1 ] && continue		# the subject, checked above
+	[ "${#line}" -gt 75 ] || continue
+	case "$line" in
+		' '*|'	'*) continue ;;		# quoted, not prose
+		*://*) continue ;;		# carries a url
+	esac
+	head=${line%%:*}
+	if [ "$head" != "$line" ]; then
+		case "$head" in
+			'' | *[!A-Za-z-]*) ;;	# not a trailer name
+			*) continue ;;		# `Fixes:`, `Link:`, `Signed-off-by:` ...
+		esac
+	fi
+	long="$long
+commit-msg:   $n: ${#line} columns: $line"
+done <<EOF
+$body
+EOF
+
+if [ -n "$long" ]; then
+	echo "commit-msg: body line(s) past 75 columns." >&2
+	printf '%s\n' "$long" | sed '/^$/d' >&2
+	echo "commit-msg: wrap prose at 75. Trailers, urls and indented" >&2
+	echo "commit-msg: (quoted) lines are exempt and need no wrapping." >&2
 	exit 1
 fi
 

@@ -11,6 +11,8 @@ One tool, merged from three that had grown apart:
   situ/tools/lint_conventions.py  the checker: ASCII, tabs, trailing space,
                                   final newline, with a tokenize-based
                                   exemption for Python string literals
+                                  (C/C++ literals are exempt here too, by a
+                                  scanner written for the purpose)
 
 The two tabify.py copies were byte-identical in code and differed only in
 their docstrings, which is the cheap kind of drift. The two check-indent.sh
@@ -92,9 +94,11 @@ DEFAULTS: Config = {
 
 	# ASCII-only content. Off by default: three projects require it, one
 	# explicitly exempts Markdown, and it is not yet a global rule.
-	# In Python it means ASCII *outside string literals*, which is what the
-	# rule has always said -- a tick a program prints is output, not prose.
-	# Other languages get the whole file, having no tokenizer here.
+	# In Python and in C/C++ it means ASCII *outside string literals*, which
+	# is what the rule has always said -- a tick a program prints is output,
+	# not prose. Every other language still gets the whole file, having no
+	# lexer here, and so does a file in either of those two that will not
+	# lex: see python_ascii_problems and c_ascii_problems.
 	"ascii_only": False,
 	"ascii_exclude_markdown": True,
 
@@ -346,6 +350,10 @@ _CASE_LABEL = re.compile(r"(?:case\b|default\s*:)")
 # Identifier runs that turn a following `"` into a C++ raw string literal.
 RAW_PREFIXES = frozenset({"R", "LR", "uR", "UR", "u8R"})
 
+# Identifier runs that turn a following `'` into a character literal. Any
+# other run before a quote means a digit separator -- see c_ascii_problems.
+CHAR_PREFIXES = frozenset({"L", "u", "U", "u8"})
+
 # Control keywords whose parenthesised head may be followed by a single
 # statement instead of a block. Their bodies are a real indent level that no
 # brace records, so a brace-counting lexer places them one level too shallow
@@ -399,7 +407,7 @@ def is_python(path: Path) -> bool:
 	return first.startswith(b"#!") and b"python" in first
 
 
-def python_ascii_problems(text: str, where: Path):
+def python_ascii_problems(text: str, where: Path) -> list[Problem] | None:
 	"""Non-ASCII outside string literals, or None if it cannot be read.
 
 	The rule this enforces has always allowed Unicode in what a program
@@ -436,6 +444,157 @@ def python_ascii_problems(text: str, where: Path):
 					break
 	except (tokenize.TokenError, SyntaxError, IndentationError):
 		return None
+	return problems
+
+
+def splice_len(text: str, i: int) -> int:
+	"""Length of a backslash-newline at `i`, or 0.
+
+	Translation phase 2: a backslash at end of line removes the newline
+	before anything else looks at the file, so a `//` comment carries on
+	into the next line and a string literal spans it. Both shapes appear in
+	real headers -- a continued comment above a macro, a long message split
+	across lines -- and a scanner that stops at the newline mislabels
+	everything after it.
+	"""
+	if text[i] != "\\":
+		return 0
+	j = i + 1
+	if j < len(text) and text[j] == "\r":
+		j += 1
+	if j < len(text) and text[j] == "\n":
+		return j - i + 1
+	return 0
+
+
+def c_ascii_problems(text: str, where: Path) -> list[Problem] | None:
+	"""Non-ASCII outside C/C++ string and character literals, or None.
+
+	The question python_ascii_problems answers, asked in the language the
+	rule's own example is written in: a glyph in a button label is output,
+	an em dash in a comment is prose. Nothing in the standard library lexes
+	C, so this does -- and only as far as the question needs, which is where
+	the literals start and stop. Braces, parens and nesting belong to
+	convert_c and are deliberately not repeated here; the two scanners
+	answer different questions and merging them would give the fixer a
+	stake in this one.
+
+	None means the file did not lex, and the caller then falls back to the
+	stricter whole-file byte check. That is the direction that matters, and
+	it is the same contract the Python side keeps: an unterminated comment,
+	string or raw string means the scanner lost its place, and a file whose
+	literals cannot be located is not a file whose prose has been cleared.
+	"""
+	problems: list[Problem] = []
+	i, n = 0, len(text)
+	line, col = 1, 1
+
+	def step(count: int = 1) -> None:
+		nonlocal i, line, col
+		for _ in range(count):
+			if i >= n:
+				return
+			if text[i] == "\n":
+				line += 1
+				col = 1
+			else:
+				col += 1
+			i += 1
+
+	def note(char: str) -> None:
+		problems.append(Problem(where, line, col,
+		                        f"non-ASCII {char!r} outside a literal"))
+
+	while i < n:
+		char = text[i]
+
+		if text.startswith("//", i):
+			while i < n and text[i] != "\n":
+				spliced = splice_len(text, i)
+				if spliced:
+					step(spliced)
+					continue
+				if ord(text[i]) > 127:
+					note(text[i])
+				step()
+			continue
+
+		if text.startswith("/*", i):
+			step(2)
+			closed = False
+			while i < n:
+				if text.startswith("*/", i):
+					step(2)
+					closed = True
+					break
+				if ord(text[i]) > 127:
+					note(text[i])
+				step()
+			if not closed:
+				return None
+			continue
+
+		if char in "\"'":
+			run = ""
+			back = i - 1
+			while back >= 0 and (text[back].isalnum() or text[back] == "_"):
+				run = text[back] + run
+				back -= 1
+
+			# `1'000'000`. C++14's digit separator is spelled like a
+			# character literal and is not one, and reading it as one
+			# desynchronises the scanner for everything after it -- an odd
+			# number of separators on a line swallows the rest of the file.
+			# The test is exact rather than heuristic: a character literal
+			# is never preceded by an identifier or a digit, because no
+			# valid program writes `foo'a'`. The encoding prefixes are the
+			# whole of the exception, so `L'x'` and `u8'x'` still lex.
+			if char == "'" and run and run not in CHAR_PREFIXES:
+				step()
+				continue
+
+			if char == '"' and run in RAW_PREFIXES:
+				# R"delim( ... )delim" -- delim is at most 16 characters
+				# and holds no paren, backslash or whitespace. Qt sources
+				# carry whole JavaScript programs this way, quotes and all.
+				opened = text.find("(", i + 1)
+				delim = text[i + 1:opened] if opened >= 0 else None
+				if (delim is not None and len(delim) <= 16
+						and not any(c in delim for c in "()\\ \t\r\n")):
+					closer = ")" + delim + '"'
+					at = text.find(closer, opened + 1)
+					if at < 0:
+						return None
+					step(at + len(closer) - i)
+					continue
+				# Not a raw string after all; read it as an ordinary one.
+
+			quote = char
+			step()
+			closed = False
+			while i < n:
+				spliced = splice_len(text, i)
+				if spliced:
+					step(spliced)
+					continue
+				if text[i] == "\\":
+					step(2)			# escapes whatever follows
+					continue
+				if text[i] == quote:
+					step()
+					closed = True
+					break
+				if text[i] == "\n":
+					break			# unterminated: no valid literal
+				step()
+			if not closed:
+				return None
+			continue
+
+		if ord(char) > 127:
+			note(char)
+		step()
+
 	return problems
 
 
@@ -544,9 +703,12 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 
 	if cfg["ascii_only"] and not (cfg["ascii_exclude_markdown"] and path.suffix == ".md"):
 		found = None
-		if is_python(path):
+		reader = (python_ascii_problems if is_python(path)
+		          else c_ascii_problems if path.suffix in C_SUFFIXES
+		          else None)
+		if reader is not None:
 			try:
-				found = python_ascii_problems(raw.decode("utf-8"), rel)
+				found = reader(raw.decode("utf-8"), rel)
 			except UnicodeDecodeError:
 				found = None            # not UTF-8 either; the bytes decide
 		if found is None:
