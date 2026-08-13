@@ -4276,6 +4276,31 @@ What it changes is where the next reader looks. 1,591 sites now say the Y1 regis
 representation would take them, and 424 still say the helper allocator would -- which was
 the actual proportion all along.
 
+#### The artifact agrees, which the counters could not prove
+
+The reconciliation above is about counters. A rebuild is about bytes:
+
+```
+before  8d0ddf6799ad7ee6b48002b52164662f79321ab2b3c93a194c36e7024a49f690
+after   8d0ddf6799ad7ee6b48002b52164662f79321ab2b3c93a194c36e7024a49f690
+```
+
+A full `make detour` with the change in -- 547,613 in-place patches, 195,510 detours, a
+3,143,556-byte `.avxsse` at 0x148988000, 431,937 function table entries -- reproduces the
+binary bit for bit, and run under Proton again it faults at `0x1422D2F56`, the same
+address, with the same exception sequence and the same eleven frames as Finding 74.
+
+Two things follow, and the second was not being claimed before:
+
+- **`held_back` moved no output byte.** Asserted from the counters, now checked against
+  the artifact, which is the stronger statement of the two.
+- **The pipeline is deterministic.** The same binary and listing in gives the same
+  110,869,504 bytes out, across a rebuild hours later with the source edited in between.
+  Nothing in `apply` depends on a timestamp, a set iteration order or a hash seed. That is
+  worth knowing on its own: it makes `sha256sum` the cheapest possible regression test for
+  any future change that is meant to be output-neutral, and this is the first time the
+  property has been checked rather than assumed.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
