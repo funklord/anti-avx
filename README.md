@@ -15,11 +15,11 @@ measured instruction mix says a translated binary should cost about **+1.34%
 in instruction count** and run within a few percent of native -- the
 performance argument against this approach does not hold.
 
-**Status: it rewrites. 97.7% of 805,131 VEX sites, and that is not enough.**
+**Status: it rewrites. 97.8% of 805,131 VEX sites, and that is not enough.**
 
 A translated binary that is 99.99% correct is worthless: the remaining 0.01%
 is a crash at an unpredictable moment. So the number to watch is not how much
-is translated but how much is left, and 18,757 sites are left. Starfield has
+is translated but how much is left, and 17,972 sites are left. Starfield has
 never been run.
 
 Nothing here is Starfield-specific except a Makefile default. The tools take

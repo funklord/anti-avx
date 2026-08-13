@@ -418,10 +418,11 @@ POOL_MASK3, POOL_BCAST, POOL_STEP = 0, 16, 32
 
 
 # How a stub gets a scratch register when the liveness scan finds none dead.
-# **The default is `none`, which refuses the site**, and that is the state to
-# leave this in until the copyright holder decides otherwise: the two
-# alternatives each buy the same sites and each pay for them in a different
-# currency. Finding 46 measures all three.
+# **The default is `home`**, set by the copyright holder after Findings 70 to
+# 72. The other three are kept because the measurements they carry are what a
+# future reader will want: `stack` cannot be described to an unwinder
+# (Finding 68), `pool` cannot be made thread-safe (Finding 46), and `none`
+# refuses 1,022 sites the home space can take.
 SPILL_NONE, SPILL_STACK, SPILL_POOL = "none", "stack", "pool"
 # **The callee home space.** Win64 makes a caller reserve 32 bytes at the
 # bottom of its frame for its callees to spill their register arguments into,
@@ -433,7 +434,7 @@ SPILL_NONE, SPILL_STACK, SPILL_POOL = "none", "stack", "pool"
 # It is the thread's own stack, so Finding 46's race does not apply. And
 # `(%rsp)` needs no register to address, so Finding 69 does not apply.
 SPILL_HOME = "home"
-SPILL = SPILL_NONE
+SPILL = SPILL_HOME
 HOME_SPACE = 32
 
 

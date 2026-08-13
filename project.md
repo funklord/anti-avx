@@ -3935,19 +3935,61 @@ a register. The region is dead *as written*, which is a weaker statement than it
 **So the home space is worth what it is worth: 1,022 sites, and there is no adjacent
 analysis that unlocks more.** That closes the last identified lever in the residue.
 
+### Finding 73 -- `--spill=home` is the default
+
+Taken by the copyright holder on the evidence of Findings 70 to 72, after the mechanism was
+built, executed, holed, patched and measured against its own alternatives.
+
+```
+in place                                      547,613
+detoured                                      195,510
+skipped for overlap                            36,677
+refused, stub not buildable                     4,290
+VEX in .text            805,131 ->      17,972   787,159 removed, 97.8%
+```
+
+What it did to the refusal list is sharper than the total suggests:
+
+```
+src2 aliases dst, no scratch      3,728  ->      43
+sequence with no usable scratch     855  ->      87
+                       new: no home space to borrow  3,426
+```
+
+**The scratch problem is essentially gone where the home space exists**, and what replaces
+it is a single honest counter for the functions that cannot lend one -- 1,506 leaves with
+nothing reserved, 2,367 that copy `rsp` where it cannot be followed, and the rest.
+
+Every invariant holds on a freshly built binary with the new default: headers
+self-consistent, the function table sorted and covering every stub byte, every section
+after `.text` byte-identical, all 77,763 lost boundaries deliberate, all 1,191,070 direct
+branch targets still instruction starts, zero VEX in the stub section, and `make census`
+reconciling every survivor with nothing unaccounted.
+
+The other three modes stay. `stack` and `pool` carry measurements a future reader will
+want, and `none` is what a reader comparing against them needs. `make check-spill` runs
+all four.
+
+**What is not proven, and cannot be here.** 1,022 sites now write into the translated
+program's own stack frame, on the strength of a per-function scan and an ABI argument.
+Fifteen small PEs execute the mechanism; Starfield has never been run. If a function
+reaches its home space by a path the scan does not model, the result is silent corruption
+of a live local -- the same shape as the five defects this project has already found by
+reading rather than by running.
+
 ### Final state
 
 ```
 in place                                      547,613
-detoured                                      194,844
-skipped for overlap                            36,322
-refused, stub not buildable                     4,276
-VEX in .text            805,131 ->      18,994   786,137 removed, 97.6%
+detoured                                      195,510
+skipped for overlap                            36,677
+refused, stub not buildable                     4,290
+VEX in .text            805,131 ->      17,972   787,159 removed, 97.8%
 ```
 
 Every invariant holds on a freshly built binary: the file grows only by the stub
-section, every section after `.text` is byte-identical, all 77,214 lost boundaries
-are instructions a widened window swallowed deliberately, none of the 81,434
+section, every section after `.text` is byte-identical, all 77,763 lost boundaries
+are instructions a widened window swallowed deliberately, none of the 81,985
 swallowed is reachable by any branch, and the stub section carries 0 VEX with
 exactly one jump back per detour. `make census` reconciles every survivor to a named
 cause with nothing unaccounted.
@@ -3961,7 +4003,8 @@ What remains:
 
 ```
 ymm value has no known upper half      4,601     outside any accepted window
-src2 aliases dst, no scratch           2,726     needs a register; 249 do not
+no home space to borrow                2,496     a leaf, or rsp copied away
+src2 aliases dst, no scratch              31     what the home space could not take
 ymm upper half read later              1,766     what the edges could not resolve
 sequence with no usable scratch          780     needs a register
 no direct SSE form                       710     mostly vextractf128/vinsertf128
@@ -3994,10 +4037,10 @@ code quickly.
    shares its primary's frame rather than having one of its own. A stub that moves `rsp`
    cannot be described.
 
-   **The live question is now `--spill=home`** (Finding 70), which moves nothing: it
-   borrows the callee home space Win64 already reserves, is worth 1,022 sites, and is off
-   by default because it writes into the program's own frame on the strength of a scan.
-   Turning it on is a risk to take deliberately.
+   **`--spill=home` is the answer and is now the default** (Finding 73). It moves nothing:
+   it borrows the callee home space Win64 already reserves, is worth 1,022 sites, and took
+   the `src2 aliases dst` refusal from 3,728 to 43.
+   It was turned on deliberately, and what it risks is named in Finding 73.
 
    What follows is kept because it is what was decided against and why.
 
@@ -4776,7 +4819,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **786,137 of 805,131 VEX sites, 97.6%** (Findings 24 to 66), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **787,159 of 805,131 VEX sites, 97.8%** (Findings 24 to 73), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
