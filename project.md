@@ -3832,6 +3832,61 @@ risk the copyright holder should take deliberately rather than inherit from a de
 measurements, and all three were answering "can the rewriter make space" when the question
 was "is there space already". That is worth more than the 1,022 sites.
 
+### Finding 71 -- the home space is exactly the right lifetime, and mostly unavailable
+
+Does the callee home space serve the Y2 shadow? The objection that looks fatal is that it
+is dead only **between calls**, and a shadow must hold a value for as long as the value
+lives.
+
+**The two lifetimes are the same lifetime.** The upper half of every ymm is volatile across
+a call -- that is the whole reason `vzeroupper` exists, and it is what
+`upper_half_read_later` has relied on since Finding 38. So a ymm upper half cannot outlive
+a call either, and the home space is not a partial shadow that happens to work sometimes:
+it is a shadow whose lifetime is exactly the lifetime of the thing it holds.
+
+That is the right shape. Class Y2 has wanted "sixteen 16-byte slots addressed via a
+reserved register or TLS" since the design was written, and this is 32 bytes addressed by
+`(%rsp)` with no register at all.
+
+#### What it is worth, measured on the case that needs it
+
+The run is where a register is needed and sometimes absent, so that is where to count:
+
+```
+runs found                                  9,645
+  a register is free for every pair         8,281
+  no register free -- the refusal           1,364
+    no home space in that function            983
+    the home space would serve                378
+    32 bytes too small for the run              3
+```
+
+```
+upper halves live at once, where no register was free
+  1   1,112      2   216      3   32      4   4
+```
+
+**The size is not the constraint.** Three runs in the binary need more than the two slots
+32 bytes provides. What binds is that 983 of the 1,364 -- 72% -- are in functions that
+cannot lend it.
+
+#### And the reason is a refusal of this project's own making
+
+`home_space_map` demands a call, no self-addressing, no frame register, and -- since the
+aliasing hole was closed -- no `lea` into the region and **no copy of `rsp` into another
+register at all**. That last one is broad: most copies of `rsp` are followed by bounded
+uses, and it already cost 1,655 sites on the spill.
+
+So the ceiling on the home space, for both uses, is not the ABI or the 32 bytes. It is one
+conservative scan, and narrowing it needs dataflow on where a copied `rsp` goes rather than
+a regular expression. **That is the single measurement standing between this mechanism and
+whatever it is really worth**, and it is the same measurement for the spill and the shadow.
+
+378 sites is not worth building for on its own, so it is recorded rather than done. The
+correspondence between the two lifetimes is worth more than the number, because it says
+Class Y2's shadow does not need a reserved register or a TLS slot after all -- it needs
+permission from the function it sits in.
+
 ### Final state
 
 ```
