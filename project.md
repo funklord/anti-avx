@@ -4035,6 +4035,11 @@ records it only if `ymm_run` finds nothing. Where a run is found and then declin
 those on sites the run path never looked at, and the growth of `no register free across
 the ymm run` from 446 to 911 is partly them being relabelled rather than new refusals.
 
+Finding 75 measures how much of it is relabelling: **of the 2,101 sites in the two run
+categories, 1,587 are really `ymm upper half read later`** and the remaining 514 are not
+pairs at all. Read the two run rows above as pointing at the Y1 register representation
+rather than at the helper allocator.
+
 ### Finding 74 -- Starfield runs, and the frontier moved 866 bytes
 
 "Starfield has never been run" stood in *What is still not verified* from the beginning.
@@ -4116,20 +4121,27 @@ survived, and the relocations are consistent.
 adjacent copy pair -- the Y1 shape of Finding 38, which needs **no helper register at
 all**: load the low half into the destination's own xmm and store it, then the high half.
 The collector refused it for `no register free across the ymm run`, which reads as a
-missed fallback: `ymm_run` claimed the site, `assign_helpers` found nothing free, and the
-`continue` discarded the pair strategy along with the pair reason.
+missed fallback -- as though the run strategy had claimed a site the pair could have had.
 
-**It is not a missed fallback, and the guess had to be tested to find that out.** With
-`ymm_run` monkeypatched to return `None` for that one address, the collector reaches the
-pair path and refuses it anyway, for `ymm upper half read later`. Something downstream
-reads ymm0 as 256 bits, the pair lowering would leave its upper half holding the copy's
-high half, and that is a real refusal rather than a bookkeeping artifact.
+**It is not, and the code says so above the loop.** The pair is tried *first*, precisely
+because it needs no helper; the run is the fallback for the pair rather than the other way
+round, and `collect` says as much at `tools/detour.py:1620`. What the run's `continue`
+discards is not the pair strategy -- that has already run and failed -- but the pair's
+**reason**, which the same comment promises to keep: "its reason is held back and only
+recorded if the run declines too". It is not. All three run-decline branches record their
+own reason and return to the top of the loop, and the held-back one goes with them.
 
-So the label is wrong and the verdict is right. What remains open is whether that is true
-of the other 910: the shadowing is proven to *relabel*, and whether it also *refuses*
-anything a fallback would take is unmeasured. The measurement is one run of the collector
-with the fallback wired in -- try the run, and on failure fall through to the pair instead
-of continuing -- and it is the cheapest lead in the residue.
+So for this site both refusals are real and the order was: the pair failed because ymm0's
+upper half is read downstream, the run then failed for want of a helper, and only the
+second was written down. Suppressing `ymm_run` for that one address makes the first
+surface -- `ymm upper half read later` -- which is how the order was established rather
+than guessed.
+
+**The label is wrong and the verdict is right.** What is open is not whether a fallback
+exists -- one already does -- but whether the discarded reasons hide anything: a site
+where `ymm_pair` returned `None`, so no pair was ever attempted, drops to the zero-fill
+and ordinary paths when its run declines, and those could in principle take it. That is
+the measurement, and it is the cheapest lead in the residue.
 
 #### What it is not
 
@@ -4152,6 +4164,69 @@ register file and the whole unwind walk are in `steam-1716740.log`, and diffing 
 against the same run of the unpacked original is where every number above comes from.
 Copy the binary in under a new name -- replacing `Starfield.exe` gains nothing and Steam
 will silently repair it.
+
+### Finding 75 -- the shadowing costs no sites, and a fallback would cost accounting
+
+Finding 74 left one lead: the run path discards the pair's held-back reason, so 2,101
+sites are filed under a run reason. Whether that hides a site some other strategy would
+take is now measured, and the answer is no.
+
+Two collector passes over the full listing, both carried through `place_stubs` so the
+number counts sites actually placed rather than merely accepted. The second suppresses
+`ymm_run` for exactly the 2,101 addresses the first saw the run path decline and for no
+others -- which is the fallback exactly, since every run that succeeds still succeeds and
+therefore no other window moves and overlap resolution is not perturbed.
+
+```
+                                  as it stands    with the fallback
+detoured                               195,510             195,510    +0
+skipped, window overlapped              36,677              36,677    +0
+refused, stub not buildable              4,290               4,804   +514
+```
+
+**Zero of 2,101.** Not one site the run path declined is lowered by falling through, and
+none of them was being quietly covered by a neighbour's window either.
+
+Where they go instead:
+
+```
+ymm upper half read later                1,587   the held-back pair reason, surfacing
+accepted, then the stub would not build    514
+```
+
+The 1,587 are what Finding 74 predicted from one site: a pair was tried, it failed because
+the destination's upper half is read downstream, and the run's failure was written down
+instead. Every one of them is a real refusal.
+
+The 514 are the case that pair reason could not describe -- `ymm_pair` returned `None`, so
+no pair was ever attempted. Suppressing the run drops them to the zero-fill and ordinary
+paths, which accept them as candidates, and then `build_stub` refuses all 514. **That is
+worse than neutral.** `build_stub` returns `None` with no reason and no counter names it,
+so the fallback would convert 514 precise collector refusals into invisible build-time
+ones -- the failure mode Finding 45 had to walk its three steps by hand to diagnose.
+
+#### So the fallback is not implemented
+
+It lowers nothing, and it degrades the accounting for a quarter of the sites it touches.
+Recorded here rather than left as an open lead, so it does not get had as an idea again.
+
+#### The labelling defect is real, and it is a different change
+
+`collect` states the intended behaviour at `tools/detour.py:1620` -- "its reason is held
+back and only recorded if the run declines too" -- and does not do it. All three
+run-decline branches record their own reason and `continue`, and the held-back one goes
+with them.
+
+The consequence is now measured rather than asserted: **1,587 of the 2,101 are really
+`ymm upper half read later`.** That is a different instruction to whoever picks this up.
+`no register free across the ymm run` says register pressure and points at the helper
+allocator; `ymm upper half read later` says the Y1 register representation, which is
+milestone 5 and would take all 1,587 at once. The current categories point at the wrong
+work.
+
+Fixing it is three lines and changes no output byte -- only `skipped` and `declined`.
+**It is not done here**, because it moves numbers this document quotes in several places
+and that is its own increment rather than something to slip into a measurement.
 
 ## Picking this up again
 
