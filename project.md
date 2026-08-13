@@ -3795,9 +3795,10 @@ sites with no xmm scratch                      5,699
   the function uses that region itself             1
 ```
 
-**One function in 273,902** keeps something of its own at `[rsp+0..31]`. The region is dead
-in practice as well as by the ABI, and the collector checks it per function rather than
-relying on that.
+**One function in 273,902** addresses `[rsp+0..31]` directly. That number is weaker than it
+looks and Finding 72 says why: it counts only accesses written as `(%rsp)`, and a function
+that copies `rsp` into another register can reach the region without one. The collector
+checks per function either way, and refuses any function that copies `rsp` at all.
 
 #### The honest yield, after closing the hole the first version left
 
@@ -3886,6 +3887,53 @@ whatever it is really worth**, and it is the same measurement for the spill and 
 correspondence between the two lifetimes is worth more than the number, because it says
 Class Y2's shadow does not need a reserved register or a TLS slot after all -- it needs
 permission from the function it sits in.
+
+### Finding 72 -- the dataflow was the lever, and it is worth thirteen sites
+
+Finding 71 named one analysis as "the single measurement standing between this mechanism
+and whatever it is really worth": narrowing the refusal of any function that copies `rsp`,
+by tracking where the copy points. It is built, measured and reverted.
+
+```
+--spill=home, blanket refusal      17,972
+--spill=home, with the dataflow    17,959     13 sites
+```
+
+The taint analysis is straightforward -- a register receiving `rsp` carries an offset, an
+access through it at `d` lands at `offset + d`, and anything else done with it is an escape
+-- and of the **2,367** starved sites whose function copies `rsp`, it clears thirteen. A
+function that makes a pointer to its own frame bottom essentially always uses it in a way
+no scan can vouch for.
+
+#### And the first attempt made things worse, which is the more useful half
+
+The first version also tracked `lea d(%rsp),%rX`, and **lost 625 sites**. A `lea` above the
+home space is a pointer to a local, passed to callees all day long, and treating it as
+tainted refused every function that does so. A callee reaching back below the object it was
+handed would be a bug in the callee, not a risk this has to price -- and `lea` *into* the
+region is refused outright anyway. Precision applied in the wrong place is not precision.
+
+#### Where the home space actually goes
+
+```
+sites with no xmm scratch                   5,699
+  copies rsp somewhere                      2,367
+  usable                                    1,531
+  a leaf: no home space at all              1,506
+  addresses [rsp+0..31] directly              264
+  a frame register: rsp not constant           31
+```
+
+The two big refusals are **a function that copies `rsp`** and **a function that is a leaf**,
+and neither is a scan being timid. A leaf genuinely has no home space -- nothing reserved
+it. And the copy case is not conservatism either: the dataflow proves it.
+
+This also qualifies Finding 70's "one function in 273,902". That counted direct `(%rsp)`
+accesses, and the 2,367 above are functions that could be reaching the same region through
+a register. The region is dead *as written*, which is a weaker statement than it read as.
+
+**So the home space is worth what it is worth: 1,022 sites, and there is no adjacent
+analysis that unlocks more.** That closes the last identified lever in the residue.
 
 ### Final state
 

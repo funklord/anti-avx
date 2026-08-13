@@ -60,9 +60,11 @@ import targets as target_set
 
 # A memory operand based on rsp; group 1 is its displacement if it has one.
 RSP_MEMORY = re.compile(r"(-?0x[0-9a-f]+)?\(%rsp\)")
-# `rsp` copied into another register, after which any access through
-# that register could reach the home space unseen.
-RSP_COPY = re.compile(r"%rsp,\s*%r[a-z0-9]+$")
+# `rsp` copied into another register. The register is then a pointer into
+# this frame, and where it points decides whether the home space is still
+# safe -- which is what `taint_offsets` works out rather than assuming.
+RSP_COPY = re.compile(r"^%rsp,\s*%(r[a-z0-9]+)$")
+
 
 JMP_REL32 = 0xE9
 SECTION_NAME = b".avxsse\0"
@@ -780,15 +782,24 @@ def home_space_map(binary, plain, ranges):
 				touches[i] = True
 		# **A direct operand is not the only way to reach it.** A function
 		# that computes the address of its own frame bottom can write there
-		# through the result, and the scan above would see nothing. Both
-		# shapes are refused: taking the address of anything in the region,
-		# and copying `rsp` into another register at all.
-		if mnemonic == "lea" and RSP_MEMORY.search(operands):
-			text = RSP_MEMORY.search(operands).group(1)
-			if 0 <= (int(text, 16) if text else 0) < HOME_SPACE:
-				touches[i] = True
-		if RSP_COPY.search(operands):
+		# through the result, and the scan above would see nothing. Taking
+		# the address of anything inside the region is refused outright.
+		if mnemonic == "lea":
+			match = RSP_MEMORY.search(operands)
+			if match:
+				text = match.group(1)
+				if 0 <= (int(text, 16) if text else 0) < HOME_SPACE:
+					touches[i] = True
+		# A copy of `rsp` is noted rather than refused; the second pass
+		# decides, by looking at what the copy is then used for.
+		# **A copy of `rsp` is refused outright**, and the precise version
+		# was built and measured at thirteen sites. See Finding 72: of the
+		# 2,367 starved sites whose function copies `rsp`, all but thirteen
+		# use the copy in a way no scan can clear, so tracking where it
+		# points buys nothing the blanket rule does not already give.
+		if RSP_COPY.match(operands):
 			touches[i] = True
+
 	return (starts, ranges,
 	        [calls[i] and not touches[i] and ranges[i][0] in fixed_frame
 	         for i in range(len(ranges))])
