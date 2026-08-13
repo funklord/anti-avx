@@ -3972,10 +3972,12 @@ all four.
 
 **What is not proven, and cannot be here.** 1,022 sites now write into the translated
 program's own stack frame, on the strength of a per-function scan and an ABI argument.
-Fifteen small PEs execute the mechanism; Starfield has never been run. If a function
-reaches its home space by a path the scan does not model, the result is silent corruption
-of a live local -- the same shape as the five defects this project has already found by
-reading rather than by running.
+Fifteen small PEs execute the mechanism. Starfield has now been run (Finding 74) and did
+not fault, but it got 866 bytes, so that is not evidence about the home space -- nothing
+says one of the 1,022 sites was on the path, and a borrowed home slot corrupts silently
+rather than faulting anyway. If a function reaches its home space by a path the scan does
+not model, the result is silent corruption of a live local -- the same shape as the five
+defects this project has already found by reading rather than by running.
 
 ### Final state
 
@@ -3999,26 +4001,157 @@ found silent wrongness that every structural check had passed, and the numbers b
 them were inflated. Anything in this document above Finding 37 that reads higher is
 counting truncated 256-bit sites as successes.
 
-What remains:
+What remained at 95.0%, and what remains now. The right-hand column is the collector's
+declines under the `--spill=home` default, re-measured for Finding 74:
 
 ```
-ymm value has no known upper half      4,601     outside any accepted window
-no home space to borrow                2,496     a leaf, or rsp copied away
-src2 aliases dst, no scratch              31     what the home space could not take
-ymm upper half read later              1,766     what the edges could not resolve
-sequence with no usable scratch          780     needs a register
-no direct SSE form                       710     mostly vextractf128/vinsertf128
-next instruction is a branch target      511
-no register free across the ymm run      446
-next instruction transfers control       424
-outside .pdata                           403
-sequence shape not handled               164
-ymm store is a branch target              25
-operand shape not A/B/C                    9
+                                        95.0%    --spill=home
+ymm value has no known upper half        4,601        12,552   outside any accepted window
+no home space to borrow                  2,496         3,426   a leaf, or rsp copied away
+ymm upper half read later                1,766             -   see below
+ymm run upper half read later                -         1,190   what the edges could not resolve
+no register free across the ymm run        446           911   needs a helper
+no direct SSE form                         710           710   mostly vextractf128/vinsertf128
+next instruction is a branch target        511           524
+next instruction transfers control         424           427
+outside .pdata                             403           407
+sequence with no usable scratch            780            87
+src2 aliases dst, no scratch                31            43   what the home space could not take
+ymm store is a branch target                25            25
+sequence shape not handled                 164            14
+operand shape not A/B/C                      9             9
+                                                     -------
+                                                      20,325
 ```
 
-Those categories account for the *collector's* refusals. The 39,880 survivors also
-include the sites whose stub could not be built, which `make census` breaks out.
+Those categories account for the *collector's* refusals, which is a different population
+from the survivors -- `make census` exists because subtracting one from the other is the
+mistake.
+
+**`ymm upper half read later` has gone to zero, and that is not progress.** It is a *pair*
+reason, and the collector computes every pair reason before trying the run strategy but
+records it only if `ymm_run` finds nothing. Where a run is found and then declines, the
+`continue` discards the pair reason with it. So the pair reasons visible above are only
+those on sites the run path never looked at, and the growth of `no register free across
+the ymm run` from 446 to 911 is partly them being relabelled rather than new refusals.
+
+### Finding 74 -- Starfield runs, and the frontier moved 866 bytes
+
+"Starfield has never been run" stood in *What is still not verified* from the beginning.
+It has now, under Proton 10.0 on this Westmere. The installed game was not disturbed:
+both binaries were copied in beside `Starfield.exe` under new names, and the run used a
+scratch prefix rather than the game's own.
+
+Both die. That was the prediction -- 17,972 sites survive -- and **where** each dies is
+the measurement.
+
+```
+              faults at                 the instruction there
+original    RVA 0x22d2bf4     vpxor   %xmm0,%xmm0,%xmm0
+rewritten   RVA 0x22d2f56     vmovups -0x29(%rbp),%ymm0
+```
+
+866 bytes, inside the same function, reached through the same eleven-frame call stack.
+Both faults are `EXCEPTION_ILLEGAL_INSTRUCTION`, which is what a Westmere does with a VEX
+prefix.
+
+#### What the 866 bytes contain
+
+Four VEX sites in the original, none in the rewritten, two of them detoured:
+
+    1422d2bf4   vpxor   %xmm0,%xmm0,%xmm0     ->  pxor %xmm0,%xmm0       in place
+    1422d2bf8   vmovdqu %ymm0,-0x51(%rbp)     ->  jmp 0x148bbfbfd        stub
+
+    148bbfbfd   movdqu %xmm0,-0x51(%rbp)
+    148bbfc02   movdqu %xmm0,-0x41(%rbp)
+    148bbfc07   jmp    0x1422d2bfd
+
+That is the Class Y zero fill executing for real, and it is the case Finding 40 named as
+a debt. `pxor` does **not** zero [255:128], so the in-place lowering leaves ymm0's upper
+half stale -- and it does not matter, because `zeroed_ymm` proved the stored *value* is
+zero and the stub writes 32 bytes of zeros in two halves rather than reading the
+register's upper one.
+
+**The first stub this project ever wrote into a 110 MB binary was entered and returned
+from.** Instructions run in sequence, so reaching 0x22d2f56 requires the `jmp` at
+0x22d2bf8 to have been taken and the stub to have come back to 0x22d2bfd.
+
+#### The unwinder is the result that could not be manufactured here
+
+The fault forces wine to walk the rebuilt function table -- 431,937 entries, 299,780 bytes
+of unwind info, at a base the original PE never had. Both runs produce the **same eleven
+frames**:
+
+    22d3adb  22c7474  186eefb  22c7910  22c7774  28cb219  28cbbc5
+    2b7e38   1039     ucrtbase+29e92    365d80c
+
+`detour-verify` already checks that the table is sorted and covers every stub byte, but it
+checks our table with our code. This is `RtlLookupFunctionEntry` binary-searching it
+431,937 entries deep, eleven times, and agreeing with the original binary's stack exactly.
+**It is the first witness to the exception directory that is independent of the tool that
+wrote it.**
+
+It is also narrower than it looks, and the narrowing is the honest part: **no unwound
+frame was inside the stub section.** The chained-`RUNTIME_FUNCTION` path of Finding 48 --
+the thing `make check-unwind` exists for -- was not exercised, because the fault happened
+in `.text` with no stub on the stack. What is confirmed at scale is the lookup and the
+coverage, not the fragments.
+
+#### What else did not happen
+
+The rewritten run raises exactly the same exception sequence as the control -- `6ba`,
+`c000001d`, `c000001d`, `6be`, `6ba` -- and **not one access violation** in either. 287
+modules load before the fault against the control's 288: the whole graph, including
+`steam_api64.dll`, `sl.interposer.dll`, `bink2w64.dll`, `libxess.dll` and `dxgi.dll`.
+
+So 547,613 in-place patches and 195,510 detours sit in the address space of a process that
+loaded 287 modules and ran several hundred milliseconds of its own startup, and nothing
+structural broke. That is weak evidence per instruction and strong evidence about the
+file: the image loads, the sections are where the loader expects them, the TLS directory
+survived, and the relocations are consistent.
+
+#### The site it died on is refused for the right reason under the wrong name
+
+`vmovups -0x29(%rbp),%ymm0` followed immediately by `vmovups %ymm0,-0x51(%rbp)` is an
+adjacent copy pair -- the Y1 shape of Finding 38, which needs **no helper register at
+all**: load the low half into the destination's own xmm and store it, then the high half.
+The collector refused it for `no register free across the ymm run`, which reads as a
+missed fallback: `ymm_run` claimed the site, `assign_helpers` found nothing free, and the
+`continue` discarded the pair strategy along with the pair reason.
+
+**It is not a missed fallback, and the guess had to be tested to find that out.** With
+`ymm_run` monkeypatched to return `None` for that one address, the collector reaches the
+pair path and refuses it anyway, for `ymm upper half read later`. Something downstream
+reads ymm0 as 256 bits, the pair lowering would leave its upper half holding the copy's
+high half, and that is a real refusal rather than a bookkeeping artifact.
+
+So the label is wrong and the verdict is right. What remains open is whether that is true
+of the other 910: the shadowing is proven to *relabel*, and whether it also *refuses*
+anything a fallback would take is unmeasured. The measurement is one run of the collector
+with the fallback wired in -- try the run, and on failure fall through to the pair instead
+of continuing -- and it is the cheapest lead in the residue.
+
+#### What it is not
+
+**This is a frontier moving, not a game starting.** It got 866 bytes, and the next
+survivor being 866 bytes away is the honest scale of 17,972 remaining sites on a hot path:
+how far it gets is measured in instructions, not in frames. Nothing here says a lowering
+computed the right *value* -- only that four of them did not fault and the code after them
+behaved as the original's did.
+
+#### How to reproduce it
+
+    cp build/Starfield-unpacked-detour.exe "$GAME/Starfield-antiavx.exe"
+    STEAM_COMPAT_CLIENT_INSTALL_PATH=~/.steam/steam \
+    STEAM_COMPAT_DATA_PATH=/some/scratch/prefix \
+    PROTON_LOG=1 PROTON_LOG_DIR=/some/scratch \
+      "$PROTON/proton" run "$GAME/Starfield-antiavx.exe"
+
+`PROTON_LOG=1` is what makes it a measurement rather than a crash: the fault address, the
+register file and the whole unwind walk are in `steam-1716740.log`, and diffing that
+against the same run of the unpacked original is where every number above comes from.
+Copy the binary in under a new name -- replacing `Starfield.exe` gains nothing and Steam
+will silently repair it.
 
 ## Picking this up again
 
@@ -4726,8 +4859,10 @@ now.
    reachability of everything swallowed, and that the stub section contains no VEX
    with exactly one jump back per detour.
 
-4. **Soak.** Long gameplay sessions. **Not started.** Starfield has never been run,
-   translated or otherwise; there is no Windows host here.
+4. **Soak.** Long gameplay sessions. **Not started, but no longer blocked on a host.**
+   Finding 74 runs both binaries under Proton on this machine and reads the fault
+   address out of `PROTON_LOG`, so the harness for a soak exists; what is missing is a
+   translation that survives longer than 866 bytes.
 
 ### The machine, because it decides what can be tested
 
@@ -4754,7 +4889,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
 | `make check-pe` | fifteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
-| `make detour-verify` | on Starfield: header self-consistency, size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53 |
+| `make detour-verify` | on Starfield: header self-consistency, size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53. Its function-table claim now has an independent witness: Finding 74 has wine looking the table up 431,937 entries deep, eleven frames, and agreeing with the original |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
 | `make check-unwind` | that a handler registered through `.pdata` is reached from `.text` and from inside a stub, and that a stub which moved `rsp` still hands it a frame 16 bytes wrong | whether the shipping Windows unwinder agrees with wine's |
 | `make bench`, `make placement` | what a detour costs on this CPU, and where detours land structurally | which code is hot, which needs the game running |
@@ -4768,8 +4903,13 @@ things: the lowerings executed in isolation, and fifteen PEs built for the purpo
 
 Named rather than left implicit, because an absent gap gets guessed at:
 
-- **Starfield has never been run.** No Windows host, and 10,618 VEX sites survive
-  anyway, so it would not get far.
+- ~~**Starfield has never been run.**~~ **It has, under Proton -- Finding 74.** It gets
+  866 bytes further than the original and dies on the next refused site, which is the
+  honest scale of 17,972 survivors on a hot path. What that run does settle is
+  structural: the image loads, four lowerings execute including a stub, and wine's
+  unwinder walks the rebuilt 431,937-entry function table to a call stack identical to
+  the original's. What it does not settle is whether any lowering computed the right
+  value.
 - **Flags.** `comiss` and `ucomiss` set EFLAGS and nothing compares them. The
   lowering is a prefix strip, so the risk is low, but low is not measured.
 - **The helper classes are not wired in.** `f16c`, `fmaddsub`, `permil` and `permd`
@@ -4951,6 +5091,15 @@ registers, and an exception that could not be dispatched from inside a stub. Eve
 caught by asking what the code computes rather than what shape it has, and two of the
 checks that should have caught them earlier could not: one shared a function with the code
 it checked, and one was empty by construction.
+
+**The target now runs, which changes the character of the remaining work rather than the
+size of it.** Finding 74 puts the rewritten binary 866 bytes past where the original dies,
+through four lowerings and one stub, with wine's unwinder validating the rebuilt function
+table independently of the tool that wrote it. But 866 bytes is the point: the residue is
+not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
+immediately, and every one of the 17,972 has to go before any of this can be soaked. What
+the run adds is a measuring instrument -- each fault address names the next site, and the
+site it named turned out to be refused under a misleading label.
 
 Reproduce the measurements with:
 

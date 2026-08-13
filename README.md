@@ -19,8 +19,15 @@ performance argument against this approach does not hold.
 
 A translated binary that is 99.99% correct is worthless: the remaining 0.01%
 is a crash at an unpredictable moment. So the number to watch is not how much
-is translated but how much is left, and 17,972 sites are left. Starfield has
-never been run.
+is translated but how much is left, and 17,972 sites are left.
+
+**Starfield has now been run, under Proton, and it gets 866 bytes further.**
+The original dies on the first AVX instruction it executes; the rewritten one
+executes that instruction and three more, through two stubs, and dies on the
+next site the rewriter refused. Wine's unwinder walked the rebuilt 431,937-entry
+function table and produced a call stack identical to the original's for all
+eleven frames. See `project.md`, Finding 74 -- that is a frontier moving, not a
+game starting.
 
 Nothing here is Starfield-specific except a Makefile default. The tools take
 the binary as an argument, read its PE headers, `.pdata` and relocations, and
