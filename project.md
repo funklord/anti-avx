@@ -4550,6 +4550,14 @@ it rather than adding to it. The debt is the same one the whole 256-bit design a
 rests on: a lowered VEX.128 write no longer zeroes the upper half, which is harmless while
 every unprovable 256-bit read is refused, and will need repaying when the Y2 shadow exists.
 
+#### What Finding 79 did to the population it did not take
+
+The 343 sites the split attributed to the path budget were measured **before** this change,
+and it moved them: a walk that now ends at a VEX.128 write is a walk that never reaches the
+budget. Re-measured afterwards, the residue is 238, and the budget's share of it is **124,
+not 343**. A bucket count taken before a change is not a forecast of what that change
+leaves behind, which is the third time this document has had to say so.
+
 #### The test, and the consequence it checks
 
 `make check-pe` gains `lowwrite`: a pair, a `vpxor` on the same register's low half, and a
@@ -4569,6 +4577,64 @@ walk *giving up*, ten at a back edge and one at the budget, because a 400-step w
 more of both than a 40-step one. A probe that cannot tell a real read from its own
 conservatism returns a negative that reads exactly like a finding. `evidence.md` names it:
 a failing check is not evidence either.
+
+### Finding 80 -- a constant with a measurement behind it
+
+`PATH_BUDGET = 400` bounded how many instructions `upper_half_read_later` may examine
+across every path it follows from one site. It is a safety valve rather than a knob -- the
+walk takes both edges of every branch it can resolve, so a branchy region costs
+exponentially in paths and something has to stop it -- and 400 had **no measurement behind
+it at all**.
+
+It was binding on 124 sites. Raising it is very nearly free, because only those 124 walks
+ever reach it: the other ~805,000 stop at a call, a full overwrite or a resolved branch long
+before. Measured end to end, `collect` plus `place_stubs` on the real binary:
+
+```
+budget       placed      gain    seconds
+   400      196,945         --       213
+ 4,000      197,025        +80       214
+40,000      197,051        +26       213
+400,000     197,062        +11       215
+```
+
+**+80, +26, +11 against a flat 213 seconds.** The gain is asymptotic and the cost is not
+there, which is the whole shape of the finding: a bound that almost never binds costs
+nothing to loosen, and 400 was quietly refusing sites for no reason anyone had priced.
+
+Rebuilt and verified:
+
+```
+VEX in .text     805,131 ->  14,871      790,260 removed, 98.2%
+                             15,083 before
+function table   433,372 -> 433,478      one entry per stub, +106
+```
+
+Every `detour-verify` invariant holds, and 212 sites go for 106 detours -- the same
+better-than-one-for-one as Findings 78 and 79, a window swallowing more than the site that
+opened it.
+
+**40,000 is the knee.** It takes 106 of the ~117 on offer while keeping a bound a thousand
+times tighter than the last point. The last point buys eleven more sites for a valve whose
+entire job is to terminate on a binary nobody here has seen, and that is a poor trade --
+this tooling is not Starfield-specific and the next input could be shaped very differently.
+Removing the bound outright would be worse still for the same reason.
+
+#### What is left is not a budget problem
+
+44 sites blew through even 4,000. Those are **path explosion**: the walk re-examines the
+same successors along different prefixes, so work that should be linear in the region is
+exponential in paths. A memo collapses that, and it has to be a **one-way** one --
+
+- caching a **"read"** is sound, because a read found from a position exists whatever
+  prefix reached it;
+- caching a **"dead"** is not, because Finding 78 made a revisited branch terminate as
+  dead, so a "dead" answer depends on which branches were in `visiting` when it was
+  computed. Reused under a shorter prefix it would skip paths that do contain a read.
+
+That asymmetry is the whole difficulty, and it is why this is a rewrite of a load-bearing
+analysis rather than a dictionary. For 44 sites it is not obviously worth doing, and it is
+recorded here so the next person does not have to rediscover which direction is safe.
 
 ## Picking this up again
 
@@ -5376,7 +5442,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **790,048 of 805,131 VEX sites, 98.1%** (Findings 24 to 79), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **790,260 of 805,131 VEX sites, 98.2%** (Findings 24 to 80), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -5514,7 +5580,7 @@ size of it.** Finding 74 puts the rewritten binary 866 bytes past where the orig
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. But 866 bytes is the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 15,083 that remain has to go before any of this can be
+immediately, and every one of the 14,871 that remain has to go before any of this can be
 soaked. What the run adds is a measuring instrument -- each fault address names the next
 site, and the site it named turned out to be refused under a misleading label.
 

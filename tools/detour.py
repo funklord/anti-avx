@@ -1314,7 +1314,35 @@ def zeroed_ymm(instructions, index, register, blocked, limit=80):
 	return False
 
 
-PATH_BUDGET = 400
+# How many instructions `upper_half_read_later` may examine across all the
+# paths it follows from one site. It is a safety valve rather than a tuning
+# knob: the walk explores both edges of every branch it can resolve, so a
+# branchy region costs exponentially in paths, and something has to stop it.
+#
+# 400 was a number with no measurement behind it and it was binding on 124
+# sites. Raising it is very nearly free, because only those 124 walks ever
+# reach it -- the other ~805,000 stop at a call, a full overwrite or a
+# resolved branch long before. Measured end to end on the real binary,
+# collect plus place_stubs:
+#
+#     budget       placed      gain    seconds
+#        400      196,945         --       213
+#      4,000      197,025        +80       214
+#     40,000      197,051        +26       213
+#    400,000      197,062        +11       215
+#
+# So 40,000: the knee. It takes 106 of the ~117 sites on offer, and the last
+# point buys eleven more for a bound a thousand times looser, which is a poor
+# trade for a valve whose whole job is to terminate on a binary nobody here
+# has seen. Finding 80.
+#
+# What is left after it is not a budget problem. 44 sites blew through 4,000
+# and are genuine path explosion: the walk re-examines the same successors
+# along different prefixes. Memoising would collapse that, and only in one
+# direction -- caching "read" is sound, caching "dead" is not, because
+# Finding 78 made a revisited branch terminate as dead and that answer
+# depends on which branches were on the path when it was computed.
+PATH_BUDGET = 40000
 
 
 def upper_half_read_later(instructions, index, register, limit=40,
