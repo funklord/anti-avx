@@ -1148,46 +1148,90 @@ def free_across(plain, positions, definition, until, site_registers):
 	return usable
 
 
-def assign_helpers(plain, positions, index, members):
-	"""One helper register per pair in the run, all distinct, or None.
+def lifetimes(index, members, start):
+	"""Every (register, load position, store positions) the run holds open.
 
-	Greedy over the pairs in load order, which is enough here: a run holds
-	ten pairs at the very most and the candidate sets are large. Distinctness
-	has to be enforced rather than assumed -- two pairs' helpers are both
-	invisible to the original code, so nothing else keeps them apart.
+	**A lifetime, not a register, is what needs a helper.** The two are the
+	same thing only while a run ends the moment anything touches a tracked
+	register, which is what `ymm_run` does today -- so one register can be
+	loaded once, stored, and that is the whole of it. The moment a run can
+	survive its low half being clobbered and pick the register up again, one
+	register carries two values that share nothing and overlap nowhere.
+
+	Keying on the register is a silent-wrongness bug in that world rather
+	than a missed optimisation. The old version kept the LAST load and the
+	LAST store per register, so a register loaded twice would have both
+	lifetimes assigned one helper, and the earlier lifetime's store would
+	read a helper the later lifetime had not loaded yet -- it would assemble,
+	verify, and store the wrong 16 bytes. Finding 77.
+
+	Returns them in load order, or None if a store arrives for a register
+	that is not open, which no caller should be able to produce.
 	"""
-	loads = {register: position for kind, position, register in members
-	         if kind == "load"}
-	stores = {register: position for kind, position, register in members
-	          if kind == "store"}
-	loads[wide_move(*plain[index][1:4])[1]] = index
+	out, open_at = [], {start: (index, [])}
+	for kind, position, register in members:
+		if kind == "load":
+			if register in open_at:
+				load_at, stores = open_at.pop(register)
+				out.append((register, load_at, stores))
+			open_at[register] = (position, [])
+		elif kind == "store":
+			if register not in open_at:
+				return None
+			open_at[register][1].append(position)
+	for register, (load_at, stores) in open_at.items():
+		out.append((register, load_at, stores))
+	return sorted(out, key=lambda span: span[1])
+
+
+def assign_helpers(plain, positions, index, members):
+	"""One helper register per LIFETIME in the run, all distinct, or None.
+
+	Greedy over the lifetimes in load order, which is enough here: a run
+	holds ten at the very most and the candidate sets are large. Distinctness
+	has to be enforced rather than assumed -- two helpers are both invisible
+	to the original code, so nothing else keeps them apart.
+
+	Keyed by position rather than by register, so that `lower_ymm_run` can
+	ask "which helper does THIS load or store use" instead of "which helper
+	does this register use". See `lifetimes` for why that distinction is a
+	correctness one.
+	"""
+	spans = lifetimes(index, members, wide_move(*plain[index][1:4])[1])
+	if spans is None:
+		return None
 	taken, out = set(), {}
-	for register, load_at in sorted(loads.items(), key=lambda kv: kv[1]):
-		store_at = stores.get(register)
-		if store_at is None:
+	for _register, load_at, stores in spans:
+		if not stores:
 			return None
 		own = scratch_finder.xmm_numbers(plain[load_at][3])
-		free = free_across(plain, positions, load_at, store_at, own) - taken
+		free = free_across(plain, positions, load_at, stores[-1], own) - taken
 		if not free:
 			return None
 		chosen = min(free)
 		taken.add(chosen)
-		out[register] = chosen
+		out[load_at] = chosen
+		for position in stores:
+			out[position] = chosen
 	return out
 
 
 def lower_ymm_run(strategy, at, pool):
 	"""The run, with every 256-bit copy split and everything else moved."""
-	helpers, entries = strategy
+	_helpers, entries = strategy
 	body = bytearray()
-	for kind, register, vex, tail, address, length, moved in entries:
+	# The second field is the helper this load or store uses, resolved per
+	# entry when the run was collected. It used to be the ymm register, with
+	# the helper looked up from it -- which cannot express one register
+	# holding two values in one run. See `lifetimes`.
+	for kind, helper, vex, tail, address, length, moved in entries:
 		if kind == "plain":
 			fixed = moved_instruction(moved, at + len(body), pool)
 			if fixed is None:
 				return None
 			body += fixed
 			continue
-		high_vex, high_tail = retarget(vex, tail, helpers[register])
+		high_vex, high_tail = retarget(vex, tail, helper)
 		for one_vex, one_tail, delta in ((vex, tail, 0),
 		                                 (high_vex, high_tail, 16)):
 			piece = narrow_piece(one_vex, one_tail, delta, address, length,
@@ -1700,9 +1744,14 @@ def collect(binary, listing):
 				# was a live defect for as long as runs have existed --
 				# a later 256-bit read of any register in the run would take
 				# whatever was left in its upper half. Finding 64.
+				# Over the run's ymm registers, which `helpers` no longer keys
+				# on: it keys on the position of each load and store, so that
+				# one register can hold two values. See `lifetimes`.
+				held_open = {operands.rpartition(",")[2]}
+				held_open |= {r for _k, _p, r in members if r is not None}
 				if any(upper_half_read_later(instructions, last, register,
 				                             positions=positions)
-				       for register in helpers):
+				       for register in held_open):
 					refusal = held_back(pair_reason,
 					                    "ymm run upper half read later")
 					skipped[refusal] += 1
@@ -1713,7 +1762,7 @@ def collect(binary, listing):
 					skipped[refusal] += 1
 					declined[address] = refusal
 					continue
-				entries = [("load", operands.rpartition(",")[2], vex,
+				entries = [("load", helpers[index], vex,
 				            encoding[vex["length"]:], address, len(encoding),
 				            None)]
 				for kind, position, register in members:
@@ -1727,7 +1776,7 @@ def collect(binary, listing):
 							                   scope))))
 						continue
 					one = inplace.decode_vex(entry[1])
-					entries.append((kind, register, one,
+					entries.append((kind, helpers[position], one,
 					                entry[1][one["length"]:], entry[0],
 					                len(entry[1]), None))
 				run = (helpers, entries)

@@ -4301,6 +4301,72 @@ Two things follow, and the second was not being claimed before:
   any future change that is meant to be output-neutral, and this is the first time the
   property has been checked rather than assumed.
 
+### Finding 77 -- the allocator keys on lifetimes, before it has to
+
+The first piece of the Y1 register representation, and it changes nothing today. That is
+the point of it.
+
+#### What the measurement actually said, after being wrong twice
+
+The first pass counted 12,552 surviving 256-bit stores and was inflated about tenfold. A
+256-bit store is declined at **its own** index, where `ymm_pair` sees no load and `ymm_run`
+refuses a store -- so every non-zero-fill store lands in `ymm value has no known upper
+half` even when the pair window started at its load already covers it. `census`'s docstring
+names exactly that trap and the diagnostic walked into it anyway. Excluding sites inside a
+placed window:
+
+```
+256-bit stores whose value is not a known zero    12,552
+  already covered by a pair or run window          7,828
+  genuinely unreached                              4,724
+    a copy whose load is too far to pair           3,092
+    something else (vpxor)                         1,106
+    a computed 256-bit value                         354
+    no defining write within 200                     136
+
+of the 3,092 copies, what stops the run:
+  nothing -- the run reaches it                    2,286   median span 1
+  a 256-bit op that is not a copy half               468   median span 4
+  a branch target inside the span                    186   median span 3
+  a control transfer inside the span                  89   median span 13
+  the value is touched other than by a store          63   median span 9
+```
+
+**The forward walk is not the blocker.** For 2,286 the run reaches the store and the site
+is refused downstream -- 1,591 for `ymm upper half read later` and 424 for `no register
+free` account for almost exactly that population.
+
+One block was read closely on the way and it misled: at `0x14004e230` a run dies because a
+128-bit write to `%xmm0` clobbers the low half of a tracked register, and `ymm_run` ends
+the **whole** run rather than dropping that one register -- leaving `vmovups %ymm1` at
+`0x14004e304` behind, though ymm1 was never touched. That reads like the lever and the
+count says it is 63 sites. **An example is not a distribution**, and this document has now
+recorded that lesson three times: Finding 39 about the gapped pair, Finding 44 about the
+backward walk, and here.
+
+#### The rekey, and why it lands before the thing that needs it
+
+Dropping a clobbered register and carrying on means a register can be loaded, stored,
+clobbered and loaded again inside one run. `assign_helpers` kept the LAST load and LAST
+store per register, so both lifetimes would get one helper and **the earlier lifetime's
+store would read a helper the later lifetime had not loaded yet** -- assembling cleanly,
+verifying cleanly, and storing the wrong sixteen bytes. That is the sixth member of the
+silent-wrongness family this project keeps finding.
+
+So `lifetimes()` returns each `(register, load position, store positions)` and
+`assign_helpers` keys its result on **position**, letting `lower_ymm_run` ask which helper
+*this* load or store uses rather than which helper this register uses.
+
+```
+before  8d0ddf6799ad7ee6b48002b52164662f79321ab2b3c93a194c36e7024a49f690
+after   8d0ddf6799ad7ee6b48002b52164662f79321ab2b3c93a194c36e7024a49f690
+```
+
+**The bug was latent, and the identical hash is what proves it.** The two keyings can only
+agree on all 195,510 placements if no run today holds two lifetimes of one register, which
+is exactly what `ymm_run` guarantees by ending at the first touch. The prerequisite is in
+before the change that would have made it live, which is the order that costs nothing.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
