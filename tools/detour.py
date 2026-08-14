@@ -1337,8 +1337,26 @@ def upper_half_read_later(instructions, index, register, limit=40,
 		budget = [PATH_BUDGET]
 	for step in range(1, limit + 1):
 		position = index + step
-		if position >= len(instructions) or position in visiting:
-			return True		# off the end, or a back edge
+		if position >= len(instructions):
+			return True		# off the end of what the listing describes
+		if position in visiting:
+			# **A revisit means the cycle carried no read.** `visiting` holds
+			# the branches this path has already recursed through, and every
+			# instruction between one of them and here has been examined --
+			# a read would have returned True before the walk got back. Going
+			# round again examines the same instructions and explores the same
+			# successors, because this walk is path-insensitive and takes BOTH
+			# edges at every branch it can resolve. So the cycle contributes
+			# nothing and this path is dead.
+			#
+			# Answering "read" here instead was the largest refusal after a
+			# genuine read: 487 of the 1,591 sites declined for `ymm upper
+			# half read later`, which is a loop being treated as unknowable
+			# rather than as examined. Finding 78.
+			#
+			# Termination is unaffected -- this returns without recursing, and
+			# `limit` and `budget` bound the walk regardless.
+			return False
 		if budget[0] <= 0:
 			return True
 		budget[0] -= 1

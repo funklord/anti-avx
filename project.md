@@ -4367,6 +4367,116 @@ agree on all 195,510 placements if no run today holds two lifetimes of one regis
 is exactly what `ymm_run` guarantees by ending at the first touch. The prerequisite is in
 before the change that would have made it live, which is the order that costs nothing.
 
+### Finding 78 -- a loop is examined, not unknowable
+
+`upper_half_read_later` answered "read" when its walk returned to a position it had
+already recursed through. That refusal was the largest after a genuine read.
+
+#### Splitting the refusal first
+
+The 1,591 sites declined `ymm upper half read later` are not one thing, and the check
+reaches its verdict from five different places. Classified by which one fires -- the check
+reimplemented with a reason attached, since it recurses through the module global and a
+wrapper cannot see which of its own `return`s fired:
+
+```
+genuinely read                 1,017    60.5%
+  read by vmovups                979    a SECOND 256-bit store of the same value
+  read by vextractf128            30
+  vmulps, vmovdqu, vinsertf128, vpsadbw   8
+the scan giving up               664    39.5%
+  a back edge                    487
+  the path budget ran out        171
+  an indirect branch               6
+```
+
+**A read needs the ymm represented as two xmm registers; a give-up needs only a better
+scan.** The second is analysis, changes no emitted byte, and is where this went.
+
+#### The argument
+
+`visiting` holds the branches the current path has already recursed through. Returning to
+one means every instruction on that cycle has been examined and none of them read the
+register -- a read would have returned `True` before the walk got back. Going round again
+examines the same instructions and explores the same successors, because the walk is
+path-insensitive and takes **both** edges at every branch it can resolve. So the cycle
+contributes nothing, and the path is dead rather than unknowable.
+
+Termination is unaffected: the case returns without recursing, and `limit` and `budget`
+bound the walk exactly as before.
+
+#### What it is worth
+
+```
+placed        195,510 -> 195,803   +293
+declined       20,325 ->  20,030   -295
+  ymm upper half read later      1,591 -> 1,303   -288
+  ymm run upper half read later     90 ->    83     -7
+```
+
+**295 of the 487, not all of them.** Resolving the back edge lets the walk carry on, and
+some sites then meet a genuine read or exhaust the budget instead -- the first blocking
+reason was never the only one. Two of the 295 lose their window to an overlap, so 293
+placements.
+
+On the real binary, rebuilt and verified:
+
+```
+VEX in .text     805,131 ->  17,379      787,752 removed, 97.8%
+                             17,972 before
+function table   431,937 -> 432,230      one entry per stub, +293
+stub section   3,143,556 -> 3,151,150 bytes
+```
+
+**593 sites for 293 detours**, because a window swallows more than the site that opened
+it -- a pair is two, a run more. Every `detour-verify` invariant holds unchanged: the
+headers self-consistent, the table sorted and covering every stub byte, every section
+after `.text` byte-identical, all 77,970 lost boundaries deliberate, all 1,191,070 direct
+branch targets still instruction starts, and zero VEX in the stub section with exactly one
+jump back per detour.
+
+#### The test, and breaking it on purpose
+
+`make check-pe` gains `loopcopy`: a copy pair followed by a loop that touches only `%ecx`.
+**The loop body must not mention the ymm or the program tests nothing** -- a loop that
+reloaded it would end the walk at a full overwrite, which is a different rule that already
+worked, and the walk would never reach the back edge at all.
+
+```
+with the rule      loopcopy -- original 29, rewritten 66, want 66
+rule reverted      loopcopy -- original 29, rewritten 29, want 66   FAIL
+```
+
+The second line is the one that matters. A new test passing is not evidence that it tests
+anything, and this one was checked by putting the old answer back and watching the program
+die at 29 again.
+
+#### And the horizon underneath it, which is not a defect
+
+This rests on `upper_half_read_later` at all, so the assumption underneath was settled
+first: the walk falls out of its loop to `return False` after 40 instructions, which is
+"forty instructions with no call, no branch and no mention of this ymm implies nothing
+reads it" -- a number someone chose rather than an argument. Over all 7,540 accepted
+pair/run sites:
+
+```
+a call or ret ends it     3,384    sound -- Win64 makes every ymm upper half volatile
+every successor is dead   2,199    sound -- Finding 42's edge following
+overwritten entire        1,889    sound -- a full 256-bit write consults nothing
+EXHAUSTED THE HORIZON        68    resting on the assumption
+```
+
+**68 of 7,540, and a walk ten times deeper finds a genuine read in none of them.** The
+assumption is unproven and empirically clean; 68 is small enough to enumerate if it ever
+needs hardening.
+
+**The check that measured this reported the opposite first, and was wrong.** It counted any
+deeper "read" as a counterexample and announced eleven -- every one of which was the deeper
+walk *giving up*, ten at a back edge and one at the budget, because a 400-step walk crosses
+more of both than a 40-step one. A probe that cannot tell a real read from its own
+conservatism returns a negative that reads exactly like a finding. `evidence.md` names it:
+a failing check is not evidence either.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -5311,9 +5421,9 @@ size of it.** Finding 74 puts the rewritten binary 866 bytes past where the orig
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. But 866 bytes is the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 17,972 has to go before any of this can be soaked. What
-the run adds is a measuring instrument -- each fault address names the next site, and the
-site it named turned out to be refused under a misleading label.
+immediately, and every one of the 17,379 that remain has to go before any of this can be
+soaked. What the run adds is a measuring instrument -- each fault address names the next
+site, and the site it named turned out to be refused under a misleading label.
 
 Reproduce the measurements with:
 

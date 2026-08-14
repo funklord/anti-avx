@@ -729,6 +729,47 @@ source:	.long 1, 2, 3, 4
 
 
 
+# 21. A copy pair whose upper half outlives a LOOP that never touches it.
+#
+# `upper_half_read_later` walks forward from the store, meets the `jne`, and
+# recurses into both edges. Down the taken edge it comes back round to that
+# same `jne` -- a position already in `visiting`. It used to answer "read"
+# there and refuse the pair; Finding 78 answers "dead", because coming back
+# means every instruction on the cycle was examined and none of them read the
+# register.
+#
+# **The loop body must not mention the ymm, or this tests nothing.** A loop
+# that reloads it would end the walk at a full overwrite, which is a different
+# rule and one that already worked -- the walk would never reach the back edge
+# at all. `spin` therefore touches only %ecx.
+#
+# Without the rule the pair is refused, the VEX survives, and a Westmere dies
+# at 29; with it the program returns the upper half of the copy, 66.
+PROGRAMS["loopcopy"] = (66, """
+	.text
+	.globl _start
+_start:
+	subq	$104, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* the pair ... */
+	vmovups	%ymm0, (%rdi)
+	movl	$3, %ecx		/* ... and a loop after it that */
+spin:					/* touches no ymm at all, so the */
+	decl	%ecx			/* walk reaches the back edge */
+	jne	spin
+	movl	16(%rdi), %eax		/* upper half of the copy: 66 */
+	addq	$104, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 66, 6, 7, 8
+""")
+
+
+
 # 20. The same starved site, in a function that CALLS something -- which is
 # what reserves the 32 bytes of callee home space at the bottom of its frame.
 #
