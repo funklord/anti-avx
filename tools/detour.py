@@ -1335,6 +1335,7 @@ def upper_half_read_later(instructions, index, register, limit=40,
 	"""
 	if budget is None:
 		budget = [PATH_BUDGET]
+	narrow = "%xmm" + register[len("%ymm"):]
 	for step in range(1, limit + 1):
 		position = index + step
 		if position >= len(instructions):
@@ -1401,6 +1402,27 @@ def upper_half_read_later(instructions, index, register, limit=40,
 				                         inside):
 					return True
 			return False
+		# **A VEX.128 write to the low half zeroes the upper one**, which is
+		# architecture rather than an idiom -- the same fact Class Y1-zero is
+		# built on -- and it ends the upper half's life as firmly as a call
+		# does. Nothing downstream can read the half this lowering is about to
+		# leave stale, because the original zeroed it here.
+		#
+		# The scan matched the `%ymm` spelling only, so a `vpxor
+		# %xmm0,%xmm0,%xmm0` sitting between a pair and a later 256-bit store
+		# of the same register read as "nothing happened", and the store beyond
+		# it read as a live use of the upper half. 812 of the 998 sites blocked
+		# by a later wide store are exactly this. Finding 79.
+		#
+		# **The VEX test is load-bearing.** A legacy SSE write to xmm leaves
+		# bits [255:128] alone, so matching on the destination alone would be
+		# wrong on precisely the instructions this project emits.
+		if narrow in operands:
+			fields = inplace.split_operands(operands)
+			if fields and fields[-1] == narrow:
+				vex = inplace.decode_vex(encoding)
+				if vex is not None and not vex["L"]:
+					return False
 		if register not in operands:
 			continue
 		# **A write that does not read it ends its life as firmly as a call

@@ -4470,6 +4470,80 @@ EXHAUSTED THE HORIZON        68    resting on the assumption
 assumption is unproven and empirically clean; 68 is small enough to enumerate if it ever
 needs hardening.
 
+### Finding 79 -- the instruction that kills an upper half and does not say so
+
+Finding 78 left 1,303 sites refused for `ymm upper half read later`, and named the shape of
+the largest part: 979 blocked by a later `vmovups` that reads the register, which is a
+**second 256-bit store of the same value**. `ymm_run` exists for exactly that -- Finding 51
+put it in, "a store does not end the value's life" -- so the question was never how to lower
+the second store. It was what stops the run reaching it.
+
+```
+what blocks the 1,386 declined sites   for those, what stops the run
+  read by vmovups          998           the value is touched (vpxor)    558
+  the budget ran out       343           the value is touched (vmovsd)   254
+  read by vextractf128      27           nothing -- the run reaches it   104
+  an unresolved branch      11           a control transfer               47
+```
+
+**812 of the 998 are stopped by an instruction writing the register's low half**, and that
+is not a run problem at all. It is the scan reading the wrong thing.
+
+#### The blind spot
+
+`vpxor %xmm0,%xmm0,%xmm0` **zeroes bits [255:128] of ymm0.** That is architecture, and it is
+the same fact Class Y1-zero is entirely built on. So the upper half a pair is about to leave
+stale is dead from that instruction onwards, and nothing after it can observe the
+difference.
+
+`upper_half_read_later` searched the operand text for `%ymm0`. Those operands say `%xmm0`.
+So the walk stepped over the instruction that **ends the upper half's life** and reported
+the 256-bit store beyond it as a live use. One spelling, 812 sites.
+
+The fix is five lines, and the VEX test in the middle of them is load-bearing rather than
+defensive: **a legacy SSE write to xmm leaves [255:128] alone**, so matching on the
+destination alone would be wrong on precisely the instructions this project emits. Getting
+that backwards turns a missed lowering into silent corruption.
+
+#### What the spelling was costing
+
+```
+                        before 78    after 78    after 79
+placed                    195,510     195,803     196,945
+declined                   20,325      20,030      18,882
+ymm upper half read later   1,591       1,303         225
+```
+
+**+1,142 sites for Finding 79 on its own**, and the category is 86% gone. `ymm run upper
+half read later` follows it from 90 to 13.
+
+#### The condition this rests on, stated rather than assumed
+
+After the pair, this binary's ymm0 upper half is **stale where the original's is zero**. The
+lowered `pxor %xmm0,%xmm0` does not zero it, because SSE does not. So every later 256-bit
+read of that register must be either a provable zero store -- lowered from `zeroed_ymm`'s
+proof, which writes zeros and never reads the register's upper half -- or refused outright.
+Both hold: `ymm_run` breaks the moment a tracked register is touched, and `zeroed_ymm`
+proves the zero independently of any of this.
+
+That is **Finding 40's Y3 debt**, and it is worth being explicit that this change leans on
+it rather than adding to it. The debt is the same one the whole 256-bit design already
+rests on: a lowered VEX.128 write no longer zeroes the upper half, which is harmless while
+every unprovable 256-bit read is refused, and will need repaying when the Y2 shadow exists.
+
+#### The test, and the consequence it checks
+
+`make check-pe` gains `lowwrite`: a pair, a `vpxor` on the same register's low half, and a
+256-bit store after it. It checks the consequence and not merely the mechanism -- the second
+store must land as 32 bytes of **zero** while the first lands as the copy, so the program
+returns `77 + 0`. A lowering that leaked its stale upper half into the second store returns
+something far from 77 rather than something next to it.
+
+```
+with the rule      lowwrite -- original 29, rewritten 77, want 77
+rule reverted      lowwrite -- original 29, rewritten 29, want 77   FAIL
+```
+
 **The check that measured this reported the opposite first, and was wrong.** It counted any
 deeper "read" as a counterexample and announced eleven -- every one of which was the deeper
 walk *giving up*, ten at a back edge and one at the budget, because a 400-step walk crosses

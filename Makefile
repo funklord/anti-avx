@@ -345,7 +345,7 @@ outside: $(LISTING)
 
 PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              fallthrough pastread swallowed gapped interleaved permilps \
-             twostore loopcopy
+             twostore loopcopy lowwrite
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)

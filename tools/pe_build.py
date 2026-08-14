@@ -729,6 +729,43 @@ source:	.long 1, 2, 3, 4
 
 
 
+# 22. A copy pair, a VEX.128 write to the SAME register's low half, and a
+# 256-bit store of it afterwards.
+#
+# The store reads the register, so `upper_half_read_later` refuses the pair --
+# unless it notices the `vpxor` in between. That instruction zeroes bits
+# [255:128] of %ymm0 as architecture, so the upper half the pair leaves stale
+# is dead from there and nothing downstream can observe it. The scan matched
+# the `%ymm` spelling only and read `%xmm0` as an unrelated register.
+#
+# The second store must therefore land as 32 bytes of ZERO while the first
+# lands as the copy, and the program adds one to the other: 77 + 0. A pair
+# lowering that leaked its stale upper half into the second store would return
+# something far from 77 rather than something adjacent to it.
+PROGRAMS["lowwrite"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$136, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* the pair ... */
+	vmovups	%ymm0, (%rdi)
+	vpxor	%xmm0, %xmm0, %xmm0	/* ... killed by a VEX.128 write ... */
+	vmovups	%ymm0, 64(%rdi)		/* ... and read after it: zero */
+	movl	16(%rdi), %eax		/* upper half of the copy: 77 */
+	addl	80(%rdi), %eax		/* upper half of the zero store: 0 */
+	addq	$136, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 77, 6, 7, 8
+""")
+
+
+
 # 21. A copy pair whose upper half outlives a LOOP that never touches it.
 #
 # `upper_half_read_later` walks forward from the store, meets the `jne`, and
