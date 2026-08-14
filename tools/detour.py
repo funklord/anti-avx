@@ -1346,6 +1346,19 @@ def zeroed_ymm(instructions, index, register, blocked, limit=80):
 	it. There are none in `.text`, checked rather than assumed.
 	"""
 	narrow = "%xmm" + register[len("%ymm"):]
+	# **The store's own address counts, and it was not being checked.** The
+	# walk below refuses a branch target it passes over, on the grounds that
+	# another path reaches the store without passing the zeroing. That is
+	# exactly as true when the STORE is the branch target, and this started
+	# at index-1 and never looked.
+	#
+	# It shipped wrong bytes. At 0x1424e3b5f a `jmp` lands on the store and
+	# skips the `vxorps` two instructions above it, so on that path ymm0
+	# holds something else and the lowering wrote the low half twice. Two
+	# such sites were in the built binary and nineteen more were accepted by
+	# the scan and lost elsewhere. Finding 82.
+	if instructions[index][0] in blocked:
+		return False
 	for step in range(1, limit + 1):
 		position = index - step
 		if position < 0:

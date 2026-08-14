@@ -4719,6 +4719,64 @@ The addressing in the committed version is deliberately bare, `(%rax)` and then
 displacements off the same register, because a displacement makes the instruction five
 bytes and dissolves the entire difficulty being tested.
 
+### Finding 82 -- the store that was itself the branch target
+
+**A shipped miscompilation, and the sixth of this shape.** Found by chasing why the
+frontier did not move after Finding 81, which is not what the chase was for.
+
+`zeroed_ymm` walks back from a 256-bit store to the nearest write of its register, and
+refuses a **branch target** it passes over. Its own docstring gives the reason: "another
+path reaches the store without passing the zeroing". The walk starts at `index - 1`. It
+never looked at the store's own address, where that reason is exactly as true.
+
+At `0x1424e3b5f`, in the binary this project had built and verified:
+
+```
+original                            rewritten
+1424e3b55: jmp 0x1424e3b5f          jmp 0x1424e3b5f        unchanged
+1424e3b5b: vxorps %xmm0,%xmm0,...   xorps %xmm0,%xmm0
+1424e3b5f: vmovups %ymm0,0x0(%rbp)  jmp 0x148bf1fe7        detoured
+
+148bf1fe7: movups %xmm0,0x0(%rbp)
+148bf1feb: movups %xmm0,0x10(%rbp)  the low half, into both halves
+```
+
+Two paths reach that store. The fall-through zeroes ymm0 and the lowering is right; the
+`jmp` skips the `vxorps` entirely, and on that path ymm0 holds something else while xmm0
+holds something else again. The stub writes the low half twice -- 32 bytes wrong, silently,
+in code that runs.
+
+```
+256-bit stores zeroed_ymm calls zero          9,795
+  the store is ITSELF a branch target            21
+    and lowered into a stub, so shipped           2
+```
+
+The fix is one test at the top of the walk, and it costs the two sites it was wrong about.
+
+#### Why `check-pe` has no program for this
+
+It was written and then removed, which is worth recording because the reasoning applies to
+the whole class. The correct handling of such a site is to **refuse** it -- and a refused
+VEX instruction is still VEX, so the program dies at 29 on this CPU. `check-pe` asserts
+that the rewritten binary *runs and returns a value*; a program whose correct outcome is
+"this must not be lowered" has no such value, and the harness cannot express it.
+
+The program was built, run, and observed to return 29 with the fix in place. That is the
+right answer and an unrepresentable one, so the evidence for this finding is the
+measurement and the disassembly above rather than a green test. **Saying so is better than
+contorting the program into something that passes**, which would have tested the contortion.
+
+#### What found it
+
+Not a check. The frontier did not move after Finding 81, and asking why led to `zero_run`
+correctly declining a group because `zeroed_ymm` had refused its second member -- for
+crossing the branch target at the first. Reading that rule to understand the refusal is
+what exposed the case it does not cover. **The bug was found by asking why something did
+not work, not by any gate**, and no structural check in the project would have caught it:
+the output is well formed, the table is sorted, the boundaries reconcile. It writes the
+wrong bytes.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -5525,7 +5583,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **790,584 of 805,131 VEX sites, 98.2%** (Findings 24 to 81), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **790,582 of 805,131 VEX sites, 98.2%** (Findings 24 to 82), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -5663,7 +5721,7 @@ size of it.** Finding 74 puts the rewritten binary 866 bytes past where the orig
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. But 866 bytes is the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 14,547 that remain has to go before any of this can be
+immediately, and every one of the 14,549 that remain has to go before any of this can be
 soaked. What the run adds is a measuring instrument -- each fault address names the next
 site, and the site it named turned out to be refused under a misleading label.
 
