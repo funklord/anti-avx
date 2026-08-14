@@ -4614,11 +4614,22 @@ Every `detour-verify` invariant holds, and 212 sites go for 106 detours -- the s
 better-than-one-for-one as Findings 78 and 79, a window swallowing more than the site that
 opened it.
 
-**40,000 is the knee.** It takes 106 of the ~117 on offer while keeping a bound a thousand
-times tighter than the last point. The last point buys eleven more sites for a valve whose
-entire job is to terminate on a binary nobody here has seen, and that is a poor trade --
-this tooling is not Starfield-specific and the next input could be shaped very differently.
-Removing the bound outright would be worse still for the same reason.
+**40,000 was chosen off that curve as the knee, and it was the wrong column to read.**
+The argument was that the last point buys only eleven more sites for a bound ten times
+looser. Sites are not fungible. Eleven in code that never executes are worth nothing, and
+one in the loop the game runs during startup is worth the whole difference -- and the
+aggregate count cannot tell them apart, so it decided on a metric blind to the only
+distinction that mattered.
+
+**The site Starfield dies on is one of the eleven.** `0x1422d2f56`, the copy pair inside a
+loop that Finding 74 recorded and that survived Findings 78 and 79 as well. It is not path
+explosion: the walk answers "dead" after consuming 200,196 of the budget in 0.1 seconds, so
+it was only ever expensive. At 40,000 it is refused, and the game stops there.
+
+So **400,000**, and the cost side never moved -- 215 seconds against 213, inside the noise,
+because the valve binds on barely a hundred walks out of 805,000. Removing the bound
+outright would still be wrong: this tooling is not Starfield-specific, and a valve whose job
+is to terminate on an unseen binary has to have a number.
 
 #### What is left is not a budget problem
 
@@ -4635,6 +4646,78 @@ exponential in paths. A memo collapses that, and it has to be a **one-way** one 
 That asymmetry is the whole difficulty, and it is why this is a rewrite of a load-bearing
 analysis rather than a dictionary. For 44 sites it is not obviously worth doing, and it is
 recorded here so the next person does not have to rediscover which direction is safe.
+
+### Finding 81 -- short zero stores compete for the same padding
+
+Finding 80 moved the frontier to `0x14186e921`, and what stopped it there was three
+consecutive 256-bit zero stores -- Class Y1-zero, a lowering that has existed since
+Finding 40, refusing to apply.
+
+#### Why a lowering that exists does not reach them
+
+`vmovups %ymm0,(%rax)` with no displacement encodes in **four bytes** and a `jmp rel32`
+needs five, so the site has to widen its window over a neighbour. Where the neighbour is
+another 256-bit store, `build_stub` has to lower it as a swallowed instruction -- and
+`lower_vex` refuses VEX.L, as Finding 37 made it. The stub cannot be built, and the whole
+group is lost.
+
+That is why they show up as lost *after* the collector rather than declined by it:
+
+```
+256-bit stores of a provably zero register
+  lowered                                        9,468
+  surviving                                        327
+    4 bytes                                        325
+    5 bytes                                          2
+  (not declined -- lost after the collector)       323
+  outside .pdata                                     4
+```
+
+`zero_run` takes a consecutive group as **one window**, already longer than five bytes, so
+nothing widens and each member lowers through `lower_ymm_zero_store` instead of through the
+general path that refuses it.
+
+```
+VEX in .text     805,131 ->  14,547      790,584 removed, 98.2%
+                             14,849 before
+refused, stub not buildable    4,289 ->   3,987     -302, exactly the gain
+```
+
+#### Two mistakes, and the second nearly threw the feature away
+
+**The first version grouped every zero store**, including the 9,468 that lowered perfectly
+well alone. **The second read the wrong column.** `gain.py` reports `placed`, which counts
+*windows committed* -- and a run collapses several windows into one **by design**, so a
+working run necessarily drives that number down. It fell by 1,888 and was reported here as
+a net loss of sites. It was nothing of the kind.
+
+The column that was pointing the right way throughout is `refused`, down 302 in both the
+narrow and the wide version -- the same number, which is also the evidence that the two
+rescue the same sites and the narrowing only avoids collapsing windows that did not need
+collapsing.
+
+**A metric that cannot see the thing being changed is worse than no metric**, because it
+produces a confident number. This is the fourth time in one sitting that a count measured
+something adjacent to the question -- the stores that ignored already-covered windows, the
+pair checks that ignored the run succeeding, the horizon probe that counted its own
+conservatism, and now windows standing in for sites. The pattern is always the same: the
+quantity was easy to obtain and nobody asked what it excluded.
+
+#### The test had the same fault and passed anyway
+
+`check-pe` gains `zerorun`, three consecutive zero stores. **The first version put an
+`addq` between them** -- which is padding, exactly what the real code does not offer -- so
+each store could widen on its own and the program would have passed with the feature
+reverted. Only the mutation caught it:
+
+```
+with the rule      zerorun -- original 29, rewritten 88, want 88
+rule reverted      zerorun -- original 29, rewritten 29, want 88   FAIL
+```
+
+The addressing in the committed version is deliberately bare, `(%rax)` and then
+displacements off the same register, because a displacement makes the instruction five
+bytes and dissolves the entire difficulty being tested.
 
 ## Picking this up again
 
@@ -5370,7 +5453,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 51 mnemonics over four operand shapes, one with src2 in memory; `vblendvps`/`vblendvpd` across all five register arrangements their lowering branches on; ten FMA orderings; and the broadcasts through memory. Every one of 16 registers matching GCC's SSE intrinsic over 8 input patterns including three all-NaN | 256-bit, `vpermilps`, and any lowering whose destination is a general-purpose register -- Findings 54 to 57 count them |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | seventeen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | eighteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
 | `make detour-verify` | on Starfield: header self-consistency, size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53. Its function-table claim now has an independent witness: Finding 74 has wine looking the table up 431,937 entries deep, eleven frames, and agreeing with the original |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
@@ -5380,7 +5463,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and seventeen PEs built for the purpose.
+things: the lowerings executed in isolation, and eighteen PEs built for the purpose.
 
 ### What is still not verified
 
@@ -5442,7 +5525,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **790,260 of 805,131 VEX sites, 98.2%** (Findings 24 to 80), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **790,584 of 805,131 VEX sites, 98.2%** (Findings 24 to 81), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -5580,7 +5663,7 @@ size of it.** Finding 74 puts the rewritten binary 866 bytes past where the orig
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. But 866 bytes is the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 14,871 that remain has to go before any of this can be
+immediately, and every one of the 14,547 that remain has to go before any of this can be
 soaked. What the run adds is a measuring instrument -- each fault address names the next
 site, and the site it named turned out to be refused under a misleading label.
 

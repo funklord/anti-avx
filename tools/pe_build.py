@@ -729,6 +729,46 @@ source:	.long 1, 2, 3, 4
 
 
 
+# 23. Three consecutive 256-bit zero stores with no displacement, which is
+# what clearing a structure looks like and what Starfield stopped on.
+#
+# Each encodes in FOUR bytes and a detour needs five, so each has to widen
+# its window over a neighbour -- and the neighbour is another zero store that
+# wanted the same padding. The first wins, the second's window overlaps a
+# committed one and is skipped, and so on. Taken as one window the group is
+# already long enough and nothing has to widen.
+#
+# The addressing is deliberately bare: `(%rax)` rather than `0x20(%rax)`,
+# because a displacement makes the instruction five bytes and the whole
+# difficulty disappears. %rax is stepped between them instead, which is also
+# what the real code does.
+#
+# 96 bytes are cleared and one poisoned dword read back, so a store landing
+# at the wrong offset returns the poison rather than 88.
+PROGRAMS["zerorun"] = (88, """
+	.text
+	.globl _start
+_start:
+	subq	$168, %rsp
+	vzeroupper
+	movq	%rsp, %rax
+	movl	$0xa5a5a5a5, 32(%rax)	/* poison inside the cleared range */
+	movl	$88, 128(%rax)		/* the answer, outside it */
+	vpxor	%xmm0, %xmm0, %xmm0
+	vmovups	%ymm0, (%rax)		/* four bytes, and the only thing */
+	vmovups	%ymm0, 0x20(%rax)	/* it can widen over is another */
+	vmovups	%ymm0, 0x40(%rax)	/* 256-bit store, which cannot move */
+	movq	%rsp, %rax
+	movl	32(%rax), %ecx		/* must be zero, not the poison */
+	addl	128(%rax), %ecx		/* plus 88 */
+	movl	%ecx, %eax
+	addq	$168, %rsp
+	ret
+func_end:
+""")
+
+
+
 # 22. A copy pair, a VEX.128 write to the SAME register's low half, and a
 # 256-bit store of it afterwards.
 #

@@ -1003,6 +1003,67 @@ def lower_ymm_zero_store(vex, tail, address, length, at):
 	return low_half + high_half
 
 
+def zero_run(instructions, index, blocked, zeroed, limit=16):
+	"""Consecutive 256-bit zero stores, taken as one window.
+
+	**Short zero stores compete with each other for padding.** A 256-bit
+	store with no displacement encodes in four bytes and a `jmp rel32` needs
+	five, so its window has to widen over a neighbour -- and where the
+	neighbour is another zero store, it widens over a site that wanted the
+	same trick. The first one wins, the second's window overlaps a committed
+	one and is skipped, and MSVC emits these in threes and fours because that
+	is what clearing a structure looks like.
+
+	Measured: of 9,795 stores of a provably zero register, 327 survive, 325
+	of them four bytes long, and 323 are lost after the collector rather than
+	refused by it. The site Starfield stopped at was the first of three in a
+	row. Finding 81.
+
+	Taking the group as one window removes the competition: nothing has to
+	widen, because the run is already longer than five bytes, and each store
+	lowers into the same stub. `limit` bounds the group; there is no reason
+	for a long one and an unbounded walk here would be a new way to be slow.
+
+	Returns (positions, last position) with at least two members, or None.
+	`zeroed` decides whether a store's register is provably zero at its own
+	position -- passed in rather than called here so this stays a scan.
+	"""
+	members, at = [index], None
+	address, encoding, _m, _o, _c = instructions[index]
+	at = address + len(encoding)
+	for step in range(1, limit):
+		position = index + step
+		if position >= len(instructions):
+			break
+		next_address, bits, name, text, _cc = instructions[position]
+		if next_address != at or next_address in blocked:
+			break
+		if name.startswith(CONTROL_PREFIXES):
+			break
+		what = wide_move(bits, name, text)
+		if what is None or what[0] != "store":
+			break
+		if not zeroed(position, what[1]):
+			break
+		members.append(position)
+		at = next_address + len(bits)
+	if len(members) < 2:
+		return None
+	return members, members[-1]
+
+
+def lower_zero_run(entries, at):
+	"""Every store in the run, two 128-bit stores each, into one stub."""
+	body = bytearray()
+	for vex, tail, address, length in entries:
+		piece = lower_ymm_zero_store(vex, tail, address, length,
+		                             at + len(body))
+		if piece is None:
+			return None
+		body += piece
+	return bytes(body)
+
+
 def conditional_branch(mnemonic):
 	"""True for a branch that can fall through to the next instruction.
 
@@ -1331,10 +1392,21 @@ def zeroed_ymm(instructions, index, register, blocked, limit=80):
 #     40,000      197,051        +26       213
 #    400,000      197,062        +11       215
 #
-# So 40,000: the knee. It takes 106 of the ~117 sites on offer, and the last
-# point buys eleven more for a bound a thousand times looser, which is a poor
-# trade for a valve whose whole job is to terminate on a binary nobody here
-# has seen. Finding 80.
+# 40,000 was chosen off that curve as the knee, on the grounds that the last
+# point buys only eleven more sites for a bound ten times looser. **That read
+# the wrong column.** Sites are not fungible: eleven in code that never runs
+# are worth nothing, and one in the loop the game executes during startup is
+# worth the whole difference. The aggregate count cannot see which is which,
+# and it was allowed to decide.
+#
+# The site Starfield actually dies on -- 0x1422d2f56, a copy pair inside a
+# loop -- is one of the eleven. It is not path explosion: the walk answers
+# "dead" after consuming 200,196 of the budget in 0.1 seconds, so it was only
+# ever expensive. At 40,000 it is refused and the game stops there.
+#
+# So 400,000, and the cost side never moved: 215 seconds against 213, inside
+# the noise, because the valve binds on barely a hundred walks out of 805,000.
+# Finding 80.
 #
 # What is left after it is not a budget problem. 44 sites blew through 4,000
 # and are genuine path explosion: the walk re-examines the same successors
@@ -1342,7 +1414,7 @@ def zeroed_ymm(instructions, index, register, blocked, limit=80):
 # direction -- caching "read" is sound, caching "dead" is not, because
 # Finding 78 made a revisited branch terminate as dead and that answer
 # depends on which branches were on the path when it was computed.
-PATH_BUDGET = 40000
+PATH_BUDGET = 400000
 
 
 def upper_half_read_later(instructions, index, register, limit=40,
@@ -1509,6 +1581,14 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# A 256-bit copy: both instructions become four 128-bit moves, so
 		# neither is lowered on its own.
 		body = lower_ymm_pair(strategy[1], stub_address)
+		if body is None:
+			return None, 0
+		return bytes(body) + encode_jump(stub_address + len(body) + 5,
+		                                 start + window), 0
+	if kind == "zerorun":
+		# Consecutive stores of an all-zero register, taken together so that
+		# none of them has to widen its window over another. See `zero_run`.
+		body = lower_zero_run(strategy[1], stub_address)
 		if body is None:
 			return None, 0
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
@@ -1877,6 +1957,39 @@ def collect(binary, listing):
 						skipped["ymm store operand cannot be offset"] += 1
 						declined[address] = "ymm store operand cannot be offset"
 						continue
+					# **Consecutive zero stores compete for the same
+					# padding**, so take the group as one window before
+					# letting any of them widen. See `zero_run`.
+					#
+					# Only where the site is too short to detour on its own.
+					# Grouping every zero store instead cost 1,888 placements
+					# for 327 gained: one long window collides with
+					# neighbouring candidates that would each have been
+					# placed, and 9,468 of these lower perfectly well alone.
+					# The overlap count rose by 2,199 and said so.
+					found = None
+					if len(encoding) < 5:
+						found = zero_run(
+							instructions, index, blocked,
+							lambda position, register: zeroed_ymm(
+								instructions, position, register, blocked))
+					if found is not None:
+						members, last = found
+						tail_entry = instructions[last]
+						span = tail_entry[0] + len(tail_entry[1]) - address
+						entries = []
+						for position in members:
+							one = instructions[position]
+							one_vex = inplace.decode_vex(one[1])
+							entries.append((one_vex,
+							                one[1][one_vex["length"]:],
+							                one[0], len(one[1])))
+						if inplace.covered_by(ranges, address, span) \
+								and lower_zero_run(entries, address) is not None:
+							candidates.append(
+								(address, encoding, operands, mnemonic, span,
+								 [], None, [], ("zerorun", entries)))
+							continue
 					strategy = ("zero", None)
 				else:
 					skipped["ymm value has no known upper half"] += 1
@@ -2709,6 +2822,11 @@ def place_stubs(candidates, stub_base, spill_base=0):
 			_helpers, entries = strategy[1]
 			for entry in entries[1:]:
 				swallowed.add(entry[4])
+		if strategy is not None and strategy[0] == "zerorun":
+			# Every store after the first loses its boundary to the group's
+			# single window. Its address is the third field of the entry.
+			for entry in strategy[1][1:]:
+				swallowed.add(entry[2])
 	return placed, blob, swallowed, overlapped, refused
 
 
