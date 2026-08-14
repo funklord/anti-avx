@@ -8,11 +8,12 @@ Code style for this project -- `tools/vex_scan.py`, whatever tooling follows
 it, the `Makefile` and the documents.
 
 **The global source**, `~/.claude/guidelines/code-style.md`, applies to every
-private project and sits above both this file and `project.md`. Where either
-disagrees with it, that is **drift to fix, not a local override**. A genuine
-divergence needs a technical reason and is signalled to the list in `claude-guidelines`' `project.md` rather
-than decided in passing -- and when a conflict actually comes up, stop and ask instead of
-picking a winner.
+private project and sits above both this file and `project.md`. Where
+either disagrees with it, that is **drift to fix, not a local override**.
+A genuine divergence needs a technical reason and is signalled to the list
+in `claude-guidelines`' `project.md` rather than decided in passing -- and
+when a conflict actually comes up, stop and ask instead of picking a
+winner.
 
 Nothing is vendored.
 
@@ -23,7 +24,8 @@ Nothing is vendored.
 3. **Lowercase filenames,** unless a tool demands otherwise.
 
 Everything below is these three rules in detail, plus the exceptions that
-are already settled. An exception not listed here is not yet settled: signal it to the list in
+are already settled. An exception not listed here is not yet settled:
+signal it to the list in
 `claude-guidelines`' `project.md` rather than deciding in passing.
 
 ## 1. Naming
