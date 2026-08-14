@@ -4767,6 +4767,51 @@ right answer and an unrepresentable one, so the evidence for this finding is the
 measurement and the disassembly above rather than a green test. **Saying so is better than
 contorting the program into something that passes**, which would have tested the contortion.
 
+#### What the other nineteen are, which matters for how much to worry
+
+All 21 were checked rather than assumed, and they are not one thing:
+
+```
+a forward jmp that skips the zeroing        1   0x1424e3b5f, shipped, wrong
+an indirect target (reloc/pdata/switch)     1   0x14091d538, shipped, unknowable
+a loop back-edge, the store being the head 19   correct, and unprovably so
+```
+
+The nineteen are `memset` loops and they all look like this:
+
+```
+14092c3f0: vmovups %ymm0,(%rax)        <- the loop head, and the store
+           vmovups %ymm0,0x20(%rax)
+           vmovups %ymm0,0x40(%rax)
+           vmovups %xmm0,0x60(%rax)
+           lea     0x80(%rax),%rax
+           vmovups %xmm0,-0x10(%rax)
+           sub     $0x1,%rdx
+           jne     0x14092c3f0
+```
+
+**Nothing in the body writes ymm0 or xmm0**, so the register is still zero on every
+iteration and lowering them would have been right. The scan cannot see that, and the fix
+refuses them -- which costs nothing today, since placement had already lost all nineteen.
+
+So the defect is one site rather than twenty-one, and the honest summary is that the rule
+was unsound, one instance of the unsoundness reached the binary, and the rest were correct
+by circumstance.
+
+#### And the fix blocks Finding 81 on exactly the shape that motivated it
+
+`0x14186e921`, where Starfield stops, is one of the nineteen. Before this it was refused
+because `zeroed_ymm` would not vouch for the *second* store, having crossed the loop head;
+now the head is refused for being the head. The `zero_run` of Finding 81 cannot form there
+at all.
+
+The way out is a real condition rather than a relaxation: **a loop head keeps its zero if
+nothing between it and its own back edge writes the register.** That is bounded, local, and
+checkable by exactly the kind of scan this file is full of -- walk from the store to the
+`jne` that targets it, refuse on any write to the register or any escape from the range.
+It would take all nineteen, and the site the game dies on with them. It is not built here
+because Finding 82 is a correctness fix and belongs on its own.
+
 #### What found it
 
 Not a check. The frontier did not move after Finding 81, and asking why led to `zero_run`
