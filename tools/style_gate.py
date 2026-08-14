@@ -948,7 +948,24 @@ def convert_c(text: str, width: int) -> str:
 					# inside it ends at a `;` seen at THAT depth, not at zero.
 					# Testing against zero leaves every braceless body opened
 					# inside a lambda unclosed for the rest of the file.
-					stack.append([pending_switch, False, paren])
+					# The fourth field is the braceless-body count this block
+					# opened INSIDE of -- its floor. A `;` in here closes the
+					# bodies opened in here and must not reach past it: in
+					#
+					#     for (i = 0; i < 3; i++)
+					#             if (i) {
+					#                     g();
+					#                     g();
+					#             }
+					#
+					# the brace consumes the `if`'s body and the `for`'s is
+					# still open around the whole block. Resetting to zero at
+					# the first `;` dropped it, so the first statement was
+					# right and every later one and the closing brace were
+					# reported a tab too deep -- the level was lost after one
+					# statement rather than never taken, which is what made it
+					# look like an indentation fault in the file.
+					stack.append([pending_switch, False, paren, virtual])
 					pending_switch = False
 				elif counting and c == "}":
 					if stack:
@@ -957,9 +974,11 @@ def convert_c(text: str, width: int) -> str:
 					await_body = False
 				elif counting and c == ";" and paren == (stack[-1][2] if stack else 0):
 					# End of a statement closes every braceless body that was
-					# waiting on it -- `if (a) if (b) x;` opened two.
+					# waiting on it -- `if (a) if (b) x;` opened two -- but
+					# only those opened inside the current block. Anything
+					# still open around the block is this frame's floor.
 					pending_switch = False
-					virtual = 0
+					virtual = stack[-1][3] if stack else 0
 					await_body = False
 				i += 1
 			elif state == "block_comment":
