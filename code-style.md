@@ -10,8 +10,8 @@ it, the `Makefile` and the documents.
 **The global source**, `~/.claude/guidelines/code-style.md`, applies to every
 private project and sits above both this file and `project.md`. Where either
 disagrees with it, that is **drift to fix, not a local override**. A genuine
-divergence needs a technical reason and is raised rather than decided in
-passing -- and when a conflict actually comes up, stop and ask instead of
+divergence needs a technical reason and is signalled to the list in `claude-guidelines`' `project.md` rather
+than decided in passing -- and when a conflict actually comes up, stop and ask instead of
 picking a winner.
 
 Nothing is vendored.
@@ -23,8 +23,8 @@ Nothing is vendored.
 3. **Lowercase filenames,** unless a tool demands otherwise.
 
 Everything below is these three rules in detail, plus the exceptions that
-are already settled. An exception not listed here is not yet settled: raise
-it rather than deciding in passing.
+are already settled. An exception not listed here is not yet settled: signal it to the list in
+`claude-guidelines`' `project.md` rather than deciding in passing.
 
 ## 1. Naming
 
@@ -134,21 +134,44 @@ Continuation lines inside brackets are not indentation-significant at all.
 Never a space *before* a tab in leading whitespace -- that is the case that
 raises `TabError`.
 
-Anything else that seems to need spaces: raise it, get it settled, and add
-it here.
+Anything else that seems to need spaces: signal it to the list in
+`claude-guidelines`' `project.md`, follow the rule meanwhile, and it gets
+settled and added here in a pass rather than in whichever project met it
+first.
 
 ## 3. Filenames
 
-Lowercase and `snake_case` for everything the project names itself --
-sources, headers, documentation. So `main_window.cpp`, not
-`MainWindow.cpp`.
+**Lowercase, always**, for everything the project names itself. So
+`main_window.cpp`, not `MainWindow.cpp`.
+
+**The separator follows what the name binds to**, and the two cases are a
+technical difference rather than a matter of taste:
+
+- **`snake_case` where the filename becomes an identifier** -- a source
+  file, a header, a module. `desired_state.rs` *is* the module
+  `desired_state`, and `desired-state.rs` cannot be a module at all,
+  because a hyphen is not legal in a Rust path; Python imports are the
+  same. That is the language's requirement wearing a convention's
+  clothes, and it is not negotiable where it applies.
+- **`kebab-case` for prose** -- documentation, design notes, decision
+  records. Nothing imports `code-style.md`, so no identifier is at stake,
+  and kebab-case is what markdown and URLs settled on long ago.
+
+The rule used to say `snake_case` for prose too, and every private project
+was quietly ignoring it. It was rewritten after measuring all fourteen
+trees: of 197 tracked markdown basenames, 174 were already kebab-case.
 
 Settled exceptions:
 
 - **Names a tool will not accept lowercased** -- `Makefile`,
   `CMakeLists.txt`, `AndroidManifest.xml`, `Dockerfile`, `Cargo.toml`.
 - **Root files with an established convention** -- `README.md`, `LICENSE`,
-  `CHANGELOG.md`, `AUTHORS`.
+  `CHANGELOG.md`, `AUTHORS`, `VERSION`. The last is this workspace's own
+  rather than the wider world's, and is settled by use: thirteen of the
+  fourteen private projects track one, and a build reads it for the
+  package version and for whatever the program prints, so the number
+  lives in exactly one place. `claude-guidelines` is the one without it,
+  and it packages nothing.
 - **Package-system spellings** -- kebab-case where Cargo or Debian require
   it.
 
@@ -207,8 +230,9 @@ Three layers, and they are not equals:
 
 A project copy that disagrees with the source is **drift, not an
 override**: fix it. A project that genuinely needs to diverge needs a
-technical reason, and that is a decision to raise with the user -- not one
-to make while working on something else.
+technical reason, and that is not a decision to make while working
+on something else -- signal it to the list in `claude-guidelines`'
+`project.md` and keep following the source meanwhile.
 
 **When a conflict between layers actually comes up, stop and ask.** Do not
 silently pick a winner, even the global one.
