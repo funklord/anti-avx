@@ -16,7 +16,14 @@
 
 msg="$1"
 
-TOOLING='generated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
+# `\b` on the phrase and not on the names, which is the difference between
+# the two kinds of term here. The names are matched as substrings on purpose
+# -- a vendor word at the end of a path under the tree is still an
+# attribution, which was measured rather than assumed. `generated with` is
+# not a name, it is English, and unanchored it matched inside `regenerated
+# with`, refusing a message describing a header emitted a second time. A
+# gate that refuses ordinary prose is one somebody works around.
+TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 
 # What the prose check reads, and it is deliberately not the whole file.
 #
