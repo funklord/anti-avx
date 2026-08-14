@@ -729,6 +729,92 @@ source:	.long 1, 2, 3, 4
 
 
 
+# 25. The store AFTER a loop head, whose backward walk must cross it.
+#
+# Finding 83 taught the scan that a loop head keeps its zero, and gained
+# nothing: the second store in the body walks back, meets the head -- a
+# branch target -- and refuses on the older rule. Finding 84 recurses there,
+# because a branch target is only opaque if the value at it is, and the head
+# has just been proved zero.
+#
+# This is the shape Starfield stops on at 0x14186e921, minus the widths. Both
+# stores must land, over two iterations, so a lowering that takes the head
+# and refuses the body leaves poison at offset 48 and never returns 33.
+PROGRAMS["zerochain"] = (33, """
+	.text
+	.globl _start
+_start:
+	subq	$200, %rsp
+	movq	%rsp, %rax
+	movl	$0xa5a5a5a5, 16(%rax)	/* poison every upper half */
+	movl	$0xa5a5a5a5, 48(%rax)
+	movl	$0xa5a5a5a5, 80(%rax)
+	movl	$0xa5a5a5a5, 112(%rax)
+	movl	$33, 128(%rax)		/* the answer, past the cleared range */
+	vzeroupper
+	movq	$2, %rdx
+	vpxor	%xmm0, %xmm0, %xmm0
+loop:
+	vmovups	%ymm0, (%rax)		/* the head: Finding 83 */
+	vmovups	%ymm0, 0x20(%rax)	/* the body: needs Finding 84 */
+	leaq	0x40(%rax), %rax
+	subq	$1, %rdx
+	jne	loop
+	movq	%rsp, %rax
+	movl	16(%rax), %ecx
+	addl	48(%rax), %ecx
+	addl	80(%rax), %ecx
+	addl	112(%rax), %ecx
+	addl	128(%rax), %ecx
+	movl	%ecx, %eax
+	addq	$200, %rsp
+	ret
+func_end:
+""")
+
+
+
+# 24. A memset loop whose HEAD is the zero store, which Finding 82 refused
+# and Finding 83 takes back.
+#
+# The store is a branch target -- its own back edge -- so another path
+# reaches it without passing the `vpxor`. That path is the previous
+# iteration, and the body writes nothing to ymm0, so the register is still
+# zero when it arrives. The induction needs every premise: only the head is
+# entered, no call, no write to the register anywhere in the body.
+#
+# 64 bytes are cleared over two iterations from a poisoned buffer, so a
+# lowering that runs once, or writes the wrong half, leaves poison behind and
+# returns something far from 44.
+PROGRAMS["loophead"] = (44, """
+	.text
+	.globl _start
+_start:
+	subq	$136, %rsp
+	movq	%rsp, %rax
+	movl	$0xa5a5a5a5, 16(%rax)	/* poison the first upper half */
+	movl	$0xa5a5a5a5, 48(%rax)	/* and the second */
+	movl	$44, 96(%rax)		/* the answer, past the cleared range */
+	vzeroupper
+	movq	$2, %rdx
+	vpxor	%xmm0, %xmm0, %xmm0
+loop:
+	vmovups	%ymm0, (%rax)		/* the head, and a branch target */
+	leaq	32(%rax), %rax
+	subq	$1, %rdx
+	jne	loop
+	movq	%rsp, %rax
+	movl	16(%rax), %ecx		/* both upper halves must be zero */
+	addl	48(%rax), %ecx
+	addl	96(%rax), %ecx		/* plus 44 */
+	movl	%ecx, %eax
+	addq	$136, %rsp
+	ret
+func_end:
+""")
+
+
+
 # 23. Three consecutive 256-bit zero stores with no displacement, which is
 # what clearing a structure looks like and what Starfield stopped on.
 #

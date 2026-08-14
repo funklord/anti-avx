@@ -1303,7 +1303,62 @@ def lower_ymm_run(strategy, at, pool):
 	return bytes(body)
 
 
-def zeroed_ymm(instructions, index, register, blocked, limit=80):
+def zero_survives_loop(instructions, index, register, blocked, sources,
+                       limit=32):
+	"""True if the loop this store heads cannot disturb the register.
+
+	Finding 82 refuses a zero store that is itself a branch target, because
+	another path reaches it without passing the zeroing. **Nineteen of the
+	twenty-one it refused were correct anyway**, and all of one shape: a
+	`memset` loop whose head is the store, whose body writes the register
+	nowhere, and whose only entry is that head. The register is zero on the
+	fall-through by the walk below, and zero on every later iteration because
+	nothing between the head and the back edge touches it.
+
+	That is an induction, and it needs all of its premises:
+
+	  * **every** edge into the store comes from inside the body, so there is
+	    no third path carrying an unknown value;
+	  * **no instruction in the body is a branch target**, or control could
+	    enter mid-loop and reach the back edge without ever passing the head;
+	  * nothing in the body **writes** the register, in either spelling;
+	  * no call and no unconditional transfer out, a call being opaque and
+	    the upper half of every ymm volatile across one.
+
+	Refusing when `sources` is absent keeps every other caller conservative.
+	Finding 83.
+	"""
+	address = instructions[index][0]
+	incoming = sources.get(address) if sources else None
+	if not incoming:
+		return False			# indirect, or no direct source at all
+	last = max(incoming)
+	if any(source <= address for source in incoming):
+		return False			# an edge from outside the body
+	narrow = "%xmm" + register[len("%ymm"):]
+	for step in range(1, limit + 1):
+		position = index + step
+		if position >= len(instructions):
+			return False
+		at, _encoding, mnemonic, operands, _comment = instructions[position]
+		if at > last:
+			return False		# walked past the back edge without meeting it
+		if at in blocked:
+			return False		# the body is enterable somewhere other than
+						# its head
+		fields = inplace.split_operands(operands)
+		if fields and fields[-1] in (narrow, register):
+			return False		# the body writes it
+		if at == last:
+			return True		# the back edge, and nothing on the way wrote
+		if mnemonic.startswith(CONTROL_PREFIXES) \
+				and not conditional_branch(mnemonic):
+			return False		# a call, or a jump out of the body
+	return False
+
+
+def zeroed_ymm(instructions, index, register, blocked, limit=80,
+               sources=None, depth=4):
 	"""True if every bit of `register` is zero when `index` executes.
 
 	**A VEX.128 instruction zeroes bits [255:128] of its destination**, which
@@ -1357,34 +1412,63 @@ def zeroed_ymm(instructions, index, register, blocked, limit=80):
 	# holds something else and the lowering wrote the low half twice. Two
 	# such sites were in the built binary and nineteen more were accepted by
 	# the scan and lost elsewhere. Finding 82.
+	# ...unless it heads a loop that cannot disturb the register, which is
+	# what nineteen of the twenty-one turned out to be. See
+	# `zero_survives_loop`; without `sources` this stays the flat refusal.
 	if instructions[index][0] in blocked:
-		return False
+		if not zero_survives_loop(instructions, index, register, blocked,
+		                          sources):
+			return False
 	for step in range(1, limit + 1):
 		position = index - step
 		if position < 0:
 			return False
 		address, encoding, mnemonic, operands, _comment = instructions[position]
-		if address in blocked:
-			return False
 		if mnemonic.startswith(CONTROL_PREFIXES) \
 				and not conditional_branch(mnemonic):
 			return False
-		if narrow not in operands and register not in operands:
-			continue
-		fields = inplace.split_operands(operands)
-		if fields and fields[-1] not in (narrow, register):
-			# **A pure source, so the value is unchanged and the walk goes
-			# on.** In AT&T the destination is the last operand, and the one
-			# family that writes a non-last one is `vgather*`, which zeroes
-			# its mask. There are none in `.text`, checked rather than
-			# assumed, so a register named anywhere but last is read-only.
-			continue
-		if mnemonic not in scratch_finder.ZEROING:
-			return False
-		if len(fields) != 3 or set(fields) != {narrow}:
-			return False
-		vex = inplace.decode_vex(encoding)
-		return vex is not None and not vex["L"]
+		fields = ()
+		writes = False
+		if narrow in operands or register in operands:
+			fields = inplace.split_operands(operands)
+			# In AT&T the destination is the last operand, and the one family
+			# that writes a non-last one is `vgather*`, which zeroes its mask.
+			# There are none in `.text`, checked rather than assumed, so a
+			# register named anywhere but last is read-only.
+			writes = bool(fields) and fields[-1] in (narrow, register)
+		if writes:
+			# **This instruction decides the value, however control arrived**,
+			# so whether it is a branch target does not matter and must not be
+			# asked -- the first version of this recursion tested `blocked`
+			# before looking at the write, which for a target that writes the
+			# register would have answered about the value BEFORE it. Finding
+			# 84.
+			if mnemonic not in scratch_finder.ZEROING:
+				return False
+			if len(fields) != 3 or set(fields) != {narrow}:
+				return False
+			vex = inplace.decode_vex(encoding)
+			return vex is not None and not vex["L"]
+		if address in blocked:
+			# **A branch target is only opaque if the value AT it is.** The
+			# refusal here says another path reaches this point without
+			# passing the zeroing -- true, and it stops mattering when the
+			# register is zero on every path into that point too, which is
+			# exactly what this function answers. Nothing between there and
+			# the store writes it, or the walk would have returned above.
+			#
+			# So recurse, and bound it. `depth` stops a chain of targets
+			# walking the whole function: each step costs a full backward
+			# walk, and the shapes this is for -- a memset loop whose head is
+			# a store, and the stores after it -- need one or two.
+			#
+			# Exhausting the bound is a refusal, so an unresolved answer stays
+			# "not zero", which is the safe direction.
+			if depth <= 0:
+				return False
+			return zeroed_ymm(instructions, position, register, blocked,
+			                  limit, sources, depth - 1)
+		# A pure source, or no mention at all: the value is unchanged.
 	return False
 
 
@@ -1782,14 +1866,22 @@ def collect(binary, listing):
 	instructions = list(parse_with_comments(listing))
 	# The liveness scan wants the plain four-field shape.
 	plain = [(a, e, m, o) for a, e, m, o, _c in instructions]
+	# **Which instructions branch where, not merely that they do.** `blocked`
+	# answers "can anything reach this address"; `sources` answers "and from
+	# where", which is what tells a loop back edge from an arbitrary entry.
+	# See `zero_survives_loop`.
+	sources = {}
 	for i, (address, _e, mnemonic, operands, comment) in enumerate(instructions):
 		if mnemonic.startswith(("j", "call", "loop")) and operands:
 			first = operands.split()[0]
 			if first.startswith("0x"):
 				try:
-					blocked.add(int(first, 16))
+					target = int(first, 16)
 				except ValueError:
 					pass
+				else:
+					blocked.add(target)
+					sources.setdefault(target, []).append(address)
 		elif mnemonic == "lea" and isinstance(comment, int) \
 				and "(%rip)" in operands:
 			# A function address taken PC-relatively, so no relocation
@@ -1963,7 +2055,8 @@ def collect(binary, listing):
 			fields = inplace.split_operands(operands)
 			if (len(fields) == 2 and fields[0].startswith("%ymm")
 					and "(" in fields[1]):
-				if zeroed_ymm(instructions, index, fields[0], blocked):
+				if zeroed_ymm(instructions, index, fields[0], blocked,
+				              sources=sources):
 					if lower_ymm_zero_store(vex, encoding[vex["length"]:],
 					                        address, len(encoding),
 					                        address) is None:
@@ -1985,7 +2078,8 @@ def collect(binary, listing):
 						found = zero_run(
 							instructions, index, blocked,
 							lambda position, register: zeroed_ymm(
-								instructions, position, register, blocked))
+								instructions, position, register, blocked,
+								sources=sources))
 					if found is not None:
 						members, last = found
 						tail_entry = instructions[last]

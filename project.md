@@ -4822,6 +4822,78 @@ not work, not by any gate**, and no structural check in the project would have c
 the output is well formed, the table is sorted, the boundaries reconcile. It writes the
 wrong bytes.
 
+### Finding 83 -- the loop head keeps its zero, and that alone is worth nothing
+
+Finding 82 refused every zero store that is a branch target, and nineteen of the
+twenty-one were `memset` loops that were correct anyway. `zero_survives_loop` takes them
+back, by induction rather than by relaxing anything: the register is zero on the
+fall-through by the ordinary walk, and zero on every later iteration because nothing
+between the head and its own back edge disturbs it.
+
+The induction needs all of its premises, and stating them is most of the work:
+
+  * **every** edge into the store comes from inside the body, or a third path carries an
+    unknown value;
+  * **no instruction in the body is a branch target**, or control enters mid-loop and
+    reaches the back edge without ever passing the head;
+  * nothing in the body **writes** the register, in either spelling;
+  * no call and no unconditional transfer out, a call being opaque and every ymm upper
+    half volatile across one.
+
+It needed `sources` -- which instruction branches where, not merely that something does --
+because a set of targets cannot tell a back edge from an arbitrary entry.
+
+**Measured on Starfield: zero sites.** `make check-pe` gains `loophead` and proves the rule
+works, and the binary does not move a byte. The second store in the body walks back, meets
+the head, and refuses on the older rule -- so the group still cannot form, the four-byte
+head still has to widen over a 256-bit store, and the stub still fails. One conservatism
+was removed and the one behind it held every site exactly as before.
+
+### Finding 84 -- a branch target is only opaque if the value at it is
+
+The rule Finding 83 ran into: the backward walk refuses any branch target it passes over.
+That is right when the value there is unknown and needless when it is not, and "is this
+register zero at that point" is the question the function already answers. So it recurses,
+bounded by `depth`, exhausting to a refusal so an unresolved answer stays "not zero".
+
+```
+VEX in .text     805,131 ->  13,602      791,529 removed, 98.3%
+                             14,549 before, and 947 of them here
+```
+
+**And the site Starfield stops on is lowered.** `0x14186e921`, three consecutive four-byte
+zero stores at a loop head, becomes one window and one stub:
+
+```
+148b0b7e8: movups %xmm0,(%rax)      movups %xmm0,0x10(%rax)
+           movups %xmm0,0x20(%rax)  movups %xmm0,0x30(%rax)
+           movups %xmm0,0x40(%rax)  movups %xmm0,0x50(%rax)
+           jmp 0x14186e92f
+```
+
+#### The bug in the fix, which is the same bug as before
+
+The first version tested `blocked` **before** looking at whether the instruction writes the
+register. For a branch target that writes it -- `vmovaps something,%ymm0` -- that recurses
+and answers about the value *before* the write, then reports zero for a register holding
+something else. Silent wrongness in the fix for a silent-wrongness finding, two findings
+later.
+
+The order that is right decides on the write first: **an instruction that writes the
+register determines its value however control arrived**, which makes the branch-target
+question moot rather than prior.
+
+**That guard is not tested, and cannot be here.** Its correct outcome is a refusal, and a
+refused VEX instruction still dies at 29 on this CPU, so `check-pe` -- which asserts a
+rewritten binary that runs and returns a value -- has no way to express it. It is an
+argument in a comment and an ordering in the code. The same limit as Finding 82, recorded
+in the same words, because the class keeps recurring: **the cases this project most needs
+to test are the ones whose right answer is to refuse.**
+
+What is tested: `zerochain` returns 33 with the recursion and 29 without, and `loophead`
+still passes at `depth=0`, which shows the two rules are independent rather than one
+masking the other.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -5556,7 +5628,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 51 mnemonics over four operand shapes, one with src2 in memory; `vblendvps`/`vblendvpd` across all five register arrangements their lowering branches on; ten FMA orderings; and the broadcasts through memory. Every one of 16 registers matching GCC's SSE intrinsic over 8 input patterns including three all-NaN | 256-bit, `vpermilps`, and any lowering whose destination is a general-purpose register -- Findings 54 to 57 count them |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | eighteen PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | twenty PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
 | `make detour-verify` | on Starfield: header self-consistency, size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53. Its function-table claim now has an independent witness: Finding 74 has wine looking the table up 431,937 entries deep, eleven frames, and agreeing with the original |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
@@ -5566,7 +5638,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and eighteen PEs built for the purpose.
+things: the lowerings executed in isolation, and twenty PEs built for the purpose.
 
 ### What is still not verified
 
@@ -5628,7 +5700,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **790,582 of 805,131 VEX sites, 98.2%** (Findings 24 to 82), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **791,529 of 805,131 VEX sites, 98.3%** (Findings 24 to 84), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -5766,7 +5838,7 @@ size of it.** Finding 74 puts the rewritten binary 866 bytes past where the orig
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. But 866 bytes is the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 14,549 that remain has to go before any of this can be
+immediately, and every one of the 13,602 that remain has to go before any of this can be
 soaked. What the run adds is a measuring instrument -- each fault address names the next
 site, and the site it named turned out to be refused under a misleading label.
 
