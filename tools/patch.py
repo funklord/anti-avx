@@ -34,6 +34,7 @@ the restriction.
 """
 
 import bisect
+import re
 import struct
 import subprocess
 import sys
@@ -119,6 +120,11 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import lower			# noqa: E402  -- after the sys.path fix above
 
 
+# objdump renders a redundant REX prefix as its own token -- `rex.W jmp *m64`
+# rather than `jmp`. See parse_listing.
+REX_PREFIX = re.compile(r"^rex(\.[RXBW]+)?$")
+
+
 def parse_listing(path):
 	"""Yield (address, encoding, mnemonic, operands) from an objdump listing.
 
@@ -171,8 +177,27 @@ def parse_listing(path):
 		fields = body.strip().split(None, 1)
 		if not fields:
 			continue
-		pending = [address, bytearray(encoding), fields[0],
-		           (fields[1] if len(fields) > 1 else "")]
+		mnemonic = fields[0]
+		operands = fields[1] if len(fields) > 1 else ""
+		# **objdump prints a redundant REX prefix as a token of its own**, so
+		# `48 ff 25` -- the encoding every import thunk ends with -- reads as
+		# the mnemonic `rex.W` with `jmp *0x...(%rip)` as its operands. Every
+		# test in this tree that asks what an instruction IS then answers
+		# wrongly about it, and they are the tests that decide where a window
+		# may reach and where a scan must stop.
+		#
+		# Measured in the listing: 38,465 instructions are printed this way
+		# and **5,477 of them are jumps**, invisible to any
+		# `startswith(CONTROL_PREFIXES)` check. outside.py rejects a thunk
+		# that plainly ends in one, which is what led here. Finding 85.
+		#
+		# A lone prefix with no instruction after it is left alone: that is
+		# objdump decoding data as code, and it is not a jump.
+		if REX_PREFIX.match(mnemonic) and operands:
+			rest = operands.split(None, 1)
+			mnemonic = rest[0]
+			operands = rest[1] if len(rest) > 1 else ""
+		pending = [address, bytearray(encoding), mnemonic, operands]
 	if pending is not None:
 		yield (pending[0], bytes(pending[1]), pending[2], pending[3])
 

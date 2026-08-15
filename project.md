@@ -4894,6 +4894,68 @@ What is tested: `zerochain` returns 33 with the recursion and 29 without, and `l
 still passes at `depth=0`, which shows the two rules are independent rather than one
 masking the other.
 
+### Finding 85 -- 5,477 jumps no control-transfer test could see
+
+Finding 84 moved the frontier to `0x14001eac0`, an import thunk: load a float constant,
+tail-jump through a pointer, bracketed by `int3`. It is outside `.pdata`, and
+`outside.leaf_ranges` exists precisely to recover such things -- bracketed by padding,
+entered by a call or jump, ending in a control transfer, decoding cleanly. It meets every
+condition, including the one that looked doubtful: nothing in `.text` references it, but
+its address is stored as an absolute pointer at file offset `0x3a4d470`, and `from_reloc`
+reads relocated **values**, so it is in `known`.
+
+It was refused anyway, and the reason is that objdump prints a redundant REX prefix as a
+token of its own:
+
+```
+14001eac8:  48 ff 25 21 1a a2 03    rex.W jmp *0x3a21a21(%rip)
+
+parse_listing ->  mnemonic 'rex.W'   operands 'jmp *0x3a21a21(%rip)'
+```
+
+So `terminates` is false for an instruction that is nothing but a jump. And the same is
+true of **every** test in this tree that asks what an instruction is:
+
+```
+instructions printed with the prefix split off   38,465
+  of which the real mnemonic is jmp               5,477
+  push 31,457, add 789, and a long tail
+```
+
+`zeroed_ymm` walking back is supposed to stop at an unconditional jump; `upper_half_read_
+later` walking forward is supposed to follow one rather than fall through it; `ymm_run`
+and `zero_run` are supposed to break on one. None of them could see these.
+
+**Whether that produced wrong output or only missed opportunities is not established
+here.** The branch-target checks plausibly caught most cases incidentally, the instruction
+after a `jmp` usually being a target or padding. It is recorded as unmeasured rather than
+argued either way.
+
+#### One rule, two parsers, and a checker that disagreed with the collector
+
+The fix belongs in the parse, and there are two of them: `patch.parse_listing` and
+`detour.parse_with_comments`, the same code twice, differing only in that one keeps
+objdump's resolved-target comment.
+
+**Fixing one was worse than fixing neither for as long as it lasted.** `verify` reads the
+first and its branch-target count moved from 1,191,070 to 1,191,105; `collect` reads the
+second and went on treating `rex.W` as a mnemonic. For that build the verifier and the
+collector held different views of the same listing, which is the state in which a real
+discrepancy gets blamed on the check.
+
+```
+VEX in .text     805,131 ->  13,507      791,624 removed, 98.3%
+                             13,602 before
+in place         547,613 -> 547,707      +94, the thunks patching directly
+```
+
+and `0x14001eac0` is `movss 0x4ee528c(%rip),%xmm0` -- in place, no stub needed, because the
+SSE form is the same length. It was never hard; it was invisible.
+
+The right structural answer is one parser with an optional comment field. That is a
+refactor with its own risk and it is not done inside a correctness fix, so the rule lives
+in `patch.REX_PREFIX` and the second parser calls it.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -5700,7 +5762,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **791,529 of 805,131 VEX sites, 98.3%** (Findings 24 to 84), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **791,624 of 805,131 VEX sites, 98.3%** (Findings 24 to 85), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -5838,7 +5900,7 @@ size of it.** Finding 74 puts the rewritten binary 866 bytes past where the orig
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. But 866 bytes is the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 13,602 that remain has to go before any of this can be
+immediately, and every one of the 13,507 that remain has to go before any of this can be
 soaked. What the run adds is a measuring instrument -- each fault address names the next
 site, and the site it named turned out to be refused under a misleading label.
 

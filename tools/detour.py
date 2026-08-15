@@ -1805,8 +1805,18 @@ def parse_with_comments(listing):
 		fields = body.strip().split(None, 1)
 		if not fields:
 			continue
-		pending = [address, bytearray(encoding), fields[0],
-		           (fields[1] if len(fields) > 1 else ""), comment]
+		mnemonic = fields[0]
+		operands = fields[1] if len(fields) > 1 else ""
+		# The same REX-prefix correction `patch.parse_listing` makes, and it
+		# has to be made twice because there are two parsers. Fixing only the
+		# other one moved `verify`'s branch-target count by 35 and left the
+		# collector reading `rex.W` as a mnemonic, which is the half that
+		# decides anything. Finding 85.
+		if inplace.REX_PREFIX.match(mnemonic) and operands:
+			rest = operands.split(None, 1)
+			mnemonic = rest[0]
+			operands = rest[1] if len(rest) > 1 else ""
+		pending = [address, bytearray(encoding), mnemonic, operands, comment]
 	if pending is not None:
 		yield (pending[0], bytes(pending[1]), pending[2], pending[3], pending[4])
 
