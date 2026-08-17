@@ -729,6 +729,59 @@ source:	.long 1, 2, 3, 4
 
 
 
+# 26. A four-byte Class C site with an unconditional `jmp` immediately after
+# it, which is what 367 of the 427 refused sites look like.
+#
+# The site needs seven bytes as SSE and has four, so it must widen -- and the
+# only neighbour is a jump, which the collector refused to swallow because a
+# relative displacement cannot be MOVED. It can be re-aimed: `jmp rel8`
+# becomes `jmp rel32` at the same absolute target, and a stub containing an
+# unconditional jump simply never reaches its trailing jump home.
+#
+# The jump is TAKEN at run time, so a displacement re-aimed wrongly does not
+# compute a wrong number -- it lands somewhere else entirely. `far` is placed
+# past a `ud2` that must never execute, so a jump landing short traps rather
+# than falling through to the answer by luck.
+# **The site must be boxed in on BOTH sides**, or the test proves nothing.
+# Forward widening is what this rule enables, but when it is refused the
+# collector widens BACKWARDS instead -- and the first version of this program
+# had an ordinary `vmovss` in front, so the site was lowered either way and
+# the program returned 81 with the rule reverted. The real site at
+# 0x14004d240 has a `je` above it and a `jmp` below it, which is why it is
+# refused, so the `jne` here is load-bearing rather than scenery.
+PROGRAMS["swallowjmp"] = (81, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	nine(%rip), %xmm1
+	vmovss	three(%rip), %xmm3
+	xorl	%ecx, %ecx
+	testl	%ecx, %ecx
+	jne	wrong			/* not taken, and blocks widening backwards */
+	vdivss	%xmm3, %xmm1, %xmm5	/* four bytes, dst != src1: 9/3 = 3 */
+	jmp	far			/* two bytes, and the only padding left */
+	ud2				/* must never execute */
+wrong:
+	movl	$1, %eax
+	addq	$40, %rsp
+	ret
+far:
+	vmulss	%xmm5, %xmm5, %xmm0	/* 3 * 3 = 9 */
+	vmulss	%xmm5, %xmm0, %xmm0	/* 9 * 3 = 27 */
+	vmulss	%xmm3, %xmm0, %xmm0	/* 27 * 3 = 81 */
+	vcvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+nine:	.float 9.0
+three:	.float 3.0
+""")
+
+
+
 # 25. The store AFTER a loop head, whose backward walk must cross it.
 #
 # Finding 83 taught the scan that a loop head keeps its zero, and gained

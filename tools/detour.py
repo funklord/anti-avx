@@ -833,6 +833,94 @@ def swallowed_scratch(plain, position, address, encoding, operands, mnemonic,
 	return scratch_finder.find_scratch(plain, position, scope=scope)
 
 
+# A relative branch cannot be MOVED, only re-aimed. `jmp rel8` reaches 128
+# bytes and a stub is twelve kilobytes away, so the displacement is not
+# adjustable -- the instruction has to be re-emitted in a wider form pointing
+# at the same absolute address. A stub is freely sized, so growing two bytes
+# into five costs nothing there.
+#
+# Conditional forms are deliberately absent. There are three such sites in the
+# binary, each needing its own opcode from a sixteen-entry table, and a table
+# written for three sites is a table nobody checks. They stay refused.
+BRANCH_REEMIT = {"jmp": b"\xe9", "jmpq": b"\xe9", "call": b"\xe8",
+                 "callq": b"\xe8"}
+
+
+def swallowable_transfer(encoding, mnemonic, operands, comment, address):
+	"""True if a window may widen over this control transfer.
+
+	**A stub containing an unconditional transfer simply does not come back**,
+	and its trailing jump home becomes dead code -- which is correct rather
+	than merely harmless. A `call` is fine too: it returns into the stub and
+	falls into that jump. What is refused is a CONDITIONAL branch, where the
+	fall-through edge would have to become the jump home and both edges be
+	right at once, and where there are three sites in the whole binary.
+
+	Measured over the 427 sites this refusal was costing: 367 `jmp rel8`, 22
+	`jmp rel32`, 20 `call rel32`, 13 `ret`, 2 indirect calls and 3 conditional.
+	Every one of them would give a window of at least the five bytes a detour
+	needs. Finding 86.
+
+	The test is `moved_branch` itself where it applies, so the collector can
+	only accept what the encoder can actually emit -- the alternative is a
+	candidate that fails in `build_stub` with no reason recorded, which is the
+	shape Finding 45 had to diagnose by hand.
+	"""
+	if conditional_branch(mnemonic):
+		return False
+	# **Ask the encoder that will actually be used**, rather than a
+	# reimplementation of its rules. The first version tested `moved_branch`
+	# directly and answered yes for an indirect branch through memory, which
+	# `moved_instruction` routes to `relocate` instead -- and `relocate`
+	# refuses it. A collector that accepts what the encoder rejects produces a
+	# candidate that dies in `build_stub` with no reason recorded, which is
+	# the failure Finding 45 had to diagnose by hand.
+	#
+	# **Probe from the branch's own address, not from zero.** The stub's
+	# address is unknown here and only affects whether a rel32 reaches; from
+	# zero every target in this image overflows, and the first version of this
+	# answered "not swallowable" for all 402 sites it was written to take.
+	# Reaching is not in doubt for the real `at`: the stub section sits a few
+	# megabytes past a 58 MB `.text`, well inside rel32's range.
+	return moved_instruction((address, encoding, comment, operands, mnemonic),
+	                         address) is not None
+
+
+def moved_branch(moved, mnemonic, operands, comment, address, at):
+	"""A swallowed branch, re-emitted at `at` aimed where it always went.
+
+	`ret` carries no displacement and copies across untouched. An indirect
+	branch through memory is a RIP-relative operand, which `relocate` already
+	handles, so it is not this function's business. What is left is the
+	relative forms, and for them the absolute target is what objdump has
+	already resolved: the operand text for a direct branch is the target.
+
+	Returns None for anything it cannot encode, which is the answer that
+	keeps the caller refusing rather than guessing.
+	"""
+	if mnemonic.startswith("ret"):
+		return bytes(moved)
+	opcode = BRANCH_REEMIT.get(mnemonic)
+	if opcode is None:
+		return None
+	target = None
+	first = operands.split()[0] if operands else ""
+	if first.startswith("0x"):
+		try:
+			target = int(first, 16)
+		except ValueError:
+			target = None
+	elif comment is not None and "*" in operands:
+		return None		# indirect: relocate's business, not this one
+	if target is None:
+		return None
+	# rel32 is measured from the end of the five-byte instruction.
+	delta = target - (at + 5)
+	if not -0x80000000 <= delta <= 0x7FFFFFFF:
+		return None
+	return opcode + struct.pack("<i", delta)
+
+
 def moved_instruction(entry, at, pool=0):
 	"""One swallowed instruction, re-encoded to execute at `at`.
 
@@ -859,6 +947,13 @@ def moved_instruction(entry, at, pool=0):
 		# than carry it across.
 		return lower_vex(address, moved, moved_operands, moved_mnemonic, at,
 		                 scratch, pool)
+	# A relative branch is re-aimed rather than relocated: its displacement
+	# is measured from itself, not from RIP as an operand, so `relocate`
+	# would copy it verbatim and send it 12 KB wrong. See `moved_branch`.
+	if moved_mnemonic.startswith(CONTROL_PREFIXES) \
+			and "(%rip)" not in moved_operands:
+		return moved_branch(moved, moved_mnemonic, moved_operands, comment,
+		                    address, at)
 	# objdump comments a resolved target for several shapes, so the comment
 	# only means a RIP displacement when the operand says (%rip). Anything
 	# else copies across untouched.
@@ -2194,7 +2289,10 @@ def collect(binary, listing):
 					reason = "next instruction not adjacent"
 				elif nxt_address in blocked:
 					reason = "next instruction is a branch target"
-				elif nxt_mnemonic.startswith(CONTROL_PREFIXES):
+				elif nxt_mnemonic.startswith(CONTROL_PREFIXES) \
+						and not swallowable_transfer(
+							nxt_encoding, nxt_mnemonic, nxt_operands,
+							nxt_comment, nxt_address):
 					reason = "next instruction transfers control"
 				elif window + len(nxt_encoding) < 5:
 					reason = "still too short"
@@ -3209,8 +3307,22 @@ def verify(original, patched, listing=None):
 	               if len(line.split("\t")) >= 3
 	               and line.split("\t")[1].split()[:1] in (["c4"], ["c5"]))
 	jumps = done.stdout.count("\tjmp ")
+	# **This number is reported, not asserted, and it stopped meaning "one
+	# jump back per detour" the moment a window could swallow a branch.** It
+	# equalled the detour count for as long as every stub held exactly one
+	# jump -- the one home -- and it was quoted in project.md as a verified
+	# invariant on the strength of the two figures matching. They no longer
+	# do: Finding 86 re-emits a swallowed unconditional transfer inside the
+	# stub, so 198,660 detours carry 199,798 jumps and both numbers are right.
+	#
+	# Saying "jumps back" of a count that includes jumps that do not come back
+	# is the kind of claim `evidence.md` is about, so it says what it counts.
+	# The real invariant -- one jump home per stub, at its end -- needs the
+	# per-stub bounds this pass does not have, and asserting it is its own
+	# piece of work rather than a wording fix.
 	print(f"verify: stub section has {stub_vex:,} VEX instructions "
-	      f"(must be 0) and {jumps:,} jumps back")
+	      f"(must be 0) and {jumps:,} jmp instructions, one home per detour "
+	      f"plus one per swallowed transfer")
 	if stub_vex:
 		problems += 1
 	return 1 if problems else 0
