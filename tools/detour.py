@@ -1773,7 +1773,7 @@ def upper_half_read_later(instructions, index, register, limit=40,
 
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
                stub_address, scratch=None, pool=0, preceding=(),
-               strategy=None, spill_base=0):
+               strategy=None, spill_base=0, reasons=None):
 	"""The stub body for one window, placed at stub_address.
 
 	`start` is the window's first byte, which is the site's own address
@@ -1796,6 +1796,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# copies rather than after a site.
 		body = lower_ymm_run(strategy[1], stub_address, pool)
 		if body is None:
+			if reasons is not None:
+				reasons["the run would not lower"] += 1
 			return None, 0
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
 		                                 start + window), 0
@@ -1804,6 +1806,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# neither is lowered on its own.
 		body = lower_ymm_pair(strategy[1], stub_address)
 		if body is None:
+			if reasons is not None:
+				reasons["the pair would not lower"] += 1
 			return None, 0
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
 		                                 start + window), 0
@@ -1812,6 +1816,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# none of them has to widen its window over another. See `zero_run`.
 		body = lower_zero_run(strategy[1], stub_address)
 		if body is None:
+			if reasons is not None:
+				reasons["the zero run would not lower"] += 1
 			return None, 0
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
 		                                 start + window), 0
@@ -1821,6 +1827,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	for entry in preceding:
 		fixed = moved_instruction(entry, stub_address + len(body), pool)
 		if fixed is None:
+			if reasons is not None:
+				reasons["a preceding instruction will not move"] += 1
 			return None, 0
 		body += fixed
 
@@ -1840,16 +1848,22 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		saved = encode_spill(borrowed, True, stub_address + len(body),
 		                     spill_base)
 		if saved is None:
+			if reasons is not None:
+				reasons["the borrowed register could not be saved"] += 1
 			return None, 0
 		body += saved
 		lowered = lower_vex(site, encoding, operands, mnemonic,
 		                    stub_address + len(body), borrowed, pool)
 		if lowered is None:
+			if reasons is not None:
+				reasons["the borrowed register could not be restored"] += 1
 			return None, 0
 		body += lowered
 		restored = encode_spill(borrowed, False, stub_address + len(body),
 		                        spill_base)
 		if restored is None:
+			if reasons is not None:
+				reasons["the zero store would not lower"] += 1
 			return None, 0
 		body += restored
 		if SPILL == SPILL_STACK:
@@ -1863,12 +1877,16 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		lowered = lower_vex(site, encoding, operands, mnemonic,
 		                    stub_address + len(body), scratch, pool)
 	if lowered is None:
+		if reasons is not None:
+			reasons["the site itself will not lower"] += 1
 		return None, 0
 	body += lowered
 
 	for entry in displaced:
 		fixed = moved_instruction(entry, stub_address + len(body), pool)
 		if fixed is None:
+			if reasons is not None:
+				reasons["a displaced instruction will not move"] += 1
 			return None, 0
 		body += fixed
 
@@ -2938,7 +2956,7 @@ def stub_base_of(data):
 	return image_base + (highest + alignment - 1) // alignment * alignment
 
 
-def place_stubs(candidates, stub_base, spill_base=0):
+def place_stubs(candidates, stub_base, spill_base=0, reasons=None):
 	"""Choose and build the stubs. (placed, blob, swallowed, overlap, refused)
 
 	**One selection rule, executed once and used by both apply and verify.**
@@ -3038,9 +3056,14 @@ def place_stubs(candidates, stub_base, spill_base=0):
 				displaced = list(displaced) + extra
 				rescued.add(j)
 		if body is None:
+			# **Only this call decides a refusal.** The extension above
+			# failing is ordinary -- it falls back to the plain stub -- so
+			# passing `reasons` to it would name causes for sites that were
+			# placed perfectly well.
 			body, prologue = build_stub(
 				start, encoding, operands, mnemonic, window, displaced,
-				stub_address, scratch, pool, preceding, strategy, spill_base)
+				stub_address, scratch, pool, preceding, strategy, spill_base,
+				reasons)
 		if body is None:
 			refused.add(start)
 			continue
@@ -3106,8 +3129,14 @@ def apply_all(binary, listing, output):
 	if SPILL == SPILL_POOL:
 		spill_base = stub_base
 		stub_base += SECTION_ALIGNMENT
+	# **The largest remaining bucket was the one with no reason.** `build_stub`
+	# returned None and nothing said why, so 3,959 refusals reconciled to
+	# "refused" and stopped there -- and Finding 45 had to walk its three
+	# steps by hand to find out that a swallowed instruction wanted a scratch.
+	# Every failure path names itself now. Finding 88.
+	stub_reasons = Counter()
 	placed, blob, _swallowed, overlapped, refused = place_stubs(
-		candidates, stub_base, spill_base)
+		candidates, stub_base, spill_base, stub_reasons)
 
 	for site, window, stub_address, _length, _prologue in placed:
 		offset = raddr + (site - vaddr)
@@ -3157,6 +3186,8 @@ def apply_all(binary, listing, output):
 	open(output, "wb").write(bytes(image))
 	print(f"apply: {len(patches):,} in-place patches, {len(placed):,} detours, "
 	      f"{len(overlapped):,} skipped for overlap, {len(refused):,} refused")
+	for why, count in stub_reasons.most_common():
+		print(f"apply:   refused, {why:<38} {count:>8,}")
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "
 	      f"{len(blob):,} bytes")
 	print(f"apply: {len(pdata) // 12:,} function table entries "

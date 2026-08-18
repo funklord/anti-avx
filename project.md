@@ -5095,6 +5095,39 @@ Reverting only the backward path leaves `swallowjmp` passing at 81 and drops `co
 to 29. The two programs exercise different rules rather than one masking the other, which
 is what a mutation is for and what two green tests alone would not have shown.
 
+### Finding 88 -- the largest bucket was the one with no reason
+
+`0x1406ed33b`, where Starfield stopped after Finding 87, is not declined by the collector
+at all. It is a candidate whose stub would not build -- the 3,959 sites `census` can
+reconcile no further than "refused", because `build_stub` returns None and says nothing.
+
+Finding 45 hit this once and had to walk the three steps by hand, discovering that a
+swallowed instruction wanted a scratch of its own; that was worth 2,437 stubs and was found
+by reading rather than by any report. So every failure path names itself now, and the
+answer is lopsided:
+
+```
+the site itself will not lower             2,780    70%
+a displaced instruction will not move      1,167    29%
+a preceding instruction will not move         16
+```
+
+**2,780 sites are accepted by the collector and then refused by `lower_vex`.** That is the
+collector and the encoder disagreeing about the same instruction, which is the shape
+Finding 86 hit in `swallowable_transfer` and fixed by making one code path decide. Here the
+collector checks `has_direct_sse_form` and the operand shape, and something else in
+`lower_vex` declines afterwards. It is the largest single lever left and it is not yet
+diagnosed.
+
+The counter reports 3,963 against 3,959 refusals because `refused` is a set of addresses
+and this counts events: four candidates share a start address with another, which backward
+widening can produce. Worth knowing before the two numbers are compared again.
+
+Only the fallback `build_stub` call is given the counter. The extension call above it fails
+routinely and falls back to the plain stub, so passing it there would name causes for sites
+that were placed -- the same over-counting that has had to be corrected four times in this
+sitting.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
