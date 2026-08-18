@@ -5031,6 +5031,70 @@ The line says what it counts now, and the milestone table no longer claims the i
 Asserting the real one -- one jump home per stub, at its end -- needs per-stub bounds that
 pass does not have, and is its own piece of work.
 
+### Finding 87 -- a conditional branch is the one transfer that falls through
+
+Finding 86 moved the frontier to `0x14004d456`, in the other positional bucket: the
+instruction AFTER the site is branched to, so swallowing it would leave that branch landing
+inside the five-byte jump that replaced it.
+
+The measurement first, over all 524:
+
+```
+one edge, from inside the span   304    conditional predecessor 194, jmp 110
+2 direct edges                   139
+3 direct edges                    35
+one edge, 24+ bytes away          32
+a back edge                       10
+a static target                    4    <- the only unenumerable ones
+```
+
+**Four sites out of 524 have edges nothing in `.text` names.** That bucket was expected to
+be the wall and is not.
+
+#### The refusal was one test doing three jobs
+
+Backward widening refused any predecessor that transfers control, reasoning that it "does
+not fall through into the site". That is right for a `call`, which returns into the middle
+of a window, and for an unconditional `jmp`, after which the site is unreachable. It is
+**wrong for a conditional branch**, which falls through by definition -- and that is the
+one shape where the window is sound.
+
+Nothing has to be relocated. The branch's target lies outside the window, so the stub holds
+the re-emitted branch, the lowered site, and the jump home:
+
+```
+148988135: je     0x14004d45a      the original target, re-aimed
+14898813b: movaps %xmm1,%xmm0
+14898813e: divss  %xmm3,%xmm0      the lowered vdivss
+148988142: jmp    0x14004d45a      the jump home
+```
+
+Taken skips the divide; not taken performs it and falls into the jump home. Identical to
+the original.
+
+```
+VEX in .text     805,131 ->  12,042      793,089 removed, 98.5%
+                             12,505 before
+```
+
+#### The table Finding 86 declined now earns its place
+
+"A sixteen-entry table written for three sites is one nobody checks" was true of the three
+conditional sites forward of a window. Backwards there are 194, across six conditions, so
+`CONDITION_CODES` is written -- and `jrcxz`, `loop`, `loope` and `loopne` are excluded **by
+name**, because they exist only in a rel8 form. There is nothing to widen them into, and a
+lookup that missed that would emit a jump to an arbitrary address.
+
+One arithmetic detail worth naming: rel32 is measured from the END of the instruction,
+which is five bytes for `e9`/`e8` and **six** for the two-byte conditional opcode. A
+constant 5 there lands every conditional one byte short of its target.
+
+#### The mutation discriminates, which is the point of running it
+
+Reverting only the backward path leaves `swallowjmp` passing at 81 and drops `condbefore`
+to 29. The two programs exercise different rules rather than one masking the other, which
+is what a mutation is for and what two green tests alone would not have shown.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -5768,7 +5832,7 @@ than compiling with MSVC or a cross-compiler.
 | `make check-aliasing` | no lowering reads a register it has already overwritten -- symbolically, over 18 operand shapes | arithmetic; it simulates moves rather than running them |
 | `make check-lowering` | 51 mnemonics over four operand shapes, one with src2 in memory; `vblendvps`/`vblendvpd` across all five register arrangements their lowering branches on; ten FMA orderings; and the broadcasts through memory. Every one of 16 registers matching GCC's SSE intrinsic over 8 input patterns including three all-NaN | 256-bit, `vpermilps`, and any lowering whose destination is a general-purpose register -- Findings 54 to 57 count them |
 | `make check-f16c`, `check-fmaddsub`, `check-permil`, `check-permd` | the helpers, exhaustively -- both F16C directions, all 256 permute controls, all 16,777,216 `vpermd` index sets | that the rewriter *calls* them; they are not wired in yet |
-| `make check-pe` | twenty-one PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
+| `make check-pe` | twenty-two PEs built here, rewritten, and run under wine: originals die of an illegal instruction, rewritten ones return the right answers | scale, and anything Starfield does that these do not |
 | `make scratch-check` | every register claimed as scratch is written before read on every path, by enumerating paths rather than intersecting sets | the ABI half of the whole-function argument, which no tool can check. It shared `xmm_numbers` with the code it checks until Finding 52, and so could not see a `%ymm` operand either |
 | `make detour-verify` | on Starfield: header self-consistency, size, section identity, boundary reconciliation, stub integrity, that the rebuilt function table is sorted and covers every stub byte, and that all 1,191,070 direct branch targets still begin an instruction | **semantics -- every one of these is about shape.** Indirect branch targets have no witness but `targets.py`, which the collector also used -- Finding 53. Its function-table claim now has an independent witness: Finding 74 has wine looking the table up 431,937 entries deep, eleven frames, and agreeing with the original |
 | `make check-spill` | that all three ways of getting a scratch register round-trip it, and that the default still refuses the site | anything about a second thread, or about unwinding |
@@ -5778,7 +5842,7 @@ than compiling with MSVC or a cross-compiler.
 The row to keep in mind is `detour-verify`. It is the only check that runs against
 the real target, and it is entirely structural. **Everything known about Starfield's
 translation is that it is well formed.** The semantic evidence all comes from small
-things: the lowerings executed in isolation, and twenty-one PEs built for the purpose.
+things: the lowerings executed in isolation, and twenty-two PEs built for the purpose.
 
 ### What is still not verified
 
@@ -5840,7 +5904,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **792,626 of 805,131 VEX sites, 98.4%** (Findings 24 to 86), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **793,089 of 805,131 VEX sites, 98.5%** (Findings 24 to 87), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -5978,7 +6042,7 @@ size of it.** Finding 74 puts the rewritten binary 866 bytes past where the orig
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. But 866 bytes is the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 12,505 that remain has to go before any of this can be
+immediately, and every one of the 12,042 that remain has to go before any of this can be
 soaked. What the run adds is a measuring instrument -- each fault address names the next
 site, and the site it named turned out to be refused under a misleading label.
 

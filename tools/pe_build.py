@@ -729,6 +729,48 @@ source:	.long 1, 2, 3, 4
 
 
 
+# 27. A four-byte Class C site with a CONDITIONAL branch before it and that
+# branch's target immediately after it -- the shape of 304 refused sites, and
+# of 0x14004d456 where Starfield stopped.
+#
+# Forward widening is refused because the next instruction is branched to:
+# swallowing it would leave the `je` landing inside the five-byte jump that
+# replaced it. Backward widening was refused too, because the previous
+# instruction transfers control -- but a CONDITIONAL branch is the one
+# transfer that falls through into the site, which is exactly what makes the
+# window sound. Its target lies outside the window, so nothing is relocated;
+# the branch is re-emitted as `0f 8x rel32` inside the stub.
+#
+# %xmm0 is poisoned with 100.0 first, so a branch re-aimed wrongly -- taken
+# when it should fall through -- returns 10000 rather than something near 27.
+PROGRAMS["condbefore"] = (27, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	hundred(%rip), %xmm0	/* poison */
+	vmovss	nine(%rip), %xmm1
+	vmovss	three(%rip), %xmm3
+	xorl	%ecx, %ecx
+	cmpl	$1, %ecx		/* 0 != 1, so the branch is NOT taken */
+	je	skip			/* two bytes, and falls through to the site */
+	vdivss	%xmm3, %xmm1, %xmm0	/* four bytes, dst != src1: 9/3 = 3 */
+skip:
+	vmulss	%xmm0, %xmm0, %xmm0	/* 3 * 3 = 9, the branch target */
+	vmulss	%xmm3, %xmm0, %xmm0	/* 9 * 3 = 27 */
+	vcvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+nine:	.float 9.0
+three:	.float 3.0
+hundred:	.float 100.0
+""")
+
+
+
 # 26. A four-byte Class C site with an unconditional `jmp` immediately after
 # it, which is what 367 of the 427 refused sites look like.
 #

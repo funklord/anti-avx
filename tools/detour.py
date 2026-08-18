@@ -845,6 +845,24 @@ def swallowed_scratch(plain, position, address, encoding, operands, mnemonic,
 BRANCH_REEMIT = {"jmp": b"\xe9", "jmpq": b"\xe9", "call": b"\xe8",
                  "callq": b"\xe8"}
 
+# The conditional forms, `0f 80+cc rel32`. Finding 86 left these out on the
+# grounds that a sixteen-entry table written for three sites is one nobody
+# checks -- true of the three sites FORWARD of a window. Backwards there are
+# 194, across six conditions, and the table earns its place.
+#
+# **`jrcxz`, `loop`, `loope` and `loopne` are deliberately absent.** They exist
+# only in a rel8 form, so there is nothing to widen them into, and a lookup
+# that missed that would emit a jump to somewhere arbitrary. Anything not in
+# this table is refused.
+CONDITION_CODES = {
+	"jo": 0x0, "jno": 0x1, "jb": 0x2, "jnae": 0x2, "jc": 0x2,
+	"jae": 0x3, "jnb": 0x3, "jnc": 0x3, "je": 0x4, "jz": 0x4,
+	"jne": 0x5, "jnz": 0x5, "jbe": 0x6, "jna": 0x6, "ja": 0x7, "jnbe": 0x7,
+	"js": 0x8, "jns": 0x9, "jp": 0xA, "jpe": 0xA, "jnp": 0xB, "jpo": 0xB,
+	"jl": 0xC, "jnge": 0xC, "jge": 0xD, "jnl": 0xD,
+	"jle": 0xE, "jng": 0xE, "jg": 0xF, "jnle": 0xF,
+}
+
 
 def swallowable_transfer(encoding, mnemonic, operands, comment, address):
 	"""True if a window may widen over this control transfer.
@@ -866,8 +884,15 @@ def swallowable_transfer(encoding, mnemonic, operands, comment, address):
 	candidate that fails in `build_stub` with no reason recorded, which is the
 	shape Finding 45 had to diagnose by hand.
 	"""
-	if conditional_branch(mnemonic):
-		return False
+	# **A conditional is swallowable in both directions**, which Finding 86
+	# did not use and Finding 87 does. Forward: the stub holds the lowered
+	# site, then the re-emitted branch, then the jump home -- taken goes to
+	# the original target, not taken falls into the jump home, which is where
+	# the fall-through went anyway. Backward: the stub holds the re-emitted
+	# branch, then the lowered site, then the jump home -- and a conditional
+	# is the one transfer that DOES fall through into the site, which is what
+	# the backward path's refusal was really about.
+	#
 	# **Ask the encoder that will actually be used**, rather than a
 	# reimplementation of its rules. The first version tested `moved_branch`
 	# directly and answered yes for an indirect branch through memory, which
@@ -902,7 +927,10 @@ def moved_branch(moved, mnemonic, operands, comment, address, at):
 		return bytes(moved)
 	opcode = BRANCH_REEMIT.get(mnemonic)
 	if opcode is None:
-		return None
+		code = CONDITION_CODES.get(mnemonic)
+		if code is None:
+			return None		# jrcxz, loop and friends have no rel32 form
+		opcode = bytes((0x0F, 0x80 + code))
 	target = None
 	first = operands.split()[0] if operands else ""
 	if first.startswith("0x"):
@@ -914,8 +942,10 @@ def moved_branch(moved, mnemonic, operands, comment, address, at):
 		return None		# indirect: relocate's business, not this one
 	if target is None:
 		return None
-	# rel32 is measured from the end of the five-byte instruction.
-	delta = target - (at + 5)
+	# rel32 is measured from the END of the instruction, which is five bytes
+	# for `e9`/`e8` and SIX for the two-byte conditional opcode. Getting that
+	# wrong lands every conditional one byte short of its target.
+	delta = target - (at + len(opcode) + 4)
 	if not -0x80000000 <= delta <= 0x7FFFFFFF:
 		return None
 	return opcode + struct.pack("<i", delta)
@@ -2329,7 +2359,10 @@ def collect(binary, listing):
 					pass		# not adjacent; something lies between
 				elif address in blocked:
 					pass		# the site is branched to; it cannot vanish
-				elif previous[2].startswith(CONTROL_PREFIXES):
+				elif previous[2].startswith(CONTROL_PREFIXES) \
+						and not swallowable_transfer(
+							previous[1], previous[2], previous[3],
+							previous[4], previous[0]):
 					pass		# does not fall through into the site
 				elif len(previous[1]) + len(encoding) < 5:
 					pass
