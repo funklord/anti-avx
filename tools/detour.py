@@ -631,7 +631,7 @@ def encode_jump(from_end, to_address):
 
 
 def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
-              pool=0):
+              pool=0, reasons=None):
 	"""Lower one VEX instruction for execution at `at`. Bytes, or None.
 
 	Used for the Class C site itself and for a swallowed instruction that
@@ -642,6 +642,8 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	"""
 	vex = inplace.decode_vex(encoding)
 	if vex is None:
+		if reasons is not None:
+			reasons["lower: not a VEX encoding"] += 1
 		return None
 	# **Only mnemonics with a direct SSE form.** Stripping a VEX prefix is
 	# a lowering only for those; for anything else it produces bytes that
@@ -655,6 +657,8 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 		if mnemonic in SEQUENCE_MNEMONICS or FMA_PATTERN.match(mnemonic):
 			tail = encoding[vex["length"]:]
 			if len(tail) < 2:
+				if reasons is not None:
+					reasons["lower: a sequence with no modrm"] += 1
 				return None
 			if mnemonic.startswith("vblendv"):
 				return lower_blendv(vex, tail, mnemonic, scratch)
@@ -662,12 +666,22 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 				return lower_broadcast(vex, tail, mnemonic, encoding,
 				                       address, at)
 			if mnemonic == "vpermilps":
-				return lower_permilps(vex, tail, operands, scratch, at, pool)
-			return lower_fma(vex, tail, mnemonic, scratch, address,
-			                 encoding, at)
+				out = lower_permilps(vex, tail, operands, scratch, at, pool)
+				if out is None and reasons is not None:
+					reasons["lower: vpermilps would not lower"] += 1
+				return out
+			out = lower_fma(vex, tail, mnemonic, scratch, address,
+			                encoding, at)
+			if out is None and reasons is not None:
+				reasons["lower: the FMA would not lower"] += 1
+			return out
+		if reasons is not None:
+			reasons["lower: no direct SSE form and not a sequence"] += 1
 		return None
 	tail = encoding[vex["length"]:]
 	if len(tail) < 2:
+		if reasons is not None:
+			reasons["lower: no modrm"] += 1
 		return None
 	fields = inplace.split_operands(operands)
 	registers = [o for o in fields if not o.startswith("$")]
@@ -697,6 +711,8 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 			# kept exactly as the VEX form had it.
 			source2 = (vex["B"] << 3) | (tail[1] & 7)
 			if scratch is None or scratch in (destination, source, source2):
+				if reasons is not None:
+					reasons["lower: the aliased form has no usable scratch"] += 1
 				return None
 			body += encode_movaps(scratch, source2)
 			body += encode_movaps(destination, source)
@@ -708,10 +724,20 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	elif len(registers) == 3:
 		pass				# destination already holds the first source
 	elif len(registers) != 2:
+		if reasons is not None:
+			reasons["lower: a four-operand form"] += 1
 		return None			# four-operand forms are not Class A/B/C
 
 	operation = inplace.sse_encoding(vex, tail)
 	if operation is None:
+		if reasons is not None:
+			# `sse_encoding` refuses two different things and they mean
+			# opposite amounts of work: an unsupported opcode map is an
+			# encoding gap, while VEX.L is a 256-bit instruction that no Y
+			# strategy claimed -- it needs the register model, not a table
+			# entry. Naming them together hid which. Finding 89.
+			reasons["lower: 256-bit, no Y strategy took it" if vex["L"]
+			        else "lower: no SSE encoding for the opcode"] += 1
 		return None
 
 	if rip_relative(tail):
@@ -720,12 +746,16 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 		# immediate follows it.
 		offset = len(operation) - 4 - (1 if has_immediate else 0)
 		if offset < 0:
+			if reasons is not None:
+				reasons["lower: the RIP field is not where expected"] += 1
 			return None
 		old = struct.unpack_from("<i", operation, offset)[0]
 		target = address + len(encoding) + old
 		new_end = at + len(body) + len(operation)
 		displacement = target - new_end
 		if not -(1 << 31) <= displacement < (1 << 31):
+			if reasons is not None:
+				reasons["lower: the RIP displacement will not reach"] += 1
 			return None
 		operation = (operation[:offset]
 		             + struct.pack("<i", displacement)
@@ -1853,7 +1883,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			return None, 0
 		body += saved
 		lowered = lower_vex(site, encoding, operands, mnemonic,
-		                    stub_address + len(body), borrowed, pool)
+		                    stub_address + len(body), borrowed, pool, reasons)
 		if lowered is None:
 			if reasons is not None:
 				reasons["the borrowed register could not be restored"] += 1
@@ -1874,8 +1904,11 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		lowered = lower_ymm_zero_store(vex, encoding[vex["length"]:], site,
 		                               len(encoding), stub_address + len(body))
 	else:
+		# The site's own lowering, and the only lower_vex call whose failure
+		# means the stub is refused -- a swallowed one is attributed to
+		# `moved_instruction` above. Finding 89.
 		lowered = lower_vex(site, encoding, operands, mnemonic,
-		                    stub_address + len(body), scratch, pool)
+		                    stub_address + len(body), scratch, pool, reasons)
 	if lowered is None:
 		if reasons is not None:
 			reasons["the site itself will not lower"] += 1

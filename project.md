@@ -5128,6 +5128,48 @@ routinely and falls back to the plain stub, so passing it there would name cause
 that were placed -- the same over-counting that has had to be corrected four times in this
 sitting.
 
+### Finding 89 -- the 2,780 are 256-bit, and were never an encoding gap
+
+Finding 88 named the refused bucket and left its largest part unexplained: 2,780 sites
+accepted by the collector and refused by `lower_vex`. Instrumenting its nine paths answers
+it in one line.
+
+```
+the site itself will not lower             2,780
+  256-bit, no Y strategy took it           2,654    95%
+  an unsupported opcode map                    0
+a displaced instruction will not move      1,167
+a preceding instruction will not move         16
+```
+
+**Not one is an encoding gap.** `sse_encoding` refuses two things -- an unsupported opcode
+map, and `vex["L"]` -- and naming them together hid which, so the first split was worth
+making before drawing any conclusion.
+
+#### The collector and the encoder ask different questions
+
+Class Y claims only the **moves**: the adjacent pair, the run, the zero store. A 256-bit
+instruction that is not a move -- `vmulps %ymm2,%ymm1,%ymm0` and its kind -- falls past that
+branch to the ordinary path, where `has_direct_sse_form` asks whether the **mnemonic** has
+an SSE form. It does. So the site becomes a candidate, and `sse_encoding` refuses it later
+because that asks about the **encoding**, and VEX.L has no SSE form at all.
+
+That guard is Finding 37's, and it is the one that must not be relaxed: dropping the prefix
+from a 256-bit instruction yields a valid 128-bit one that assembles, disassembles, carries
+no VEX, and writes half the bytes the program asked for. It was reached once, by 32,749
+sites.
+
+So the 2,654 are **correctly unlowerable and wrongly filed**. They need both halves of
+every operand in registers, which is the Y register model of milestone 5 -- not a table
+entry, not a scratch, and nothing a peephole reaches. Filed as "stub not buildable" they
+read as an encoding bug worth chasing; they are the same population the census already
+names elsewhere as needing the register model.
+
+The fix is the one Finding 86 applied to `swallowable_transfer`: **let the collector refuse
+what the encoder cannot encode**, so a 256-bit site no Y strategy claimed is declined by
+name rather than accepted and dropped later. It is worth no sites and stops the largest
+bucket in the census pointing at work that does not exist.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
