@@ -3025,7 +3025,8 @@ def stub_base_of(data):
 	return image_base + (highest + alignment - 1) // alignment * alignment
 
 
-def place_stubs(candidates, stub_base, spill_base=0, reasons=None):
+def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
+                detail=None):
 	"""Choose and build the stubs. (placed, blob, swallowed, overlap, refused)
 
 	**One selection rule, executed once and used by both apply and verify.**
@@ -3129,10 +3130,19 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None):
 			# failing is ordinary -- it falls back to the plain stub -- so
 			# passing `reasons` to it would name causes for sites that were
 			# placed perfectly well.
+			# A fresh counter per site when `detail` is wanted, so the
+			# reason can be attributed to the address as well as tallied.
+			per = Counter() if detail is not None else None
 			body, prologue = build_stub(
 				start, encoding, operands, mnemonic, window, displaced,
 				stub_address, scratch, pool, preceding, strategy, spill_base,
-				reasons)
+				per if per is not None else reasons)
+			if per is not None:
+				if reasons is not None:
+					reasons.update(per)
+				if body is None and per:
+					detail[start] = (next(iter(per)), window,
+					                 list(preceding), list(displaced))
 		if body is None:
 			refused.add(start)
 			continue

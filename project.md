@@ -5243,6 +5243,48 @@ mistake it for one.
 The counted events come to 1,183 against 1,167 refusals for the reason Finding 88 gave:
 `refused` is a set of addresses and this counts events.
 
+### Finding 92 -- the home space survives these windows, because they are tiny
+
+Finding 91 named 798 sites refused because a swallowed `dst == src2` form had no scratch,
+and asked whether `--spill=home` could be offered to a swallowed instruction as it already
+is to a site. The site-level argument is that `[rsp+0..31]` is dead by the ABI. A window is
+longer than a site, and two things inside one would break that:
+
+  * **a `call`**, because the home space exists precisely so a callee can write its register
+    arguments there -- and Finding 86 made this reachable rather than theoretical by letting
+    a window swallow `call rel32`;
+  * **anything moving `rsp`**, since the save writes `[rsp+0]` and the restore reads it, and
+    a `push` in between returns the wrong eight bytes silently.
+
+Measured over the population the borrow would serve:
+
+```
+refused for "the aliased form has no usable scratch"   795
+  nothing disturbs the home space                      795
+window sizes: 8 bytes 640, 9 bytes 153, 10 bytes 2
+```
+
+**None of them, and the reason is structural.** These windows are a four-byte site plus one
+neighbour. There is no room in eight bytes for a call or a stack adjustment.
+
+#### What that licenses, and what it does not
+
+It licenses the **population**: every one of these 795 could take the borrow today. It does
+not license the **mechanism**, and the difference decides how to build it. A window is only
+this short because nothing has widened it; a `zero_run` covers up to sixteen stores, an
+`ymm_run` a whole span, and Finding 86 admits a swallowed `call` by design. A borrow written
+on the strength of this measurement would be correct now and wrong the first time it met a
+longer window, with no test to say so -- and a home slot restored after a call returns the
+callee's argument, which is a silently wrong value rather than a crash.
+
+**So the guard belongs in the code, not in this document.** Refuse the borrow when the
+window contains a call, a push or pop, or a write to `rsp`, and the measurement above stops
+being load-bearing: it becomes the reason the guard costs nothing today rather than the
+reason it can be omitted.
+
+The count is 795 here against 798 in Finding 91 for the reason Finding 88 gave -- that was
+counting events and this is keyed by address.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
