@@ -5206,6 +5206,43 @@ been broken down, and `moved_instruction` has several ways to refuse -- a VEX ne
 that will not lower, a RIP displacement that will not reach, a branch shape `moved_branch`
 declines. That breakdown is the next cheap measurement.
 
+### Finding 91 -- what is left of the refused bucket is register pressure
+
+With the 256-bit sites declined where they belong, the refused bucket is 1,201, and 1,167
+of it is one thing: the site is fine and the neighbour it must swallow will not move.
+`moved_instruction` names why:
+
+```
+the aliased form has no usable scratch      798    68%
+the VEX neighbour would not lower           185
+no direct SSE form and not a sequence       111
+256-bit, no Y strategy took it               80
+the FMA would not lower                        7
+vpermilps would not lower                      2
+```
+
+**798 are register pressure on the swallowed instruction.** It is a `dst == src2` form,
+where the `movaps` that sets up the destination would destroy `src2` before the operation
+reads it, so a scratch is required -- and nothing is dead at that position. Finding 45
+added `swallowed_scratch` for this exact shape and took 2,437 sites; these are what the
+scan cannot find a register for.
+
+That is the first tractable thing in the bucket, and the mechanism already exists.
+`--spill=home` borrows the callee home space for a **site** with no dead register and is
+worth 1,022 (Findings 70 to 73). A swallowed instruction has never been offered it. The
+same argument applies -- the home space is dead by the ABI at any point inside the
+function, and the lowering already knows how to save and restore through it -- but the
+window is longer, so whether the borrow is still safe across it is the question to settle
+before building, not after.
+
+The 185 that report only "the VEX neighbour would not lower" carry no inner reason, which
+means `lower_vex` refused them by a path the instrumentation does not name. That is a gap
+in the measurement rather than a finding, and it is recorded so the next reader does not
+mistake it for one.
+
+The counted events come to 1,183 against 1,167 refusals for the reason Finding 88 gave:
+`refused` is a set of addresses and this counts events.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

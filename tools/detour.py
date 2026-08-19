@@ -981,7 +981,7 @@ def moved_branch(moved, mnemonic, operands, comment, address, at):
 	return opcode + struct.pack("<i", delta)
 
 
-def moved_instruction(entry, at, pool=0):
+def moved_instruction(entry, at, pool=0, reasons=None):
 	"""One swallowed instruction, re-encoded to execute at `at`.
 
 	The sixth field is a scratch register for the swallowed instruction, and
@@ -1005,20 +1005,39 @@ def moved_instruction(entry, at, pool=0):
 	if moved and moved[0] in (0xC4, 0xC5):
 		# The swallowed instruction is VEX as well. Lower it here rather
 		# than carry it across.
-		return lower_vex(address, moved, moved_operands, moved_mnemonic, at,
-		                 scratch, pool)
+		#
+		# Its own refusals are collected separately and re-labelled, so that
+		# "the neighbour would not lower, because it is 256-bit" does not
+		# arrive in the same bucket as the site saying the same thing.
+		# Finding 91.
+		inner = Counter() if reasons is not None else None
+		out = lower_vex(address, moved, moved_operands, moved_mnemonic, at,
+		                scratch, pool, inner)
+		if out is None and reasons is not None:
+			if inner:
+				for why, count in inner.items():
+					reasons["moved: " + why.replace("lower: ", "")] += count
+			else:
+				reasons["moved: the VEX neighbour would not lower"] += 1
+		return out
 	# A relative branch is re-aimed rather than relocated: its displacement
 	# is measured from itself, not from RIP as an operand, so `relocate`
 	# would copy it verbatim and send it 12 KB wrong. See `moved_branch`.
 	if moved_mnemonic.startswith(CONTROL_PREFIXES) \
 			and "(%rip)" not in moved_operands:
-		return moved_branch(moved, moved_mnemonic, moved_operands, comment,
-		                    address, at)
+		out = moved_branch(moved, moved_mnemonic, moved_operands, comment,
+		                   address, at)
+		if out is None and reasons is not None:
+			reasons["moved: the branch shape cannot be re-aimed"] += 1
+		return out
 	# objdump comments a resolved target for several shapes, so the comment
 	# only means a RIP displacement when the operand says (%rip). Anything
 	# else copies across untouched.
 	rip = comment if "(%rip)" in moved_operands else None
-	return relocate(moved, address, at, rip)
+	out = relocate(moved, address, at, rip)
+	if out is None and reasons is not None:
+		reasons["moved: the displacement will not relocate"] += 1
+	return out
 
 
 YMM_MOVES = frozenset("vmovups vmovaps vmovdqu vmovdqa vmovupd vmovapd".split())
@@ -1855,7 +1874,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	body = bytearray()
 	prologue = 0
 	for entry in preceding:
-		fixed = moved_instruction(entry, stub_address + len(body), pool)
+		fixed = moved_instruction(entry, stub_address + len(body), pool,
+		                          reasons)
 		if fixed is None:
 			if reasons is not None:
 				reasons["a preceding instruction will not move"] += 1
@@ -1916,7 +1936,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	body += lowered
 
 	for entry in displaced:
-		fixed = moved_instruction(entry, stub_address + len(body), pool)
+		fixed = moved_instruction(entry, stub_address + len(body), pool,
+		                          reasons)
 		if fixed is None:
 			if reasons is not None:
 				reasons["a displaced instruction will not move"] += 1
