@@ -5170,6 +5170,42 @@ what the encoder cannot encode**, so a 256-bit site no Y strategy claimed is dec
 name rather than accepted and dropped later. It is worth no sites and stops the largest
 bucket in the census pointing at work that does not exist.
 
+### Finding 90 -- the collector refuses what the encoder cannot encode
+
+Finding 89's fix, and it is worth no sites by construction: these were already refused, one
+step later and under a name that pointed at work that does not exist.
+
+```
+refused, stub not buildable    3,959 ->  1,201
+  the site itself will not lower  2,780 ->    21
+  a displaced instruction will not move     1,167
+  a preceding instruction will not move        16
+skipped for overlap           37,075 -> 36,983
+VEX in .text                  12,042 -> 12,042
+```
+
+**The VEX count is the check that matters.** A change there would mean the refusal had
+caught something that was previously being lowered, which is the regression this shape can
+produce; it does not move.
+
+The overlap count falling by 92 was not predicted and is the more interesting number: a
+site declined up front stops being a candidate, so it stops colliding with its neighbours.
+Those 92 windows were being blocked by candidates that could never have been built.
+
+**Sequence and FMA mnemonics are excluded from the refusal deliberately.** They never reach
+`sse_encoding` -- `lower_permilps` and `lower_fma` are called directly -- so refusing them
+here would decline sites their own lowerings might yet take. The status quo is kept for
+them rather than quietly narrowed.
+
+#### What is left in the bucket
+
+`a displaced instruction will not move`, 1,167, is now the largest part and a different
+problem: the site is fine and the neighbour it must swallow is not. Finding 45 took 2,437
+of these by giving the swallowed instruction a scratch of its own. What remains has not
+been broken down, and `moved_instruction` has several ways to refuse -- a VEX neighbour
+that will not lower, a RIP displacement that will not reach, a branch shape `moved_branch`
+declines. That breakdown is the next cheap measurement.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

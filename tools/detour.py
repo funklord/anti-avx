@@ -2294,6 +2294,21 @@ def collect(binary, listing):
 		# sequences, long after the code below had learned to handle them.
 		needs_sequence = (mnemonic in SEQUENCE_MNEMONICS
 		                  or FMA_PATTERN.match(mnemonic) is not None)
+		# **A 256-bit site no Y strategy claimed cannot be lowered at all**,
+		# and the collector has to say so rather than accept it and let the
+		# stub fail. The test below asks whether the MNEMONIC has an SSE
+		# form, which for `vmulps` and its kind it does; `sse_encoding`
+		# refuses the ENCODING later, because VEX.L has none, and the site
+		# lands in "stub not buildable" with 2,653 others reading as an
+		# encoding bug worth chasing. It is the register model they want.
+		#
+		# The sequence and FMA mnemonics are excluded: those do not go
+		# through `sse_encoding` at all, and refusing them here would decline
+		# sites their own lowerings might yet take. Finding 90.
+		if vex["L"] and strategy is None and not needs_sequence:
+			skipped["256-bit, no Y strategy took it"] += 1
+			declined[address] = "256-bit, no Y strategy took it"
+			continue
 		if not inplace.has_direct_sse_form(mnemonic) and not needs_sequence:
 			skipped["no direct SSE form"] += 1
 			declined[address] = "no direct SSE form"
