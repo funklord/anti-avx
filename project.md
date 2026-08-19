@@ -5285,6 +5285,49 @@ reason it can be omitted.
 The count is 795 here against 798 in Finding 91 for the reason Finding 88 gave -- that was
 counting events and this is keyed by address.
 
+### Finding 93 -- the home space lends to a neighbour too
+
+Finding 92 asked whether the borrow survives a window and answered yes for all 795, their
+windows being eight to ten bytes. **Reading the site's own spill path changed the design and
+made that answer beside the point.** The site brackets tightly -- save, one lowering,
+restore, nothing in between -- so doing the same for a swallowed instruction means the
+bracket never spans the window at all and its length stops mattering.
+
+`emit_swallowed` is one helper called from both the `preceding` and `displaced` loops rather
+than the logic written twice, so the tightness is structural instead of something a later
+reader has to preserve by discipline.
+
+```
+VEX in .text                               12,042 -> 11,751     +291
+detours                                   199,124 -> 199,235
+refused                                     1,201 ->    909
+  moved: the aliased form has no usable scratch  795 ->    517
+```
+
+**291 of the 795, and the shortfall is the constraint Finding 71 already measured.** The
+borrow needs the function to have home space at all and not to copy `rsp` where the scan
+cannot follow it; a leaf has none, and 2,367 functions copy it. The swallowed borrow
+inherits the site borrow's limits exactly, which is the answer rather than a disappointment.
+
+Neither `the swallowed borrow could not be saved` nor `... restored` appears in the census,
+so `encode_spill` refused nothing -- worth checking rather than assuming, since a save that
+silently failed would leave a live register destroyed.
+
+#### What the measurement was actually for
+
+It licensed the population and not the mechanism, and the distinction is the finding. A
+borrow written to span a window would be correct today and wrong the first time a
+`zero_run` or a swallowed `call` widened one, with no test to say so and a silently wrong
+value rather than a crash. The tight bracket makes Finding 92 an explanation of why the
+guard costs nothing rather than a reason to omit it.
+
+#### Two mislabelled reasons, found while reading the spill path
+
+The instrumentation of Finding 88 attached "the borrowed register could not be restored" to
+the site's lowering failing, and "the zero store would not lower" to the restore failing --
+each one line off. Both counted zero, so nothing was misread; both would have lied the
+moment they fired. Corrected.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -6094,7 +6137,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **793,089 of 805,131 VEX sites, 98.5%** (Findings 24 to 87), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **793,380 of 805,131 VEX sites, 98.5%** (Findings 24 to 93), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -6232,7 +6275,7 @@ size of it.** Finding 74 puts the rewritten binary 866 bytes past where the orig
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. But 866 bytes is the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 12,042 that remain has to go before any of this can be
+immediately, and every one of the 11,751 that remain has to go before any of this can be
 soaked. What the run adds is a measuring instrument -- each fault address names the next
 site, and the site it named turned out to be refused under a misleading label.
 

@@ -847,6 +847,45 @@ def home_space_free(home, address):
 	return usable[i]
 
 
+def swallowed_borrow(plain, address, encoding, operands, mnemonic, home):
+	"""A register a swallowed instruction may borrow, or None.
+
+	`swallowed_scratch` returns None when nothing is dead at the neighbour's
+	position, and `lower_vex` then refuses an aliased `dst == src2` form
+	because the `movaps` setting up the destination would destroy `src2`
+	first. 795 sites are refused that way -- the largest part of what is
+	left in the refused bucket. Finding 91.
+
+	The site already has an answer for exactly this: borrow a live register
+	and give it back through the callee home space, which is dead by the ABI.
+	This offers the same to a neighbour.
+
+	**The bracket is tight, which is what makes the window's length
+	irrelevant.** `encode_spill` writes the save immediately before this one
+	instruction's lowering and the restore immediately after, so nothing --
+	no call, no push, no adjustment of `rsp` -- can come between them. Finding
+	92 asked whether the borrow survives a window and measured that it would
+	for all 795, their windows being eight to ten bytes; the answer that
+	matters is that it never spans one. A borrow written to span a window
+	would be correct today and wrong the first time a `zero_run` or a
+	swallowed `call` widened one, with nothing to say so.
+
+	The site's own spill block and this one cannot overlap either: `preceding`
+	is emitted before it and `displaced` after.
+	"""
+	if SPILL != SPILL_HOME or not home_space_free(home, address):
+		return None
+	fields = inplace.split_operands(operands)
+	registers = [o for o in fields if not o.startswith("$")]
+	borrowed = spill_register(registers)
+	if borrowed is None:
+		return None
+	if lower_vex(address, encoding, operands, mnemonic, address, borrowed,
+	             address) is None:
+		return None
+	return borrowed
+
+
 def swallowed_scratch(plain, position, address, encoding, operands, mnemonic,
                       scope):
 	"""A scratch for an instruction a window is about to swallow, or None.
@@ -1820,6 +1859,40 @@ def upper_half_read_later(instructions, index, register, limit=40,
 	return False
 
 
+def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons):
+	"""One swallowed instruction, bracketed by a save and restore if it
+	borrowed a register. Returns the bytes, or None.
+
+	The bracket is tight by construction -- save, this one lowering, restore
+	-- so no call and no movement of `rsp` can come between them whatever the
+	window turns out to hold. See `swallowed_borrow`. Finding 93.
+	"""
+	borrowing = len(entry) > 6 and entry[6]
+	out = bytearray()
+	if borrowing:
+		saved = encode_spill(entry[5], True, stub_address + len(body),
+		                     spill_base)
+		if saved is None:
+			if reasons is not None:
+				reasons["the swallowed borrow could not be saved"] += 1
+			return None
+		out += saved
+	fixed = moved_instruction(entry, stub_address + len(body) + len(out), pool,
+	                          reasons)
+	if fixed is None:
+		return None
+	out += fixed
+	if borrowing:
+		restored = encode_spill(entry[5], False,
+		                        stub_address + len(body) + len(out), spill_base)
+		if restored is None:
+			if reasons is not None:
+				reasons["the swallowed borrow could not be restored"] += 1
+			return None
+		out += restored
+	return bytes(out)
+
+
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
                stub_address, scratch=None, pool=0, preceding=(),
                strategy=None, spill_base=0, reasons=None):
@@ -1874,8 +1947,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	body = bytearray()
 	prologue = 0
 	for entry in preceding:
-		fixed = moved_instruction(entry, stub_address + len(body), pool,
-		                          reasons)
+		fixed = emit_swallowed(entry, body, stub_address, pool,
+		                       spill_base, reasons)
 		if fixed is None:
 			if reasons is not None:
 				reasons["a preceding instruction will not move"] += 1
@@ -1906,14 +1979,14 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		                    stub_address + len(body), borrowed, pool, reasons)
 		if lowered is None:
 			if reasons is not None:
-				reasons["the borrowed register could not be restored"] += 1
+				reasons["the site itself will not lower"] += 1
 			return None, 0
 		body += lowered
 		restored = encode_spill(borrowed, False, stub_address + len(body),
 		                        spill_base)
 		if restored is None:
 			if reasons is not None:
-				reasons["the zero store would not lower"] += 1
+				reasons["the borrowed register could not be restored"] += 1
 			return None, 0
 		body += restored
 		if SPILL == SPILL_STACK:
@@ -1936,8 +2009,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	body += lowered
 
 	for entry in displaced:
-		fixed = moved_instruction(entry, stub_address + len(body), pool,
-		                          reasons)
+		fixed = emit_swallowed(entry, body, stub_address, pool,
+		                       spill_base, reasons)
 		if fixed is None:
 			if reasons is not None:
 				reasons["a displaced instruction will not move"] += 1
@@ -2414,12 +2487,18 @@ def collect(binary, listing):
 				elif window + len(nxt_encoding) < 5:
 					reason = "still too short"
 				else:
+					taken = swallowed_scratch(
+						plain, index + 1, nxt_address, nxt_encoding,
+						nxt_operands, nxt_mnemonic, scope)
+					borrow = None
+					if taken is None:
+						borrow = swallowed_borrow(
+							plain, nxt_address, nxt_encoding, nxt_operands,
+							nxt_mnemonic, home)
 					displaced.append((nxt_address, nxt_encoding, nxt_comment,
 					                  nxt_operands, nxt_mnemonic,
-					                  swallowed_scratch(
-						                  plain, index + 1, nxt_address,
-						                  nxt_encoding, nxt_operands,
-						                  nxt_mnemonic, scope)))
+					                  taken if borrow is None else borrow,
+					                  borrow is not None))
 					window += len(nxt_encoding)
 
 			if reason is not None:
@@ -2454,12 +2533,18 @@ def collect(binary, listing):
 				elif len(previous[1]) + len(encoding) < 5:
 					pass
 				else:
+					taken = swallowed_scratch(
+						plain, index - 1, previous[0], previous[1],
+						previous[3], previous[2], scope)
+					borrow = None
+					if taken is None:
+						borrow = swallowed_borrow(
+							plain, previous[0], previous[1], previous[3],
+							previous[2], home)
 					preceding.append((previous[0], previous[1], previous[4],
 					                  previous[3], previous[2],
-					                  swallowed_scratch(
-						                  plain, index - 1, previous[0],
-						                  previous[1], previous[3],
-						                  previous[2], scope)))
+					                  taken if borrow is None else borrow,
+					                  borrow is not None))
 					start = previous[0]
 					window = len(previous[1]) + len(encoding)
 					reason = None
