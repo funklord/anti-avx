@@ -5321,6 +5321,30 @@ borrow written to span a window would be correct today and wrong the first time 
 value rather than a crash. The tight bracket makes Finding 92 an explanation of why the
 guard costs nothing rather than a reason to omit it.
 
+#### What the executed path is blocked by now
+
+The site Starfield stops on, `0x1406ed33b`, is one of the 517 the borrow cannot serve, and
+the reason is worth naming because it closes the avenue rather than leaving it open:
+
+```
+site 0x1406ed33b   moved: the aliased form has no usable scratch
+  neighbour 0x1406ed33f  vsubss %xmm1,%xmm5,%xmm1   scratch=None  borrow=False
+
+1406ed150: mov %rsp,%rax        the containing function's first instruction
+1406ed163: sub $0xe8,%rsp
+1406ed16a: vmovaps %xmm6,-0x58(%rax)
+```
+
+It is **not a leaf** -- it makes three calls, so the home space exists. It copies `rsp` into
+`rax` in its first instruction and addresses its frame through the copy, which is the MSVC
+prologue idiom, and `home_space_free` refuses that because it cannot prove the home space is
+not reached through it.
+
+That is exactly the case **Finding 72** built a dataflow for and reverted: of 2,367 starved
+sites whose function copies `rsp`, tracking where the copy points cleared **thirteen**. The
+frontier is therefore blocked by an avenue this document already measured and closed, not by
+anything new.
+
 #### Two mislabelled reasons, found while reading the spill path
 
 The instrumentation of Finding 88 attached "the borrowed register could not be restored" to
