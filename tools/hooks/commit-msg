@@ -135,6 +135,28 @@ if [ "${#subject}" -gt 75 ] && [ "$(columns "$subject")" -gt 75 ]; then
 	exit 1
 fi
 
+#    And the subject must be ONE line, which is the part the limit above
+#    cannot see. git's subject is everything up to the first blank line,
+#    joined with spaces -- so a subject wrapped onto a second short line
+#    passes every per-line check here and is over-long by the time anything
+#    reads it. Measured in fuzznet by writing one: `git log --oneline`
+#    printed 93 columns for the commit that found it, and a deliberate case
+#    joined to 123. The check above measures a physical line; this measures
+#    what git will call the subject, which is the thing the limit is for.
+#
+#    Comment lines are skipped rather than counted, because git strips them
+#    before deciding anything, so one on line 2 never joins the subject.
+joined=$(awk '/^[[:space:]]*$/ { exit } /^#/ { next } \
+              { if (n++) printf " "; printf "%s", $0 } END { printf "\n" }' "$msg")
+if [ "$joined" != "$subject" ]; then
+	echo "commit-msg: the subject is wrapped onto more than one line." >&2
+	echo "commit-msg: git joins everything before the first blank line into" >&2
+	echo "commit-msg: one subject, giving $(columns "$joined") columns:" >&2
+	echo "commit-msg:   $joined" >&2
+	echo "commit-msg: put a blank line after the subject." >&2
+	exit 1
+fi
+
 # 3. Body lines at the same 75 columns, for the same reason: the log is read in
 #    a terminal. This was the stated convention long before anything enforced
 #    it, and only the subject was checked -- so a body line at 76 sailed
