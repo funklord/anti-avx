@@ -5352,6 +5352,62 @@ the site's lowering failing, and "the zero store would not lower" to the restore
 each one line off. Both counted zero, so nothing was misread; both would have lied the
 moment they fired. Corrected.
 
+### Finding 94 -- the 256-bit residue is 2,234, not 11,624
+
+Going after the 256-bit sites starts with counting them, and the count the census gives is
+the wrong one. `ymm value has no known upper half` stands at 11,624 declines, and a store is
+declined at **its own index** -- where `ymm_pair` sees no load and `ymm_run` refuses a store
+-- so it lands there whether or not the window its load opened covers it. `census`'s
+docstring has warned about this since Finding 35 and it is still the easiest number in the
+document to misread.
+
+```
+256-bit stores whose value is not a known zero   11,714
+  already covered by a pair or run window         9,480
+  genuinely unreached                             2,234
+    a copy whose load is too far to pair          1,530
+    a computed 256-bit value                        354
+    a vpxor that could not be proved zero           188
+    no defining write within 200                    136
+```
+
+And of the 1,530 copies, what actually stops a single window spanning them:
+
+```
+nothing -- the run reaches it        725    blocked after the walk
+a 256-bit op that is not a copy half 467
+a branch target inside the span      186
+a control transfer inside the span    89
+the value is touched                  63
+```
+
+**The whole 256-bit store residue is 2,234 sites**, and the largest tractable group in it is
+725 where the walk arrives and something downstream -- a helper, the upper-half check,
+`.pdata`, an overlap -- refuses. Those are the same causes Findings 78 to 93 have been
+taking one at a time.
+
+#### What that does to milestone 5
+
+The milestone row still reads "the 12,552 stores and 11,226 loads that remain do", written
+when those were the counts. They are not. The register model is worth **2,234 stores** by
+this measurement, plus the loads that pair with them and something under a thousand
+arithmetic sites -- `vmulps` 176, `vaddps` 105, `vsubps` 71, `vpaddd` 63, `vpand` 61,
+`vfmadd231ps` 71 and a tail.
+
+**84% of the 256-bit declines are `vmovups` with a memory operand**, 13,542 of 16,075, which
+confirms Finding 39's framing at the far end of the work: this binary's 256-bit traffic is
+memcpy, and the register model it needs is one for data movement rather than a general
+allocator over arithmetic.
+
+Two smaller things the same pass turned up, recorded rather than acted on:
+
+  * **49 declines are `(bad)`** -- bytes objdump could not decode, counted as VEX sites.
+    Data read as code, and it inflates whatever bucket it lands in.
+  * **`no home space to borrow` is 3,390 and only 237 of them are 256-bit.** The other
+    ~3,150 are 128-bit sites starved of a scratch in a function the borrow cannot serve --
+    a population the size of the aliased one, behind the same `rsp`-copy limit Finding 72
+    priced at thirteen.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
