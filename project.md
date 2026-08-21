@@ -5408,6 +5408,49 @@ Two smaller things the same pass turned up, recorded rather than acted on:
     a population the size of the aliased one, behind the same `rsp`-copy limit Finding 72
     priced at thirteen.
 
+### Finding 95 -- a run helper can be borrowed too, and this bracket does span
+
+424 sites are declined `no register free across the ymm run`: `assign_helpers` wants one
+register per lifetime, dead at the load and untouched to the store, and finds none. That is
+register pressure, and the home space is what this project uses for register pressure.
+
+**This bracket spans the window, and Finding 93's did not.** A run's helper carries the
+upper half from the load to the store, so a save before the run and a restore after it
+enclose everything between. A call cannot be inside one -- `ymm_run` breaks on every control
+transfer -- so `rsp` is the whole of what is left to check: a `push` or a `sub $n,%rsp`
+between the save and the restore leaves them addressing different memory, and the restore
+returns whatever the push wrote. A silently wrong register, not a crash.
+
+Measured before building:
+
+```
+424 declined for no free register
+  the function cannot lend                 265
+  could borrow: the span leaves rsp alone  159
+  rsp moves inside the span                  0
+```
+
+Not one span touches `rsp`, so the guard costs nothing today -- **which is why it is in the
+code and not in this paragraph.** A span that grows later has nothing else to stop it, and
+Finding 92 already recorded that distinction the other way round.
+
+```
+VEX in .text     11,751 ->  11,409      793,722 removed, 98.6%
+detours         199,235 -> 199,360
+```
+
+**342 sites from 159 borrows**, because a run window covers the load, its stores and
+whatever is interleaved between them rather than one instruction.
+
+Neither `the run borrow could not be saved` nor `... restored` appears, so `encode_spill`
+refused nothing in the run path. Every `detour-verify` invariant holds -- the table sorted
+and covering every stub byte matters most here, since a spill emitted at the wrong offset
+would desynchronise a stub's length from what `place_stubs` recorded.
+
+The 265 that cannot lend are behind the same limits as everything else this session: a leaf
+has no home space, and a function that copies `rsp` cannot be vouched for. That is the third
+lever in a row capped by Finding 71's constraint rather than by its own mechanism.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -6217,7 +6260,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **793,380 of 805,131 VEX sites, 98.5%** (Findings 24 to 93), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **793,722 of 805,131 VEX sites, 98.6%** (Findings 24 to 95), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -6355,7 +6398,7 @@ size of it.** Finding 74 puts the rewritten binary 866 bytes past where the orig
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. But 866 bytes is the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 11,751 that remain has to go before any of this can be
+immediately, and every one of the 11,409 that remain has to go before any of this can be
 soaked. What the run adds is a measuring instrument -- each fault address names the next
 site, and the site it named turned out to be refused under a misleading label.
 

@@ -1458,7 +1458,42 @@ def lifetimes(index, members, start):
 	return sorted(out, key=lambda span: span[1])
 
 
-def assign_helpers(plain, positions, index, members):
+RSP_WRITTEN = re.compile(r",\s*%rsp\s*$")
+
+
+def span_keeps_rsp(instructions, first, last):
+	"""True if nothing between `first` and `last` moves the stack pointer.
+
+	**The guard the run borrow needs, and the reason it is different from the
+	swallowed one.** Finding 93 brackets a single lowering, so nothing can
+	come between the save and the restore whatever the window holds. A run's
+	helper carries the upper half from the load to the store, so the bracket
+	encloses the whole span -- and a `push` or a `sub $n,%rsp` inside it
+	leaves the save and the restore addressing different memory, so the
+	restore returns whatever the push wrote. A silently wrong register, not a
+	crash.
+
+	A call cannot be inside a run at all: `ymm_run` breaks on every control
+	transfer. So `rsp` is the whole of what is left to check.
+
+	Measured over the 424 sites this was written for: 159 are in a function
+	that can lend, and **not one of those spans touches `rsp`**. The guard
+	costs nothing today, which is why it must be in the code rather than in
+	the finding -- a span that grows later has nothing else to stop it.
+	Finding 95.
+	"""
+	for position in range(first, last + 1):
+		if position >= len(instructions):
+			return False
+		_a, _e, mnemonic, operands, _c = instructions[position]
+		if mnemonic in ("push", "pushq", "pop", "popq"):
+			return False
+		if RSP_WRITTEN.search(operands or ""):
+			return False
+	return True
+
+
+def assign_helpers(plain, positions, index, members, lendable=False):
 	"""One helper register per LIFETIME in the run, all distinct, or None.
 
 	Greedy over the lifetimes in load order, which is enough here: a run
@@ -1474,25 +1509,39 @@ def assign_helpers(plain, positions, index, members):
 	spans = lifetimes(index, members, wide_move(*plain[index][1:4])[1])
 	if spans is None:
 		return None
-	taken, out = set(), {}
+	taken, out, borrowed = set(), {}, set()
 	for _register, load_at, stores in spans:
 		if not stores:
 			return None
 		own = scratch_finder.xmm_numbers(plain[load_at][3])
 		free = free_across(plain, positions, load_at, stores[-1], own) - taken
 		if not free:
-			return None
-		chosen = min(free)
+			# **Nothing is dead across this lifetime, so borrow one that is
+			# live and give it back**, exactly as a starved site does. The
+			# caller decides whether the function can lend and whether the
+			# span leaves `rsp` alone; this only picks a register the run
+			# does not itself name. Finding 95.
+			if not lendable:
+				return None
+			free = set(range(16)) - taken - set(own)
+			for position in list(stores) + [load_at]:
+				free -= set(scratch_finder.xmm_numbers(plain[position][3]))
+			if not free:
+				return None
+			chosen = min(free)
+			borrowed.add(chosen)
+		else:
+			chosen = min(free)
 		taken.add(chosen)
 		out[load_at] = chosen
 		for position in stores:
 			out[position] = chosen
-	return out
+	return out, borrowed
 
 
 def lower_ymm_run(strategy, at, pool):
 	"""The run, with every 256-bit copy split and everything else moved."""
-	_helpers, entries = strategy
+	_helpers, entries = strategy[0], strategy[1]
 	body = bytearray()
 	# The second field is the helper this load or store uses, resolved per
 	# entry when the run was collected. It used to be the ymm register, with
@@ -1916,13 +1965,35 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# stub. It carries its own instruction list rather than using
 		# `displaced`, because they have to land BETWEEN the halves of the
 		# copies rather than after a site.
-		body = lower_ymm_run(strategy[1], stub_address, pool)
+		# **A borrowed helper is saved before the run and restored after
+		# it**, so the bracket encloses the whole span -- which is why
+		# `span_keeps_rsp` had to vouch for it. See Finding 95.
+		borrowed = sorted(strategy[1][2]) if len(strategy[1]) > 2 else []
+		head = bytearray()
+		for register in borrowed:
+			saved = encode_spill(register, True, stub_address + len(head),
+			                     spill_base)
+			if saved is None:
+				if reasons is not None:
+					reasons["the run borrow could not be saved"] += 1
+				return None, 0
+			head += saved
+		body = lower_ymm_run(strategy[1], stub_address + len(head), pool)
 		if body is None:
 			if reasons is not None:
 				reasons["the run would not lower"] += 1
 			return None, 0
-		return bytes(body) + encode_jump(stub_address + len(body) + 5,
-		                                 start + window), 0
+		out = bytearray(head) + body
+		for register in borrowed:
+			restored = encode_spill(register, False,
+			                        stub_address + len(out), spill_base)
+			if restored is None:
+				if reasons is not None:
+					reasons["the run borrow could not be restored"] += 1
+				return None, 0
+			out += restored
+		return bytes(out) + encode_jump(stub_address + len(out) + 5,
+		                                start + window), 0
 	if kind == "pair":
 		# A 256-bit copy: both instructions become four 128-bit moves, so
 		# neither is lowered on its own.
@@ -2261,7 +2332,15 @@ def collect(binary, listing):
 				members, last = found
 				tail_entry = instructions[last]
 				window = tail_entry[0] + len(tail_entry[1]) - address
-				helpers = assign_helpers(plain, positions, index, members)
+				# The borrow is offered only where the function can lend
+				# and the span leaves `rsp` alone -- see `span_keeps_rsp`
+				# for why the second matters here and did not in Finding 93.
+				lendable = (SPILL == SPILL_HOME
+				            and home_space_free(home, address)
+				            and span_keeps_rsp(instructions, index, last))
+				assigned = assign_helpers(plain, positions, index, members,
+				                          lendable)
+				helpers, borrowed = assigned if assigned else (None, set())
 				if helpers is None:
 					refusal = held_back(
 						pair_reason,
@@ -2312,7 +2391,7 @@ def collect(binary, listing):
 					entries.append((kind, helpers[position], one,
 					                entry[1][one["length"]:], entry[0],
 					                len(entry[1]), None))
-				run = (helpers, entries)
+				run = (helpers, entries, borrowed)
 				if lower_ymm_run(run, address, address) is None:
 					refusal = held_back(pair_reason,
 					                    "ymm run operand cannot be moved")
@@ -3254,7 +3333,7 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 		if strategy is not None and strategy[0] == "run":
 			# Same again over a longer stretch: every boundary from the one
 			# after the first load to the last store's own disappears.
-			_helpers, entries = strategy[1]
+			entries = strategy[1][1]
 			for entry in entries[1:]:
 				swallowed.add(entry[4])
 		if strategy is not None and strategy[0] == "zerorun":
