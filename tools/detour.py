@@ -821,8 +821,6 @@ def home_space_map(binary, plain, ranges):
 				text = match.group(1)
 				if 0 <= (int(text, 16) if text else 0) < HOME_SPACE:
 					touches[i] = True
-		# A copy of `rsp` is noted rather than refused; the second pass
-		# decides, by looking at what the copy is then used for.
 		# **A copy of `rsp` is refused outright**, and the precise version
 		# was built and measured at thirteen sites. See Finding 72: of the
 		# 2,367 starved sites whose function copies `rsp`, all but thirteen

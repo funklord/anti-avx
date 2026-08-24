@@ -5451,6 +5451,85 @@ The 265 that cannot lend are behind the same limits as everything else this sess
 has no home space, and a function that copies `rsp` cannot be vouched for. That is the third
 lever in a row capped by Finding 71's constraint rather than by its own mechanism.
 
+### Finding 96 -- the `rsp` copy refuses 2,464 sites and protects none of them
+
+Three levers in a row -- the site borrow, the swallowed borrow of Finding 93, the run
+borrow of Finding 95 -- ended capped by `home_space_free` rather than by their own
+mechanism, and the executed path has stalled at `0x1406ED33B` for three builds behind the
+same check. So the refusals were split by cause, weighted by the sites they cost:
+
+```
+4,160 starved sites
+  it copies rsp somewhere                   2,464
+  a leaf: no home space exists at all       1,262
+  the function addresses [rsp+0..31]          361
+  outside any known function                   51
+  a frame register: rsp is not constant         22
+```
+
+The leaves are closed and stay closed: nothing reserved the space, and Finding 49 shut the
+alternative. The copy is the majority, and Finding 72 recorded it as equally closed.
+
+**It is not.** There are two home spaces, and the refusal conflates them. The one this
+function's caller reserved sits above the return address; the one it reserves for its own
+callees sits at the bottom of its frame, and the borrow writes only the second. MSVC's
+`mov %rsp,%rax` prologue idiom exists precisely to reach the *first* one after the pushes
+have moved `rsp`, so the copy that triggers the refusal is normally pointing a whole frame
+away from the region at risk.
+
+`0x1406ed150` is the frontier's own function and shows it without any analysis. It copies
+`rsp` at entry, dereferences the copy at `+8` and `+16` -- the caller's shadow -- and at
+`-88` through `-168` for saved xmm registers. Its frame is eight pushes and `sub $0xe8`,
+so `[rsp+0..31]` is `entry-296` through `entry-265`. Nothing through the copy comes within
+97 bytes of it.
+
+Measured across the whole bucket, tracking the copy's offset from entry `rsp` and taking
+the frame size from the unwind codes:
+
+```
+2,464 sites whose function copies rsp
+  provably clearable                          846
+  arithmetic derives a pointer not followed  1,420
+  the copy escapes                            113
+  an indexed lea derives one                    85
+  it lands in the region                          0
+```
+
+**Not one function reaches the region through the copy.** The 1,505 that are not cleared
+are the tracker losing a pointer, which is a limit of the analysis rather than a fact about
+the program -- a distinction Finding 72 did not draw, and the reason its conclusion reads
+harder than its evidence supports.
+
+The zero is load-bearing, so it carries a capability proof rather than an assurance: the
+classifier is fed a store that does land in the region, one eight bytes above it, and a
+byte-write that must not be mistaken for a pointer kill. It aborts rather than reporting a
+number if any of the three comes back wrong. An earlier revision of the same measurement
+returned zero because a bad narrow-write rule had killed the taint early, and a zero from a
+probe that cannot find a hit reads exactly like a zero from a program that has none.
+
+#### What this does not settle
+
+**Finding 72 says the opposite and has not been edited.** Its sentence -- that a function
+making a pointer to its own frame bottom "essentially always uses it in a way no scan can
+vouch for" -- is contradicted by the table above. Its *number* is not explained here: the
+dataflow was built and reverted inside `24c0081`, so the code was never in the tree and
+cannot be read back. A region conflation would produce exactly thirteen, since the idiom's
+stores at `+8/+16/+24` land in `[0,32)` if the frame is never subtracted, but that is a
+hypothesis about code nobody can see and is recorded as one.
+
+Two further weaknesses in that model are visible without it. `lea` into the region is
+refused separately, so the copy rule was never carrying it; and the escape rule prices a
+callee dereferencing the pointer, which no borrow can suffer -- the swallowed bracket
+admits nothing between save and restore, and `ymm_run` breaks on every control transfer, so
+no window contains a call.
+
+**The change is not made.** Clearing the copy rule would roughly triple the population
+writing into the translated program's frame, from 1,022 to something near 3,400, and
+Finding 73 records that mechanism as argued from the ABI and executed, never proven. Its
+failure mode is silent corruption of a live local. Whether that trade is worth 846 sites
+and the frontier is the copyright holder's, not the implementer's, and the code still
+refuses every `rsp`-copying function until it is taken.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
