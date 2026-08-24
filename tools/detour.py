@@ -652,7 +652,10 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	# nothing at all and the disassembler desynchronises from there.
 	# Class D, F and H need real sequences and belong in their own tools.
 	if mnemonic in inplace.DESTINATION_IN_VVVV:
-		return lower_vvvv_shift(vex, encoding, operands)
+		out = lower_vvvv_shift(vex, encoding, operands)
+		if out is None and reasons is not None:
+			reasons["lower: the vvvv shift would not lower"] += 1
+		return out
 	if not inplace.has_direct_sse_form(mnemonic):
 		if mnemonic in SEQUENCE_MNEMONICS or FMA_PATTERN.match(mnemonic):
 			tail = encoding[vex["length"]:]
@@ -661,10 +664,16 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 					reasons["lower: a sequence with no modrm"] += 1
 				return None
 			if mnemonic.startswith("vblendv"):
-				return lower_blendv(vex, tail, mnemonic, scratch)
+				out = lower_blendv(vex, tail, mnemonic, scratch)
+				if out is None and reasons is not None:
+					reasons["lower: vblendv would not lower"] += 1
+				return out
 			if mnemonic in BROADCASTS:
-				return lower_broadcast(vex, tail, mnemonic, encoding,
-				                       address, at)
+				out = lower_broadcast(vex, tail, mnemonic, encoding,
+				                      address, at)
+				if out is None and reasons is not None:
+					reasons["lower: the broadcast would not lower"] += 1
+				return out
 			if mnemonic == "vpermilps":
 				out = lower_permilps(vex, tail, operands, scratch, at, pool)
 				if out is None and reasons is not None:

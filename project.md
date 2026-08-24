@@ -5530,6 +5530,39 @@ failure mode is silent corruption of a live local. Whether that trade is worth 8
 and the frontier is the copyright holder's, not the implementer's, and the code still
 refuses every `rsp`-copying function until it is taken.
 
+### Finding 97 -- the 185 unnamed refusals were mostly `vblendv`
+
+Finding 91 recorded that 185 sites reported only `the VEX neighbour would not lower` and
+carried no inner reason, and called it a gap in the measurement rather than a finding. It
+was one line of cause: `lower_vex` captures a helper's `None` and labels it for
+`lower_permilps` and `lower_fma`, and returns three others' results directly --
+`lower_vvvv_shift`, `lower_blendv` and `lower_broadcast` -- so a refusal from any of those
+three arrived with nothing to say for itself and fell through to the generic counter.
+
+Labelled, the bucket is:
+
+```
+moved: vblendv would not lower              162
+lower: the vvvv shift would not lower        21    every "site itself" refusal
+moved: the broadcast would not lower          5
+moved: the vvvv shift would not lower         4
+```
+
+The generic label no longer appears at all, so nothing is left unattributed behind it.
+
+**162 of them are Class D**, which puts them in the same family as the 517 refused
+`the aliased form has no usable scratch`: `lower_blendv` needs the mask in `%xmm0`, four
+registers are named where three fit, and it refuses when there is no scratch or when the
+only scratch collides with one of the four. That is register pressure on a swallowed
+instruction, and register pressure is what the home space exists to relieve -- so with the
+517 it makes a fourth lever standing behind `home_space_free`, the check Finding 96
+measured as protecting no function at all.
+
+The rebuild is identical to the one before it -- 11,409 sites, 199,360 detours, 435,787
+function table entries, 81,944 lost boundaries, 1,191,105 branch targets, 200,495 stub
+jumps -- which is what makes this instrumentation rather than a change that happens to
+report differently.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
