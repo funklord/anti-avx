@@ -798,11 +798,26 @@ def convert_c(text: str, width: int) -> str:
 	paren = 0			# ( ) depth, to find where a control head ends
 	head_paren = None		# paren depth a control head is unwinding to
 	virtual = 0			# open braceless bodies: real levels, no braces
+	linkage_extern = False		# saw `extern`, watching for its linkage string
+	linkage_spec = False		# saw `extern "C"`, awaiting the `{`
 	await_body = False		# an `else`/`do` whose body shape is not yet known
 	stmt_level = 0			# level of the line the current statement began on
 
 	def case_extra(frames: list[list[int]]) -> int:
 		return sum(1 for f in frames if f[0] and f[1])
+
+	def depth(frames: list[list[int]]) -> int:
+		"""Open braces that actually indent.
+
+		`extern "C" { ... }` is a brace and not a level: every C++ project
+		writes the declarations inside it at the same column as the ones
+		outside, because the block says how to link them and not where they
+		sit. Counting it put a spurious tab on any line carrying alignment
+		-- a wrapped parameter list, say -- and none on lines starting at
+		column 0, so it surfaced as scattered findings in headers rather
+		than as a whole block being wrong.
+		"""
+		return sum(1 for f in frames if not f[4])
 
 	for line in lines:
 		state_at_start = state
@@ -820,6 +835,15 @@ def convert_c(text: str, width: int) -> str:
 			new = line			# blank: no churn
 		elif state_at_start in ("string", "raw"):
 			new = line			# inside a literal: content
+		elif pp_cont:
+			# A backslash-continued directive's later lines are aligned
+			# under the directive, not indented by the structure around it:
+			# a `do { ... } while (0)` macro at file scope is written with
+			# tabs for readability and belongs at depth 0 by this model,
+			# so rewriting them to the structural level reports every line
+			# of the macro. check_text() already stands down on exactly
+			# these lines for the same reason; this is the fixer agreeing.
+			new = line
 		elif state_at_start == "normal" and not pp_cont and rest[0] == "#":
 			new = line			# preprocessor directive
 		else:
@@ -830,13 +854,13 @@ def convert_c(text: str, width: int) -> str:
 			            and _CASE_LABEL.match(rest) is not None)
 			if is_close:
 				frames = stack[:-1]
-				level = len(stack) - 1 + case_extra(frames)
+				level = depth(frames) + case_extra(frames)
 			elif is_label:
 				frames = stack[:-1]
-				level = len(stack) + case_extra(frames)
+				level = depth(stack) + case_extra(frames)
 			else:
 				frames = stack
-				level = len(stack) + case_extra(frames)
+				level = depth(stack) + case_extra(frames)
 			# A braceless body is one real level per open construct. A brace
 			# on its own line belongs to the construct that opened it, not to
 			# the body it is about to start, so it does not take that level.
@@ -901,6 +925,19 @@ def convert_c(text: str, width: int) -> str:
 							# `else`/`do` followed by a statement rather than
 							# a block: that statement is the body.
 							virtual += 1
+					if linkage_spec:
+						# `extern "C" JNIEXPORT void f(...) { ... }` is a
+						# linkage specifier on one declaration, and that
+						# brace opens a function body, which does indent.
+						# Only a `{` following the string with nothing but
+						# whitespace between opens a linkage BLOCK. hydra's
+						# JNI entry points are the case that found this: 47
+						# lines reported in one file by the first version
+						# of this rule.
+						linkage_spec = False
+						linkage_extern = False
+					if was_ident == "extern":
+						linkage_extern = True
 					if was_ident in CTRL_HEADS:
 						head_paren = paren	# body begins when this unwinds
 					elif was_ident in ("else", "do"):
@@ -925,6 +962,10 @@ def convert_c(text: str, width: int) -> str:
 							continue
 					state = "string"	# not actually a raw string
 				elif c == '"':
+					# `extern` then a string is a linkage specifier, and
+					# the block it may open is transparent.
+					if linkage_extern:
+						linkage_spec = True
 					state = "string"
 				elif c == "'":
 					state = "char"
@@ -965,13 +1006,18 @@ def convert_c(text: str, width: int) -> str:
 					# reported a tab too deep -- the level was lost after one
 					# statement rather than never taken, which is what made it
 					# look like an indentation fault in the file.
-					stack.append([pending_switch, False, paren, virtual])
+					stack.append([pending_switch, False, paren, virtual,
+					              linkage_spec])
 					pending_switch = False
+					linkage_extern = False
+					linkage_spec = False
 				elif counting and c == "}":
 					if stack:
 						stack.pop()
 					virtual = 0
 					await_body = False
+					linkage_extern = False
+					linkage_spec = False
 				elif counting and c == ";" and paren == (stack[-1][2] if stack else 0):
 					# End of a statement closes every braceless body that was
 					# waiting on it -- `if (a) if (b) x;` opened two -- but
@@ -980,6 +1026,9 @@ def convert_c(text: str, width: int) -> str:
 					pending_switch = False
 					virtual = stack[-1][3] if stack else 0
 					await_body = False
+					# `extern "C" int f(void);` declares rather than opens.
+					linkage_extern = False
+					linkage_spec = False
 				i += 1
 			elif state == "block_comment":
 				if c == "*" and i + 1 < n and line[i + 1] == "/":
