@@ -508,20 +508,52 @@ def encode_rip(prefix, opcode, reg, target, at):
 	return bytes(out)
 
 
-def spill_register(registers):
-	"""A register the site does not name, to borrow and give back.
+def spill_candidates(registers):
+	"""Every register the site does not name, lowest first.
 
-	Always available: a site has at most four operands and there are sixteen
-	registers. This is not `find_scratch` -- nothing is claimed about the
-	register being dead, which is exactly why it has to be saved first.
+	**One candidate is not enough, and the failure is silent.** SSE
+	`blendvps` takes its mask in an implicit `%xmm0`, so `lower_blendv`
+	refuses a scratch of 0 -- and 0 is exactly what the first-free rule
+	returns whenever the site does not name it, which is 600 of this
+	binary's 3,572 `vblendv` instructions. Offering that one register and
+	giving up handed those the only register the lowering cannot accept,
+	while 2,196 of the 2,210 that need a scratch have one that works.
+
+	So the caller tries them in turn and lets the lowering decide. Nothing
+	here claims a register is dead -- that is `find_scratch` -- which is why
+	whichever is taken has to be saved first. See Finding 100.
 	"""
 	used = set()
 	for operand in registers:
 		used.update(scratch_finder.xmm_numbers(operand))
-	for number in range(16):
-		if number not in used:
-			return number
+	return [number for number in range(16) if number not in used]
+
+
+def borrow_that_lowers(address, encoding, operands, mnemonic, at, pool=0):
+	"""The first borrowable register this lowering will actually accept.
+
+	Both borrow paths ask through here rather than each trying a register of
+	its own: the site's, and `swallowed_borrow` for a neighbour. One code
+	path deciding is the same rule that keeps the collector and the encoder
+	agreeing about what can be encoded.
+	"""
+	registers = [o for o in inplace.split_operands(operands)
+	             if not o.startswith("$")]
+	for borrowed in spill_candidates(registers):
+		if lower_vex(address, encoding, operands, mnemonic, at, borrowed,
+		             pool) is not None:
+			return borrowed
 	return None
+
+
+def spill_register(registers):
+	"""The first register the site does not name, or None.
+
+	Always available: a site has at most four operands and there are sixteen
+	registers. Prefer `spill_candidates` where a lowering may refuse one.
+	"""
+	candidates = spill_candidates(registers)
+	return candidates[0] if candidates else None
 
 
 def encode_spill(borrowed, save, at, spill_base):
@@ -1112,13 +1144,8 @@ def swallowed_borrow(plain, address, encoding, operands, mnemonic, home):
 		return None
 	fields = inplace.split_operands(operands)
 	registers = [o for o in fields if not o.startswith("$")]
-	borrowed = spill_register(registers)
-	if borrowed is None:
-		return None
-	if lower_vex(address, encoding, operands, mnemonic, address, borrowed,
-	             address) is None:
-		return None
-	return borrowed
+	return borrow_that_lowers(address, encoding, operands, mnemonic, address,
+	                          address)
 
 
 def swallowed_scratch(plain, position, address, encoding, operands, mnemonic,
@@ -2788,10 +2815,9 @@ def collect(binary, listing):
 					skipped["no home space to borrow"] += 1
 					declined[address] = "no home space to borrow"
 					continue
-				borrowed = spill_register(registers)
-				if borrowed is not None and lower_vex(
-						address, encoding, operands, mnemonic, address,
-						borrowed, address) is not None:
+				borrowed = borrow_that_lowers(address, encoding, operands,
+				                              mnemonic, address, address)
+				if borrowed is not None:
 					strategy = ("spill", borrowed)
 					trial = True
 			if trial is None:
@@ -3272,6 +3298,7 @@ def selftest():
 				failures += 1
 
 	failures += reach_selftest()
+	failures += borrow_selftest()
 
 	if failures:
 		print(f"selftest: {failures} of {len(SELFTEST)} lowerings are wrong",
@@ -3319,6 +3346,49 @@ REACH_CASES = [
 	("an unknown frame",
 	 [("mov", "%rsp,%rax"), ("mov", "%rcx,-0x28(%rax)")], True),
 ]
+
+
+# `vblendvps %xmm4,%xmm3,%xmm2,%xmm1`, which names four registers and not
+# %xmm0. Assembled rather than hand-encoded.
+BLENDV = (bytes.fromhex("c4e3694acb40"), "%xmm4,%xmm3,%xmm2,%xmm1",
+          "vblendvps")
+
+
+def borrow_selftest():
+	"""Prove the borrow does not offer a register the lowering refuses.
+
+	SSE `blendvps` reads its mask from an implicit `%xmm0`, so `lower_blendv`
+	rejects a scratch of 0 -- and 0 is the first register a site not naming
+	it leaves free. Offering only that one and giving up refused 600 of this
+	binary's `vblendv` instructions with a register they could never use,
+	while another would have lowered them. Finding 100.
+	"""
+	encoding, operands, mnemonic = BLENDV
+	registers = [o for o in inplace.split_operands(operands)
+	             if not o.startswith("$")]
+	failures = 0
+	first = spill_register(registers)
+	if first != 0:
+		print(f"selftest: the first free register is {first}, not 0 -- this "
+		      f"case no longer reproduces the bug", file=sys.stderr)
+		failures += 1
+	if lower_vex(0, encoding, operands, mnemonic, 0, first) is not None:
+		print("selftest: blendv accepted %xmm0 as a scratch, which it "
+		      "cannot use", file=sys.stderr)
+		failures += 1
+	taken = borrow_that_lowers(0, encoding, operands, mnemonic, 0)
+	if taken is None:
+		print("selftest: the borrow found no register for the blendv",
+		      file=sys.stderr)
+		failures += 1
+	elif taken == 0:
+		print("selftest: the borrow took %xmm0, which blendv cannot use",
+		      file=sys.stderr)
+		failures += 1
+	if not failures:
+		print(f"selftest: the blendv borrow skips %xmm0 and takes "
+		      f"%xmm{taken}")
+	return failures
 
 
 def reach_selftest():

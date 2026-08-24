@@ -5697,6 +5697,55 @@ representation -- a shadow for every live upper half, maintained across the whol
 rather than within one window -- which is a larger piece of work than anything in Findings
 88 to 98 and is not started here.
 
+### Finding 100 -- the borrow offered the one register the lowering refuses
+
+`spill_register` returns the lowest-numbered register a site does not name, and both
+borrow paths took it, tried one lowering with it, and gave up. SSE `blendvps` reads its
+mask from an implicit `%xmm0`, so `lower_blendv` rejects a scratch of 0 -- and 0 is
+exactly what the first-free rule returns whenever the site does not name it.
+
+So every `vblendv` neighbour that needed a borrow was handed the only register its
+lowering documents it cannot use, and refused.
+
+**Three numbers, and the distance between them is the finding:**
+
+```
+vblendv instructions whose first free register is %xmm0        600
+of those, sites actually REFUSED for it                        153
+sites recovered by trying the other candidates                  24
+VEX sites that removed                                         106
+```
+
+600 is a population, not a prize. Most of those instructions never reach the borrow: they
+lower with a dead register `find_scratch` supplies, or they sit inside a window that was
+accepted anyway. 153 is what the refusal list actually held, and 24 of those had another
+register that worked -- the remaining 129 fail inside `lower_blendv` for reasons no
+scratch addresses, being 256-bit or having a memory `src2` the register-direct path does
+not handle. The gap from 600 to 24 is the same conflation this project has miscounted
+four times before, caught here by rebuilding rather than by predicting.
+
+```
+VEX in .text     10,625 ->  10,519      794,612 removed, 98.7%
+detours         199,782 -> 199,864
+refused             797 ->     773      vblendv 153 -> 129
+```
+
+82 more windows removed 106 more sites, a window covering more than the site it is
+anchored on.
+
+**The retry lives in one place.** `borrow_that_lowers` asks the lowering rather than
+guessing for it, and both callers -- the site's own borrow and `swallowed_borrow` for a
+neighbour -- go through it. Two code paths answering one question is how a collector and
+an encoder come to disagree about what can be encoded, which has cost this project a
+build already, and the same reasoning put the Y decline reason inside `ymm_run` in Finding
+99.
+
+The test asserts the defect rather than the fix: that the first free register IS 0 for a
+`vblendv` naming four other registers, that `lower_vex` refuses it, and that the borrow
+nevertheless returns one that lowers. Reverting to a single candidate makes it report that
+the borrow found no register at all, so it guards the behaviour instead of describing it.
+The encoding it uses was assembled rather than hand-written.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
