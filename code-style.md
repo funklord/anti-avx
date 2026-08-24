@@ -185,19 +185,33 @@ rather than `helpers/`, `doc/` rather than `docs/`, `fixture/` rather than
 one of them and forty of them go in the same place, and the directory
 should not have to be renamed when the count changes.
 
-**The exception is a name somebody else has already settled**, and that is
-a fact about a tool or an ecosystem rather than a preference. Measured in
-this workspace, it covers:
+There are two exceptions, and they are not equal. This is the same shape
+as the lowercase rule above, which yields first to `Makefile` because make
+will not read anything else, and only then to `README.md` because the world
+settled it.
 
-- **Cargo** looks for `tests/`, `examples/` and `benches/` by those exact
-  names, and a workspace's members conventionally sit in `crates/`.
-  `cargo-fuzz` requires `fuzz_targets/`.
-- **GitHub** requires `.github/workflows/`.
-- **git** keeps `hooks/`, which is why `tools/hooks/` is spelled that way.
+**First: a name a tool requires is not a name we choose.** It outranks the
+singular exactly as it outranks lowercase, it needs no measurement and no
+argument, and the test is whether something breaks when the name changes.
+This is a *technical* fact, so it is open-ended rather than a list -- a
+tool met tomorrow that demands a name gets the same answer, whether the
+name it demands is plural, singular, capitalised or none of those.
 
-Where a tool demands the name there is nothing to decide. Where the plural
-is merely widespread, name what it was measured against in the project's
-copy, so the next reader does not reopen it.
+Present here: **Cargo** looks for `tests/`, `examples/` and `benches/` by
+those exact names, and `cargo-fuzz` for `fuzz_targets/`. **GitHub**
+requires `.github/workflows/`. **git** keeps `hooks/`, which is why
+`tools/hooks/` is spelled that way.
+
+**Second: a plural an ecosystem has settled**, which is a convention rather
+than a requirement -- nothing breaks, but a reader would be surprised by
+the singular. Cargo workspaces conventionally keep members in `crates/`,
+and that is this kind rather than the first. **These need measuring**, and
+the project's copy names what it was measured against, so the next reader
+does not reopen it.
+
+Where the two are confused, the cost lands on whoever renames a directory
+because it looked like a convention and finds the build no longer works.
+So say which kind is being claimed.
 
 **This rule does not reach the settled inventory.** Three canonical names in
 `harmonization.md` are plural -- `tools/`, `docs/` and `docs/decisions/` --
@@ -209,22 +223,6 @@ four projects alone, besides `sync.py`, every Makefile's hook target and the
 `~/.claude/tools/` the copies are spread from. An inventory entry is a name
 other things point at, which is exactly what makes it expensive and exactly
 what makes it worth having.
-
-Settled exceptions:
-
-- **Names a tool will not accept lowercased** -- `Makefile`,
-  `CMakeLists.txt`, `AndroidManifest.xml`, `Dockerfile`, `Cargo.toml`.
-- **Root files with an established convention** -- `README.md`, `LICENSE`,
-  `CHANGELOG.md`, `AUTHORS`, `VERSION`. The last is this workspace's own
-  rather than the wider world's, and is settled by use: thirteen of the
-  fourteen private projects track one, and a build reads it for the
-  package version and for whatever the program prints, so the number
-  lives in exactly one place. `claude-guidelines` is the one without it,
-  and it packages nothing.
-- **Package-system spellings** -- kebab-case where Cargo or Debian require
-  it. That is now the same spelling prose uses, so a crate directory and
-  the design note beside it agree by construction rather than by
-  coincidence.
 
 ## ASCII in source
 
