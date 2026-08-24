@@ -1068,6 +1068,63 @@ hundred:	.float 100.0
 """)
 
 
+# 23. A copy of `rsp` that never reaches the home space -- the MSVC prologue
+# idiom, and the shape the blanket refusal was written against.
+#
+# `movq %rsp,%r10` at entry makes a pointer to the frame, which is what
+# Findings 72 and 73 refused any function for. Here it addresses a local at
+# `entry-0x40`, while the callee home space this function reserves sits at
+# `entry-0x68` through `entry-0x49` -- a different region, and the whole
+# point of `copy_reaches_home`. The local is written before the site and read
+# after it, so a borrow that landed in the wrong place returns 29 rather
+# than faulting.
+#
+# The frame must be declared in FRAMES or the unwind codes claim zero, the
+# analysis puts the home space at `entry+0`, and the test passes without
+# testing the arithmetic.
+#
+# Under `--rsp=blanket` the function cannot lend, the aliased site is
+# refused, and the surviving VEX faults on a CPU without AVX -- which is the
+# A/B this program exists for.
+PROGRAMS["rspcopy"] = (107, """
+	.text
+	.globl _start
+_start:
+	vzeroupper
+	movq	%rsp, %r10		/* the copy the blanket rule refused */
+	subq	$104, %rsp		/* 32 of home space, and locals */
+	call	helper			/* makes the home space real */
+	movq	$55, -0x40(%r10)	/* a local, well clear of the region */
+	vmovss	ten(%rip), %xmm1
+	vmovss	three(%rip), %xmm0
+	vmovss	hundred(%rip), %xmm2	/* the register the spill will borrow */
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, and no register is dead */
+	leaq	after(%rip), %rcx
+	jmp	*%rcx			/* indirect: nothing forward is provable */
+after:
+	vaddss	%xmm2, %xmm0, %xmm0	/* 7 + 100, only if xmm2 came back */
+	vcvttss2si %xmm0, %eax
+	cmpq	$55, -0x40(%r10)	/* and the local must be untouched */
+	je	done
+	movl	$29, %eax
+done:
+	addq	$104, %rsp
+	ret
+helper:
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+hundred:	.float 100.0
+""")
+
+# The prologue allocation each program really makes, where a test depends on
+# the unwind codes saying so. Everything absent here declares nothing, which
+# is what every program before this one did.
+FRAMES = {"rspcopy": 104}
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:
@@ -1099,7 +1156,7 @@ def align(value, to):
 	return (value + to - 1) // to * to
 
 
-def build(path, text, code_size, handler=None):
+def build(path, text, code_size, handler=None, frame=0):
 	"""Write a PE whose entry point is the start of `text`."""
 	# .xdata first, because .pdata points into it. A minimal UNWIND_INFO:
 	# version 1, no flags, no prolog, no unwind codes. Nothing here ever
@@ -1112,11 +1169,27 @@ def build(path, text, code_size, handler=None):
 	# with no imports and no CRT gets structured exception handling: the
 	# dispatcher finds the handler through `.pdata` rather than through
 	# anything the program registers at run time.
+	#
+	# **And unless the program declares a `frame`.** "No unwind codes" is
+	# honest enough for a program nothing unwinds, but `copy_reaches_home`
+	# reads the frame size out of these codes to work out where the callee
+	# home space sits -- so a program written to test THAT needs codes that
+	# tell the truth, or it passes against a frame of zero and proves
+	# nothing. See Finding 98.
+	codes = b""
+	count = 0
+	if frame:
+		if frame % 8 or not 8 <= frame <= 128:
+			raise SystemExit(f"pe_build.py: frame {frame} is not a small "
+			                 f"multiple of 8")
+		# UWOP_ALLOC_SMALL, and the array is padded to an even node count.
+		codes = struct.pack("<BB", 0, (((frame - 8) // 8) << 4) | 2) + b"\0\0"
+		count = 1
 	if handler is None:
-		xdata = struct.pack("<BBBB", 1, 0, 0, 0)
+		xdata = struct.pack("<BBBB", 1, 0, count, 0) + codes
 	else:
-		xdata = struct.pack("<BBBBI", 1 | (1 << 3), 0, 0, 0,
-		                    SECTION_ALIGNMENT + handler)
+		xdata = struct.pack("<BBBB", 1 | (1 << 3), 0, count, 0) + codes \
+			+ struct.pack("<I", SECTION_ALIGNMENT + handler)
 
 	sections = []
 	rva = SECTION_ALIGNMENT
@@ -1210,7 +1283,8 @@ def main(argv):
 	expected, source = PROGRAMS[name]
 	text, symbols = assemble(source)
 	code_size = symbols["func_end"]
-	sections = build(output, text, code_size, symbols.get("handler"))
+	sections = build(output, text, code_size, symbols.get("handler"),
+	                 FRAMES.get(name, 0))
 	print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
 	      f"function is {code_size} of them, expected exit code {expected}")
 	return 0

@@ -5563,6 +5563,74 @@ function table entries, 81,944 lost boundaries, 1,191,105 branch targets, 200,49
 jumps -- which is what makes this instrumentation rather than a change that happens to
 report differently.
 
+### Finding 98 -- the copy is followed, and it is worth 784 sites
+
+Finding 96 measured the blanket refusal of any function that copies `rsp` and found it
+protecting nothing: of 2,464 starved sites, not one function reaches its callee home space
+through the copy, and 846 could be proved not to. `copy_reaches_home` replaces the blanket
+rule with the offset arithmetic, and `--rsp=blanket` keeps the old behaviour reachable --
+a borrow that corrupts a live local does not fault, so comparing two binaries is the only
+way to test for one.
+
+```
+VEX in .text     11,409 ->  10,625      794,506 removed, 98.7%
+detours         199,360 -> 199,782
+refused             908 ->     797
+  the aliased form has no usable scratch    517 -> 415
+  vblendv would not lower                   162 -> 153
+```
+
+784 sites against a ceiling of 846, which is the right side of it: a function that can now
+lend still has to pass everything else, and 62 did not.
+
+**The frontier is taken.** `0x1406ED33B` held the executed path for three consecutive
+builds and was `c5 ca 5c e0`, a VEX `vsubss`; it is now `e9 1d 87 2d 08`. Its function is
+the one Finding 96 traced by hand -- the copy addresses the caller's shadow at `+8` and
+`+16` and saved registers at `-88` through `-168`, while the region the borrow wants lies
+at `-296` through `-265`.
+
+#### What makes the zero trustworthy
+
+The change rests on Finding 96's zero, and a zero is what a broken probe returns too. So
+eleven cases run in `detour.py selftest`, in both directions: a store that does reach the
+region, one eight bytes above it, the MSVC idiom writing the caller's shadow, a byte write
+that must not read as a pointer kill, a 32-bit write that must, a `lea` deriving a pointer
+into the region, immediate arithmetic walking one in, arithmetic that cannot be followed,
+an indexed access, a copy stored to memory, and an unknown frame.
+
+Three mutations confirm they bite. Removing the guard fails five of them. Restoring the
+narrow-write bug -- which is a real bug this session wrote and then caught -- fails exactly
+the byte-write case. **And conflating the two home spaces fails the MSVC idiom case**,
+making that function refuse itself: the hypothesis Finding 96 offered for where Finding
+72's thirteen came from now reproduces on demand, which is as close to confirming it as
+anything can get with the code gone from the tree.
+
+#### The test PEs were claiming a frame of zero
+
+`pe_build` wrote `UNWIND_INFO` with no unwind codes for every program, which is honest for
+a program nothing unwinds -- and useless for one testing where the home space is, since
+`prologue_frame` reads the frame out of exactly those codes. A program written against it
+would have been measured against a frame of 0, put the region at `entry+0`, and passed
+without exercising the arithmetic at all. `build` takes a declared frame now and emits a
+real `UWOP_ALLOC_SMALL`; `rspcopy` declares 104 and reads back as 104.
+
+`rspcopy` runs under wine and returns 107. Under `--rsp=blanket` it does not: exactly one
+VEX instruction survives, the aliased `vsubss`, and the program never reaches its answer.
+That difference is what says the program tests the new rule rather than passing beside it.
+
+#### What is still not proven
+
+The same thing Finding 73 recorded, and more of it. Roughly 3,400 sites now write into the
+translated program's own frame where 1,022 did, on a per-function scan and an ABI
+argument. A borrow that lands on a live local corrupts it silently. Every gate passes --
+`check`, `check-pe` across twenty-three programs, `check-spill` across all four modes --
+and none of them can see that failure, which is why `--rsp=blanket` exists.
+
+The 113 sites whose copy escapes to memory stay refused. No borrow window can contain a
+call, so nothing could dereference an escaped pointer while one is live, but that argument
+rests on a property asserted in docstrings rather than enforced, and it was not worth
+leaning on for 113 sites.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

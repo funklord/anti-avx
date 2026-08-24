@@ -64,6 +64,51 @@ RSP_MEMORY = re.compile(r"(-?0x[0-9a-f]+)?\(%rsp\)")
 # this frame, and where it points decides whether the home space is still
 # safe -- which is what `taint_offsets` works out rather than assuming.
 RSP_COPY = re.compile(r"^%rsp,\s*%(r[a-z0-9]+)$")
+# A memory operand and the register it is based on; group 1 is the
+# displacement where one is printed.
+MEMORY_BASE = re.compile(r"(-?0x[0-9a-f]+)?\(%(r[a-z0-9]+)\)")
+# An operand with an index register, whose address cannot be resolved here.
+INDEXED_BASE = re.compile(r"\(%(r[a-z0-9]+),")
+# An immediate into a register, which is how a frame pointer gets walked.
+IMMEDIATE_TO_REGISTER = re.compile(
+	r"^\$(-?0x[0-9a-f]+|-?\d+),\s*%(r[a-z0-9]+)$")
+# The 32-bit names. A write through one zeroes the upper half, so it
+# DESTROYS a frame pointer rather than deriving another -- which makes it a
+# kill. An 8- or 16-bit write leaves most of the pointer intact and is not.
+WIDE32 = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"}
+NUMBERED_NARROW = re.compile(r"^r\d+[dwb]$")
+NARROW_TO_WIDE = {"eax": "rax", "ax": "rax", "al": "rax", "ah": "rax",
+                  "ebx": "rbx", "bx": "rbx", "bl": "rbx", "bh": "rbx",
+                  "ecx": "rcx", "cx": "rcx", "cl": "rcx", "ch": "rcx",
+                  "edx": "rdx", "dx": "rdx", "dl": "rdx", "dh": "rdx",
+                  "esi": "rsi", "si": "rsi", "sil": "rsi",
+                  "edi": "rdi", "di": "rdi", "dil": "rdi",
+                  "ebp": "rbp", "bp": "rbp", "bpl": "rbp"}
+IMPLICIT_RAX = {"imul", "mul", "idiv", "div", "cqto", "cltq", "cwtl"}
+
+
+def canonical(name):
+	"""The 64-bit register a narrow name writes into."""
+	name = name.lstrip("%")
+	if name in NARROW_TO_WIDE:
+		return NARROW_TO_WIDE[name]
+	if NUMBERED_NARROW.match(name):
+		return name[:-1]
+	return name
+
+
+def immediate_step(mnemonic, operands, destination):
+	"""How far `add`/`sub` of an immediate moves `destination`, or None."""
+	if mnemonic not in ("add", "addq", "sub", "subq"):
+		return None
+	match = IMMEDIATE_TO_REGISTER.match(operands)
+	if not match or "%" + match.group(2) != destination:
+		return None
+	text = match.group(1)
+	value = int(text, 16) if "x" in text else int(text)
+	if abs(value) > 1 << 31:
+		return None
+	return -value if mnemonic.startswith("sub") else value
 
 
 JMP_REL32 = 0xE9
@@ -436,6 +481,14 @@ SPILL_NONE, SPILL_STACK, SPILL_POOL = "none", "stack", "pool"
 SPILL_HOME = "home"
 SPILL = SPILL_HOME
 HOME_SPACE = 32
+# `--rsp=` decides what a copy of `rsp` costs. `blanket` refuses any function
+# that makes one, which is what Findings 72 and 73 shipped; `followed` works
+# out where the copy points and refuses only what it cannot vouch for. See
+# Finding 96 for why the blanket rule was measured to protect no function at
+# all, and keep `blanket` reachable: a borrow that corrupts a live local does
+# not fault, so comparing two binaries is the only way to test for it.
+RSP_BLANKET, RSP_FOLLOWED = "blanket", "followed"
+RSP_RULE = RSP_FOLLOWED
 
 
 def encode_rip(prefix, opcode, reg, target, at):
@@ -773,6 +826,157 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	return bytes(body)
 
 
+def prologue_frame(data, unwind_at, start, depth=0):
+	"""Bytes the prologue takes off `rsp`, from the unwind codes, or None.
+
+	The borrow writes `[rsp+0..31]` as `rsp` stands inside the body, so
+	knowing where the body's `rsp` sits relative to the entry value is what
+	turns a copy's offset into an address. A chained fragment shares its
+	primary's frame, so the chain is followed and the sizes add.
+	"""
+	if depth > 4 or start not in unwind_at:
+		return None
+	off, base = unwind_at[start]
+	flags, _prologue, count, frame = data[off:off + 4]
+	if frame & 0xF:
+		return None			# a frame register: rsp is not the base
+	total, i, codes = 0, 0, off + 4
+	while i < count:
+		packed = data[codes + i * 2 + 1]
+		op, info = packed & 0xF, packed >> 4
+		if op == 0:			# UWOP_PUSH_NONVOL
+			total += 8
+			i += 1
+		elif op == 1:			# UWOP_ALLOC_LARGE
+			if info == 0:
+				total += struct.unpack_from(
+					"<H", data, codes + (i + 1) * 2)[0] * 8
+				i += 2
+			else:
+				total += struct.unpack_from(
+					"<I", data, codes + (i + 1) * 2)[0]
+				i += 3
+		elif op == 2:			# UWOP_ALLOC_SMALL
+			total += info * 8 + 8
+			i += 1
+		elif op == 3:			# UWOP_SET_FPREG
+			return None
+		elif op in (4, 8):
+			i += 2
+		elif op in (5, 9):
+			i += 3
+		else:
+			i += 1
+	if flags >> 3 & 4:			# UNW_FLAG_CHAININFO
+		aligned = (count + (count & 1)) * 2
+		parent = struct.unpack_from("<I", data, codes + aligned)[0]
+		outer = prologue_frame(data, unwind_at, base + parent, depth + 1)
+		if outer is None:
+			return None
+		total += outer
+	return total
+
+
+def copy_reaches_home(rows, frame):
+	"""True if a copy of `rsp` could reach `[rsp+0..31]`, or cannot be
+	followed. Refusing is the answer to every doubt.
+
+	**There are two home spaces and only one is at risk.** The 32 bytes this
+	function's caller reserved sit above the return address; the 32 it
+	reserves for its own callees sit at the bottom of its frame, and the
+	borrow writes only the second. MSVC's `mov %rsp,%rax` prologue exists to
+	reach the FIRST one after the pushes have moved `rsp`, so the copy that
+	triggered the blanket refusal normally points a whole frame away from
+	the region at risk. Finding 96 measured the difference: of 2,464 starved
+	sites whose function copies `rsp`, not one reaches the region through
+	the copy, and 846 can be proved not to.
+
+	So the copy's value is tracked as an offset from the entry `rsp`, the
+	frame comes from the unwind codes, and a dereference at `d` through a
+	copy holding `k` lands in the region exactly when `k + d` falls in
+	`[-frame, -frame+32)`.
+
+	**What it refuses, and each is a case it cannot see the end of:** an
+	unknown frame; a copy taken where `rsp` has moved by an unknown amount;
+	an indexed access or an indexed `lea` through a copy; arithmetic on a
+	copy that is not an immediate; a narrow write, which mangles a pointer
+	without destroying it; and a copy stored to memory or pushed, where it
+	leaves this function's text entirely. A 32-bit write is a kill rather
+	than a derivation, since it zeroes the upper half and what is left
+	cannot address a stack.
+
+	The escape case is refused although no borrow window can contain a call
+	-- the swallowed bracket admits nothing between its save and restore,
+	and `ymm_run` breaks on every control transfer -- so nothing could
+	dereference an escaped pointer while the borrow is live. That argument
+	is sound and is deliberately not leaned on: it is second-order, resting
+	on a property asserted in two docstrings rather than enforced by a
+	check, and it is worth 113 sites.
+	"""
+	if frame is None:
+		return True
+	low, high = -frame, -frame + HOME_SPACE
+	taint, depth = {}, 0
+	for mnemonic, operands in rows:
+		operands = operands or ""
+		fields = inplace.split_operands(operands) if operands else []
+		if mnemonic in ("push", "pushq"):
+			if canonical(operands) in taint:
+				return True		# the copy leaves this text
+			depth = None if depth is None else depth - 8
+		elif mnemonic in ("pop", "popq"):
+			depth = None if depth is None else depth + 8
+		elif RSP_WRITTEN.search(operands) and not RSP_COPY.match(operands):
+			step = immediate_step(mnemonic, operands, "%rsp")
+			depth = None if step is None or depth is None else depth + step
+		# Any dereference through a copy, including the address a `lea`
+		# forms: taking the address of the region is refused exactly as a
+		# write to it is.
+		for match in MEMORY_BASE.finditer(operands):
+			if match.group(2) in taint:
+				text = match.group(1)
+				landing = taint[match.group(2)] + \
+					(int(text, 16) if text else 0)
+				if low <= landing < high:
+					return True
+		match = INDEXED_BASE.search(operands)
+		if match and match.group(1) in taint:
+			return True
+		if RSP_COPY.match(operands):
+			if depth is None:
+				return True
+			taint[RSP_COPY.match(operands).group(1)] = depth
+			continue
+		if mnemonic == "lea" and len(fields) == 2 \
+				and fields[1].startswith("%"):
+			match = MEMORY_BASE.fullmatch(fields[0])
+			if match and match.group(2) in taint:
+				text = match.group(1)
+				taint[canonical(fields[1])] = taint[match.group(2)] + \
+					(int(text, 16) if text else 0)
+				continue
+		if len(fields) == 2 and fields[0].startswith("%") \
+				and canonical(fields[0]) in taint and "(" in fields[1]:
+			return True			# stored to memory
+		if fields and fields[-1].startswith("%"):
+			name = fields[-1].lstrip("%")
+			wide = canonical(name)
+			if wide not in taint:
+				taint.pop(wide, None)
+			elif mnemonic.startswith("mov") or mnemonic in ("pop", "popq") \
+					or name in WIDE32 or NUMBERED_NARROW.match(name):
+				del taint[wide]		# overwritten, or zero-extended away
+			else:
+				step = immediate_step(mnemonic, operands, fields[-1])
+				if step is None:
+					return True
+				taint[wide] += step
+		if mnemonic in IMPLICIT_RAX:
+			taint.pop("rax", None)
+			taint.pop("rdx", None)
+	return False
+
+
 def home_space_map(binary, plain, ranges):
 	"""Which functions can lend their callee home space to a stub.
 
@@ -796,6 +1000,7 @@ def home_space_map(binary, plain, ranges):
 	rva, size = struct.unpack_from("<II", data, pe + 24 + 112 + 3 * 8)
 	at = rva_to_offset(data, rva) if rva and size else None
 	fixed_frame = set()
+	unwind_at = {}
 	if at is not None:
 		for i in range(size // 12):
 			begin, end, unwind = struct.unpack_from("<III", data, at + i * 12)
@@ -804,12 +1009,14 @@ def home_space_map(binary, plain, ranges):
 			off = rva_to_offset(data, unwind)
 			if off is None or off + 4 > len(data):
 				continue
+			unwind_at[base + begin] = (off, base)
 			if not data[off + 3] & 0xF:		# no frame register
 				fixed_frame.add(base + begin)
 
 	starts = [start for start, _end in ranges]
 	calls = [False] * len(ranges)
 	touches = [False] * len(ranges)
+	copies = [False] * len(ranges)
 	for address, _encoding, mnemonic, operands in plain:
 		i = bisect.bisect_right(starts, address) - 1
 		if i < 0 or address >= ranges[i][1]:
@@ -830,13 +1037,34 @@ def home_space_map(binary, plain, ranges):
 				text = match.group(1)
 				if 0 <= (int(text, 16) if text else 0) < HOME_SPACE:
 					touches[i] = True
-		# **A copy of `rsp` is refused outright**, and the precise version
-		# was built and measured at thirteen sites. See Finding 72: of the
-		# 2,367 starved sites whose function copies `rsp`, all but thirteen
-		# use the copy in a way no scan can clear, so tracking where it
-		# points buys nothing the blanket rule does not already give.
+		# **A copy of `rsp` is noted, and where it points decides.** The
+		# blanket refusal this replaces was measured to protect no function
+		# in the binary -- see Finding 96 and `copy_reaches_home` -- and
+		# `--rsp=blanket` restores it for comparison.
 		if RSP_COPY.match(operands):
-			touches[i] = True
+			copies[i] = True
+
+	if RSP_RULE == RSP_BLANKET:
+		for i in range(len(ranges)):
+			if copies[i]:
+				touches[i] = True
+	else:
+		# Only the functions a copy would otherwise refuse are worth
+		# following, so the bodies are collected for those alone rather
+		# than for all of them.
+		wanted = {i for i in range(len(ranges))
+		          if copies[i] and not touches[i] and calls[i]
+		          and ranges[i][0] in fixed_frame}
+		bodies = {i: [] for i in wanted}
+		for address, _encoding, mnemonic, operands in plain:
+			i = bisect.bisect_right(starts, address) - 1
+			if i in bodies and address < ranges[i][1]:
+				bodies[i].append((mnemonic, operands))
+		for i in wanted:
+			if copy_reaches_home(bodies[i],
+			                     prologue_frame(data, unwind_at,
+			                                    ranges[i][0])):
+				touches[i] = True
 
 	return (starts, ranges,
 	        [calls[i] and not touches[i] and ranges[i][0] in fixed_frame
@@ -3011,6 +3239,8 @@ def selftest():
 				      f"xmm{destination}", file=sys.stderr)
 				failures += 1
 
+	failures += reach_selftest()
+
 	if failures:
 		print(f"selftest: {failures} of {len(SELFTEST)} lowerings are wrong",
 		      file=sys.stderr)
@@ -3018,6 +3248,70 @@ def selftest():
 	print(f"selftest: {len(SELFTEST)} lowerings, none reads a register it "
 	      f"has overwritten")
 	return 0
+
+
+# Each case is (what it is, the body, whether the copy reaches the region).
+# The frame is 0x28 throughout, so the region the borrow wants lies at
+# entry-0x28 through entry-0x9.
+REACH_CASES = [
+	("a store the copy does reach",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
+	  ("mov", "%rcx,-0x28(%rax)")], True),
+	("a store eight bytes above the region",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
+	  ("mov", "%rcx,-0x8(%rax)")], False),
+	("the MSVC idiom writing the caller's shadow",
+	 [("mov", "%rsp,%rax"), ("mov", "%rcx,0x8(%rax)"), ("push", "%rbx"),
+	  ("sub", "$0x20,%rsp"), ("mov", "%rcx,0x10(%rax)")], False),
+	("a byte write, which mangles a pointer without destroying it",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("add", "$0x1,%al"),
+	  ("mov", "%rcx,(%rax)")], True),
+	("a 32-bit write, which zeroes the pointer away",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("xor", "%eax,%eax"),
+	  ("mov", "%rcx,(%rax)")], False),
+	("a lea deriving a pointer into the region",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
+	  ("lea", "-0x28(%rax),%rbx"), ("mov", "%rcx,(%rbx)")], True),
+	("immediate arithmetic walking a copy into the region",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("sub", "$0x28,%rax"),
+	  ("mov", "%rcx,(%rax)")], True),
+	("arithmetic that cannot be followed",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("add", "%rdx,%rax"),
+	  ("mov", "%rcx,(%rax)")], True),
+	("an indexed access through the copy",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
+	  ("mov", "%rcx,(%rax,%rdx,1)")], True),
+	("the copy stored to memory",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
+	  ("mov", "%rax,(%rdi)")], True),
+	("an unknown frame",
+	 [("mov", "%rsp,%rax"), ("mov", "%rcx,-0x28(%rax)")], True),
+]
+
+
+def reach_selftest():
+	"""Prove `copy_reaches_home` still discriminates. Failures, or 0.
+
+	**A zero from a probe that cannot find a hit reads exactly like a zero
+	from a program that has none**, and Finding 96 rests on a zero: not one
+	function in the binary reaches its callee home space through a copy of
+	`rsp`. An earlier revision of that measurement returned the same zero
+	because a bad narrow-write rule had killed the pointer early, so the
+	cases below fix both directions -- what must be caught, and what must
+	not be refused for nothing.
+	"""
+	failures = 0
+	for what, rows, expected in REACH_CASES:
+		got = copy_reaches_home(rows, None if "unknown frame" in what
+		                        else 0x28)
+		if got != expected:
+			print(f"selftest: {what}: copy_reaches_home said {got}, "
+			      f"want {expected}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(REACH_CASES)} rsp-copy cases, caught in both "
+		      f"directions")
+	return failures
 
 
 def census(binary, listing, patched):
@@ -3120,8 +3414,17 @@ def main(argv):
 	# evaluation switch rather than a tuning knob: the default refuses the
 	# site, as it always has, and the other two exist so that all three can
 	# be built and compared. See Finding 46.
-	global SPILL
+	global SPILL, RSP_RULE
 	argv = list(argv)
+	for i, item in enumerate(argv):
+		if item.startswith("--rsp="):
+			RSP_RULE = item.split("=", 1)[1]
+			if RSP_RULE not in (RSP_BLANKET, RSP_FOLLOWED):
+				print(f"detour.py: unknown rsp rule {RSP_RULE!r}",
+				      file=sys.stderr)
+				return 2
+			del argv[i]
+			break
 	for i, item in enumerate(argv):
 		if item.startswith("--spill="):
 			SPILL = item.split("=", 1)[1]
