@@ -5631,6 +5631,72 @@ call, so nothing could dereference an escaped pointer while one is live, but tha
 rests on a property asserted in docstrings rather than enforced, and it was not worth
 leaning on for 113 sites.
 
+### Finding 99 -- the next frontier is not incrementally reachable
+
+With `0x1406ED33B` taken, Starfield faults at `0x14004E230`, and it is a different class:
+`vmovaps 0x4eb9028(%rip),%ymm0`, declined as 256-bit before it was ever a candidate. The
+catch-all that reported it said only that no Y strategy took it, so `ymm_run` now carries
+its own reason and `plan` names all 3,590:
+
+```
+256-bit: arithmetic rather than a copy                        2,034   1,925 outside a window
+256-bit: no store before 256-bit arithmetic on the value        858     730
+256-bit: no store before a branch target inside the run         212
+256-bit: no store before a control transfer                     165
+256-bit: no store before the value is touched                   148
+256-bit: loaded and never stored before 256-bit arithmetic      112
+256-bit: loaded and never stored before the value is touched     61   <- the frontier
+```
+
+The reason comes from `ymm_run` rather than from a second walk beside it. Two code paths
+answering one question is how a collector and an encoder come to disagree, which has
+happened here once already.
+
+**Nothing is wrong with the frontier's own value.** `ymm0` is loaded, stored twice and
+dead within four instructions. What takes the run down is `ymm1`, loaded inside it from
+`.rdata` and not stored until `0x14004E304` -- fifty instructions later, past the limit of
+48, and needing a helper register dead across all of it. The `loaded - stored` check then
+discards the run including the two `ymm0` stores that were complete.
+
+#### The option measured and rejected
+
+`ymm_run` carries an upper half in a helper from the load to the last store, which is what
+forces both the limit and the long-lived register. Where the SOURCE is a RIP-relative
+address in a non-writable section, it need not: the same bytes are there at the store, so
+the upper half can be re-read through a scratch live for two instructions rather than
+fifty -- and a momentary scratch is what the home space already lends.
+
+Both of this site's sources are in `.rdata`, which the section flags say nothing may
+write. So the shape fits. The population does not:
+
+```
+of the 3,590 declined
+  not a wide move (256-bit arithmetic)                    2,034
+  the source is not a RIP constant                        1,307
+  read-only source, but no store before it dies             202
+  the source is in a WRITABLE section                        35
+  READ-ONLY SOURCE, reachable by re-loading                  12
+```
+
+Twelve sites, and **all twelve are already within the limit of 48** -- median distance six,
+maximum twenty-six. The constraint the strategy relieves is not the one binding them. It
+would also need a value tied to its source across window boundaries, since the frontier's
+stranded `ymm1` is stored in a different window from the one that loads it. That is a
+change to the Y representation rather than an addition to it, for twelve sites.
+
+Recorded rather than built, so the next reader does not measure it again. The measurement
+counts a section it cannot classify as writable, stops at every control transfer, and
+stops when the register is touched, so twelve is a floor rather than an estimate -- but
+not by the order of magnitude the design would need.
+
+#### What is actually left
+
+2,034 sites are arithmetic on a `ymm`, not a copy, and 202 more load a value that
+arithmetic consumes. No strategy about copies reaches either. They want the full register
+representation -- a shadow for every live upper half, maintained across the whole function
+rather than within one window -- which is a larger piece of work than anything in Findings
+88 to 98 and is not started here.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

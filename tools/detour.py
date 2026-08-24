@@ -1548,7 +1548,13 @@ def wide_move(encoding, mnemonic, operands):
 	return None
 
 
-def ymm_run(instructions, index, blocked, limit=48):
+def note(why, reason):
+	"""Record a decline reason where the caller asked for one."""
+	if why is not None:
+		why.append(reason)
+
+
+def ymm_run(instructions, index, blocked, limit=48, why=None):
 	"""A stretch of 256-bit copies whose halves all lie inside it.
 
 	Finding 39 refused the gapped copy because the four-move lowering
@@ -1585,18 +1591,28 @@ def ymm_run(instructions, index, blocked, limit=48):
 	"""
 	address, encoding, mnemonic, operands, _comment = instructions[index]
 	first = wide_move(encoding, mnemonic, operands)
-	if first is None or first[0] != "load":
+	if first is None:
+		note(why, "256-bit: arithmetic rather than a copy")
+		return None
+	if first[0] != "load":
+		note(why, "256-bit: a store whose load was not taken")
 		return None
 	tracked = {first[1]}
 	members, at, last_store = [], address + len(encoding), None
+	stopped = "the run reached its limit"
 	for step in range(1, limit + 1):
 		position = index + step
 		if position >= len(instructions):
 			break
 		next_address, bits, name, text, _c = instructions[position]
-		if next_address != at or next_address in blocked:
+		if next_address != at:
+			stopped = "a gap in the listing"
+			break
+		if next_address in blocked:
+			stopped = "a branch target inside the run"
 			break
 		if name.startswith(CONTROL_PREFIXES):
+			stopped = "a control transfer"
 			break
 		what = wide_move(bits, name, text)
 		vex = inplace.decode_vex(bits)
@@ -1616,14 +1632,17 @@ def ymm_run(instructions, index, blocked, limit=48):
 			at = next_address + len(bits)
 			continue
 		if vex is not None and vex["L"]:
+			stopped = "256-bit arithmetic on the value"
 			break			# a 256-bit instruction that is not a copy half
 		if any(r in text or "%xmm" + r[len("%ymm"):] in text
 		       for r in tracked):
+			stopped = "the value is touched"
 			break			# the value is touched other than by a store
 		members.append(("plain", position, None))
 		at = next_address + len(bits)
 
 	if last_store is None:
+		note(why, "256-bit: no store before " + stopped)
 		return None
 	# Trim whatever followed the last store: it is not part of the copy and
 	# carrying it would only widen the window.
@@ -1631,6 +1650,13 @@ def ymm_run(instructions, index, blocked, limit=48):
 	loaded = {first[1]} | {r for kind, _p, r in members if kind == "load"}
 	stored = {r for kind, _p, r in members if kind == "store"}
 	if loaded - stored:
+		# **The whole run goes, and completed stores go with it.** A second
+		# value loaded inside the run whose own store lies past where the
+		# walk stopped takes the run down. 61 sites, the frontier
+		# 0x14004E230 among them, where the stranded value is a `.rdata`
+		# constant stored fifty instructions later. Finding 99 measured the
+		# way out and rejected it.
+		note(why, "256-bit: loaded and never stored before " + stopped)
 		return None		# a register loaded and never stored has no use
 	return members, members[-1][1]
 
@@ -2523,6 +2549,7 @@ def collect(binary, listing):
 			continue
 
 		strategy = None
+		y_reason = []
 		# A 256-bit copy through one ymm, taken as a unit. Both halves of
 		# it are refused individually -- there is no SSE form of either --
 		# so this has to be seen before either is considered alone.
@@ -2562,7 +2589,7 @@ def collect(binary, listing):
 		# so that nothing between the two halves has to move. The whole span
 		# goes into one stub, which is what keeps it an ordinary window.
 		if vex["L"]:
-			found = ymm_run(instructions, index, blocked)
+			found = ymm_run(instructions, index, blocked, why=y_reason)
 			if found is not None:
 				members, last = found
 				tail_entry = instructions[last]
@@ -2714,8 +2741,13 @@ def collect(binary, listing):
 		# through `sse_encoding` at all, and refusing them here would decline
 		# sites their own lowerings might yet take. Finding 90.
 		if vex["L"] and strategy is None and not needs_sequence:
-			skipped["256-bit, no Y strategy took it"] += 1
-			declined[address] = "256-bit, no Y strategy took it"
+			# The reason comes from `ymm_run` itself rather than from a
+			# second walk beside it: two code paths answering one question
+			# is how a collector and an encoder come to disagree.
+			told = (y_reason[0] if y_reason
+			        else "256-bit, no Y strategy took it")
+			skipped[told] += 1
+			declined[address] = told
 			continue
 		if not inplace.has_direct_sse_form(mnemonic) and not needs_sequence:
 			skipped["no direct SSE form"] += 1
