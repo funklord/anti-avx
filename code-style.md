@@ -177,6 +177,55 @@ Settled exceptions:
 - **Package-system spellings** -- kebab-case where Cargo or Debian require
   it.
 
+### Singular, unless somebody else standardised the plural
+
+**Prefer the singular for a directory this project names itself.** `helper/`
+rather than `helpers/`, `doc/` rather than `docs/`, `fixture/` rather than
+`fixtures/`. The name says what kind of thing lives there, not how many;
+one of them and forty of them go in the same place, and the directory
+should not have to be renamed when the count changes.
+
+**The exception is a name somebody else has already settled**, and that is
+a fact about a tool or an ecosystem rather than a preference. Measured in
+this workspace, it covers:
+
+- **Cargo** looks for `tests/`, `examples/` and `benches/` by those exact
+  names, and a workspace's members conventionally sit in `crates/`.
+  `cargo-fuzz` requires `fuzz_targets/`.
+- **GitHub** requires `.github/workflows/`.
+- **git** keeps `hooks/`, which is why `tools/hooks/` is spelled that way.
+
+Where a tool demands the name there is nothing to decide. Where the plural
+is merely widespread, name what it was measured against in the project's
+copy, so the next reader does not reopen it.
+
+**This rule does not reach the settled inventory.** Three canonical names in
+`harmonization.md` are plural -- `tools/`, `docs/` and `docs/decisions/` --
+and they stay until the copyright holder says otherwise, because renaming
+them is a cross-project rewrite rather than a spelling change. Measured
+before this was written: the decision records are cited by path 270 times in
+netcfgd and 95 times in situ, and `tools/` is named as a path 161 times in
+four projects alone, besides `sync.py`, every Makefile's hook target and the
+`~/.claude/tools/` the copies are spread from. An inventory entry is a name
+other things point at, which is exactly what makes it expensive and exactly
+what makes it worth having.
+
+Settled exceptions:
+
+- **Names a tool will not accept lowercased** -- `Makefile`,
+  `CMakeLists.txt`, `AndroidManifest.xml`, `Dockerfile`, `Cargo.toml`.
+- **Root files with an established convention** -- `README.md`, `LICENSE`,
+  `CHANGELOG.md`, `AUTHORS`, `VERSION`. The last is this workspace's own
+  rather than the wider world's, and is settled by use: thirteen of the
+  fourteen private projects track one, and a build reads it for the
+  package version and for whatever the program prints, so the number
+  lives in exactly one place. `claude-guidelines` is the one without it,
+  and it packages nothing.
+- **Package-system spellings** -- kebab-case where Cargo or Debian require
+  it. That is now the same spelling prose uses, so a crate directory and
+  the design note beside it agree by construction rather than by
+  coincidence.
+
 ## ASCII in source
 
 Source and comments are ASCII. Write `--` where prose would use an em dash,
@@ -241,6 +290,68 @@ silently pick a winner, even the global one.
 
 This precedence rule lives here and in the global guidelines only. It does
 not belong in a `project.md`.
+
+## Keeping the copies in sync
+
+Each private project keeps a copy of this file at its repo root -- except
+the one this file lives in. `claude-guidelines` holds the source at
+`guidelines/code-style.md`, and a copy beside it would be the same document
+twice in one repository with nothing to keep the two honest; its root
+`code-style.md` says so and points here. Every other private project carries
+a copy, opening with a header that names the source:
+
+```markdown
+<!-- Copied from ~/.claude/guidelines/code-style.md -- the source. Keep in
+     sync; fix drift the moment you notice it. -->
+```
+
+Below the copied rules, a project adds only what is genuinely its own: its
+exempt paths, its formatter verdicts, its language-specific notes, its
+tooling commands.
+
+**This source is deliberately plain ASCII** -- no em dashes, no section
+signs, no arrows -- so that a copy can be byte-verbatim in every project,
+including one whose own rules restrict the characters its files may
+contain. Keep it that way when editing: a typographic character introduced
+here becomes a transliteration problem in every repository that carries a
+copy.
+
+Where a copy must still be adapted, **"do not diverge" means semantically
+identical, not byte-identical**: a project transliterating to satisfy its
+own character-set rule, or renumbering a heading to fit its own structure,
+is that project's rule working correctly, **not drift, and not something to
+reconcile back**. What must match is every rule and every exception, in
+substance.
+
+**`sync.py --check` now reports the copies that have fallen behind**, which
+until 2026-08-24 nothing did. The three files spread verbatim were checked on
+every run and this one -- the document that says what the rules are -- was
+checked by nobody, so drift was indistinguishable from the adaptation the
+section above asks for. It found real losses: four copies had dropped
+*Precedence*, the section saying this source outranks them; three had dropped
+*Formatters*, whose rule was paid for by a formatter rewriting committed
+files; one had dropped *ASCII in source*; and seven had dropped this very
+section, which is the one that would have told a reader to look.
+
+It asks the weaker question that can actually be answered -- does the copy
+still carry a section for every section here -- and it never writes this
+file, because overwriting a copy would delete the part the project owns. A
+heading that *extends* one of these satisfies it, since that is what
+recording a project's own formatter verdict looks like.
+
+**If you notice a copy diverging from the source, reconcile it as soon as
+you notice** -- do not leave it for later and do not work around it. If the
+divergence looks deliberate rather than stale, that is the conflict case
+above: ask.
+
+Noticing requires looking. **Re-read this source before writing or
+reconciling any project's copy**, rather than working from what was loaded
+at the start of the session -- it may have changed since, and a copy
+reconciled against a stale source is drift being written rather than
+fixed.
+
+The project's `project.md` may state the three rules in brief and point
+here for the detail. It does not restate the precedence rule.
 
 ## What is specific to this project
 
