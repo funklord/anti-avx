@@ -493,7 +493,7 @@ def report(total, vex_total, evex_total, vex_by_mnemonic, name_v_total,
 	# The COMPLETE inventory, not a top-N.
 	#
 	# This used to print the top 40, and that truncation had a cost. The
-	# lowering table in tools/lower.py has to carry a rule for every
+	# lowering table in tool/lower.py has to carry a rule for every
 	# mnemonic that occurs, so building it needed the whole list -- and
 	# because the report would not give it, the list got extracted with an
 	# ad-hoc grep into a file beside the report that `make clean` did not

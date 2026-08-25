@@ -791,7 +791,7 @@ def lower_fma(match, registers, notes):
 	return body, "F", notes
 
 
-# Kept in step with tools/vex_scan.py deliberately: the same set decides the
+# Kept in step with tool/vex_scan.py deliberately: the same set decides the
 # cost model there and the emitted sequence here, and two copies that drift
 # would make the estimate describe code the lowering does not produce.
 #

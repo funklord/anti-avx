@@ -44,19 +44,19 @@ someone starting cold.
 project.md              the design, the measurements, and every open question
 code-style.md           style rules, copied from the global source
 
-tools/vex_scan.py       the inventory: every VEX site by mnemonic
-tools/lower.py          the lowering RULES; `verify` proves they assemble
-tools/patch.py          in-place patching, and the encoding primitives
+tool/vex_scan.py       the inventory: every VEX site by mnemonic
+tool/lower.py          the lowering RULES; `verify` proves they assemble
+tool/patch.py          in-place patching, and the encoding primitives
                         everything else uses
-tools/detour.py         the rewriter: collect, place_stubs, build_stub,
+tool/detour.py         the rewriter: collect, place_stubs, build_stub,
                         lower_vex, apply, verify, census, selftest
-tools/targets.py        branch targets from .reloc, .pdata, .xdata, switch
+tool/targets.py        branch targets from .reloc, .pdata, .xdata, switch
                         tables and SEH scope tables
-tools/outside.py        the code .pdata does not describe
-tools/scratch.py        liveness: find_scratch, and `check` proves its claims
-tools/lowering_cases.py generates the executable cases from the real rules
-tools/pe_build.py       builds AVX PEs so the rewriter has a target it owns
-tools/placement.py      where detours land; icache_bench.c what they cost
+tool/outside.py        the code .pdata does not describe
+tool/scratch.py        liveness: find_scratch, and `check` proves its claims
+tool/lowering_cases.py generates the executable cases from the real rules
+tool/pe_build.py       builds AVX PEs so the rewriter has a target it owns
+tool/placement.py      where detours land; icache_bench.c what they cost
 
 src/f16c.c              software half-precision conversion, since Westmere
                         has no F16C

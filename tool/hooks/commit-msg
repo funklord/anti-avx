@@ -1,5 +1,5 @@
 #!/bin/sh
-# Copied from ~/.claude/tools/commit-msg -- the source. Keep in sync;
+# Copied from ~/.claude/tool/commit-msg -- the source. Keep in sync;
 # fix drift the moment you notice it. Install with `make hooks`.
 # Commit message checks, following kernel practice.
 #
@@ -39,7 +39,7 @@ TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 #
 # Second, the names of the shared tooling tree. Without this no commit could
 # say where these files come from: this hook lives at
-# ~/.claude/tools/commit-msg, the style gate beside it, and the guidelines
+# ~/.claude/tool/commit-msg, the style gate beside it, and the guidelines
 # under ~/.claude/guidelines/. Naming one read as a "tooling reference" --
 # the rule firing on the one use it was never meant to cover, where the
 # workaround is to describe a path instead of writing it, making the log

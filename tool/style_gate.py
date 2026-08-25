@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# Copied from ~/.claude/tools/style_gate.py -- the source. Keep in sync;
+# Copied from ~/.claude/tool/style_gate.py -- the source. Keep in sync;
 # fix drift the moment you notice it.
 """The indentation and whitespace gate for private projects.
 
 One tool, merged from three that had grown apart:
 
-  fuzzypickles/tools/tabify.py    the C/C++ fixer (brace-nesting lexer)
-  beerssh/tools/tabify.py         a copy of it, drifted in the docstring only
-  */tools/check-indent.sh         file enumeration plus the collapse floor
-  situ/tools/lint_conventions.py  the checker: ASCII, tabs, trailing space,
+  fuzzypickles/tool/tabify.py    the C/C++ fixer (brace-nesting lexer)
+  beerssh/tool/tabify.py         a copy of it, drifted in the docstring only
+  */tool/check-indent.sh         file enumeration plus the collapse floor
+  situ/tool/lint_conventions.py  the checker: ASCII, tabs, trailing space,
                                   final newline, with a tokenize-based
                                   exemption for Python string literals
                                   (C/C++ literals are exempt here too, by a

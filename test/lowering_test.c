@@ -558,7 +558,7 @@ static __m128i ref_fnmadd231ss(__m128i d, __m128i a, __m128i b)
  * So a lane where both sides are NaN is not evidence of anything, and is not
  * counted. Every other lane is still compared exactly, which is what keeps
  * the ordering under test: get 132 and 231 the wrong way round and ordinary
- * numbers disagree at once. tools/f16c_oracle.py and test/fmaddsub_test.c
+ * numbers disagree at once. tool/f16c_oracle.py and test/fmaddsub_test.c
  * already draw the line in the same place.
  */
 static int nan_equivalent(const __m128i *got, const __m128i *want, int lane)
@@ -627,7 +627,7 @@ static reference3_fn reference3_for(const char *mnemonic)
  * whole point of the lowering -- a single pshufd would read 128 bits where
  * vbroadcastss reads 32, so a source four bytes from the end of a mapped
  * page would fault where the original did not. The reference says only what
- * the result must be; tools/detour.py's comment carries the argument for
+ * the result must be; tool/detour.py's comment carries the argument for
  * why it is reached the way it is. */
 
 static __m128i ref_broadcastss(__m128i a, __m128i b)

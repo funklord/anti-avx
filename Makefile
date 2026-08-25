@@ -90,13 +90,13 @@ style: style-source style-docs
 # Assemble every lowering rule and prove no VEX prefix survives. Needs no
 # game binary, so it belongs in `check` where `scan` and `coverage` do not.
 verify:
-	$(PYTHON) tools/lower.py verify
+	$(PYTHON) tool/lower.py verify
 
 # Prove no lowering reads a register it has already overwritten. Needs no
 # game binary either: it assembles its own operand shapes, lowers them, and
 # disassembles the result back to simulate the register moves.
 check-aliasing:
-	$(PYTHON) tools/detour.py selftest
+	$(PYTHON) tool/detour.py selftest
 
 # Execute the lowerings and check what they computed, against GCC compiling
 # the equivalent SSE intrinsic. The one test that runs translated code: this
@@ -125,7 +125,7 @@ check-f16c-exhaustive: $(TEST_BIN)
 # only implementation on this machine that nobody here wrote. Exhaustive
 # over all 65,536 halves.
 check-f16c-oracle: $(TEST_BIN)
-	$(PYTHON) tools/f16c_oracle.py $(TEST_BIN)
+	$(PYTHON) tool/f16c_oracle.py $(TEST_BIN)
 
 # The alternating-lane FMA lowerings. Separate from check-f16c because they
 # are a different rule with a different failure mode: F16C is an algorithm
@@ -179,9 +179,9 @@ $(BUILD_DIR)/permd_test: $(BUILD_DIR)/permd_test.o $(BUILD_DIR)/permd.o
 
 # Both halves come out of one generator run, so one recipe produces both and
 # the .inc names the .s as its sibling rather than repeating the command.
-$(BUILD_DIR)/lowering_cases.s: tools/lowering_cases.py tools/detour.py \
-                               tools/lower.py tools/patch.py | $(BUILD_DIR)
-	$(PYTHON) tools/lowering_cases.py emit $(BUILD_DIR)/lowering_cases.s \
+$(BUILD_DIR)/lowering_cases.s: tool/lowering_cases.py tool/detour.py \
+                               tool/lower.py tool/patch.py | $(BUILD_DIR)
+	$(PYTHON) tool/lowering_cases.py emit $(BUILD_DIR)/lowering_cases.s \
 	          $(BUILD_DIR)/lowering_cases.inc
 
 $(BUILD_DIR)/lowering_cases.inc: $(BUILD_DIR)/lowering_cases.s
@@ -205,12 +205,12 @@ $(BUILD_DIR)/lowering_test: $(BUILD_DIR)/lowering_test.o \
 .SECONDARY: $(TEST_OBJS)
 
 style-source:
-	$(PYTHON) tools/style_gate.py
+	$(PYTHON) tool/style_gate.py
 
 # Holds project.md to the tree: no statement made twice, no backticked path
 # naming a file that does not exist.
 style-docs:
-	$(PYTHON) tools/style_gate.py docs
+	$(PYTHON) tool/style_gate.py docs
 
 # -- measurement -------------------------------------------------------------
 
@@ -232,9 +232,9 @@ $(LISTING): $(TARGET) | $(BUILD_DIR)
 # and `vpmaskmovq` in the first scan, and chasing them is how the DRM wrapper
 # was found. Keep the flag.
 
-$(REPORT): $(LISTING) tools/vex_scan.py | $(BUILD_DIR)
+$(REPORT): $(LISTING) tool/vex_scan.py | $(BUILD_DIR)
 	@echo "  vex_scan $< -> $@  (~75 s, ~1.1 GB RSS)"
-	$(PYTHON) tools/vex_scan.py $< > $@
+	$(PYTHON) tool/vex_scan.py $< > $@
 
 # Which VEX sites in the binary have a lowering rule, and which do not. The
 # gap list is the point: it is the set of instructions a translator would
@@ -246,7 +246,7 @@ $(REPORT): $(LISTING) tools/vex_scan.py | $(BUILD_DIR)
 # value of the target is that it goes quiet only when the binary can
 # actually be translated.
 coverage: $(LISTING)
-	$(PYTHON) tools/lower.py coverage $<
+	$(PYTHON) tool/lower.py coverage $<
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -261,7 +261,7 @@ $(TARGET):
 
 # Ddisasm is not packaged for Debian and is not in this tree. Unpack
 # GrammaTech's focal builds into a scratch prefix and point DDISASM_PREFIX at
-# it; tools/run_ddisasm.sh does the rest. See project.md, Finding 12, for
+# it; tool/run_ddisasm.sh does the rest. See project.md, Finding 12, for
 # what it needs and what happened.
 #
 # This target is NOT part of `check`, and not only because it needs the game
@@ -272,7 +272,7 @@ disassemble: | $(BUILD_DIR)
 	@test -n "$$DDISASM_PREFIX" || { \
 		echo "disassemble: set DDISASM_PREFIX to an unpacked ddisasm tree" >&2; \
 		exit 1; }
-	tools/run_ddisasm.sh $(TARGET) $(BUILD_DIR)/$(basename $(notdir $(TARGET))).gtirb \
+	tool/run_ddisasm.sh $(TARGET) $(BUILD_DIR)/$(basename $(notdir $(TARGET))).gtirb \
 		$(DDISASM_LIMIT_GB) $(DDISASM_TIMEOUT)
 
 # -- in-place rewriting (milestone 4) ----------------------------------------
@@ -282,13 +282,13 @@ DETOURED = $(BUILD_DIR)/$(basename $(notdir $(TARGET)))-detour.exe
 
 # What can be rewritten without moving anything, and what cannot.
 patch-plan: $(LISTING)
-	$(PYTHON) tools/patch.py plan $(TARGET) $<
+	$(PYTHON) tool/patch.py plan $(TARGET) $<
 
 # Rewrite classes A, B and Z in place. No relocation, no reassembly: the
 # output is the same size as the input and byte-identical outside the
 # instructions it rewrote.
-$(PATCHED): $(TARGET) $(LISTING) tools/patch.py | $(BUILD_DIR)
-	$(PYTHON) tools/patch.py apply $(TARGET) $(LISTING) $@
+$(PATCHED): $(TARGET) $(LISTING) tool/patch.py | $(BUILD_DIR)
+	$(PYTHON) tool/patch.py apply $(TARGET) $(LISTING) $@
 
 patch: $(PATCHED)
 
@@ -297,29 +297,29 @@ patch: $(PATCHED)
 # both bugs this tool has had, and the one worth running after any change
 # to it.
 patch-verify: $(PATCHED)
-	$(PYTHON) tools/patch.py verify $(TARGET) $(PATCHED)
+	$(PYTHON) tool/patch.py verify $(TARGET) $(PATCHED)
 
 # Class C, which cannot be rewritten in place: a stub section is appended and
 # each site becomes a jump into it. Only sites already five bytes or longer
 # are touched -- see project.md, Finding 15, for why the shorter ones are
 # left alone rather than made to fit.
 detour-plan: $(LISTING)
-	$(PYTHON) tools/detour.py plan $(TARGET) $<
+	$(PYTHON) tool/detour.py plan $(TARGET) $<
 
-$(DETOURED): $(TARGET) $(LISTING) tools/detour.py tools/patch.py | $(BUILD_DIR)
-	$(PYTHON) tools/detour.py apply $(TARGET) $(LISTING) $@
+$(DETOURED): $(TARGET) $(LISTING) tool/detour.py tool/patch.py | $(BUILD_DIR)
+	$(PYTHON) tool/detour.py apply $(TARGET) $(LISTING) $@
 
 detour: $(DETOURED)
 
 detour-verify: $(DETOURED) $(LISTING)
-	$(PYTHON) tools/detour.py verify $(TARGET) $(DETOURED) $(LISTING)
+	$(PYTHON) tool/detour.py verify $(TARGET) $(DETOURED) $(LISTING)
 
 # -- measuring the cost ------------------------------------------------------
 
 # What a detour actually costs on this CPU, which is the translation target.
 # NOT part of `check`: it is a timing measurement, so it is slow and its
 # result depends on what else the machine is doing.
-$(BUILD_DIR)/icache_bench: tools/icache_bench.c | $(BUILD_DIR)
+$(BUILD_DIR)/icache_bench: tool/icache_bench.c | $(BUILD_DIR)
 	$(CC) -O2 -std=c11 -Wall -Wextra -o $@ $<
 
 bench: $(BUILD_DIR)/icache_bench
@@ -329,17 +329,17 @@ bench: $(BUILD_DIR)/icache_bench
 # many loop bodies contain one. Static structure only -- it cannot say which
 # loops execute.
 placement: $(LISTING)
-	$(PYTHON) tools/placement.py report $(TARGET) $<
+	$(PYTHON) tool/placement.py report $(TARGET) $<
 
 # Reconcile what survives against what the rewriter declined, by comparing
 # address sets rather than totals.
 census: $(LISTING) $(DETOURED)
 	objdump -d -j .text $(DETOURED) > $(BUILD_DIR)/after.asm
-	$(PYTHON) tools/detour.py census $(TARGET) $(LISTING) $(BUILD_DIR)/after.asm
+	$(PYTHON) tool/detour.py census $(TARGET) $(LISTING) $(BUILD_DIR)/after.asm
 
 # Which of the sites .pdata refuses to vouch for are real leaf functions.
 outside: $(LISTING)
-	$(PYTHON) tools/outside.py report $(TARGET) $<
+	$(PYTHON) tool/outside.py report $(TARGET) $<
 
 # -- the end-to-end test, on PEs this project builds itself ------------------
 
@@ -377,16 +377,16 @@ EXTRA_PES  = $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
              $(BUILD_DIR)/pe-unwindspill.exe $(BUILD_DIR)/pe-unwindspill.asm
 .SECONDARY: $(PE_LISTINGS) $(EXTRA_PES)
 
-$(BUILD_DIR)/pe-%.exe: tools/pe_build.py | $(BUILD_DIR)
-	$(PYTHON) tools/pe_build.py sample $* $@
+$(BUILD_DIR)/pe-%.exe: tool/pe_build.py | $(BUILD_DIR)
+	$(PYTHON) tool/pe_build.py sample $* $@
 
 $(BUILD_DIR)/pe-%.asm: $(BUILD_DIR)/pe-%.exe
 	objdump -d -j .text $< > $@
 
 $(BUILD_DIR)/sse-%.exe: $(BUILD_DIR)/pe-%.exe $(BUILD_DIR)/pe-%.asm \
-                           tools/detour.py tools/patch.py tools/outside.py \
-                           tools/scratch.py tools/targets.py tools/lower.py
-	$(PYTHON) tools/detour.py apply $(BUILD_DIR)/pe-$*.exe \
+                           tool/detour.py tool/patch.py tool/outside.py \
+                           tool/scratch.py tool/targets.py tool/lower.py
+	$(PYTHON) tool/detour.py apply $(BUILD_DIR)/pe-$*.exe \
 	          $(BUILD_DIR)/pe-$*.asm $@
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
@@ -407,7 +407,7 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 	@set -e; \
 	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
 	for name in $(PE_NAMES); do \
-		want=`$(PYTHON) tools/pe_build.py names | \
+		want=`$(PYTHON) tool/pe_build.py names | \
 		      awk -v n=$$name '$$1 == n { print $$2 }'`; \
 		$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-$$name.exe \
 			>/dev/null 2>&1 && new=0 || new=$$?; \
@@ -446,10 +446,10 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
 	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
-	want=`$(PYTHON) tools/pe_build.py names | \
+	want=`$(PYTHON) tool/pe_build.py names | \
 	      awk '$$1 == "spill" { print $$2 }'`; \
 	for mode in none stack pool; do \
-		$(PYTHON) tools/detour.py --spill=$$mode apply \
+		$(PYTHON) tool/detour.py --spill=$$mode apply \
 			$(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 			$(BUILD_DIR)/sse-spill-$$mode.exe >/dev/null; \
 		$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-spill-$$mode.exe \
@@ -468,10 +468,10 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 		fi; \
 	done; \
 	echo "check-spill: none refuses; stack and pool both give the register back"; \
-	want=`$(PYTHON) tools/pe_build.py names | \
+	want=`$(PYTHON) tool/pe_build.py names | \
 	      awk '$$1 == "homespill" { print $$2 }'`; \
 	for mode in none home; do \
-		$(PYTHON) tools/detour.py --spill=$$mode apply \
+		$(PYTHON) tool/detour.py --spill=$$mode apply \
 			$(BUILD_DIR)/pe-homespill.exe $(BUILD_DIR)/pe-homespill.asm \
 			$(BUILD_DIR)/sse-homespill-$$mode.exe >/dev/null; \
 		$(WINE_ENV) timeout 120 wine \
@@ -512,7 +512,7 @@ check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe \
 	@set -e; \
 	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
 	for name in unwind unwindstub; do \
-		want=`$(PYTHON) tools/pe_build.py names | \
+		want=`$(PYTHON) tool/pe_build.py names | \
 		      awk -v n=$$name '$$1 == n { print $$2 }'`; \
 		$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-$$name.exe \
 			>/dev/null 2>&1 && got=0 || got=$$?; \
@@ -521,10 +521,10 @@ check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe \
 			echo "check-unwind: $$name changed behaviour"; exit 1; \
 		fi; \
 	done; \
-	$(PYTHON) tools/detour.py --spill=stack apply \
+	$(PYTHON) tool/detour.py --spill=stack apply \
 		$(BUILD_DIR)/pe-unwindspill.exe $(BUILD_DIR)/pe-unwindspill.asm \
 		$(BUILD_DIR)/sse-unwindspill.exe >/dev/null; \
-	want=`$(PYTHON) tools/pe_build.py names | \
+	want=`$(PYTHON) tool/pe_build.py names | \
 	      awk '$$1 == "unwindspill" { print $$2 }'`; \
 	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-unwindspill.exe \
 		>/dev/null 2>&1 && got=0 || got=$$?; \
@@ -539,17 +539,17 @@ check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe \
 # by enumerating paths rather than intersecting sets. Needs the listing, so
 # it cannot live in `check`.
 scratch-check: $(LISTING)
-	$(PYTHON) tools/scratch.py check $< $(TARGET)
+	$(PYTHON) tool/scratch.py check $< $(TARGET)
 
 # -- git hooks ---------------------------------------------------------------
 
-# The hook lives in tools/hooks/ rather than only in .git/hooks so that it
+# The hook lives in tool/hooks/ rather than only in .git/hooks so that it
 # survives a clone and can be diffed against its siblings. An untracked hook
 # enforces a rule nobody can see.
 hooks:
 	@test -d .git || { echo "hooks: not a git repository" >&2; exit 1; }
-	@install -m 0755 tools/hooks/commit-msg .git/hooks/commit-msg
-	@echo "hooks: commit-msg installed from tools/hooks/"
+	@install -m 0755 tool/hooks/commit-msg .git/hooks/commit-msg
+	@echo "hooks: commit-msg installed from tool/hooks/"
 
 # -- cleaning ----------------------------------------------------------------
 

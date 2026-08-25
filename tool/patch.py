@@ -358,7 +358,7 @@ def classify(mnemonic, vex, operands, direct, nds):
 	and a three-operand one whose first source is xmm0 have the same bits
 	there, and only the opcode says which is which.
 
-	So the form comes from the operand list, which is what tools/lower.py
+	So the form comes from the operand list, which is what tool/lower.py
 	uses and what the disassembler already worked out.
 	"""
 	if mnemonic == "vzeroupper":
@@ -391,7 +391,7 @@ def classify(mnemonic, vex, operands, direct, nds):
 
 
 def load_tables():
-	"""The mnemonic tables from tools/lower.py, so there is one authority."""
+	"""The mnemonic tables from tool/lower.py, so there is one authority."""
 	sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 	import lower
 	return lower.DIRECT_MNEMONICS, lower.NDS_MNEMONICS

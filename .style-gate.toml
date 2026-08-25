@@ -1,4 +1,4 @@
-# Configuration for tools/style_gate.py -- see code-style.md.
+# Configuration for tool/style_gate.py -- see code-style.md.
 #
 # Nothing here changes the rules. It says which files in *this* tree they
 # apply to.

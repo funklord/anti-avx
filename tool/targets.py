@@ -4,7 +4,7 @@
 A detour that widens its window past the instruction it replaces needs to
 know that nothing enters the window part-way through. Direct branches are
 in the disassembly. Indirect ones are not, and "cannot enumerate them" is
-what stopped tools/detour.py at the four-byte sites.
+what stopped tool/detour.py at the four-byte sites.
 
 They can mostly be enumerated, from four sources, and the interesting part
 is which of them is sound:

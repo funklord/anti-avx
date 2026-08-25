@@ -16,7 +16,7 @@ claim the whole project rests on.
 
 There is no mingw here, so the PE is assembled with `as` and wrapped by
 hand. That is less of a detour than it sounds: the file format work already
-exists in tools/detour.py, which appends a section to a 102 MB PE without
+exists in tool/detour.py, which appends a section to a 102 MB PE without
 disturbing it, and the headers below are the same fields read from the other
 side.
 
@@ -669,7 +669,7 @@ source:	.long 1, 2, 3, 4
 #
 # The last lowering with no executable case, and the reason is structural:
 # it reads its permute constants from the stub section's pool through a
-# RIP-relative displacement, so tools/lowering_cases.py cannot generate it --
+# RIP-relative displacement, so tool/lowering_cases.py cannot generate it --
 # that generator emits `.byte` and cannot know where the assembler will put
 # them. A whole PE can, because the rewriter lays the pool down itself.
 #

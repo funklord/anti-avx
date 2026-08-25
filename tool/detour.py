@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Detours: a stub section, and a jump at every site that will not fit.
 
-tools/patch.py rewrites the sites whose SSE form is no longer than the VEX
+tool/patch.py rewrites the sites whose SSE form is no longer than the VEX
 one. Everything else that HAS a lowering comes here -- Class C by
 construction, and the class A and B sites whose SSE encoding happens to be
 one byte longer. Class C is the obvious case -- `vaddss %xmm2,%xmm1,%xmm0` is four bytes
@@ -12,7 +12,7 @@ live somewhere else and the site has to jump to it.
 one leaves both its start and its end address exactly where they were, and
 no address changes meaning. The four-byte register-to-register forms have to
 swallow a neighbour to make room, which is safe only where nothing can
-branch to the address that ends up inside the window. tools/targets.py
+branch to the address that ends up inside the window. tool/targets.py
 enumerates what can be branched to, including the switch tables that hold
 table-relative offsets no relocation records.
 
@@ -2138,7 +2138,7 @@ def upper_half_read_later(instructions, index, register, limit=40,
 			# stops at one to reach anything.
 			return False
 		if mnemonic.startswith(CONTROL_PREFIXES):
-			# **Follow the edges, exactly as tools/scratch.py does, and for
+			# **Follow the edges, exactly as tool/scratch.py does, and for
 			# the same reason: stopping here was the largest single bucket.**
 			# 2,617 of the 5,200 refused pairs stopped at a branch, against
 			# 1,052 that genuinely read the register.
@@ -2547,7 +2547,7 @@ def collect(binary, listing):
 	# The code oracle, in two parts. .pdata is the binary's own statement
 	# about where its functions are and needs no disassembly to read, but the
 	# x64 ABI lets a leaf function omit its unwind data -- and refusing those
-	# was the largest single reason sites survived. tools/outside.py recovers
+	# was the largest single reason sites survived. tool/outside.py recovers
 	# them, under conditions strict enough that data cannot pass: bracketed
 	# by int3, entered by a call or jump, ending in a control transfer, and
 	# containing no byte objdump failed to decode.
@@ -2805,7 +2805,7 @@ def collect(binary, listing):
 		# A sequence may need somewhere to put an intermediate. Ask the
 		# liveness scan; a site with no dead register is left alone rather
 		# than spilled, because a stub that moves rsp breaks stack walking
-		# (see tools/scratch.py).
+		# (see tool/scratch.py).
 		# A Class C site whose src2 IS the destination needs one too, for the
 		# reason spelled out in lower_vex: the movaps that sets up the
 		# destination would destroy src2 first.

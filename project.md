@@ -86,7 +86,7 @@ to code, and the DRM demonstrably never encrypted `.text`.
 ### Re-measurement by an independent method
 
 Milestone 0 was counted with `grep -P "\tv[a-z0-9]+ "`, which identifies VEX by **how
-the mnemonic is spelled**. `tools/vex_scan.py` re-counts by **the encoding bytes** — a
+the mnemonic is spelled**. `tool/vex_scan.py` re-counts by **the encoding bytes** — a
 leading `C4` or `C5`, which in 64-bit mode cannot be `LES`/`LDS` and is therefore
 unambiguously a VEX prefix. Re-running the same grep would have been one witness
 counted twice; this is a genuinely separate question being asked of the same bytes.
@@ -123,7 +123,7 @@ Reproduce with:
 
 ```bash
 objdump -d -j .text Starfield-unpacked.exe > text.asm    # ~0.9 GB, ~30 s
-python3 tools/vex_scan.py text.asm                       # ~75 s, ~1.1 GB RSS
+python3 tool/vex_scan.py text.asm                       # ~75 s, ~1.1 GB RSS
 ```
 
 or `make scan`, which writes both into `$(BUILD_DIR)` and is what `make clean`
@@ -326,7 +326,7 @@ ymm definitions                    13,097
 
 **Y2 cannot be deleted from the design** — 574 is not zero. But it is 574, and 390 of
 them are `vmovups`, so the shadow path is a narrow, enumerable special case rather
-than a pervasive one. The full address list is what `tools/vex_scan.py` prints; a
+than a pervasive one. The full address list is what `tool/vex_scan.py` prints; a
 representative site is `0x140311b2e`, where `vmovups 0xd0(%rsp),%ymm1/2/3` is followed
 by `jmp 0x140311bd3` and the values are consumed in the target block.
 
@@ -438,7 +438,7 @@ straight to 256-bit splitting, with no Class D term at all. Corrected below.
 
 ### Finding 10 — the binary needs F16C, which is not a re-encoding problem
 
-`tools/lower.py` carries a rule for every VEX mnemonic and reports what it cannot
+`tool/lower.py` carries a rule for every VEX mnemonic and reports what it cannot
 cover. Over all 804,951 VEX sites:
 
 ```
@@ -630,7 +630,7 @@ because it bears on whether a *correct* round-trip is achievable at all, and the
 - **Ddisasm 1.9.5 runs on this host**, unpacked from GrammaTech's `focal` packages
   into a scratch prefix with no root. It needs Ubuntu 20.04 Boost 1.71 and
   `libprotobuf17`, which Debian 13 does not have; those come from the Ubuntu archive.
-  `tools/run_ddisasm.sh` runs it under `prlimit` and a `timeout`.
+  `tool/run_ddisasm.sh` runs it under `prlimit` and a `timeout`.
 - **Loading the 102 MB PE is not the problem.** With `-n` (no analysis) it parses in
   1.2 s using 408 MB and writes a 130 MB GTIRB. The cost is entirely in the analysis.
 - **The round trip works end to end on small PEs.** `start.exe` (300 KB) goes to
@@ -783,7 +783,7 @@ and the import directory are all still correct *because they were never touched*
 output is the same size as the input and byte-identical outside the rewritten
 instructions.
 
-`tools/patch.py`, `make patch`. Verified on the real binary:
+`tool/patch.py`, `make patch`. Verified on the real binary:
 
 ```
 size unchanged                       102,242,144 bytes
@@ -839,7 +839,7 @@ the lowering rules and their tests, not on this tool.
 
 ### Finding 15 — Class C by detour, and where it has to stop
 
-Class C cannot be rewritten in place: four bytes become seven. `tools/detour.py`
+Class C cannot be rewritten in place: four bytes become seven. `tool/detour.py`
 appends a stub section and turns each site into a jump into it.
 
 ```
@@ -915,7 +915,7 @@ Nothing here has been executed, and the invariants remain structural.
 Finding 15 stopped at the 91,039 four-byte Class C sites because widening a detour
 window past the instruction it replaces needs to know nothing branches into the
 window, and indirect branches are not in the disassembly. They can largely be
-enumerated, and `tools/targets.py` does it from four sources:
+enumerated, and `tool/targets.py` does it from four sources:
 
 ```
 .reloc  (absolute pointers)      91,617   COMPLETE, not a heuristic
@@ -1066,7 +1066,7 @@ destination lives in vvvv, and data.
 ### Finding 18 — a scratch register, without touching the stack
 
 Hard part 5 is where to get a scratch for the multi-instruction sequences.
-`tools/scratch.py` answers it, and the first thing to say is what it does **not** do.
+`tool/scratch.py` answers it, and the first thing to say is what it does **not** do.
 
 **Spilling to the stack is the obvious answer and it is wrong here.** Win64 has no red
 zone, so a stub would have to move `rsp` — and the stubs live in a section with no
@@ -1304,7 +1304,7 @@ model the front end at all, and the fair objection to the whole approach is that
 instruction-cache behaviour than they do in issue slots.
 
 That is measurable here, and unusually directly: **this machine is the target**, a
-Xeon X5675 with a 32 KB 4-way L1i. `tools/icache_bench.c` generates the same loop
+Xeon X5675 with a 32 KB 4-way L1i. `tool/icache_bench.c` generates the same loop
 twice at run time -- once straight, once with every Nth adjacent pair replaced by a
 jump into a stub that performs the pair and jumps back, which is the widened-window
 shape of Finding 16 -- with the stubs mapped 64 MB away so they share no page and no
@@ -1358,7 +1358,7 @@ detour taken once and never again pays a cold miss this does not model.
 
 Finding 22 measured what a detour costs and could not say where they fall. Execution
 counts need the game running, but the structure is in the binary and carries most of
-the question. `tools/placement.py`, `make placement`.
+the question. `tool/placement.py`, `make placement`.
 
 **Four fifths of the code is untouched.** Weighting by instructions rather than
 counting functions, because the dense ones are small:
@@ -1436,7 +1436,7 @@ and how many were objdump walking into data. **The two need opposite work**: a l
 function's VEX must be lowered, and a constant pool that happens to decode as VEX
 must be left alone, because "patching" it corrupts the data.
 
-`tools/outside.py`, `make outside`, answers it. The first attempt got it wrong in a
+`tool/outside.py`, `make outside`, answers it. The first attempt got it wrong in a
 way worth recording: it grouped each run of non-`.pdata` instructions and tested
 whether anything branched to the run's *first* address. But MSVC pads between
 functions with `int3`, so a run begins with padding, and every genuine leaf function
@@ -1735,7 +1735,7 @@ comes from GCC compiling the equivalent SSE intrinsic: a different encoder, a
 different register allocator, and no knowledge of what this project believes the
 answer to be.
 
-`tools/lowering_cases.py` generates the cases from `detour.lower_vex` itself, so they
+`tool/lowering_cases.py` generates the cases from `detour.lower_vex` itself, so they
 cannot drift from what the rewriter emits, and `test/lowering_test.c` runs them.
 37 mnemonics across three operand shapes -- `distinct`, `dst_is_src1` and
 `dst_is_src2`, that last being the Finding 25 case -- give 111 cases and 888
@@ -1800,7 +1800,7 @@ original    exit 29     0x1D, the low byte of STATUS_ILLEGAL_INSTRUCTION
 rewritten   exit 169    the answer
 ```
 
-`make check-pe`, five seconds from clean. There is no mingw here, so `tools/pe_build.py`
+`make check-pe`, five seconds from clean. There is no mingw here, so `tool/pe_build.py`
 assembles with `as` and writes the headers itself -- less of a detour than it sounds,
 since `detour.py` already appends a section to a 102 MB PE without disturbing it, and
 these are the same fields read from the other side. No imports and no relocations:
@@ -2057,7 +2057,7 @@ place every path funnels through, and a caller that wants a 128-bit encoding out
 256-bit source -- which is exactly what a Y strategy does -- must now say so by
 clearing `L` and asking for one half at a time. Silence is not consent.
 
-`tools/lowering_cases.py` carries nine 256-bit forms it asserts are *refused*,
+`tool/lowering_cases.py` carries nine 256-bit forms it asserts are *refused*,
 checked when the cases are generated, so the hole the fixtures left is closed by the
 fixtures.
 
@@ -2372,7 +2372,7 @@ an overlap or to an operand that cannot be offset, which is why that counter wen
 424 to 537.
 
 **2,617 pairs still stop at a branch**, and that is now the largest single bucket in the
-pair rule. `tools/scratch.py` already follows edges without building a CFG -- an
+pair rule. `tool/scratch.py` already follows edges without building a CFG -- an
 unconditional jump has one successor, a conditional has two and the answer is the
 intersection -- and the same traversal answers this question. It is the obvious next
 increment on Class Y, and it is a bigger change than this one because the walker is
@@ -2381,7 +2381,7 @@ written around register sets rather than around a single yes/no.
 ### Finding 42 -- the same edges, followed twice
 
 Finding 41 left 2,617 pairs stopping at a branch, and named the fix rather than making
-it: `tools/scratch.py` already follows edges without building a CFG, and Finding 27
+it: `tool/scratch.py` already follows edges without building a CFG, and Finding 27
 had already measured that following them was worth almost everything while widening the
 window was worth almost nothing. The second scan needed the same answer.
 
@@ -2630,7 +2630,7 @@ could not decode.
 Finding 18. Building the alternatives rather than arguing about them turned the question
 inside out.
 
-`tools/detour.py --spill=none|stack|pool` selects where a borrowed register is saved.
+`tool/detour.py --spill=none|stack|pool` selects where a borrowed register is saved.
 It is an evaluation switch and not a tuning knob: **the default refuses the site, as it
 always has**, and the other two exist so that all three can be built and run.
 
@@ -3203,7 +3203,7 @@ the compiler decides which operand of a commutative multiply becomes the destina
 SSE returns the **destination's** NaN when both are NaN. That choice cannot be pinned from
 the source, so a lane where both sides are NaN is not evidence and is reported rather than
 failed. Eleven of them. Every other lane is still compared exactly, which is what keeps
-the ordering under test. `tools/f16c_oracle.py` and `test/fmaddsub_test.c` already draw
+the ordering under test. `tool/f16c_oracle.py` and `test/fmaddsub_test.c` already draw
 the line in the same place.
 
 #### The stale artifact, which is a new shape of an old lesson
@@ -3259,7 +3259,7 @@ What exists instead is `make check-permil`, which is exhaustive over all 256 con
 but it tests `src/permil.c`, the reference implementation, **not the bytes the rewriter
 emits**. That distinction is the whole subject of Findings 54 to 57, so it is written down
 rather than left to be rediscovered. Closing it means either a harness that assembles the
-lowering from text rather than bytes, or a PE program of the kind `tools/pe_build.py`
+lowering from text rather than bytes, or a PE program of the kind `tool/pe_build.py`
 already builds -- the second is cheaper and is where the 256-bit strategies are tested.
 
 ### Finding 58 -- the remaining stores are copies, not computations
@@ -3355,7 +3355,7 @@ avoid. That is the honest price of the last large-looking bucket.
 ### Finding 60 -- the last lowering nothing had executed
 
 `vpermilps` with a variable control, inlined rather than called (Finding 20). Finding 57
-named it as the one sequence `tools/lowering_cases.py` cannot reach, and the reason is
+named it as the one sequence `tool/lowering_cases.py` cannot reach, and the reason is
 structural rather than awkward: the lowering reads its permute constants from the stub
 section's pool through a RIP-relative displacement, and that generator emits `.byte` --
 it cannot know where the assembler will place them, so it cannot compute the
@@ -4121,7 +4121,7 @@ missed fallback -- as though the run strategy had claimed a site the pair could 
 
 **It is not, and the code says so above the loop.** The pair is tried *first*, precisely
 because it needs no helper; the run is the fallback for the pair rather than the other way
-round, and `collect` says as much at `tools/detour.py:1620`. What the run's `continue`
+round, and `collect` says as much at `tool/detour.py:1620`. What the run's `continue`
 discards is not the pair strategy -- that has already run and failed -- but the pair's
 **reason**, which the same comment promises to keep: "its reason is held back and only
 recorded if the run declines too". It is not. All four run-decline branches record their
@@ -4208,7 +4208,7 @@ Recorded here rather than left as an open lead, so it does not get had as an ide
 
 #### The labelling defect is real, and it is a different change
 
-`collect` states the intended behaviour at `tools/detour.py:1620` -- "its reason is held
+`collect` states the intended behaviour at `tool/detour.py:1620` -- "its reason is held
 back and only recorded if the run declines too" -- and does not do it. All four
 run-decline branches record their own reason and `continue`, and the held-back one goes
 with them.
@@ -5822,7 +5822,7 @@ code quickly.
 
    What follows is kept because it is what was decided against and why.
 
-   Spilling was rejected in `tools/scratch.py` because the stub section has no
+   Spilling was rejected in `tool/scratch.py` because the stub section has no
    `.pdata`, so `RtlVirtualUnwind` treats a stub as a leaf and reads the frame from an
    `rsp` the spill has moved. **That is true and it is misattributed**: a stub is
    entered by a jump, so `[rsp]` was never a return address, and `make check-unwind`
@@ -5866,7 +5866,7 @@ placement.py      where detours land; icache_bench.c what they cost
 
 ### Practical things that cost time to learn
 
-- **Delete `tools/__pycache__` before trusting a source revert.** Python validates a
+- **Delete `tool/__pycache__` before trusting a source revert.** Python validates a
   cached `.pyc` on the source file's size and mtime, so a same-length edit reverted
   within the same second keeps executing the old bytecode -- and `git diff` is empty,
   and `inspect.getsource` reads the file rather than the code object, so both corroborate
@@ -6049,7 +6049,7 @@ vsubss %xmm0,%xmm1,%xmm0   →  movaps %xmm1,%xmmT
 `MAXSS(a,b)` returns `b` when either operand is NaN and when both are zeros of
 opposite sign, so it is *not* commutative at precisely the inputs clamping code hits.
 Treating it as commutative is a silent wrong answer that survives ordinary testing.
-The full non-commutative inventory is in `tools/vex_scan.py`'s output.
+The full non-commutative inventory is in `tool/vex_scan.py`'s output.
 
 ### Class D — no direct SSE form
 
@@ -6523,7 +6523,7 @@ crash and the rewritten one must work" is a real experiment rather than a wish. 
 is also why every reference has to come from somewhere other than the original
 instruction.
 
-The absence of mingw is why `tools/pe_build.py` writes PE headers by hand rather
+The absence of mingw is why `tool/pe_build.py` writes PE headers by hand rather
 than compiling with MSVC or a cross-compiler.
 
 ### What each check proves, and what it does not
@@ -6602,9 +6602,9 @@ crash at an unpredictable moment.
 | # | Deliverable | Proves | Status |
 |---|---|---|---|
 | 0 | Full VEX inventory across all 58 MB of `.text` | Scope | **DONE** — see Measurements |
-| 0.5 | Operand-level re-measurement on the unpacked binary (`tools/vex_scan.py`) | Lowering rules can be costed and scoped from measured operand shapes, not a mnemonic histogram | **DONE** — Findings 5-8 |
-| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tools/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. Class A/B/C lowerings are now **executed** and checked against GCC's SSE intrinsics (Finding 31), which is the differential harness this row asked for, minus the AVX host: the reference is the compiler rather than the original instruction, because no AVX exists here to run. |
-| 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tools/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
+| 0.5 | Operand-level re-measurement on the unpacked binary (`tool/vex_scan.py`) | Lowering rules can be costed and scoped from measured operand shapes, not a mnemonic histogram | **DONE** — Findings 5-8 |
+| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tool/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. Class A/B/C lowerings are now **executed** and checked against GCC's SSE intrinsics (Finding 31), which is the differential harness this row asked for, minus the AVX host: the reference is the compiler rather than the original instruction, because no AVX exists here to run. |
+| 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
 | 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **793,722 of 805,131 VEX sites, 98.6%** (Findings 24 to 95), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
@@ -6703,7 +6703,7 @@ the project's largest risk.
   reference, and that reference checked against CPython's binary16. The one part
   still unverified is NaN *payload* behaviour, which needs F16C hardware — see
   Finding 10.
-- **New: the differential harness still has no AVX host.** `tools/lower.py verify`
+- **New: the differential harness still has no AVX host.** `tool/lower.py verify`
   proves the emitted SSE assembles and contains no VEX; it does **not** prove the
   SSE computes what the VEX did. That needs either a machine with AVX or a software
   model of the VEX semantics, and until one exists milestone 1 is only half done.

@@ -10,7 +10,7 @@
  *
  *   2. The scalar reference agrees with something nobody here wrote. That
  *      cannot be settled inside this file; `--dump-h2f` prints every
- *      conversion so tools/f16c_oracle.py can compare them against
+ *      conversion so tool/f16c_oracle.py can compare them against
  *      CPython's own binary16 support. Two implementations by one author
  *      are one witness, however exhaustively they agree.
  *
