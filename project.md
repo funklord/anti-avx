@@ -213,7 +213,7 @@ this is where it breaks.
 `vfmaddsub231ps` (14) and `vfmsubadd231ps` (14) *alternate* add and subtract across
 the lanes of one vector. A `mulps` + `addps` sequence computes the wrong thing for
 half the elements, silently. Lowering them with the Class F sequence is a correctness
-bug, not a precision one — `tests/fmaddsub_test.c` demonstrates it rather than
+bug, not a precision one — `test/fmaddsub_test.c` demonstrates it rather than
 asserting it, by keeping the naive sequence around and checking it differs on exactly
 the two even lanes.
 
@@ -1736,7 +1736,7 @@ different register allocator, and no knowledge of what this project believes the
 answer to be.
 
 `tools/lowering_cases.py` generates the cases from `detour.lower_vex` itself, so they
-cannot drift from what the rewriter emits, and `tests/lowering_test.c` runs them.
+cannot drift from what the rewriter emits, and `test/lowering_test.c` runs them.
 37 mnemonics across three operand shapes -- `distinct`, `dst_is_src1` and
 `dst_is_src2`, that last being the Finding 25 case -- give 111 cases and 888
 executions. `make check-lowering`.
@@ -3203,7 +3203,7 @@ the compiler decides which operand of a commutative multiply becomes the destina
 SSE returns the **destination's** NaN when both are NaN. That choice cannot be pinned from
 the source, so a lane where both sides are NaN is not evidence and is reported rather than
 failed. Eleven of them. Every other lane is still compared exactly, which is what keeps
-the ordering under test. `tools/f16c_oracle.py` and `tests/fmaddsub_test.c` already draw
+the ordering under test. `tools/f16c_oracle.py` and `test/fmaddsub_test.c` already draw
 the line in the same place.
 
 #### The stale artifact, which is a new shape of an old lesson
@@ -6216,7 +6216,7 @@ pshufb <that>,data                the permute itself
 > position 7, and `pshufb` reads bit 7 of a control byte as *write zero here* — so an
 > element whose control happened to hold 32 comes back zeroed instead of permuted.
 > This is verified by mutation rather than by argument: building the helper with the
-> mask removed makes `tests/permil_test.c` fail on exactly the `0x20` and `0xfffffffc`
+> mask removed makes `test/permil_test.c` fail on exactly the `0x20` and `0xfffffffc`
 > control patterns, which is the check being shown to be worth something.
 
 Verification (`make check-permil`) is **exhaustive over the permutation space** —

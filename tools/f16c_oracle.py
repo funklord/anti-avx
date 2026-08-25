@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the scalar F16C reference against an implementation nobody here wrote.
 
-`tests/f16c_test.c` proves the vector code and the scalar reference agree
+`test/f16c_test.c` proves the vector code and the scalar reference agree
 across the entire input space. That is worth having and it is not enough:
 both were written by the same hand in the same afternoon, so however
 exhaustively they agree they are one witness, not two. If the reference

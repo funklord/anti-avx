@@ -162,7 +162,7 @@ check-isa: $(OBJS)
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/%.o: tests/%.c | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: test/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/f16c_test: $(BUILD_DIR)/f16c_test.o $(BUILD_DIR)/f16c.o
@@ -189,7 +189,7 @@ $(BUILD_DIR)/lowering_cases.inc: $(BUILD_DIR)/lowering_cases.s
 
 # -I$(BUILD_DIR) so the generated table is found; the .inc is an order-only
 # prerequisite of nothing, so it is named here to force generation first.
-$(BUILD_DIR)/lowering_test.o: tests/lowering_test.c \
+$(BUILD_DIR)/lowering_test.o: test/lowering_test.c \
                               $(BUILD_DIR)/lowering_cases.inc | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) -I$(BUILD_DIR) $(CFLAGS) -c -o $@ $<
 

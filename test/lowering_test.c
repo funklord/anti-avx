@@ -558,7 +558,7 @@ static __m128i ref_fnmadd231ss(__m128i d, __m128i a, __m128i b)
  * So a lane where both sides are NaN is not evidence of anything, and is not
  * counted. Every other lane is still compared exactly, which is what keeps
  * the ordering under test: get 132 and 231 the wrong way round and ordinary
- * numbers disagree at once. tools/f16c_oracle.py and tests/fmaddsub_test.c
+ * numbers disagree at once. tools/f16c_oracle.py and test/fmaddsub_test.c
  * already draw the line in the same place.
  */
 static int nan_equivalent(const __m128i *got, const __m128i *want, int lane)

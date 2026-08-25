@@ -61,7 +61,7 @@ tools/placement.py      where detours land; icache_bench.c what they cost
 src/f16c.c              software half-precision conversion, since Westmere
                         has no F16C
 src/fmaddsub.c          alternating-lane FMA, src/permil.c, src/permd.c
-tests/                  the C tests for those, and lowering_test.c, which
+test/                  the C tests for those, and lowering_test.c, which
                         executes the rewriter's own lowerings
 ```
 

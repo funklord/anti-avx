@@ -51,7 +51,7 @@ import patch as inplace
 # Mnemonics with a direct SSE form, chosen to cover what can go wrong rather
 # than to be exhaustive: commutative and not, scalar and packed, single and
 # double, float and integer, with an immediate and without. Every one needs
-# a reference in tests/lowering_test.c or the test fails rather than skips.
+# a reference in test/lowering_test.c or the test fails rather than skips.
 CASES = [
 	"vaddss", "vaddps", "vaddsd", "vaddpd",
 	"vsubss", "vsubps", "vsubsd", "vsubpd",

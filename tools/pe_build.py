@@ -62,7 +62,7 @@ CODE = 0xE0000020		# CODE | EXECUTE | READ | WRITE
 DATA = 0x40000040		# INITIALIZED_DATA | READ
 
 # The programs. Each exists to exercise a piece of the REWRITER, not to
-# vary the arithmetic -- tests/lowering_test.c already executes the lowerings
+# vary the arithmetic -- test/lowering_test.c already executes the lowerings
 # themselves across 37 mnemonics. What only a whole binary can test is the
 # machinery around them: windows, branch targets, RIP displacements moved
 # into a stub, and the code oracle deciding what is code.
@@ -170,7 +170,7 @@ ten:	.float 10.0
 # It also proves the ORDER inside the lowering. Emitting the low half last
 # is what leaves the register holding the low sixteen bytes; get it backwards
 # and this still copies correctly, so the program is deliberately not the
-# whole test -- tests/lowering_test.c cannot reach ymm at all, and the
+# whole test -- test/lowering_test.c cannot reach ymm at all, and the
 # ordering argument is carried by lower_ymm_pair's comment and Finding 38.
 PROGRAMS["ymm"] = (91, """
 	.text

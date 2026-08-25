@@ -744,7 +744,7 @@ def lower_fma(match, registers, notes):
 		# The obvious alternative is to negate the addend and reuse
 		# addsubps, since IEEE 754 makes a - b and a + (-b) the same
 		# operation, signed zeros included. **That is wrong, and it was
-		# caught by tests/fmaddsub_test.c rather than by reasoning.** The
+		# caught by test/fmaddsub_test.c rather than by reasoning.** The
 		# negation is a sign-bit flip across the whole register, and a NaN
 		# has a sign bit too; x86 propagates a source NaN with its sign
 		# preserved, so a NaN addend came out as ffc00000 where the

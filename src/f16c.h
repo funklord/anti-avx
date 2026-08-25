@@ -13,7 +13,7 @@
  *   *_sse   the SSE4.1 code the translator emits, four lanes at a time.
  *
  * They are compared exhaustively -- all 65,536 halves for one direction and
- * all 2^32 floats for the other -- by tests/f16c_test.c.
+ * all 2^32 floats for the other -- by test/f16c_test.c.
  *
  * Note on the calling convention: this is the algorithm and its proof, in C.
  * The stub the translator plants in a PE has to follow Win64, so it will be
