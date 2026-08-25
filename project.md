@@ -5864,6 +5864,79 @@ The residue is 10,229 and lives in the skipped tallies rather than the refused o
 live upper half, maintained across a function rather than within a window. That is the
 whole of the remaining work, and it is a design rather than an increment.
 
+### Finding 103 -- the 256-bit representation is smaller than it has been called
+
+Finding 102 closed the refused bucket and said what was left wants "a shadow for every live
+upper half, maintained across a function rather than within a window", calling it a design
+rather than an increment. Scoped, it is much closer to an increment, and the number that
+was making it look large was never measured.
+
+**Almost nothing has 256-bit code, and almost none of it holds more than one value.**
+
+```
+260,729 functions
+  7,355 contain any 256-bit instruction          2.8%
+
+peak simultaneous upper halves, of those 7,355
+  0 live   2,581    35.1%      no ymm destination at all -- the zero idiom
+  1 live   4,026    89.8%
+  2 live     612    98.2%
+  3 live      67    99.1%
+  4+ live    69   100.0%      of which 8 functions reach sixteen
+```
+
+So the representation does not need a register allocator. It needs **one register**, and
+occasionally two.
+
+**And the register is there.** Taking each lifetime from its defining write to its last
+read, ending at the next write to the same register or at a call:
+
+```
+12,878 lifetimes
+  a register is free across it   12,255    95.2%
+  written and never read again      566
+  none free                          57     0.4%
+
+registers free across a lifetime: median 15, 10th percentile 11
+lifetime length: median 3 instructions, 90th 14, max 208
+```
+
+Fifteen of sixteen registers are typically untouched across a span that is usually three
+instructions long.
+
+#### The first measurement of this was wrong, and the ABI said so
+
+It reported 1,892 lifetimes with no register free -- 29% -- because it took a lifetime as
+running to the last MENTION of the register in the function. A function that defines
+`ymm0`, calls something, then redefines and uses `ymm0` again became one long span crossing
+the call, and the span was then charged for every register the call clobbers.
+
+**Win64 makes the upper half of every `ymm` volatile across a call**, so a lifetime that
+appears to span one cannot be a real lifetime in correct code -- it is two, with a
+redefinition between them. The architecture contradicting the measurement is what exposed
+it, which is the rule this project already keeps: a gate that disagrees with something
+known to be true is the first suspect. Bounding lifetimes properly takes the failures from
+1,892 to 57.
+
+#### What the design actually has to solve
+
+Not register pressure. Three things, and only the first is new:
+
+- **A lifetime crosses window boundaries.** `ymm_run` carries an upper half in a helper
+  within one stub; here the stub that lowers the definition must hand the value to a
+  different stub that lowers the read. A register does persist between them -- that is why
+  the shadow works at all -- but nothing today reserves one across that distance, and
+  `free_across` is the check that would have to.
+- **A branch into the middle of a lifetime** breaks the shadow, exactly as it breaks a run.
+  `targets.py` already enumerates what can be branched to and the walk above does not
+  consult it, so the 95.2% is an upper bound until it does.
+- **The 57 with no register free** fall back to the home space or stay refused, which is
+  the same answer every other lever here reached.
+
+The linear walk also ignores control flow within the lifetime, so a value defined on one
+path and read on another is counted as one span. Both simplifications push the figure
+optimistic; neither moves it by the order of magnitude that would change the conclusion.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
