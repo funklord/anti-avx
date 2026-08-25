@@ -5798,6 +5798,72 @@ every case used `cmp`, so it tested nothing and reported nothing. That is the va
 in miniature, inside the very check written to prevent one, and it is how the missing
 `test` case was found -- 391 give-ups with no case covering the mnemonic at all.
 
+### Finding 102 -- the refused bucket is exhausted, and three ideas died proving it
+
+After Finding 101 the refused bucket is 737, and every part of it is now accounted for.
+None of what remains is reachable without the 256-bit register representation.
+
+```
+a displaced instruction will not move                704
+  the aliased form has no usable scratch             385
+  vblendv would not lower                            119
+  no direct SSE form and not a sequence              112
+  256-bit, no Y strategy took it                      83
+the site itself will not lower                        21   all vvvv shifts
+a preceding instruction will not move                 12
+the FMA, broadcast, vvvv shift, vpermilps             17
+```
+
+**The two largest are the same cause.** Splitting each by why its function cannot lend:
+
+```
+                          aliased 385      vblendv 119
+a leaf, nothing reserved          129               44
+an rsp copy not followed          230               49
+the function uses the region       23                9
+no candidate register lowers        0               10
+outside any known function          3                7
+```
+
+A leaf is closed by Finding 49. A function that uses the region is refused correctly. The
+ten that no register lowers are exactly the 256-bit `vblendv` -- there are fourteen in the
+binary and no scratch can help any of them.
+
+**On the 279 "not followed", the honest reading is narrower than the label.**
+`copy_reaches_home` answers True both when it proves a reach and when it gives up, and
+this split cannot tell those apart. What can: after Finding 101 removed `lea`, `cmp` and
+`test`, the largest remaining give-up cause was the conditional move at 463 events, and
+handling it moved **zero** sites. So most of these are functions that genuinely reach their
+home space, and the pointer analysis has stopped being what limits this bucket.
+
+#### Three ideas measured and rejected
+
+**Tracking a copy across a conditional move.** Sound, and strictly better than giving up:
+keeping the copy tracked checks every later dereference, while the alternative value is
+not `rsp`-derived and is covered by the assumption the mechanism already makes for every
+untracked register. Only a move between two tracked copies at different offsets is
+genuinely ambiguous. It eliminated 463 of the 581 remaining give-ups and gained **no
+sites** -- 10,229 before and after, the same detour count, the same buckets -- so it was
+reverted rather than committed. Giving up was already safe; precision there could only buy
+permissiveness, and there was none left to buy.
+
+**A memory `src2` for `vblendv`.** `lower_blendv` declines `modrm.mod != 3` as "not handled
+here", and SSE `blendvps` is specified as `xmm2/m128`, so the refusal is a limitation
+rather than a constraint and the RIP machinery to move such an operand into a stub already
+exists. Measured across every `vblendv` in the binary: 3,558 register-direct, 14 256-bit,
+and **zero with a memory `src2`**. The branch never fires. A lowering written for it would
+have been dead code with a test nothing exercised.
+
+**Re-loading a 256-bit upper half from a read-only source.** Finding 99, twelve sites.
+
+#### What is left
+
+The residue is 10,229 and lives in the skipped tallies rather than the refused ones:
+11,624 `ymm value has no known upper half`, 2,034 `256-bit: arithmetic rather than a copy`,
+858 with no store before arithmetic reaches the value. Every one wants a shadow for each
+live upper half, maintained across a function rather than within a window. That is the
+whole of the remaining work, and it is a design rather than an increment.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
