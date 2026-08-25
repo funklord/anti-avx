@@ -5746,6 +5746,58 @@ nevertheless returns one that lowers. Reverting to a single candidate makes it r
 the borrow found no register at all, so it guards the behaviour instead of describing it.
 The encoding it uses was assembled rather than hand-written.
 
+### Finding 101 -- most of what "arithmetic" refused was not arithmetic
+
+Finding 96 reported 1,420 starved sites lost because something did arithmetic on a tainted
+copy of `rsp` that was not an immediate `add`/`sub`, and Finding 98 took that as the
+analysis meeting a real limit. It was not one. Asking WHICH arithmetic, by wrapping
+`immediate_step` rather than walking beside it:
+
+```
+lea       2,959          xchg      15          add        5
+test        391          xor       15          sub        4
+cmp         162          cmove     12          inc        3
+vpextrq      42          imul       8          ... 26 mnemonics in all
+```
+
+**None of the top three is arithmetic on a pointer.** `cmp` and `test` write no register
+at all -- they set flags -- so a copy in what looks like their destination operand survives
+them untouched, and reading that operand as a write gave up on 553 functions doing nothing
+to the pointer. `lea` fully overwrites its destination exactly as `mov` does, so it ends a
+pointer's life rather than deriving from it; missing from the kill list, it aborted the
+walk 2,959 times, by a wide margin the largest single cause.
+
+The rule that was missing is **does the instruction read its destination**. `add`, `sub`,
+`and`, `inc` and `imul` do, and derive. `mov`, `lea`, `pop` and `vpextrq` do not, and kill.
+`cmp` and `test` write nothing at all.
+
+```
+VEX in .text     10,519 ->  10,229      794,902 removed, 98.7%
+detours         199,864 -> 200,017
+refused             773 ->     737
+  the aliased form has no usable scratch    415 -> 385
+```
+
+**290 sites, and the refusal buckets understate it.** The walk used to abort at the first
+`lea`, which in most prologues is early; now it runs on and sometimes finds a reach that
+the abort had been hiding. So the change moves sites in both directions -- some functions
+clear, others are refused for a real reason instead of a bookkeeping one -- and the net is
+what the site count shows. Nothing shipped on the strength of the bug: an abort answered
+"may reach", so everything it touched was refused.
+
+#### The test needs both directions, and one case cannot give them
+
+Giving up and genuinely reaching the region both answer True, so a single `cmp` case would
+pass while the walk was aborting. It takes two: one where the copy stays clear of the
+region, which fails if the walk aborts, and one where it lands inside, which fails if `cmp`
+is treated as a kill instead. Fifteen cases now, and three mutations bite -- `lea` back to
+deriving, `cmp`/`test` read as a write, and `cmp` treated as a kill.
+
+The first attempt at that third mutation removed only the bare `test` from the set while
+every case used `cmp`, so it tested nothing and reported nothing. That is the vacuous pass
+in miniature, inside the very check written to prevent one, and it is how the missing
+`test` case was found -- 391 give-ups with no case covering the mnemonic at all.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

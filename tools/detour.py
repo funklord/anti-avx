@@ -85,6 +85,19 @@ NARROW_TO_WIDE = {"eax": "rax", "ax": "rax", "al": "rax", "ah": "rax",
                   "edi": "rdi", "di": "rdi", "dil": "rdi",
                   "ebp": "rbp", "bp": "rbp", "bpl": "rbp"}
 IMPLICIT_RAX = {"imul", "mul", "idiv", "div", "cqto", "cltq", "cwtl"}
+# **These write no register at all**, only flags, so a copy of `rsp` in what
+# looks like their destination operand survives them untouched. Reading that
+# operand as a write gave up on 553 functions doing nothing to the pointer.
+# Finding 101.
+FLAGS_ONLY = {"test", "testb", "testw", "testl", "testq",
+              "cmp", "cmpb", "cmpw", "cmpl", "cmpq"}
+# **These overwrite their destination without reading it**, so they end a
+# pointer's life rather than deriving another from it, exactly as `mov`
+# does. `lea` missing from here gave up on 2,959 -- the largest single cause
+# by a wide margin, and the reason the first measurement of this analysis
+# read as 1,420 sites lost to arithmetic.
+OVERWRITES = {"lea", "vpextrq", "vpextrd", "movzbl", "movzwl", "movsbl",
+              "movswl", "movslq", "movzbq", "movzwq", "movsbq", "movswq"}
 
 
 def canonical(name):
@@ -990,12 +1003,14 @@ def copy_reaches_home(rows, frame):
 		if len(fields) == 2 and fields[0].startswith("%") \
 				and canonical(fields[0]) in taint and "(" in fields[1]:
 			return True			# stored to memory
-		if fields and fields[-1].startswith("%"):
+		if fields and fields[-1].startswith("%") \
+				and mnemonic not in FLAGS_ONLY:
 			name = fields[-1].lstrip("%")
 			wide = canonical(name)
 			if wide not in taint:
 				taint.pop(wide, None)
 			elif mnemonic.startswith("mov") or mnemonic in ("pop", "popq") \
+					or mnemonic in OVERWRITES \
 					or name in WIDE32 or NUMBERED_NARROW.match(name):
 				del taint[wide]		# overwritten, or zero-extended away
 			else:
@@ -3343,6 +3358,20 @@ REACH_CASES = [
 	("the copy stored to memory",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
 	  ("mov", "%rax,(%rdi)")], True),
+	# `cmp` needs BOTH directions: giving up and reaching the region both
+	# answer True, so a single case would pass while the walk was aborting.
+	("a cmp writes no register, and the copy stays clear of the region",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("cmp", "$0x10,%rax"),
+	  ("mov", "%rcx,-0x8(%rax)")], False),
+	("a cmp writes no register, and the copy is still tracked after it",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("cmp", "$0x10,%rax"),
+	  ("mov", "%rcx,-0x28(%rax)")], True),
+	("a test writes no register either, and it is a separate mnemonic",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("test", "%rax,%rax"),
+	  ("mov", "%rcx,-0x8(%rax)")], False),
+	("a lea overwrites the copy rather than deriving from it",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
+	  ("lea", "0x10(%rdi),%rax"), ("mov", "%rcx,-0x28(%rax)")], False),
 	("an unknown frame",
 	 [("mov", "%rsp,%rax"), ("mov", "%rcx,-0x28(%rax)")], True),
 ]
