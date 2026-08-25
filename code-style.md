@@ -213,16 +213,19 @@ Where the two are confused, the cost lands on whoever renames a directory
 because it looked like a convention and finds the build no longer works.
 So say which kind is being claimed.
 
-**This rule does not reach the settled inventory.** Three canonical names in
-`harmonization.md` are plural -- `tool/`, `docs/` and `docs/decisions/` --
-and they stay until the copyright holder says otherwise, because renaming
-them is a cross-project rewrite rather than a spelling change. Measured
-before this was written: the decision records are cited by path 270 times in
-netcfgd and 95 times in situ, and `tool/` is named as a path 161 times in
-four projects alone, besides `sync.py`, every Makefile's hook target and the
-`~/.claude/tool/` the copies are spread from. An inventory entry is a name
-other things point at, which is exactly what makes it expensive and exactly
-what makes it worth having.
+**The settled inventory took this rule by the holder's instruction, not by
+sweep.** When this section was first written, three canonical names in
+`harmonization.md` were plural -- `tools/`, `docs/` and `docs/decisions/` --
+and the paragraph here held them out of reach, because renaming an inventory
+entry is a cross-project rewrite rather than a spelling change: the decision
+records were cited by path hundreds of times, and `tools/` was named from
+`sync.py`, every Makefile's hook target and the `~/.claude` symlink the
+copies are spread from. The holder then said to rename all three, and they
+are `tool/`, `doc/` and `doc/decision/` now, moved in a deliberate pass with
+each project's gates run against the result. The history is kept because the
+next inventory entry will raise the same question, and the answer stays the
+same: an inventory name moves when its owner says so, at whatever cost was
+measured, and not as a side effect of a style rule.
 
 ## ASCII in source
 
