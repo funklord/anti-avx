@@ -1150,7 +1150,7 @@ PROGRAMS["longpair"] = (107, """
 _start:
 	vzeroupper
 	subq	$40, %rsp
-	vmovups	source(%rip), %ymm0	/* 32 bytes; the store is far below */
+	vmovups	source(%rip), %ymm0	/* 32 bytes; the stores are far below */
 	movaps	pad(%rip), %xmm3
 	mulps	%xmm3, %xmm3
 	addps	%xmm3, %xmm3
@@ -1199,14 +1199,13 @@ _start:
 	mulps	%xmm4, %xmm4
 	addps	%xmm4, %xmm4
 	xorps	%xmm4, %xmm4
-	movaps	pad(%rip), %xmm5
-	mulps	%xmm5, %xmm5
-	addps	%xmm5, %xmm5
-	xorps	%xmm5, %xmm5
 	vmovups	%ymm0, sink(%rip)	/* both halves, or the upper is lost */
-	movl	sink+28(%rip), %eax	/* the eighth lane: 8 */
-	imull	$13, %eax, %eax
-	addl	$3, %eax
+	vmovups	%ymm0, sink2(%rip)	/* a SECOND store of the same value */
+	movl	sink+28(%rip), %eax	/* eighth lane: 8 */
+	movl	sink2+28(%rip), %ecx	/* and 8 again, if it was carried */
+	addl	%ecx, %eax		/* 16 only if BOTH stores got the half */
+	imull	$6, %eax, %eax
+	addl	$11, %eax		/* 16 * 6 + 11 = 107 */
 	addq	$40, %rsp
 	ret
 func_end:
@@ -1215,6 +1214,8 @@ source:	.long 1, 2, 3, 4
 	.long 5, 6, 7, 8
 pad:	.long 0, 0, 0, 0
 sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+sink2:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
 """)
 

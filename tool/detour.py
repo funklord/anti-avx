@@ -2289,8 +2289,8 @@ def lower_long_half(vex, tail, address, length, at, shadow):
 	return bytes(body)
 
 
-def long_pair_store(instructions, index, blocked, end):
-	"""The store that closes this 256-bit load's value, or None.
+def long_pair_stores(instructions, index, blocked, end):
+	"""Every store this 256-bit load's value reaches, or None.
 
 	`ymm_pair` takes the adjacent case and `ymm_run` takes everything that
 	fits one stub. Past that the upper half dies at the window edge and the
@@ -2308,6 +2308,14 @@ def long_pair_store(instructions, index, blocked, end):
 	A target landing ON the load is fine: control entering there executes
 	the definition. Only one landing after it is fatal, which is why the
 	test is on the NEXT instruction's address rather than this one's.
+
+	**A store does not end the value's life**, and stopping at the first one
+	cost the executed path directly: Starfield's frontier moved from
+	`0x14004E230` to `0x14004E250` -- the SECOND store of the same register,
+	32 bytes on, left behind because only the first was given the shadow.
+	`ymm_run` learned the same thing at 1,019 pairs. The walk therefore
+	collects stores until something ends the value, and the caller records
+	the reservation against every one of them.
 	"""
 	address, encoding, mnemonic, operands, _c = instructions[index]
 	first = wide_move(encoding, mnemonic, operands)
@@ -2315,21 +2323,23 @@ def long_pair_store(instructions, index, blocked, end):
 		return None
 	register = first[1]
 	number = register[len("%ymm"):]
+	found = []
 	for step in range(1, 200):
 		position = index + step
 		if position >= len(instructions):
-			return None
+			break
 		next_address, bits, name, text, _d = instructions[position]
 		if next_address >= end or next_address in blocked:
-			return None
+			break
 		if name.startswith(CONTROL_PREFIXES) or name in ("call", "callq"):
-			return None
+			break
 		what = wide_move(bits, name, text)
 		if what is not None and what[0] == "store" and what[1] == register:
-			return position
+			found.append(position)
+			continue
 		if register in (text or "") or "%xmm" + number in (text or ""):
-			return None
-	return None
+			break
+	return found or None
 
 
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
@@ -2910,20 +2920,21 @@ def collect(binary, listing):
 		# sites their own lowerings might yet take. Finding 90.
 		if vex["L"] and strategy is None and not needs_sequence \
 				and len(encoding) >= 5:
-			partner = long_pair_store(instructions, index, blocked,
-			                          ranges[bisect.bisect_right(
-			                              [r[0] for r in ranges], address)
-			                              - 1][1] if ranges else 0)
-			if partner is not None:
+			partners = long_pair_stores(instructions, index, blocked,
+			                            ranges[bisect.bisect_right(
+			                                [r[0] for r in ranges], address)
+			                                - 1][1] if ranges else 0)
+			if partners is not None:
 				own = scratch_finder.xmm_numbers(operands)
-				free = free_across(plain, positions, index, partner, own)
+				free = free_across(plain, positions, index, partners[-1], own)
 				tail = encoding[vex["length"]:]
 				if free and inplace.covered_by(ranges, address,
 				                               len(encoding)):
 					shadow = min(free)
 					if lower_long_half(vex, tail, address, len(encoding),
 					                   address, shadow) is not None:
-						long_shadow[instructions[partner][0]] = shadow
+						for partner in partners:
+							long_shadow[instructions[partner][0]] = shadow
 						candidates.append(
 							(address, encoding, operands, mnemonic,
 							 len(encoding), [], None, [],

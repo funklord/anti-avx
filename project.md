@@ -6004,6 +6004,49 @@ cause was an ad-hoc `WINEPREFIX` in scratch rather than the initialised one `mak
 uses. **Run the probe against a case known to be good** -- the rule was already written down
 and applying it first would have saved all four.
 
+### Finding 105 -- a store does not end the value's life, here either
+
+Finding 104 shipped the long pair taking the FIRST store it found, and Starfield's frontier
+moved 32 bytes: from `0x14004E230` to `0x14004E250`, the SECOND store of the same register,
+left behind because only one was given the shadow. `ymm_run` had already learned this at
+1,019 pairs and the new walk had dropped it.
+
+The walk collects every store the value reaches now, and the reservation is taken across
+the LAST of them.
+
+```
+VEX in .text      9,616 ->   9,613       795,518 removed, 98.8%
+detours         200,630 -> 200,633
+frontier   0x14004E250 -> 0x14005D040    some 60 KB further on
+```
+
+**Three sites, and it earns its place on the executed path rather than on the count.**
+Finding 102 records a conditional-move change that was sound, removed 463 give-ups, gained
+zero sites and was reverted for it. The difference is not the size of the number: it is
+that one of these three is the instruction the game stops on. A site count measures the
+residue and the frontier measures whether the program runs, and they are not the same
+currency.
+
+#### What the horizon actually caps
+
+Finding 104 said a span longer than 60 gets no register because `dead_from` scans 60
+instructions. That is the right number attached to the wrong quantity. `dead_from` proves a
+register dead by seeing it written before it is read, or by reaching the function's `ret`;
+what must fall inside the 60 is a point where deadness can be PROVED, not the span itself.
+
+Adding the second store pushed that program's `ret` two instructions past the horizon and
+every candidate register vanished at a span of 54, having been available at 53. The test
+therefore sits at 48 padding instructions: past `ymm_run`'s limit so the new path runs, and
+close enough that the `ret` still proves the register dead.
+
+Two predictions were wrong and both were caught by running rather than reading. The
+mutation that records only the first store was expected to return 59, the arithmetic with
+one half missing; it returns 124, because an unshadowed store is not lowered at all and the
+surviving VEX faults. And a `verify` run was killed at 50 minutes having taken 8 the time
+before -- contention from another session building in this tree, not a cost in the check.
+**It printed seven of its nine lines and stopped**, which is a truncated log reading as a
+pass if nobody counts them.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
