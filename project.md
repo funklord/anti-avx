@@ -6047,6 +6047,46 @@ before -- contention from another session building in this tree, not a cost in t
 **It printed seven of its nine lines and stopped**, which is a truncated log reading as a
 pass if nobody counts them.
 
+### Finding 106 -- the last iteration of an unrolled loop fell off the zero proof
+
+Starfield stopped at `0x14005D040`, `vmovups %ymm0,0x1d0(%rbp)`, declined `ymm value has
+no known upper half`. The value was zero and had been for 87 instructions:
+`vpxor %xmm0,%xmm0,%xmm0` at `0x14005CDCF` is a VEX.128 write and clears bits [255:128],
+which is the fact the whole Y1-zero strategy rests on.
+
+Eight stores of `ymm0` follow it at 0x30 intervals -- a structure initialisation the
+compiler unrolled, one 32-byte field per 48-byte record. Measured against `zeroed_ymm`:
+
+```
+past the vpxor   38  45  52  59  66  73  80   87
+zeroed says       T   T   T   T   T   T   T    F
+```
+
+`limit=80`, and the eighth store sits at 87. **Seven iterations proved, the last one
+refused for want of a budget**, with nothing between them touching the register.
+
+```
+VEX in .text      9,613 ->   9,531       795,600 removed, 98.8%
+detours         200,633 -> 200,715
+frontier   0x14005D040 -> 0x1400665DA    some 37 KB further on
+```
+
+**82 sites, and 128 rather than 120 is where they came from.** 120 would have covered the
+site that exposed this and left every other unrolled loop with a slightly longer body still
+falling off the same cliff. Tuning a constant to the one example that revealed it fixes one
+site and leaves the population; the 80-to-128 band held 81 more.
+
+**The horizon is a budget and budgets cost, so the cost was measured rather than assumed.**
+`zeroed_ymm` recurses on branch targets to depth 4, so a 60% larger limit need not be a 60%
+larger bill. The rebuild took **5m02s**, faster than any today.
+
+That last number is the useful one, and it corrects an assumption running through several
+findings: every slow run measured today was contention from another session building in
+this tree, not the analysis. One `verify` took 50 minutes and was killed by its timeout
+after printing seven of its nine lines; the same check took 8 minutes with the tree quiet.
+**A truncated log reads as a pass if nobody counts the lines**, and the fix is to count
+them rather than to trust the tail.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
