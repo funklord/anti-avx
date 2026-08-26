@@ -5937,6 +5937,73 @@ The linear walk also ignores control flow within the lifetime, so a value define
 path and read on another is counted as one span. Both simplifications push the figure
 optimistic; neither moves it by the order of magnitude that would change the conclusion.
 
+### Finding 104 -- a 256-bit value carried between two stubs
+
+Finding 103 scoped the representation and found it needs one register, not an allocator,
+and that the register is free across 95.2% of lifetimes. This is the first strategy built
+on that, and the smallest useful one: a 256-bit load and a store of the same register too
+far apart to share a window.
+
+`ymm_pair` takes the adjacent case; `ymm_run` takes everything that fits a single stub.
+Past that the upper half dies at the window edge and the store is declined for want of it
+-- 11,624 sites reporting `ymm value has no known upper half`, of which 2,020 lie outside
+any accepted window and are therefore real residue. A register reserved from the load to
+the store carries the value between two INDEPENDENT stubs: the load's writes the upper half
+into it, the store's reads it back.
+
+```
+VEX in .text     10,229 ->   9,616      795,515 removed, 98.8%
+detours         200,630
+refused             737 unchanged
+```
+
+613 sites from 613 detours, two per pair, and the refused bucket does not move because
+this rescues skipped stores rather than refused ones.
+
+**This is the first mechanism here whose correctness is not local.** Every other one --
+a window, a run, a bracketed borrow -- is contained in a single stub and can be read in one
+place. This one has a register live across a gap that `place_stubs` does not model, so what
+keeps it honest is the collector refusing anything it cannot see the whole of:
+
+  * **the load commits first and records the register**, and the store fires only if the
+    load actually committed. The listing is walked in address order, so the load is always
+    reached first and the two ends cannot disagree by construction rather than by care;
+  * **a branch target anywhere inside the span refuses it.** Control arriving mid-span
+    would find the shadow holding whatever the previous lifetime left -- which is exactly
+    how Finding 82's shipped miscompilation happened one window over. 14 sites hit this;
+  * **a call refuses it**, the upper half being volatile across one by the ABI. 60 sites;
+  * **the register comes from `free_across`**, so it is dead rather than merely unmentioned.
+    "Untouched across the span" would have clobbered a value defined before the load and
+    read after the store.
+
+#### The cap nobody would have found by reading
+
+`free_across` asks `dead_from` for liveness, and that scan stops after 60 instructions. So
+a span longer than 60 gets no register whatever the walk allows, and the 200-step limit in
+`long_pair_store` is not the binding one. It does not matter here -- the measured span is a
+median of 3 and a 90th percentile of 11 -- but it is a real ceiling and it was found by a
+test that overshot it rather than by reading the code.
+
+#### What the tests actually prove
+
+The `longpair` program puts 52 instructions between the load and the store: past `ymm_run`'s
+limit of 48, so the new path is what runs, and inside `dead_from`'s 60, so a register can be
+found. **The first version used 14 and tested nothing** -- `ymm_run` took the whole span
+into one stub and the new code never executed. Only the mutation of the padding count made
+that visible.
+
+Both mutations return exit 3 rather than crashing, which is the value the program yields
+when the upper half never arrives: a mismatched register between the two ends, and a load
+that writes only its own half. The failure this feature can really have is wrong DATA, and
+that is what the cases detect.
+
+One diversion is worth recording because it cost four steps. The unrewritten program
+appeared to hang instead of faulting, which looked like a defect in the test until the same
+probe was run against `pe-aliasing`, which has worked for months, and hung identically. The
+cause was an ad-hoc `WINEPREFIX` in scratch rather than the initialised one `make check-pe`
+uses. **Run the probe against a case known to be good** -- the rule was already written down
+and applying it first would have saved all four.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

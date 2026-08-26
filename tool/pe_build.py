@@ -1125,6 +1125,100 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104}
 
 
+# 24. A 256-bit load and store too far apart for one window, carried by a
+# reserved register.
+#
+# ymm_pair takes the adjacent case and ymm_run takes what fits a single
+# stub. Here fourteen ordinary SSE instructions sit between the two, so the
+# upper half dies at the window edge and the store is declined for want of
+# it -- unless the load's stub parks the upper half in a register the
+# original never names and the store's stub reads it back.
+#
+# The padding is deliberately %xmm registers the pair does not use, so a
+# register really is free across the span; and it is deliberately NOT a
+# branch target, since control arriving mid-span would find the shadow
+# holding whatever came before. Both are conditions long_pair_store
+# enforces, and the program is here to execute what it decided.
+#
+# The 32 bytes loaded are 1..8; the low half is stored to one place and the
+# high half must arrive with it. Reading back the eighth lane gives 8, and
+# 8 * 13 + 3 = 107. A shadow that never got written leaves zero there and
+# the program returns 3.
+PROGRAMS["longpair"] = (107, """
+	.text
+	.globl _start
+_start:
+	vzeroupper
+	subq	$40, %rsp
+	vmovups	source(%rip), %ymm0	/* 32 bytes; the store is far below */
+	movaps	pad(%rip), %xmm3
+	mulps	%xmm3, %xmm3
+	addps	%xmm3, %xmm3
+	xorps	%xmm3, %xmm3
+	movaps	pad(%rip), %xmm4
+	mulps	%xmm4, %xmm4
+	addps	%xmm4, %xmm4
+	xorps	%xmm4, %xmm4
+	movaps	pad(%rip), %xmm5
+	mulps	%xmm5, %xmm5
+	addps	%xmm5, %xmm5
+	xorps	%xmm5, %xmm5
+	movaps	pad(%rip), %xmm6
+	mulps	%xmm6, %xmm6
+	addps	%xmm6, %xmm6
+	xorps	%xmm6, %xmm6
+	movaps	pad(%rip), %xmm7
+	mulps	%xmm7, %xmm7
+	addps	%xmm7, %xmm7
+	xorps	%xmm7, %xmm7
+	movaps	pad(%rip), %xmm3
+	mulps	%xmm3, %xmm3
+	addps	%xmm3, %xmm3
+	xorps	%xmm3, %xmm3
+	movaps	pad(%rip), %xmm4
+	mulps	%xmm4, %xmm4
+	addps	%xmm4, %xmm4
+	xorps	%xmm4, %xmm4
+	movaps	pad(%rip), %xmm5
+	mulps	%xmm5, %xmm5
+	addps	%xmm5, %xmm5
+	xorps	%xmm5, %xmm5
+	movaps	pad(%rip), %xmm6
+	mulps	%xmm6, %xmm6
+	addps	%xmm6, %xmm6
+	xorps	%xmm6, %xmm6
+	movaps	pad(%rip), %xmm7
+	mulps	%xmm7, %xmm7
+	addps	%xmm7, %xmm7
+	xorps	%xmm7, %xmm7
+	movaps	pad(%rip), %xmm3
+	mulps	%xmm3, %xmm3
+	addps	%xmm3, %xmm3
+	xorps	%xmm3, %xmm3
+	movaps	pad(%rip), %xmm4
+	mulps	%xmm4, %xmm4
+	addps	%xmm4, %xmm4
+	xorps	%xmm4, %xmm4
+	movaps	pad(%rip), %xmm5
+	mulps	%xmm5, %xmm5
+	addps	%xmm5, %xmm5
+	xorps	%xmm5, %xmm5
+	vmovups	%ymm0, sink(%rip)	/* both halves, or the upper is lost */
+	movl	sink+28(%rip), %eax	/* the eighth lane: 8 */
+	imull	$13, %eax, %eax
+	addl	$3, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 5, 6, 7, 8
+pad:	.long 0, 0, 0, 0
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

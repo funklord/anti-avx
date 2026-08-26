@@ -2245,6 +2245,93 @@ def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons):
 	return bytes(out)
 
 
+def redirect_half(vex, tail, register):
+	"""The same operand, with its register field pointed at `register`.
+
+	A 128-bit half names its register in two places -- the modrm `reg` field
+	and the VEX `R` bit, which `decode_vex` has already un-inverted into the
+	high bit of the number. Both have to move together, and `narrow_piece`
+	reads them from exactly here.
+	"""
+	if len(tail) < 2:
+		return None
+	modrm = (tail[1] & 0xC7) | ((register & 7) << 3)
+	return dict(vex, R=(register >> 3) & 1), tail[:1] + bytes([modrm]) \
+		+ tail[2:]
+
+
+def lower_long_half(vex, tail, address, length, at, shadow):
+	"""The two 128-bit halves of one end of a long pair, or None.
+
+	**The upper half goes to a register the original never names**, so that
+	the stub lowering the OTHER end can find it. The low half keeps the
+	ymm's own xmm, which is where the original program already keeps it, so
+	every 128-bit read in between is untouched.
+
+	Both ends emit the same shape and differ only in direction, the
+	direction being a property of the encoding rather than of this: a load's
+	operand writes the register, a store's reads it. That is why one
+	function serves both, and why the pair must agree on `shadow` -- see
+	`long_pair_store`.
+	"""
+	high = redirect_half(vex, tail, shadow)
+	if high is None:
+		return None
+	body = bytearray()
+	piece = narrow_piece(high[0], high[1], 16, address, length, at)
+	if piece is None:
+		return None
+	body += piece
+	piece = narrow_piece(vex, tail, 0, address, length, at + len(body))
+	if piece is None:
+		return None
+	body += piece
+	return bytes(body)
+
+
+def long_pair_store(instructions, index, blocked, end):
+	"""The store that closes this 256-bit load's value, or None.
+
+	`ymm_pair` takes the adjacent case and `ymm_run` takes everything that
+	fits one stub. Past that the upper half dies at the window edge and the
+	store is declined for want of it. A register reserved from here to there
+	carries it between two INDEPENDENT stubs, which is the whole increment.
+
+	**What must hold, and each is a way the shadow goes stale:**
+
+	  * nothing between may branch INTO the span -- control arriving there
+	    would find the shadow holding whatever the last lifetime left, which
+	    is how Finding 82's miscompilation happened one window over;
+	  * no call, the upper half being volatile across one by the ABI;
+	  * nothing else may write the value, or the two ends disagree.
+
+	A target landing ON the load is fine: control entering there executes
+	the definition. Only one landing after it is fatal, which is why the
+	test is on the NEXT instruction's address rather than this one's.
+	"""
+	address, encoding, mnemonic, operands, _c = instructions[index]
+	first = wide_move(encoding, mnemonic, operands)
+	if first is None or first[0] != "load":
+		return None
+	register = first[1]
+	number = register[len("%ymm"):]
+	for step in range(1, 200):
+		position = index + step
+		if position >= len(instructions):
+			return None
+		next_address, bits, name, text, _d = instructions[position]
+		if next_address >= end or next_address in blocked:
+			return None
+		if name.startswith(CONTROL_PREFIXES) or name in ("call", "callq"):
+			return None
+		what = wide_move(bits, name, text)
+		if what is not None and what[0] == "store" and what[1] == register:
+			return position
+		if register in (text or "") or "%xmm" + number in (text or ""):
+			return None
+	return None
+
+
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
                stub_address, scratch=None, pool=0, preceding=(),
                strategy=None, spill_base=0, reasons=None):
@@ -2304,6 +2391,20 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		if body is None:
 			if reasons is not None:
 				reasons["the pair would not lower"] += 1
+			return None, 0
+		return bytes(body) + encode_jump(stub_address + len(body) + 5,
+		                                 start + window), 0
+	if kind == "longload" or kind == "longstore":
+		# One end of a long pair. The load's stub writes the upper half into
+		# a reserved register and the store's reads it back, so the two are
+		# lowered identically and only the encoding says which way the bytes
+		# go. See `long_pair_store` for what keeps the reservation honest.
+		vex, tail, shadow = strategy[1]
+		body = lower_long_half(vex, tail, start, len(encoding), stub_address,
+		                       shadow)
+		if body is None:
+			if reasons is not None:
+				reasons["the long pair would not lower"] += 1
 			return None, 0
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
 		                                 start + window), 0
@@ -2562,6 +2663,9 @@ def collect(binary, listing):
 	# -- `plain` is a comprehension over `instructions` -- so one mapping
 	# serves both.
 	positions = scratch_finder.address_index(plain)
+	# Which store addresses a long-pair load has reserved a register for.
+	# Written when the load commits, read when the store is reached.
+	long_shadow = {}
 	# Which functions can lend their callee home space, if asked to.
 	home = home_space_map(binary, plain, ranges) if SPILL == SPILL_HOME \
 		else None
@@ -2761,6 +2865,28 @@ def collect(binary, listing):
 								 [], None, [], ("zerorun", entries)))
 							continue
 					strategy = ("zero", None)
+				elif address in long_shadow:
+					# The load's own stub reserved a register and wrote the
+					# upper half into it. Only a load that COMMITTED to the
+					# long pair puts an entry here, so the two ends cannot
+					# disagree: the listing is walked in address order and
+					# the load is always reached first. Finding 104.
+					tail = encoding[vex["length"]:]
+					if len(encoding) >= 5 and inplace.covered_by(
+							ranges, address, len(encoding)) \
+							and lower_long_half(vex, tail, address,
+							                    len(encoding), address,
+							                    long_shadow[address]) \
+							is not None:
+						candidates.append(
+							(address, encoding, operands, mnemonic,
+							 len(encoding), [], None, [],
+							 ("longstore", (vex, tail,
+							                long_shadow[address]))))
+						continue
+					skipped["the long pair store would not lower"] += 1
+					declined[address] = "the long pair store would not lower"
+					continue
 				else:
 					skipped["ymm value has no known upper half"] += 1
 					declined[address] = "ymm value has no known upper half"
@@ -2782,6 +2908,27 @@ def collect(binary, listing):
 		# The sequence and FMA mnemonics are excluded: those do not go
 		# through `sse_encoding` at all, and refusing them here would decline
 		# sites their own lowerings might yet take. Finding 90.
+		if vex["L"] and strategy is None and not needs_sequence \
+				and len(encoding) >= 5:
+			partner = long_pair_store(instructions, index, blocked,
+			                          ranges[bisect.bisect_right(
+			                              [r[0] for r in ranges], address)
+			                              - 1][1] if ranges else 0)
+			if partner is not None:
+				own = scratch_finder.xmm_numbers(operands)
+				free = free_across(plain, positions, index, partner, own)
+				tail = encoding[vex["length"]:]
+				if free and inplace.covered_by(ranges, address,
+				                               len(encoding)):
+					shadow = min(free)
+					if lower_long_half(vex, tail, address, len(encoding),
+					                   address, shadow) is not None:
+						long_shadow[instructions[partner][0]] = shadow
+						candidates.append(
+							(address, encoding, operands, mnemonic,
+							 len(encoding), [], None, [],
+							 ("longload", (vex, tail, shadow))))
+						continue
 		if vex["L"] and strategy is None and not needs_sequence:
 			# The reason comes from `ymm_run` itself rather than from a
 			# second walk beside it: two code paths answering one question
