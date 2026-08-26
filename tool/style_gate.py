@@ -90,6 +90,12 @@ DEFAULTS: Config = {
 	# Minimum plausible file count. Below it the gate fails loudly instead
 	# of passing. A gate that has quietly stopped matching anything reads
 	# exactly like a clean tree -- see the note on collapse() below.
+	#
+	# Prefer a fraction: `floor = 0.3` means the gated count must be at
+	# least that share of every path git lists, before any filtering. A
+	# fraction stays calibrated as the tree grows; a whole number was right
+	# on the day it was chosen and decays silently after -- measured at
+	# between 22% and 80% of the real count across fourteen projects.
 	"floor": 1,
 
 	# ASCII-only content. Off by default: three projects require it, one
@@ -190,6 +196,19 @@ def type_problems(loaded: Config) -> list[str]:
 	for key in sorted(loaded):
 		value = loaded[key]
 		default = DEFAULTS[key]
+		if key == "floor":
+			# Two shapes by design: a whole number is the absolute floor,
+			# a float strictly inside (0, 1) is a share of the raw
+			# population. 1.0 is refused rather than read as 100%: TOML
+			# writers reach for `floor = 1.0` meaning the old default, and
+			# demanding every raw file be gated would fail every tree.
+			ok = ((isinstance(value, int) and not isinstance(value, bool))
+			      or (isinstance(value, float) and 0 < value < 1))
+			if not ok:
+				problems.append(f"floor: want a whole number, or a "
+				                f"fraction strictly between 0 and 1, "
+				                f"got {value!r}")
+			continue
 		if isinstance(default, bool):
 			ok, want = isinstance(value, bool), "true or false"
 		elif isinstance(default, int):
@@ -261,8 +280,16 @@ def in_git_repo(root: Path) -> bool:
 		return False
 
 
-def discover(root: Path, cfg: Config) -> list[Path]:
-	"""Every file this project owns, git-preferred with a plain-walk fallback.
+def discover(root: Path, cfg: Config) -> tuple[list[Path], int]:
+	"""Every file this project owns, and the raw count it was filtered from.
+
+	The raw count is the second return because the collapse floor needs a
+	baseline the failure modes cannot touch. Everything between the git call
+	and the kept list -- the exclude set, the include prefixes, the
+	extension selection -- is exactly what a bad edit collapses, so a floor
+	measured against the kept list of some earlier day goes stale as the
+	tree grows and fails by passing. The raw population is upstream of all
+	of it, moves with the tree, and costs nothing to return.
 
 	git is preferred because `--cached --others --exclude-standard` gets two
 	things right that a walk cannot: ignored build output and vendored
@@ -300,7 +327,7 @@ def discover(root: Path, cfg: Config) -> list[Path]:
 			continue
 		if wants_text(path, cfg) or wants_indent(path, cfg):
 			kept.append(path)
-	return sorted(set(kept))
+	return sorted(set(kept)), len(paths)
 
 
 def wants_indent(path: Path, cfg: Config) -> bool:
@@ -327,7 +354,7 @@ def wants_text(path: Path, cfg: Config) -> bool:
 	return wants_indent(path, cfg) or path.suffix in set(cfg["text_suffixes"])
 
 
-def collapse(count: int, cfg: Config) -> bool:
+def collapse(count: int, raw: int, cfg: Config) -> bool:
 	"""True if the file list has plausibly collapsed rather than come back clean.
 
 	"Found nothing" cannot mean "there is nothing to check" in a tree with
@@ -336,11 +363,36 @@ def collapse(count: int, cfg: Config) -> bool:
 	that has stopped looking is indistinguishable from a clean tree and stays
 	that way until somebody thinks to doubt it.
 
-	The floor is deliberately below the real count. It catches a list that has
-	collapsed; it is not there to police a number, so it does not need raising
-	every time a file is added.
+	`floor` takes two shapes, and the difference is what it stays true
+	against:
+
+	- **A fraction (0 < floor < 1)**: the gated count must be at least that
+	  share of the RAW population -- every path git lists before the
+	  excludes, the include prefixes and the extension selection run. Those
+	  filters are exactly what a bad edit collapses, so the baseline sits
+	  upstream of every failure this check exists to catch, and it moves
+	  with the tree: a floor of 0.3 chosen when 239 of 800 files were gated
+	  is still 0.3 when the tree is twice the size. Measured across
+	  fourteen projects before this existed, the absolute form had decayed
+	  to between 22% and 80% of the real count -- every number right on the
+	  day it was written, wrong later, and silent about it, because a floor
+	  that is too low fails by passing.
+
+	- **A whole number**: the old absolute form, kept so an un-migrated
+	  config keeps its protection. It catches a collapse; what it cannot do
+	  is stay calibrated as the tree grows.
+
+	Neither shape polices a number: adding files never requires touching
+	either. And neither promises to catch a single module dropping out --
+	that needs a floor within one module of the real count, which fires on
+	every legitimate addition. What a floor catches is a collapse. The
+	advice that once claimed the finer catch claimed more than any floor
+	can deliver.
 	"""
-	return count < int(cfg["floor"])
+	floor = cfg["floor"]
+	if isinstance(floor, float):
+		return count < floor * raw
+	return count < int(floor)
 
 
 # -------------------------------------------------------------- lexing
@@ -1255,7 +1307,10 @@ def resolve(argv: list[str]) -> tuple[str, Path, list[Path]]:
 def main(argv: list[str]) -> int:
 	mode, root, explicit = resolve(argv)
 	cfg = load_config(root)
-	files = explicit or discover(root, cfg)
+	if explicit:
+		files, raw = explicit, 0
+	else:
+		files, raw = discover(root, cfg)
 
 	if mode == "docs":
 		problems = check_docs(root, cfg)
@@ -1272,10 +1327,15 @@ def main(argv: list[str]) -> int:
 		for f in files:
 			kind = "indent+text" if wants_indent(f, cfg) else "text"
 			print(f"{f.relative_to(root)}\t{kind}")
-		print(f"\n{len(files)} file(s); floor is {cfg['floor']}", file=sys.stderr)
+		floor = cfg["floor"]
+		if isinstance(floor, float):
+			print(f"\n{len(files)} file(s) of {raw} raw; floor is "
+			      f"{floor:g} of raw = {int(floor * raw)}", file=sys.stderr)
+		else:
+			print(f"\n{len(files)} file(s); floor is {floor}", file=sys.stderr)
 		return 0
 
-	if not explicit and collapse(len(files), cfg):
+	if not explicit and collapse(len(files), raw, cfg):
 		print(f"style-gate: found {len(files)} files, expected at least "
 		      f"{cfg['floor']} --", file=sys.stderr)
 		print("style-gate:   this reads as a clean tree but is a collapsed "

@@ -20,8 +20,15 @@ indent_names = ["Makefile"]
 ascii_only = true
 ascii_exclude_markdown = true
 
-# Below this the gate fails instead of passing, because "found nothing" in a
-# tree with sources means the file list collapsed, not that the tree came
-# back clean. Thirteen files match today; eight is under the real count
-# deliberately, so adding a document does not require touching this.
-floor = 8
+# A fraction of the raw population: the gated count must be at least this
+# share of every path git lists, before excludes and extension selection
+# run. Those filters are what a bad edit collapses, so the baseline sits
+# upstream of the failure this guards, and it moves with the tree -- the
+# absolute floors this replaces had decayed to between 22% and 80% of
+# their real counts, each right on the day it was written and silent
+# after. Half the ratio measured on migration day, so a collapse of more
+# than half the gated share fires and adding files never does. It catches
+# a collapse; no floor can catch a single module dropping out, since that
+# needs a value within one module of the real count, which fires on every
+# legitimate addition.
+floor = 0.46
