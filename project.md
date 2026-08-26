@@ -6149,6 +6149,61 @@ set when they were fixed, and were never going to appear in a measurement of wha
 declined. **A cross-check between two numbers is only a check if they measure the same
 population.**
 
+### Finding 108 -- a splat is a zero store with a weaker reason
+
+Starfield stopped at `0x14082130C`, `vinsertf128 $0x1,%xmm0,%ymm0,%ymm0`, with the store
+of that register immediately after. The insert copies the low half into the high half, so
+both halves hold the same sixteen bytes -- MSVC broadcasting a 128-bit constant across a
+256-bit field.
+
+**`lower_ymm_zero_store` already emits the right code.** It writes two 128-bit stores of
+one register at deltas 0 and 16, and was written for an all-zero ymm where both halves are
+zero and the same xmm serves for each. A splat has that property one step weaker: both
+halves are the same register, whatever it holds. Identical bytes, different justification,
+and the insert itself emits nothing because the value it builds is already in the register
+the lowered program keeps.
+
+```
+vinsertf128 / vinserti128 in the binary       160
+  a splat, upper := the low half               89
+    followed at once by a store of it          41
+  upper := an xmm, low from another ymm        66
+  upper := another xmm, low kept                5
+```
+
+```
+VEX in .text      9,327 ->   9,245       795,886 removed, 98.9%
+detours         200,919 -> 200,960
+frontier   0x14082130C -> 0x1408284C7
+```
+
+41 pairs, 41 detours, 82 sites, and 41 more lost boundaries. Four numbers that had to
+agree and did.
+
+#### `verify` refused the first build, and was right
+
+The strategy worked on the first attempt -- correct stub bytes, correct site count, the PE
+test returning 107. What was wrong was the MODEL of what the window consumed: a splat pair
+covers two instructions and carries no `displaced` list, so the store's boundary vanishes
+with nothing recording that it was deliberate. `place_stubs` already had that exact case
+for `ymm_pair`, whose comment reads "the verifier is right to want it named", and `splat`
+was added without extending it.
+
+`verify: FAILED -- 41 boundaries lost that were not swallowed on purpose`, one per pair.
+**The count named the cause before any code was read.** Nothing else could have caught it:
+every emitted byte was correct, and only an invariant reconciling the collector's intent
+against the binary's real instruction boundaries can see a bookkeeping error that changes
+no output.
+
+#### The precondition no execution test could reach
+
+Loosening the immediate check to accept any `vinsertf128` left every PE test passing,
+because **this binary contains no `vinsertf128 $0x0`** -- which writes the LOW half and
+keeps the upper, and would have stored the wrong sixteen bytes twice. A shape the input
+does not contain is one execution can never exercise, so it is guarded by unit cases
+instead: one accepted, four refused -- `$0x0`, a high half from another register, a low
+half from another ymm, and a store of a register the insert did not build.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

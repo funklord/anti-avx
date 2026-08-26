@@ -1419,6 +1419,48 @@ def narrow_piece(vex, tail, delta, address, length, at):
 	return inplace.sse_encoding(narrow, tail[:2] + struct.pack("<i", value))
 
 
+def splat_pair(site, following):
+	"""(vex, tail, address, length) for a splat's store, or None.
+
+	**`vinsertf128 $1,%xmmN,%ymmN,%ymmN` puts the low half into the high
+	half**, so afterwards both halves of the ymm are the same sixteen bytes.
+	MSVC emits it to broadcast a 128-bit constant across a 256-bit field,
+	and the store that follows writes the value twice.
+
+	That is the shape `lower_ymm_zero_store` already emits: two 128-bit
+	stores of one register at deltas 0 and 16. It was written for an
+	all-zero ymm, where both halves are zero and the same xmm serves for
+	each -- and the reason it serves a splat too is the same reason, one
+	step weaker. The bytes are identical; only what makes them correct
+	differs.
+
+	89 splats in this binary, 41 of them followed immediately by a store of
+	the register. The other 48 feed arithmetic and want the register
+	representation rather than this. Finding 108.
+	"""
+	address, encoding, mnemonic, operands, _c = site
+	if mnemonic not in ("vinsertf128", "vinserti128"):
+		return None
+	fields = inplace.split_operands(operands)
+	if len(fields) != 4:
+		return None
+	immediate, source, keep, destination = fields
+	if immediate != "$0x1" or keep != destination:
+		return None
+	if not source.startswith("%xmm") or not destination.startswith("%ymm"):
+		return None
+	if source[len("%xmm"):] != destination[len("%ymm"):]:
+		return None			# the high half must come from the low one
+	store_address, store, store_mnemonic, store_operands, _d = following
+	move = wide_move(store, store_mnemonic, store_operands)
+	if move is None or move[0] != "store" or move[1] != destination:
+		return None
+	store_vex = inplace.decode_vex(store)
+	if store_vex is None or not store_vex["L"]:
+		return None
+	return (store_vex, store[store_vex["length"]:], store_address, len(store))
+
+
 def ymm_pair(site, following):
 	"""(load, store) if these two are a 256-bit copy through one ymm.
 
@@ -2418,6 +2460,18 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			return None, 0
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
 		                                 start + window), 0
+	if kind == "splat":
+		# A `vinsertf128` that broadcasts the low half, and the store that
+		# follows it. The insert itself emits nothing -- both halves are
+		# the register the original already holds -- so the whole window
+		# becomes the two 128-bit stores the value needs.
+		body = lower_ymm_zero_store(*strategy[1], at=stub_address)
+		if body is None:
+			if reasons is not None:
+				reasons["the splat store would not lower"] += 1
+			return None, 0
+		return bytes(body) + encode_jump(stub_address + len(body) + 5,
+		                                 start + window), 0
 	if kind == "zerorun":
 		# Consecutive stores of an all-zero register, taken together so that
 		# none of them has to widen its window over another. See `zero_run`.
@@ -2718,6 +2772,17 @@ def collect(binary, listing):
 		pair_reason = None
 		if vex["L"] and index + 1 < len(instructions):
 			following = instructions[index + 1]
+			splat = splat_pair(instructions[index], following)
+			if splat is not None and following[0] == address + len(encoding) \
+					and following[0] not in blocked:
+				window = len(encoding) + len(following[1])
+				if inplace.covered_by(ranges, address, window) \
+						and lower_ymm_zero_store(*splat, at=address) \
+						is not None:
+					candidates.append(
+						(address, encoding, operands, mnemonic, window,
+						 [], None, [], ("splat", splat)))
+					continue
 			pair = ymm_pair(instructions[index], following)
 			if pair is not None:
 				window = len(encoding) + len(following[1])
@@ -3472,6 +3537,7 @@ def selftest():
 
 	failures += reach_selftest()
 	failures += borrow_selftest()
+	failures += splat_selftest()
 
 	if failures:
 		print(f"selftest: {failures} of {len(SELFTEST)} lowerings are wrong",
@@ -3539,6 +3605,49 @@ REACH_CASES = [
 # %xmm0. Assembled rather than hand-encoded.
 BLENDV = (bytes.fromhex("c4e3694acb40"), "%xmm4,%xmm3,%xmm2,%xmm1",
           "vblendvps")
+
+
+# A splat and the store that follows it, then the shapes that look like one
+# and are not. `$0x0` writes the LOW half and keeps the upper, so treating it
+# as a splat would store the wrong sixteen bytes twice -- and this binary
+# contains none, so no PE test would ever have exercised it.
+SPLAT_STORE = (0, bytes.fromhex("c5fc110500000000"), "vmovups",
+               "%ymm0,0x0(%rip)", 0)
+
+
+def splat_selftest():
+	"""Prove `splat_pair` accepts a broadcast and nothing that resembles one.
+	"""
+	cases = [
+		("a genuine splat", "$0x1,%xmm0,%ymm0,%ymm0", True),
+		("$0x0 writes the LOW half, keeping the upper",
+		 "$0x0,%xmm0,%ymm0,%ymm0", False),
+		("the high half from a different register",
+		 "$0x1,%xmm3,%ymm0,%ymm0", False),
+		("the low half from a different ymm",
+		 "$0x1,%xmm0,%ymm2,%ymm0", False),
+	]
+	failures = 0
+	for what, operands, expected in cases:
+		site = (0, bytes.fromhex("c4e37d18c001"), "vinsertf128", operands, 0)
+		got = splat_pair(site, SPLAT_STORE) is not None
+		if got != expected:
+			print(f"selftest: {what}: splat_pair said {got}, want {expected}",
+			      file=sys.stderr)
+			failures += 1
+	# and a store of a register the insert did not build
+	site = (0, bytes.fromhex("c4e37d18c001"), "vinsertf128",
+	        "$0x1,%xmm0,%ymm0,%ymm0", 0)
+	other = (0, bytes.fromhex("c5fc110d00000000"), "vmovups",
+	         "%ymm1,0x0(%rip)", 0)
+	if splat_pair(site, other) is not None:
+		print("selftest: a store of another ymm was taken as the splat's",
+		      file=sys.stderr)
+		failures += 1
+	if not failures:
+		print(f"selftest: {len(cases) + 1} splat shapes, one accepted and "
+		      f"four refused")
+	return failures
 
 
 def borrow_selftest():
@@ -3923,11 +4032,16 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			swallowed.add(start + offset)	# the site, now inside the window
 		for entry in displaced:
 			swallowed.add(entry[0])
-		if strategy is not None and strategy[0] == "pair":
+		if strategy is not None and strategy[0] in ("pair", "splat"):
 			# A ymm pair carries no `displaced` list -- both instructions
 			# are lowered together -- but the store's boundary disappears
 			# just the same, and the verifier is right to want it named.
 			# A zero store is one instruction and loses no extra boundary.
+			#
+			# **A splat has exactly this shape and was added without it**,
+			# and `verify` refused the build for 41 unexplained boundaries
+			# -- one per splat pair, the store of each. The gate was doing
+			# precisely its job. Finding 108.
 			swallowed.add(start + len(encoding))
 		if strategy is not None and strategy[0] == "run":
 			# Same again over a longer stretch: every boundary from the one

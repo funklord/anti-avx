@@ -1220,6 +1220,41 @@ sink2:	.long 0, 0, 0, 0
 """)
 
 
+# 25. A 128-bit value broadcast to both halves by vinsertf128, and stored.
+#
+# `vinsertf128 $1,%xmm0,%ymm0,%ymm0` copies the low half into the high half,
+# so both halves hold the same sixteen bytes and the 32-byte store writes
+# the value twice. The lowering emits exactly what an all-zero ymm needs --
+# two 128-bit stores of one register -- because a splat has the same
+# property one step weaker: both halves are the same register.
+#
+# The eighth lane comes from the HIGH half, so a lowering that stored only
+# the low half, or stored zero above it, leaves 0 there and returns 3
+# instead of 107. Reading lane 4 as well pins the low half at the same time.
+PROGRAMS["splat"] = (107, """
+	.text
+	.globl _start
+_start:
+	vzeroupper
+	subq	$40, %rsp
+	vmovups	source(%rip), %xmm0	/* 16 bytes: 1 2 3 8 */
+	vinsertf128 $0x1, %xmm0, %ymm0, %ymm0	/* both halves now 1 2 3 8 */
+	vmovups	%ymm0, sink(%rip)	/* 32 bytes, the value twice */
+	movl	sink+28(%rip), %eax	/* the HIGH half's fourth lane: 8 */
+	movl	sink+12(%rip), %ecx	/* and the low half's: 8 */
+	addl	%ecx, %eax		/* 16 only if both halves arrived */
+	imull	$6, %eax, %eax
+	addl	$11, %eax		/* 16 * 6 + 11 = 107 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 8
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:
