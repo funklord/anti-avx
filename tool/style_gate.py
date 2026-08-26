@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import ast
 import io
+import fnmatch
 import re
 import subprocess
 import sys
@@ -310,7 +311,19 @@ def discover(root: Path, cfg: Config) -> tuple[list[Path], int]:
 		paths = [p for p in root.rglob("*") if p.is_file()]
 
 	include = [str(i).strip("/") for i in cfg["include"]]
-	exclude = {str(e).strip("/") for e in cfg["exclude"]}
+	# Excludes come in two kinds. A literal matches a path component
+	# exactly, which was the only kind until an ABI-suffixed build
+	# directory needed one entry per ABI: build-android-arm64-v8a today,
+	# a second literal the day an x86_64 emulator build exists, and a
+	# stale literal in any tree that renamed -- hydra carried plain
+	# "build-android" for weeks after its directory grew the suffix,
+	# hidden only because the git walk never shows ignored files. So an
+	# entry containing a glob character is a pattern, matched per
+	# component with fnmatch: "build-android-*" covers every ABI and
+	# survives the rename that strands a literal.
+	raw_exclude = [str(e).strip("/") for e in cfg["exclude"]]
+	exclude = {e for e in raw_exclude if not any(c in e for c in "*?[")}
+	exclude_globs = [e for e in raw_exclude if any(c in e for c in "*?[")]
 	kept = []
 	for path in paths:
 		if not path.is_file():
@@ -320,7 +333,9 @@ def discover(root: Path, cfg: Config) -> tuple[list[Path], int]:
 		except ValueError:
 			continue
 		parts = rel.parts
-		if any(p in SKIP_DIR_NAMES or p in exclude for p in parts):
+		if any(p in SKIP_DIR_NAMES or p in exclude
+		       or any(fnmatch.fnmatchcase(p, g) for g in exclude_globs)
+		       for p in parts):
 			continue
 		if include and not any(rel.as_posix() == i or rel.as_posix().startswith(i + "/")
 		                       for i in include):
