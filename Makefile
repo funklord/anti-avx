@@ -67,7 +67,7 @@ GENERATED  = $(BUILD_DIR)/lowering_cases.s $(BUILD_DIR)/lowering_cases.inc
 TEST_BIN   = $(BUILD_DIR)/f16c_test
 DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
-.PHONY: all check style style-source style-docs verify check-f16c \
+.PHONY: all test check style style-source style-docs verify check-f16c \
         check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
         check-isa \
         scan report \
@@ -82,6 +82,16 @@ all: check
 # `check` is what must pass before committing. There is no test suite yet,
 # so it is the gate alone -- and it deliberately does not depend on `scan`,
 # which needs a binary a fresh clone does not have.
+# `make test` runs the compiled test binaries, as the name means in the
+# eleven siblings that answer it. Until now this Makefile had no such
+# rule, and with a directory named test/ in the tree that was not an
+# error but a silent success: make treated the target as satisfied and
+# exited 0 having run nothing, so the cross-project habit reported a
+# pass here without building a binary. check remains the wider gate --
+# style, the lowering proof and the ISA scan on top of these.
+test: check-aliasing check-lowering check-f16c check-fmaddsub \
+      check-permil check-permd
+
 check: style verify check-aliasing check-lowering check-isa check-f16c \
        check-f16c-oracle check-fmaddsub check-permil check-permd
 
