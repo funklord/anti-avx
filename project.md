@@ -6433,6 +6433,44 @@ except by falling into it, and the direct branches are already enumerated separa
 the question is what the indirect ones do. Loosening `blocked` is the most load-bearing
 assumption in the tool, and it is not a change to make while passing.
 
+
+Measured since, because the measurement is most of the work and the decision is not:
+
+```
+RUNTIME_FUNCTION entries        236,427
+  chained (UNW_FLAG_CHAININFO)   56,269
+  primary                       180,158
+
+each chained start, by what precedes it
+  an instruction that falls through   42,184
+  a ret, jmp, int3 or ud                9,522
+  nothing that decoded                  4,555
+  not in the listing at all                 8
+```
+
+**Three-quarters are fallen into, and what would make those safe to unblock is the code
+rather than the unwind data.** A fragment reached by falling into it is a continuation of
+straight-line code, and everything that could ALSO reach it -- a direct branch, a switch
+table, a relocation, a PC-relative `lea`, a scope table's handler or its resume target --
+is enumerated separately and would stay in `blocked`. The tool already trusts exactly
+that enumeration for the byte before the fragment starts. A fragment start fallen into is
+an address in the middle of a function like any other.
+
+**The quarter that is not fallen into is where the hazard lives, and naming it is why the
+change is not made here.** A C++ catch funclet is entered by the unwinder, no instruction
+names it, and `scope_targets` says in as many words that it does not parse the `FuncInfo`
+a C++ EH function carries where a `__try`/`__except` carries a `SCOPE_TABLE`. For those,
+`.pdata` is the only thing between a funclet's first instruction and a window that would
+swallow it. Funclets are preceded by padding or by the end of the function above, which
+is what the 9,522 and the 4,555 are -- so the fall-through test excludes them here. **"It
+excludes them in this binary" is a weaker claim than "it cannot include one", and the
+difference is the whole of the risk.**
+
+What would close it is parsing `FuncInfo` far enough to enumerate catch funclets, the way
+`scope_targets` already does for `__except`, under the same rule it states: parse
+permissively, validate every field against `.text`, and be wrong in the direction that
+costs a refused site.
+
 ### Finding 111 -- two defects that had never fired, and one that could not
 
 Findings 109 and 110 were read adversarially before anything was built on them, with the
@@ -6580,6 +6618,51 @@ code quickly.
    1,586 of the unresolved stores are blocked by control flow, the rest holding real
    256-bit values that no scan can reason away, and Finding 40 also names what the model must repair: the in-place
    lowerings have already destroyed the [255:128] zeroing that VEX.128 writes perform.
+
+### Where the residue actually is
+
+Measured on the binary the tool produces after Finding 111. `make detour-plan` names
+every refusal; these are the buckets that matter, with the count outside any accepted
+window beside the total, because a site inside one has already been taken by whatever
+strategy claimed that window.
+
+```
+                                             total   outside
+256-bit: arithmetic rather than a copy       1,993     1,884
+no home space to borrow                      2,517     1,876
+ymm value has no known upper half           10,086     1,302
+outside .pdata                                 321       321
+no register free across the ymm run            213       213
+next instruction is a branch target            202       202
+the constant is read by something that
+  will not reload it                           182       182
+                                                       -----
+everything left, all buckets                           7,134
+```
+
+**Three-fifths of what is left is one piece of work.** `arithmetic rather than a copy`
+and `ymm value has no known upper half` are both decision 2 above: the first is a 256-bit
+operation on a value, and the second is 10,023 `vmovups`, 50 `vmovdqu` and 13 `vmovupd`,
+every one of them with a memory operand. Together they are 3,186 of the 7,134, and the
+182 constants refused in Finding 109 are the same thing again -- 164 of those are blocked
+by 256-bit arithmetic reading the hoisted value.
+
+**`no home space to borrow` is half a real absence and half a proof gap**, which is worth
+knowing before anyone attacks it. Classified with the tool's own predicates: 1,110 of the
+2,517 are in leaf functions, which never reserved a home space to lend, 218 more are in
+functions that address `[rsp+0..31]` themselves, and 35 are in code `.pdata` does not
+describe -- 54% a real absence. The other 1,154 are functions that copy `rsp` somewhere
+`copy_reaches_home` loses it, and **in not one of them does the copy land in the region**,
+which is Finding 96's result holding on the current bucket rather than a fresh
+disappointment.
+
+**And 180 of the survivors are not instructions.** Of the 9,223 lines in the rewritten
+`.text` whose first byte is `c4` or `c5`, objdump calls 180 of them `(bad)` -- they sit
+inside Finding 8's 744 undecodable islands, `decode_vex` reads their bytes as a prefix,
+and they are then counted as refused sites in a bucket that reads like work. `census`
+already files 81 of them under "undecodable, never classified"; the rest are spread
+through the named buckets. The residue is about two per cent smaller than its headline,
+and nothing needs doing about it except knowing.
 
 ### What each tool is for
 
