@@ -6087,6 +6087,68 @@ after printing seven of its nine lines; the same check took 8 minutes with the t
 **A truncated log reads as a pass if nobody counts the lines**, and the fix is to count
 them rather than to trust the tail.
 
+### Finding 107 -- set the zero horizon against the distribution, not the frontier
+
+Finding 106 raised `zeroed_ymm`'s limit from 80 to 128 for an unrolled loop whose last
+iteration sat at 87, and said 128 rather than 120 was what took the population rather than
+the one site. **The next frontier sat at 130.** Stepping a constant until the frontier
+stops moving is chasing it, so the distances were measured instead.
+
+For every store still declined `ymm value has no known upper half`, walking back to the
+nearest write of its own register:
+
+```
+11,128 declined stores
+  written by something that is not a zeroing   10,693
+  a control transfer first                        219
+  zeroed, and this far back                       216
+
+within 128: 12   within 256: 126   within 512: 208
+median 228, 90th 465, max 556
+```
+
+`limit=640` covers the measured maximum with headroom, and it is set once against that
+rather than against whichever site surfaces next.
+
+```
+VEX in .text      9,531 ->   9,327       795,804 removed, 98.8%
+detours         200,715 -> 200,919
+frontier   0x1400665DA -> 0x14082130C    some 7.9 MB further on
+```
+
+204 sites, matching what the distribution predicted -- which is the check that the setting
+was sized against the population and not against an example.
+
+**And the strategy is nearly done.** Only 216 of 11,128 declined stores are defined by a
+zeroing write at all. The other 10,693 are defined by a 256-bit write, a load or
+arithmetic, where no horizon helps. That is a boundary rather than a lever, and it is
+recorded so the constant is not stepped a third time.
+
+#### `real` is not the cost, and this document has twice said it was
+
+The rebuild reported **24m08s real against 5m25s user**: nineteen minutes waiting, not
+computing, from another session building in this tree. Against the previous build's 4m55s
+user, five times the budget costs **10% more CPU** -- most walks terminate long before the
+budget, so it only pays for the tail that needs it.
+
+Finding 106 called a 5m02s rebuild "faster than any today" and treated a 50-minute `verify`
+as contention on the strength of wall clock alone. Both conclusions happened to be right
+and neither was measured: **`real` measures how busy the machine was, `user` measures the
+code.** Time anything whose cost is in question with both.
+
+#### Two mistakes in the measuring, recorded because they nearly stuck
+
+The first classifier counted only an explicit `vpxor` with identical operands as zeroing a
+register, when **any VEX.128 write clears bits [255:128]** -- the fact the whole strategy
+rests on. Correcting it moved 212 to 216, so it mattered little here and would have
+understated the population in a binary that zeroes differently.
+
+The justification for correcting it was itself wrong. The argument was that 82 sites gained
+could not square with 12 zero-defined sites within 128 -- but the 82 had left the declined
+set when they were fixed, and were never going to appear in a measurement of what is still
+declined. **A cross-check between two numbers is only a check if they measure the same
+population.**
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

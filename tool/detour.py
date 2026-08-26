@@ -1922,7 +1922,7 @@ def zero_survives_loop(instructions, index, register, blocked, sources,
 	return False
 
 
-def zeroed_ymm(instructions, index, register, blocked, limit=128,
+def zeroed_ymm(instructions, index, register, blocked, limit=640,
                sources=None, depth=4):
 	"""True if every bit of `register` is zero when `index` executes.
 
