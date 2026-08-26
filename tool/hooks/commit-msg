@@ -35,7 +35,10 @@ TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # hypothetical -- a change to THIS FILE shows its own vendor list in the
 # diff, so the hook refused every commit that edited it. (A message kept
 # with --cleanup=verbatim would retain comment lines; that is the one shape
-# where this is more lenient than the stored message.)
+# where this is more lenient than the stored message.) Leading blank lines go
+# the same way and for the same reason, and it is not cosmetic: cleanup
+# strips them, so dropping them here is what makes the first line of `body`
+# the subject, which is what the line numbering in check 3 assumes.
 #
 # Second, the names of the shared tooling tree. Without this no commit could
 # say where these files come from: this hook lives at
@@ -76,7 +79,7 @@ TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # the names above neutralised, which is what the vendor checks read -- and is
 # the wrong thing to measure a column count against, since every substitution
 # here makes the line longer than the one somebody wrote.
-body=$(sed -e '/^#.*>8/,$d' -e '/^#/d' "$msg")
+body=$(sed -e '/^#.*>8/,$d' -e '/^#/d' -e '/[^[:space:]]/,$!d' "$msg")
 prose=$(printf '%s\n' "$body" \
 	| sed -E 's#claude-guidelines#tooling-guidelines#g; s#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
 
@@ -125,10 +128,24 @@ columns() {
 
 # 2. Subject at 75 columns, the kernel's limit, taken deliberately: it is what
 #    keeps `git log --oneline` and `git shortlog` readable at a terminal width.
-subject=$(sed -n '1p' "$msg")
-case "$subject" in
-	'#'*) exit 0 ;;
-esac
+#
+#    **git's subject is not line 1 of the file, and reading it as though it
+#    were switched this hook off.** Cleanup discards comment lines and leading
+#    blank lines before anything else, so with a `commit.template` whose first
+#    line is a comment -- the ordinary shape -- or with nothing worse than a
+#    stray blank line at the top, line 1 is a line git is about to throw away.
+#    This read that line and exited 0 when it began with `#`, which took the
+#    length check here, the wrapped-subject check below it and the whole body
+#    check with it, silently and for every commit made under such a template.
+#    Measured on real commits rather than reasoned about: a 96-column subject
+#    was accepted. So take the first line that is neither a comment nor blank,
+#    which is the line git will call the subject.
+#
+#    A message holding nothing else is an aborted commit, which git refuses on
+#    its own account, so it still leaves quietly. That is what the `#` case was
+#    reaching for and is the only part of it worth keeping.
+subject=$(awk '/^#/ { next } /^[[:space:]]*$/ { next } { print; exit }' "$msg")
+[ -n "$subject" ] || exit 0
 if [ "${#subject}" -gt 75 ] && [ "$(columns "$subject")" -gt 75 ]; then
 	echo "commit-msg: subject is $(columns "$subject") columns, limit is 75." >&2
 	echo "commit-msg:   $subject" >&2
@@ -145,8 +162,14 @@ fi
 #    what git will call the subject, which is the thing the limit is for.
 #
 #    Comment lines are skipped rather than counted, because git strips them
-#    before deciding anything, so one on line 2 never joins the subject.
-joined=$(awk '/^[[:space:]]*$/ { exit } /^#/ { next } \
+#    before deciding anything, so one on line 2 never joins the subject. A
+#    blank line met before the subject has begun is skipped for the same
+#    reason and must be: cleanup removes it too, and ending the join there
+#    while the subject itself starts below it made every message with a blank
+#    line at the top read as a subject wrapped onto two.
+joined=$(awk '/^#/ { next } \
+              n == 0 && /^[[:space:]]*$/ { next } \
+              /^[[:space:]]*$/ { exit } \
               { if (n++) printf " "; printf "%s", $0 } END { printf "\n" }' "$msg")
 if [ "$joined" != "$subject" ]; then
 	echo "commit-msg: the subject is wrapped onto more than one line." >&2

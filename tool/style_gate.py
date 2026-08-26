@@ -160,6 +160,23 @@ DEFAULTS: Config = {
 SKIP_DIR_NAMES = frozenset({"__pycache__", ".git"})
 
 
+# ------------------------------------------------------------- reporting
+
+def reject(message: str, *consequence: str) -> NoReturn:
+	"""Report a fault that makes this run's answer meaningless, and stop.
+
+	Lifted out of reject_config the day discovery gained a failure of its
+	own. The two are the same shape and want the same report: one line
+	naming what went wrong, indented lines saying what continuing would
+	have cost. Exit 2 in both, so a broken instrument is never confused
+	with the 1 that a real violation returns.
+	"""
+	print(f"style-gate: {message}", file=sys.stderr)
+	for line in consequence:
+		print(f"style-gate:   {line}", file=sys.stderr)
+	raise SystemExit(2)
+
+
 # ---------------------------------------------------------------- config
 
 def reject_config(path: Path, problem: str, *consequence: str) -> NoReturn:
@@ -174,10 +191,7 @@ def reject_config(path: Path, problem: str, *consequence: str) -> NoReturn:
 	So the rule is: a config that is present is read and applied exactly, or
 	the run fails. There is no middle setting where it half-applies.
 	"""
-	print(f"style-gate: {path} {problem}", file=sys.stderr)
-	for line in consequence:
-		print(f"style-gate:   {line}", file=sys.stderr)
-	raise SystemExit(2)
+	reject(f"{path} {problem}", *consequence)
 
 
 def type_problems(loaded: Config) -> list[str]:
@@ -305,6 +319,23 @@ def discover(root: Path, cfg: Config) -> tuple[list[Path], int]:
 			["git", "-C", str(root), "ls-files", "--cached", "--others",
 			 "--exclude-standard"],
 			capture_output=True, text=True, check=False)
+		# A git that exits non-zero is a broken instrument, not an empty
+		# tree, and downstream the two are indistinguishable: both arrive
+		# as no output. The case that found this is a truncated .git/index
+		# -- what a full filesystem leaves behind -- where ls-files exits
+		# 128, prints nothing on stdout and puts the reason on stderr.
+		# Read as an empty list it handed the collapse floor a raw
+		# population of zero, which no floor can fire against, so `check`
+		# printed "0 files conform" and exited 0 and `make style-source`
+		# reported a pass. Stop here instead, while git's own message is
+		# still in hand to print: the tool cannot say anything true about
+		# a file set it was unable to read.
+		if out.returncode != 0:
+			detail = out.stderr.strip().splitlines() or [
+				f"git ls-files exited {out.returncode} and said nothing."]
+			reject(f"cannot list the files in {root}.", *detail,
+			       "discovery is the whole file set, so continuing "
+			       "would check nothing and pass.")
 		names = [line for line in out.stdout.splitlines() if line]
 		paths = [root / n for n in names]
 	else:
@@ -369,6 +400,22 @@ def wants_text(path: Path, cfg: Config) -> bool:
 	return wants_indent(path, cfg) or path.suffix in set(cfg["text_suffixes"])
 
 
+def floor_count(raw: int, cfg: Config) -> int:
+	"""The smallest gated count this config calls plausible, in files.
+
+	One place computes it because three read it back: collapse() judges
+	against it, `list` prints it, and the message a collapse prints quotes
+	it. That message used to print `cfg["floor"]` itself, which for a
+	fraction read "expected at least 0.35" -- the right number in the
+	wrong unit, and one no reader could compare against the file count
+	sitting beside it.
+	"""
+	floor = cfg["floor"]
+	if isinstance(floor, float):
+		return int(floor * raw)
+	return int(floor)
+
+
 def collapse(count: int, raw: int, cfg: Config) -> bool:
 	"""True if the file list has plausibly collapsed rather than come back clean.
 
@@ -403,11 +450,20 @@ def collapse(count: int, raw: int, cfg: Config) -> bool:
 	every legitimate addition. What a floor catches is a collapse. The
 	advice that once claimed the finer catch claimed more than any floor
 	can deliver.
+
+	A raw population of zero is judged before either shape, because it is
+	the one input both are blind to. `count < floor * 0` is `0 < 0`, which
+	is False, so the fractional form passed precisely the case this
+	docstring names -- the pathspec, the glob or the git call having
+	stopped matching -- and was strictly weaker there than the absolute
+	form it replaced. Found with a truncated .git/index, where `check`
+	printed "0 files conform" and exited 0. discover() now refuses a
+	failing git before this is reached, but a floor that only holds
+	because some other check closed the door is not a floor.
 	"""
-	floor = cfg["floor"]
-	if isinstance(floor, float):
-		return count < floor * raw
-	return count < int(floor)
+	if raw == 0:
+		return True
+	return count < floor_count(raw, cfg)
 
 
 # -------------------------------------------------------------- lexing
@@ -1345,14 +1401,23 @@ def main(argv: list[str]) -> int:
 		floor = cfg["floor"]
 		if isinstance(floor, float):
 			print(f"\n{len(files)} file(s) of {raw} raw; floor is "
-			      f"{floor:g} of raw = {int(floor * raw)}", file=sys.stderr)
+			      f"{floor:g} of raw = {floor_count(raw, cfg)}", file=sys.stderr)
 		else:
 			print(f"\n{len(files)} file(s); floor is {floor}", file=sys.stderr)
 		return 0
 
 	if not explicit and collapse(len(files), raw, cfg):
+		if raw == 0:
+			print("style-gate: discovery found no files at all --",
+			      file=sys.stderr)
+			print("style-gate:   this is not an empty tree; it is a "
+			      "population nothing can be measured against.",
+			      file=sys.stderr)
+			print("style-gate:   check that --root names the project, and "
+			      "run `list`.", file=sys.stderr)
+			return 2
 		print(f"style-gate: found {len(files)} files, expected at least "
-		      f"{cfg['floor']} --", file=sys.stderr)
+		      f"{floor_count(raw, cfg)} --", file=sys.stderr)
 		print("style-gate:   this reads as a clean tree but is a collapsed "
 		      "file list.", file=sys.stderr)
 		print("style-gate:   check include/exclude in .style-gate.toml, or "
