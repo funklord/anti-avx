@@ -834,6 +834,7 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 				found = reader(raw.decode("utf-8"), rel)
 			except UnicodeDecodeError:
 				found = None            # not UTF-8 either; the bytes decide
+		fell_back = found is None
 		if found is None:
 			try:
 				raw.decode("ascii")
@@ -845,16 +846,24 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 				                 f"non-ASCII byte 0x{raw[offset]:02x}")]
 			else:
 				found = []
-		# ASCII findings JOIN the rest rather than returning early. The
-		# return here cost an order of magnitude once: a tree adopting the
-		# gate read 371 indentation findings across 7 files, spelled its em
-		# dashes out, and read 3347 across 48 -- the 7 were exactly the
-		# files that happened to be pure ASCII already, and both runs
-		# printed one summary line of the same shape. A count that depends
-		# on which OTHER rule has fired first is not a count, and the first
-		# number was quotable as measured fact. The fixer-level check below
-		# still stands down for a file the lexer refused, which is the one
-		# case where continuing would report nonsense rather than findings.
+		# ASCII findings from a SUCCESSFUL reader join the rest rather
+		# than returning early. The return here cost an order of magnitude
+		# once: a tree adopting the gate read 371 indentation findings
+		# across 7 files, spelled its em dashes out, and read 3347 across
+		# 48 -- the 7 were exactly the files that happened to be pure
+		# ASCII already. A count that depends on which OTHER rule fired
+		# first is not a count.
+		#
+		# But a finding from the BYTE FALLBACK stands alone, and situ's
+		# suite pinned that contract when the first version of this fix
+		# broke it: the fallback runs precisely because the file would not
+		# lex, so every later check that leans on literal exemptions would
+		# report through a model that refused the file. One finding from
+		# an unassessable file is the honest answer; hembygd's files all
+		# lexed, which is why both cases exist.
+		if fell_back and found:
+			problems.extend(found)
+			return problems
 		problems.extend(found or [])
 
 	text = raw.decode("utf-8", errors="replace")
