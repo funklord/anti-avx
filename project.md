@@ -6204,6 +6204,155 @@ does not contain is one execution can never exercise, so it is guarded by unit c
 instead: one accepted, four refused -- `$0x0`, a high half from another register, a low
 half from another ymm, and a store of a register the insert did not build.
 
+### Finding 109 -- the constant needs no register, because memory is the shadow
+
+Starfield stopped at `0x1408284C7`, `vmovups 0x4223441(%rip),%ymm0`: thirty-two bytes of
+`.rdata` loaded into a register, and then stored six times inside a loop that fills a
+structure with them. MSVC hoists the load out; the stores are the loop body.
+
+Nothing here could take it, and the three refusals are the same refusal:
+
+  * `ymm_pair` wants the store immediately after the load. It is sixteen instructions and
+    a loop head away.
+  * `ymm_run` wants both inside one window. The loop head is a branch target, so no
+    window may span it.
+  * `long_pair_stores` carries the upper half in a register the original never names, and
+    that register would have to stay free across the loop, with nothing branching into
+    the span.
+
+**All three are about keeping a register intact. None of them is about the value.** The
+bytes are in a section the loader maps without `IMAGE_SCN_MEM_WRITE`, so they cannot
+change between the load and the store, and the store's stub can simply fetch them again:
+
+```
+1489e65e4:  movups -0x3f9aceb(%rip),%xmm1   # 0x144a4b900   the high sixteen
+1489e65eb:  movups %xmm1,0x10(%rcx)
+1489e65ef:  movups -0x3f9ad06(%rip),%xmm1   # 0x144a4b8f0   the low sixteen
+1489e65f6:  movups %xmm1,(%rcx)
+```
+
+Those are `lower_ymm_pair`'s four moves exactly, high half first so the register ends
+holding the low sixteen -- the same bytes for the same reason as Finding 38, with the
+load half taken from wherever the value came from rather than from the instruction
+before. The load itself becomes a single move of its low half, and its upper half is
+left stale on purpose.
+
+#### The two ends have to agree, and they cannot disagree
+
+A store is lowered on a backward argument: walk to the nearest write of the register and
+ask what it was. A load is lowered on a forward one: nothing may read the upper half this
+leaves stale unless it is a store that will fetch the bytes for itself. Those are
+different questions about the same set of stores, and if they answer differently the
+result is a load with a stale upper half and a reader that trusts it.
+
+So they are not two answers. `upper_half_read_later` takes a `covered` predicate, the
+predicate calls `constant_ymm`, and `constant_ymm` is what the store branch calls. One
+decision, asked from both ends. It compares the LOAD each end walked back to, not the
+constant's address: two loads of the same bytes are two definitions, and only one of them
+is the one being lowered.
+
+#### `zeroed_ymm` was already the walk this needed
+
+The backward argument is Finding 44's, Finding 82's and Finding 84's, and it was written
+once, inside `zeroed_ymm`. What that function actually does is two things: find the
+nearest write, then ask whether it was a zeroing idiom. Only the second is about zero.
+
+`reaching_definition` is the first half, extracted -- the walk, the refusal at a call,
+the transparency of a conditional branch going backwards, the recursion at a branch
+target, and `value_survives_loop`'s induction, which was called `zero_survives_loop` and
+never asked what the value was. `zeroed_ymm` and `constant_ymm` are now two questions put
+to one answer. Writing the walk twice was the alternative, and Finding 52 is what that
+costs.
+
+`value_survives_loop` is what makes the executed site work. The stores are inside the
+loop and the load is outside it; the loop head is the first store, its only edge in is
+the back edge, and nothing in the body writes the register. That is the same induction
+that let nineteen refused zero stores through in Finding 83, reached here for a value
+that is not zero.
+
+#### A call still ends it, and being exact about why is the point
+
+The docstring's first draft claimed a call was free too, on the grounds that memory does
+not move. That is true of the memory and false of the register: the upper half of every
+ymm is volatile across a call under Win64, so a callee may leave something else in it and
+the store would write that. `reaching_definition` refuses across one and this inherits
+the refusal. **What a constant buys is the register pressure and the distance, not the
+call.**
+
+#### A four-byte store at the head of a loop
+
+The first store in the loop is `vmovups %ymm1,(%rcx)` -- four bytes, and a `jmp rel32`
+needs five. It can widen neither way: backwards is refused because the site is a branch
+target and cannot vanish into the middle of a window, and forwards it would have to
+swallow another 256-bit store, which `moved_instruction` refuses. Alone, it is the site
+the game would then have stopped on, forty-one bytes further along.
+
+Finding 81 met that exact competition among zero stores and answered it by taking the
+group as one window. Nothing in `zero_run` was about zero: it is a scan for adjacent
+256-bit stores with a predicate supplied by the caller, so it is `store_run` now and the
+constant passes a different predicate. Six stores, two constants, two registers, one
+stub, one detour.
+
+#### `.text` is in the read-only map, and that is deliberate
+
+`readonly_ranges` decides on the section characteristics rather than on the name, so
+`.text` qualifies -- and this tool writes into `.text`. It is still sound, because both
+ends read the same address in the same image: a lowered store fetching bytes the patcher
+changed fetches exactly what the original load would have fetched from the rewritten
+binary. The divergence is against the ORIGINAL image, and in-place patching has that
+everywhere.
+
+Measured through `readonly_ranges` itself rather than against a threshold read off the
+section table: of the 1,292 RIP-relative 256-bit loads in `.text`, 850 name a read-only
+section that is not `.text`, 442 name one that is writable and are refused, and **none
+names `.text`**. The question is recorded because the next binary may answer it
+differently.
+
+#### What the count is worth, and the one site that is not fungible
+
+```
+VEX in .text      9,245 ->   9,180       795,951 removed, 98.9%
+detours         200,960 -> 201,013
+candidates      239,731 -> 240,591       830 conststore, 30 constload
+refused             737 ->     737
+frontier   0x1408284C7 -> 0x14235008F
+```
+
+**Sixty-five sites, and one of them is the site the game stops on.** Of the 860 new
+candidates, 807 sit inside a window some other strategy had already committed and are
+skipped for overlap; 53 detours are placed and they cover 65 sites, the construn covering
+six by itself. Finding 80 is the reason to write that number down rather than round it
+away: sites are not fungible, and this is the second time the aggregate has been the
+wrong column to read.
+
+The refusals it does not take have a name of their own now -- `256-bit: the constant is
+read by something that will not reload it`, 182 sites, previously scattered through four
+buckets that described the run rather than the value. Those are 256-bit reads that are
+not stores: arithmetic on a hoisted constant, which is the register model and nothing
+else.
+
+**The cost is paid per iteration, and this is where it shows.** Six stores became
+twenty-four moves plus a detour, inside a loop. Every other lowering here is a straight
+trade of one instruction for two or three; this one reloads the same thirty-two bytes
+six times because there is no register to keep them in. It is correct, it is what makes
+the loop run at all, and it is the clearest argument yet for the Y1 register
+representation: hoisting the upper half into a spare xmm outside the loop would turn all
+twenty-four moves back into six.
+
+#### What the run found next
+
+The game now loads 305 modules before it faults, against 301, and stops on
+`vstmxcsr 0x178(%rsp)` at `0x14235008F` -- which is not a 256-bit problem at all. There
+are nine of these in the binary, five `vstmxcsr` and four `vldmxcsr`; `lower.py` has had
+a rule for both since the beginning, `has_direct_sse_form` says yes to both, and
+`sse_encoding` produces eight bytes against the VEX form's nine, so it would fit in place
+with a byte to spare.
+
+They survive because they take **one** operand. `patch.classify` tests for two operands
+and for three and falls off the end, and `collect` refuses `operand shape not A/B/C` by
+the same rule -- so a form neither was written against is refused twice and named once.
+That bucket is nine sites, all nine of them these, and the game is standing on one.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7013,7 +7162,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **793,722 of 805,131 VEX sites, 98.6%** (Findings 24 to 95), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **795,951 of 805,131 VEX sites, 98.9%** (Findings 24 to 109), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -7147,13 +7296,20 @@ checks that should have caught them earlier could not: one shared a function wit
 it checked, and one was empty by construction.
 
 **The target now runs, which changes the character of the remaining work rather than the
-size of it.** Finding 74 puts the rewritten binary 866 bytes past where the original dies,
+size of it.** Finding 74 put the rewritten binary 866 bytes past where the original dies,
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
-table independently of the tool that wrote it. But 866 bytes is the point: the residue is
+table independently of the tool that wrote it. That number was the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 11,409 that remain has to go before any of this can be
-soaked. What the run adds is a measuring instrument -- each fault address names the next
-site, and the site it named turned out to be refused under a misleading label.
+immediately, and every one of the 9,180 that remain has to go before any of this can be
+soaked.
+
+**What the run adds is a measuring instrument, and it has been the better half of the
+method since.** Each fault address names the next site, that site has named a strategy
+four times running -- Findings 106, 107, 108 and 109 -- and twice it named something the
+census had filed under the wrong cause. The frontier is at `0x14235008F` now, 305 modules
+in, and it names a one-operand `vstmxcsr`: nine sites, an SSE form a byte shorter than
+the VEX one, and two operand-shape tests neither of which was written against a form
+with one operand.
 
 Reproduce the measurements with:
 

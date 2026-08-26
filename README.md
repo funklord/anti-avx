@@ -19,19 +19,19 @@ performance argument against this approach does not hold.
 
 A translated binary that is 99.99% correct is worthless: the remaining 0.01%
 is a crash at an unpredictable moment. So the number to watch is not how much
-is translated but how much is left, and 9,245 sites are left.
+is translated but how much is left, and 9,180 sites are left.
 
-**Starfield has now been run, under Proton, and it gets 866 bytes further.**
-The original dies on the first AVX instruction it executes; the rewritten one
-executes that instruction and three more, through two stubs, and dies on the
-next site the rewriter refused. Wine's unwinder walked the rebuilt 431,937-entry
-function table and produced a call stack identical to the original's for all
-eleven frames. See `project.md`, Finding 74 -- that is a frontier moving, not a
-game starting.
+**Starfield has now been run, under Proton, and each run names the next site
+to work on.** The original dies on the first AVX instruction it executes.
+Wine's unwinder walked the rebuilt function table and produced a call stack
+identical to the original's for all eleven frames -- see `project.md`,
+Finding 74. The rewritten binary now loads 305 modules before it stops, on a
+one-operand `vstmxcsr` that two operand-shape tests were never written
+against. That is a frontier moving, not a game starting.
 
 Nothing here is Starfield-specific except a Makefile default. The tools take
 the binary as an argument, read its PE headers, `.pdata` and relocations, and
-have been exercised end to end on twenty-five small PEs this project builds
+have been exercised end to end on twenty-seven small PEs this project builds
 itself. Starfield is the corpus, not the target.
 
 Read [`project.md`](project.md). It is the authoritative record of intent and
@@ -91,7 +91,7 @@ binary. `make clean` removes what it wrote, by name.
 
 ```sh
 make check        the gate: style, the lowering proof, and the C tests
-make check-pe     twenty-five PEs built here, rewritten, under wine
+make check-pe     twenty-seven PEs built here, rewritten, under wine
 make check-spill  the three ways a stub can get a scratch register
 make check-unwind whether an exception can be dispatched from inside a stub
 make hooks        install the commit-msg hook into .git/hooks

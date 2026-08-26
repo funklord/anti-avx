@@ -1535,8 +1535,8 @@ def lower_ymm_zero_store(vex, tail, address, length, at):
 	return low_half + high_half
 
 
-def zero_run(instructions, index, blocked, zeroed, limit=16):
-	"""Consecutive 256-bit zero stores, taken as one window.
+def store_run(instructions, index, blocked, holds, limit=16):
+	"""Consecutive 256-bit stores the caller can vouch for, as one window.
 
 	**Short zero stores compete with each other for padding.** A 256-bit
 	store with no displacement encodes in four bytes and a `jmp rel32` needs
@@ -1557,8 +1557,11 @@ def zero_run(instructions, index, blocked, zeroed, limit=16):
 	for a long one and an unbounded walk here would be a new way to be slow.
 
 	Returns (positions, last position) with at least two members, or None.
-	`zeroed` decides whether a store's register is provably zero at its own
-	position -- passed in rather than called here so this stays a scan.
+	`holds` decides whether a store's value is known at its own position --
+	passed in rather than called here so this stays a scan, and so that the
+	same grouping serves a constant as well as a zero. Nothing above is
+	about which value it is: the competition for padding is a property of
+	four-byte stores standing next to each other. Finding 109.
 	"""
 	members, at = [index], None
 	address, encoding, _m, _o, _c = instructions[index]
@@ -1575,13 +1578,29 @@ def zero_run(instructions, index, blocked, zeroed, limit=16):
 		what = wide_move(bits, name, text)
 		if what is None or what[0] != "store":
 			break
-		if not zeroed(position, what[1]):
+		if not holds(position, what[1]):
 			break
 		members.append(position)
 		at = next_address + len(bits)
 	if len(members) < 2:
 		return None
 	return members, members[-1]
+
+
+def lower_constant_run(entries, at):
+	"""Every store in the run, four 128-bit moves each, into one stub.
+
+	Each member carries its own load, so a run may mix constants and mix
+	registers -- what makes it a run is that the stores are adjacent, not
+	that they say the same thing.
+	"""
+	body = bytearray()
+	for load, store in entries:
+		piece = lower_ymm_pair((load, store), at + len(body))
+		if piece is None:
+			return None
+		body += piece
+	return bytes(body)
 
 
 def lower_zero_run(entries, at):
@@ -1910,8 +1929,8 @@ def lower_ymm_run(strategy, at, pool):
 	return bytes(body)
 
 
-def zero_survives_loop(instructions, index, register, blocked, sources,
-                       limit=32):
+def value_survives_loop(instructions, index, register, blocked, sources,
+                        limit=32):
 	"""True if the loop this store heads cannot disturb the register.
 
 	Finding 82 refuses a zero store that is itself a branch target, because
@@ -1934,6 +1953,11 @@ def zero_survives_loop(instructions, index, register, blocked, sources,
 
 	Refusing when `sources` is absent keeps every other caller conservative.
 	Finding 83.
+
+	**The induction is about the register, not about what is in it.** Nothing
+	below asks what the value is -- only that no path into the head carries a
+	different one, and that the body writes it nowhere -- so it serves the
+	read-only constant `constant_ymm` proves exactly as it serves a zero.
 	"""
 	address = instructions[index][0]
 	incoming = sources.get(address) if sources else None
@@ -1964,6 +1988,112 @@ def zero_survives_loop(instructions, index, register, blocked, sources,
 	return False
 
 
+def reaching_definition(instructions, index, register, blocked, limit=640,
+                        sources=None, depth=4):
+	"""Where `register`'s value at `index` was decided, or None.
+
+	Returns the position of the nearest instruction that writes it. Sound
+	because it walks back to that NEAREST write, so nothing between it and
+	`index` can have changed the register. Everything unresolved is refused:
+
+	  * a **branch target** in between means another path reaches this point
+	    without passing the write;
+	  * a **call** in between is opaque, the upper half of every ymm being
+	    volatile across one -- that is what `vzeroupper` exists for -- so no
+	    definition survives it;
+
+	An instruction that merely **reads** the register is scanned past, the
+	value being unchanged by it. That was refused when this was written, on
+	the grounds that "the nearest mention decides" is the rule easiest to be
+	sure of; measured afterwards, the simplification was costing 3,299
+	stores, which is more than a simplification is worth. Finding 44.
+
+	**A conditional branch is transparent in this direction, and that is the
+	asymmetry worth understanding.** Going forwards a branch splits the paths
+	and the answer has to hold on both, which is why Finding 42 had to follow
+	the edges. Going backwards there is nothing to split: reaching this point
+	by falling through a `jcc` means the branch was not taken on this
+	execution, so everything before it ran in order. An unconditional jump is
+	not transparent -- the instruction after one is reachable only by a
+	branch, and a branch target has already been refused above, so meeting a
+	`jmp` walking backwards means bytes nothing reaches.
+
+	`vzeroall` would be the one instruction that writes an xmm without naming
+	it. There are none in `.text`, checked rather than assumed.
+
+	**What the write means is the caller's question, not this one's.**
+	`zeroed_ymm` asks whether it was a zeroing idiom and `constant_ymm`
+	whether it was a load of memory that cannot change; the walk that finds
+	it is the same walk, written once. Two of them answering one question is
+	how a collector and an encoder come to disagree -- Finding 52 -- and this
+	was one walk with one caller until there were two.
+	"""
+	# **The site's own address counts, and it was not being checked.** The
+	# walk below refuses a branch target it passes over, on the grounds that
+	# another path reaches the site without passing the write. That is
+	# exactly as true when the SITE is the branch target, and this started
+	# at index-1 and never looked.
+	#
+	# It shipped wrong bytes. At 0x1424e3b5f a `jmp` lands on the store and
+	# skips the `vxorps` two instructions above it, so on that path ymm0
+	# holds something else and the lowering wrote the low half twice. Two
+	# such sites were in the built binary and nineteen more were accepted by
+	# the scan and lost elsewhere. Finding 82.
+	# ...unless it heads a loop that cannot disturb the register, which is
+	# what nineteen of the twenty-one turned out to be. See
+	# `value_survives_loop`; without `sources` this stays the flat refusal.
+	if instructions[index][0] in blocked:
+		if not value_survives_loop(instructions, index, register, blocked,
+		                           sources):
+			return None
+	narrow = "%xmm" + register[len("%ymm"):]
+	for step in range(1, limit + 1):
+		position = index - step
+		if position < 0:
+			return None
+		address, _encoding, mnemonic, operands, _comment = \
+			instructions[position]
+		if mnemonic.startswith(CONTROL_PREFIXES) \
+				and not conditional_branch(mnemonic):
+			return None
+		if narrow in operands or register in operands:
+			# In AT&T the destination is the last operand, and the one family
+			# that writes a non-last one is `vgather*`, which zeroes its mask.
+			# There are none in `.text`, checked rather than assumed, so a
+			# register named anywhere but last is read-only.
+			fields = inplace.split_operands(operands)
+			if fields and fields[-1] in (narrow, register):
+				# **This instruction decides the value, however control
+				# arrived**, so whether it is a branch target does not matter
+				# and must not be asked -- the first version of this
+				# recursion tested `blocked` before looking at the write,
+				# which for a target that writes the register would have
+				# answered about the value BEFORE it. Finding 84.
+				return position
+		if address in blocked:
+			# **A branch target is only opaque if the value AT it is.** The
+			# refusal here says another path reaches this point without
+			# passing the write -- true, and it stops mattering when the
+			# register is decided the same way on every path into that point
+			# too, which is exactly what this function answers. Nothing
+			# between there and the site writes it, or the walk would have
+			# returned above.
+			#
+			# So recurse, and bound it. `depth` stops a chain of targets
+			# walking the whole function: each step costs a full backward
+			# walk, and the shapes this is for -- a memset loop whose head is
+			# a store, and the stores after it -- need one or two.
+			#
+			# Exhausting the bound is a refusal, so an unresolved answer
+			# stays "no definition", which is the safe direction.
+			if depth <= 0:
+				return None
+			return reaching_definition(instructions, position, register,
+			                           blocked, limit, sources, depth - 1)
+		# A pure source, or no mention at all: the value is unchanged.
+	return None
+
+
 def zeroed_ymm(instructions, index, register, blocked, limit=640,
                sources=None, depth=4):
 	"""True if every bit of `register` is zero when `index` executes.
@@ -1979,104 +2109,108 @@ def zeroed_ymm(instructions, index, register, blocked, limit=640,
 	(the copy idiom, and the gapped case Finding 39 closed) and 6,095 where
 	this scan reaches no definition at all.
 
-	Sound because it walks back to the NEAREST write, so nothing between that
-	write and the store can have changed the register. Everything unresolved
-	is refused:
-
-	  * a **branch target** in between means another path reaches the store
-	    without passing the zeroing;
-	  * a **call** in between is opaque, the upper half of every ymm being
-	    volatile across one -- that is what `vzeroupper` exists for -- so the
-	    zeroing does not survive it;
-	An instruction that merely **reads** the register is scanned past, the
-	value being unchanged by it. That was refused when this was written, on
-	the grounds that "the nearest mention decides" is the rule easiest to be
-	sure of; measured afterwards, the simplification was costing 3,299
-	stores, which is more than a simplification is worth. Finding 44.
-
-	**A conditional branch is transparent in this direction, and that is the
-	asymmetry worth understanding.** Going forwards a branch splits the paths
-	and the answer has to hold on both, which is why Finding 42 had to follow
-	the edges. Going backwards there is nothing to split: reaching this store
-	by falling through a `jcc` means the branch was not taken on this
-	execution, so everything before it ran in order. An unconditional jump is
-	not transparent -- the instruction after one is reachable only by a
-	branch, and a branch target has already been refused above, so meeting a
-	`jmp` walking backwards means bytes nothing reaches.
-
-	`vzeroall` would be the one instruction that writes an xmm without naming
-	it. There are none in `.text`, checked rather than assumed.
+	`reaching_definition` does the walking and says what wrote the register.
+	What is left here is only whether that write was the idiom, and the
+	answer has to be the same three-operand VEX.128 form the scan's own
+	`ZEROING` set names -- `vpxor %xmm0,%xmm0,%xmm0` and not `vpxor` of two
+	different registers, which computes something.
 	"""
-	narrow = "%xmm" + register[len("%ymm"):]
-	# **The store's own address counts, and it was not being checked.** The
-	# walk below refuses a branch target it passes over, on the grounds that
-	# another path reaches the store without passing the zeroing. That is
-	# exactly as true when the STORE is the branch target, and this started
-	# at index-1 and never looked.
-	#
-	# It shipped wrong bytes. At 0x1424e3b5f a `jmp` lands on the store and
-	# skips the `vxorps` two instructions above it, so on that path ymm0
-	# holds something else and the lowering wrote the low half twice. Two
-	# such sites were in the built binary and nineteen more were accepted by
-	# the scan and lost elsewhere. Finding 82.
-	# ...unless it heads a loop that cannot disturb the register, which is
-	# what nineteen of the twenty-one turned out to be. See
-	# `zero_survives_loop`; without `sources` this stays the flat refusal.
-	if instructions[index][0] in blocked:
-		if not zero_survives_loop(instructions, index, register, blocked,
-		                          sources):
-			return False
-	for step in range(1, limit + 1):
-		position = index - step
-		if position < 0:
-			return False
-		address, encoding, mnemonic, operands, _comment = instructions[position]
-		if mnemonic.startswith(CONTROL_PREFIXES) \
-				and not conditional_branch(mnemonic):
-			return False
-		fields = ()
-		writes = False
-		if narrow in operands or register in operands:
-			fields = inplace.split_operands(operands)
-			# In AT&T the destination is the last operand, and the one family
-			# that writes a non-last one is `vgather*`, which zeroes its mask.
-			# There are none in `.text`, checked rather than assumed, so a
-			# register named anywhere but last is read-only.
-			writes = bool(fields) and fields[-1] in (narrow, register)
-		if writes:
-			# **This instruction decides the value, however control arrived**,
-			# so whether it is a branch target does not matter and must not be
-			# asked -- the first version of this recursion tested `blocked`
-			# before looking at the write, which for a target that writes the
-			# register would have answered about the value BEFORE it. Finding
-			# 84.
-			if mnemonic not in scratch_finder.ZEROING:
-				return False
-			if len(fields) != 3 or set(fields) != {narrow}:
-				return False
-			vex = inplace.decode_vex(encoding)
-			return vex is not None and not vex["L"]
-		if address in blocked:
-			# **A branch target is only opaque if the value AT it is.** The
-			# refusal here says another path reaches this point without
-			# passing the zeroing -- true, and it stops mattering when the
-			# register is zero on every path into that point too, which is
-			# exactly what this function answers. Nothing between there and
-			# the store writes it, or the walk would have returned above.
-			#
-			# So recurse, and bound it. `depth` stops a chain of targets
-			# walking the whole function: each step costs a full backward
-			# walk, and the shapes this is for -- a memset loop whose head is
-			# a store, and the stores after it -- need one or two.
-			#
-			# Exhausting the bound is a refusal, so an unresolved answer stays
-			# "not zero", which is the safe direction.
-			if depth <= 0:
-				return False
-			return zeroed_ymm(instructions, position, register, blocked,
-			                  limit, sources, depth - 1)
-		# A pure source, or no mention at all: the value is unchanged.
-	return False
+	position = reaching_definition(instructions, index, register, blocked,
+	                              limit, sources, depth)
+	if position is None:
+		return False
+	_address, encoding, mnemonic, operands, _comment = instructions[position]
+	if mnemonic not in scratch_finder.ZEROING:
+		return False
+	fields = inplace.split_operands(operands)
+	if len(fields) != 3 or set(fields) != {"%xmm" + register[len("%ymm"):]}:
+		return False
+	vex = inplace.decode_vex(encoding)
+	return vex is not None and not vex["L"]
+
+
+def constant_load(instruction, readonly):
+	"""(vex, tail, address, length) if this loads 256 bits that cannot
+	change, or None.
+
+	RIP-relative only, and only from a section the loader maps without
+	`IMAGE_SCN_MEM_WRITE`. Both halves must lie inside one such section:
+	the store's stub reads thirty-two bytes from here, so a constant that
+	runs off the end of one is not one.
+
+	The tuple is the shape `ymm_pair` returns its halves in, and for the same
+	reason -- a RIP-relative displacement can only be recomputed from the
+	address and length of the instruction that carried it, and this
+	instruction is nowhere near the stub that will use it.
+	"""
+	address, encoding, mnemonic, operands, _comment = instruction
+	move = wide_move(encoding, mnemonic, operands)
+	if move is None or move[0] != "load":
+		return None
+	vex = inplace.decode_vex(encoding)
+	tail = encoding[vex["length"]:]
+	target = rip_target(tail, address, len(encoding))
+	if target is None or not inside_readonly(readonly, target, 32):
+		return None
+	return (vex, tail, address, len(encoding))
+
+
+def constant_reload(instructions, position, blocked, readonly, sources,
+                    load):
+	"""True if the 256-bit read at `position` fetches `load`'s constant.
+
+	The exception `upper_half_read_later` is given when a constant load is
+	being considered: a store that will be lowered by `conststore` reads the
+	read-only bytes rather than the register's upper half, so it is not a use
+	of the half the load's own lowering leaves stale.
+
+	It compares the LOAD each end walked back to, not the constant's address.
+	Two different loads of the same bytes are two different definitions, and
+	only one of them is the one being lowered here.
+	"""
+	entry = instructions[position]
+	what = wide_move(entry[1], entry[2], entry[3])
+	if what is None or what[0] != "store":
+		return False
+	found = constant_ymm(instructions, position, what[1], blocked, readonly,
+	                     sources=sources)
+	return found is not None and found[2] == load[2]
+
+
+def constant_ymm(instructions, index, register, blocked, readonly,
+                 limit=640, sources=None, depth=4):
+	"""The read-only load `register` still holds at `index`, or None.
+
+	**A constant needs no shadow register, because memory is the shadow.**
+	`long_pair_stores` carries an upper half from a load to a store in a
+	register the original never names, and pays for it: a register has to be
+	free across the whole span, any 128-bit use of the low half ends it, and
+	the span is bounded because a reservation held too long is one nothing
+	can verify. None of that is about the value. The store's stub loads both
+	halves again from where the load got them, so nothing is carried and
+	nothing is reserved, and the distance stops mattering.
+
+	What is still needed is that the register holds THAT constant when the
+	store executes, which is a reaching definition and nothing more.
+
+	**A call still ends it, and being exact about why is the point.** The
+	bytes cannot move; the REGISTER can. The upper half of every ymm is
+	volatile across a call under Win64 -- that is what `vzeroupper` exists
+	for -- so a callee may leave something else in it and the store would
+	write that. `reaching_definition` refuses across one and this inherits
+	the refusal rather than arguing with it. What a constant buys is the
+	register pressure and the distance, not the call.
+
+	The register cannot disagree with `constant_load`'s answer, so nothing
+	here re-checks it: the walk stops at a write to `%ymmN` or `%xmmN`, and a
+	`wide_move` load of the wide spelling is the only one of those two that
+	gets past `constant_load` at all.
+	"""
+	position = reaching_definition(instructions, index, register, blocked,
+	                              limit, sources, depth)
+	if position is None:
+		return None
+	return constant_load(instructions[position], readonly)
 
 
 # How many instructions `upper_half_read_later` may examine across all the
@@ -2122,7 +2256,8 @@ PATH_BUDGET = 400000
 
 
 def upper_half_read_later(instructions, index, register, limit=40,
-                          positions=None, budget=None, visiting=frozenset()):
+                          positions=None, budget=None, visiting=frozenset(),
+                          covered=None):
 	"""True if anything might still read the ymm's upper half.
 
 	Conservative in the direction that matters: an unresolved answer is
@@ -2136,6 +2271,12 @@ def upper_half_read_later(instructions, index, register, limit=40,
 
 	`positions` is `{address: index}`; without it a branch is opaque and the
 	answer is "read", which is what this did before the edges were followed.
+
+	`covered` is asked about a 256-bit read that would otherwise end the walk,
+	and answers whether that read is one the caller has already arranged to
+	lower without consulting the upper half. Only `constant_ymm` passes one
+	today. Without it nothing changes, which is how every other caller keeps
+	the belt-and-braces answer above.
 	"""
 	if budget is None:
 		budget = [PATH_BUDGET]
@@ -2203,7 +2344,7 @@ def upper_half_read_later(instructions, index, register, limit=40,
 			for successor in successors:
 				if upper_half_read_later(instructions, successor - 1,
 				                         register, limit, positions, budget,
-				                         inside):
+				                         inside, covered):
 					return True
 			return False
 		# **A VEX.128 write to the low half zeroes the upper one**, which is
@@ -2249,6 +2390,17 @@ def upper_half_read_later(instructions, index, register, limit=40,
 			vex = inplace.decode_vex(encoding)
 			if vex is not None and vex["L"]:
 				return False
+		# **A store the constant strategy claims reads no upper half**, so
+		# the stale one this lowering leaves behind is not what reaches
+		# memory: its stub loads both halves again from the read-only bytes
+		# the value came from. A store writes the register nowhere, so the
+		# walk carries on past it rather than ending here.
+		#
+		# The caller's predicate and the store's own lowering both come from
+		# `constant_ymm`, so the two cannot disagree about which stores these
+		# are -- there is one decision, asked twice.
+		if covered is not None and covered(position):
+			continue
 		return True
 	return False
 
@@ -2472,6 +2624,19 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			return None, 0
 		return bytes(body) + encode_jump(stub_address + len(body) + 5,
 		                                 start + window), 0
+	if kind == "construn":
+		# Consecutive stores of read-only constants, taken together for the
+		# reason the zero run below is taken together: a four-byte store at
+		# the head of a loop can widen over neither neighbour, and the one
+		# it would have to swallow is another 256-bit store that
+		# `moved_instruction` refuses. See `store_run`.
+		body = lower_constant_run(strategy[1], stub_address)
+		if body is None:
+			if reasons is not None:
+				reasons["the constant run would not lower"] += 1
+			return None, 0
+		return bytes(body) + encode_jump(stub_address + len(body) + 5,
+		                                 start + window), 0
 	if kind == "zerorun":
 		# Consecutive stores of an all-zero register, taken together so that
 		# none of them has to widen its window over another. See `zero_run`.
@@ -2535,6 +2700,27 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		vex = inplace.decode_vex(encoding)
 		lowered = lower_ymm_zero_store(vex, encoding[vex["length"]:], site,
 		                               len(encoding), stub_address + len(body))
+	elif kind == "conststore":
+		# A 256-bit store whose value is a load of read-only memory. The
+		# bytes are `lower_ymm_pair`'s exactly -- four 128-bit moves, high
+		# half first so the register ends holding the low sixteen -- and the
+		# only difference is where the load half comes from: not the
+		# instruction before this one, but the one `constant_ymm` walked back
+		# to, wherever it was.
+		vex = inplace.decode_vex(encoding)
+		lowered = lower_ymm_pair(
+			(strategy[1], (vex, encoding[vex["length"]:], site,
+			               len(encoding))),
+			stub_address + len(body))
+	elif kind == "constload":
+		# The other end, and it emits one move rather than four: the low half
+		# into the register's own xmm, which is where the original program
+		# keeps it. The upper half is left stale on purpose -- every reader
+		# of it is a `conststore`, checked by `upper_half_read_later` before
+		# this was accepted.
+		vex = inplace.decode_vex(encoding)
+		lowered = narrow_piece(vex, encoding[vex["length"]:], 0, site,
+		                       len(encoding), stub_address + len(body))
 	else:
 		# The site's own lowering, and the only lower_vex call whose failure
 		# means the stub is refused -- a swallowed one is attributed to
@@ -2733,6 +2919,11 @@ def collect(binary, listing):
 	# Which functions can lend their callee home space, if asked to.
 	home = home_space_map(binary, plain, ranges) if SPILL == SPILL_HOME \
 		else None
+	# Where a 256-bit load can be taken at its word. Only the headers are
+	# read: the ranges come from the section table, and the bytes inside them
+	# are the CPU's business rather than this tool's.
+	with open(binary, "rb") as image:
+		readonly = readonly_ranges(image.read(1 << 16))
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
 
 	# Anything already rewritten in place needs nothing further. Everything
@@ -2917,7 +3108,7 @@ def collect(binary, listing):
 					# The overlap count rose by 2,199 and said so.
 					found = None
 					if len(encoding) < 5:
-						found = zero_run(
+						found = store_run(
 							instructions, index, blocked,
 							lambda position, register: zeroed_ymm(
 								instructions, position, register, blocked,
@@ -2963,9 +3154,63 @@ def collect(binary, listing):
 					declined[address] = "the long pair store would not lower"
 					continue
 				else:
-					skipped["ymm value has no known upper half"] += 1
-					declined[address] = "ymm value has no known upper half"
-					continue
+					# **The value may be a constant, and then the store can
+					# fetch it for itself.** Nothing is reserved and nothing
+					# has to survive the distance: the stub loads both halves
+					# from the read-only bytes the register was loaded from,
+					# so a call, a loop or a branch target in between costs
+					# nothing. See `constant_ymm`.
+					held = constant_ymm(instructions, index, fields[0],
+					                    blocked, readonly, sources=sources)
+					if held is None:
+						skipped["ymm value has no known upper half"] += 1
+						declined[address] = \
+							"ymm value has no known upper half"
+						continue
+					strategy = ("conststore", held)
+					# **Consecutive constant stores compete for the same
+					# padding**, and harder than the zero stores of Finding
+					# 81 do: the one Starfield stops in is at the head of a
+					# loop, so it cannot widen backwards over an instruction
+					# that is a branch target's predecessor, and forwards it
+					# would have to swallow another 256-bit store, which
+					# `moved_instruction` refuses. Grouping is the only way
+					# either of them is reached.
+					#
+					# Only where the site is too short to detour alone, for
+					# the reason `store_run`'s caller below gives: one long
+					# window collides with neighbours that would each have
+					# been placed.
+					if len(encoding) < 5:
+						group = store_run(
+							instructions, index, blocked,
+							lambda position, name: constant_ymm(
+								instructions, position, name, blocked,
+								readonly, sources=sources) is not None)
+					else:
+						group = None
+					if group is not None:
+						members, last = group
+						tail_entry = instructions[last]
+						span = tail_entry[0] + len(tail_entry[1]) - address
+						entries = []
+						for position in members:
+							one = instructions[position]
+							one_vex = inplace.decode_vex(one[1])
+							entries.append((
+								constant_ymm(
+									instructions, position,
+									wide_move(one[1], one[2], one[3])[1],
+									blocked, readonly, sources=sources),
+								(one_vex, one[1][one_vex["length"]:], one[0],
+								 len(one[1]))))
+						if inplace.covered_by(ranges, address, span) \
+								and lower_constant_run(entries, address) \
+								is not None:
+							candidates.append(
+								(address, encoding, operands, mnemonic, span,
+								 [], None, [], ("construn", entries)))
+							continue
 		# There was a `mnemonic not in nds` test here, left over from when
 		# this only handled Class C. It quietly excluded every mnemonic
 		# that is DIRECT-only -- vcomiss and the rest -- as well as the
@@ -3005,6 +3250,36 @@ def collect(binary, listing):
 							 len(encoding), [], None, [],
 							 ("longload", (vex, tail, shadow))))
 						continue
+		# The other end of the constant: a 256-bit load of read-only memory,
+		# lowered to its low half alone and nothing else. The upper half is
+		# left stale deliberately, which is only safe where every later read
+		# of it is a store that will fetch the bytes again for itself -- so
+		# the walk below asks exactly that, through the same `constant_ymm`
+		# those stores are accepted by. One decision, asked from both ends.
+		#
+		# It is tried after the run rather than before it, and the order is
+		# not arbitrary: a run lowers everything between its halves into the
+		# one stub, where this leaves each store to detour on its own account.
+		# Where both would work the run is worth more.
+		if vex["L"] and strategy is None and mnemonic in YMM_MOVES:
+			held = constant_load(instructions[index], readonly)
+			if held is not None:
+				if upper_half_read_later(
+						instructions, index,
+						wide_move(encoding, mnemonic, operands)[1],
+						positions=positions,
+						covered=lambda position: constant_reload(
+							instructions, position, blocked, readonly,
+							sources, held)):
+					# Ahead of whatever the run said, by `held_back`'s rule:
+					# this strategy is the cheaper one -- it reserves no
+					# register and spans nothing -- so its refusal names the
+					# property of the code rather than the register pressure.
+					y_reason.insert(0, "256-bit: the constant is read by "
+					                   "something that will not reload it")
+				else:
+					strategy = ("constload", held)
+
 		if vex["L"] and strategy is None and not needs_sequence:
 			# The reason comes from `ymm_run` itself rather than from a
 			# second walk beside it: two code paths answering one question
@@ -3211,6 +3486,45 @@ def section_named(data, name):
 		if data[off:off + 8].rstrip(b"\0") == name.rstrip(b"\0"):
 			return sections_of(data)[i]
 	return None
+
+
+# A section the loader maps without IMAGE_SCN_MEM_WRITE cannot change under
+# a running program, which is the whole premise of `constant_ymm`. The second
+# flag is here because a section with no bytes in the file has nothing to
+# reload: .bss is read from nowhere and is writable anyway, but the pair is
+# what "the bytes are fixed and they are there" means.
+SECTION_WRITABLE = 0x80000000
+SECTION_UNINITIALISED = 0x00000080
+
+
+def readonly_ranges(data):
+	"""(start, end) for every section whose bytes cannot change, absolute.
+
+	Decided on the section characteristics rather than on the name. `.rdata`
+	is the one this is for and `.text` qualifies too, but the loader goes by
+	the flag and so does this -- a binary that puts its constants somewhere
+	else is not a case to guess at.
+	"""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	count = struct.unpack_from("<H", data, pe + 6)[0]
+	opt = pe + 24
+	base = struct.unpack_from("<Q", data, opt + 24)[0]
+	table = opt + struct.unpack_from("<H", data, pe + 20)[0]
+	out = []
+	for i in range(count):
+		off = table + i * 40
+		vsize, vaddr, rsize, _raddr = struct.unpack_from("<IIII", data,
+		                                                off + 8)
+		flags = struct.unpack_from("<I", data, off + 36)[0]
+		if flags & (SECTION_WRITABLE | SECTION_UNINITIALISED) or not rsize:
+			continue
+		out.append((base + vaddr, base + vaddr + (vsize or rsize)))
+	return sorted(out)
+
+
+def inside_readonly(ranges, start, size):
+	"""True if all `size` bytes from `start` lie in one unchanging range."""
+	return any(low <= start and start + size <= high for low, high in ranges)
 
 
 def rva_to_offset(data, rva):
@@ -3538,6 +3852,7 @@ def selftest():
 	failures += reach_selftest()
 	failures += borrow_selftest()
 	failures += splat_selftest()
+	failures += constant_selftest()
 
 	if failures:
 		print(f"selftest: {failures} of {len(SELFTEST)} lowerings are wrong",
@@ -3647,6 +3962,59 @@ def splat_selftest():
 	if not failures:
 		print(f"selftest: {len(cases) + 1} splat shapes, one accepted and "
 		      f"four refused")
+	return failures
+
+
+def constant_selftest():
+	"""Prove `constant_load` takes bytes that cannot change, and only those.
+
+	Every case here is a shape the real binary either does not contain or
+	contains too rarely to reach by running it -- which is exactly the gap
+	Finding 108 named. `check-pe` executes the accepted shape twice, in
+	`constant` and `constloop`; nothing executes the refusals, so they are
+	unit cases or they are untested.
+	"""
+	readonly = [(0x140002000, 0x140003000)]
+
+	def site(target, encoding, operands, mnemonic="vmovups", at=0x140001000):
+		"""One instruction whose RIP displacement lands on `target`."""
+		bits = bytes.fromhex(encoding)
+		if target is not None:
+			bits += struct.pack("<i", target - (at + len(bits) + 4))
+		return (at, bits, mnemonic, operands, target)
+
+	cases = [
+		("read-only, both halves inside",
+		 site(0x140002000, "c5fc1005", "0x0(%rip),%ymm0"), True),
+		("the second half is the last sixteen bytes of the range",
+		 site(0x140002fe0, "c5fc1005", "0x0(%rip),%ymm0"), True),
+		("the second half runs off the end of the range",
+		 site(0x140002ff0, "c5fc1005", "0x0(%rip),%ymm0"), False),
+		("a section the loader lets the program write",
+		 site(0x140004000, "c5fc1005", "0x0(%rip),%ymm0"), False),
+		# Not RIP-relative: `vmovups (%rax),%ymm0`. The address is computed
+		# at run time, so nothing here can say what is at it.
+		("through a register rather than RIP",
+		 site(None, "c5fc1000", "(%rax),%ymm0"), False),
+		# 128 bits, so it defines the low half and says nothing about the
+		# upper one -- which is the half the store needs.
+		("128-bit, which is not a definition of the whole register",
+		 site(0x140002000, "c5f81005", "0x0(%rip),%xmm0"), False),
+		# A store reads the register; it does not decide it.
+		("a store of the constant rather than a load of it",
+		 site(0x140002000, "c5fc1105", "%ymm0,0x0(%rip)"), False),
+	]
+	failures = 0
+	for what, instruction, expected in cases:
+		got = constant_load(instruction, readonly) is not None
+		if got != expected:
+			print(f"selftest: {what}: constant_load said {got}, "
+			      f"want {expected}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		accepted = sum(1 for _w, _i, e in cases if e)
+		print(f"selftest: {len(cases)} constant shapes, {accepted} accepted "
+		      f"and {len(cases) - accepted} refused")
 	return failures
 
 
@@ -4049,6 +4417,12 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			entries = strategy[1][1]
 			for entry in entries[1:]:
 				swallowed.add(entry[4])
+		if strategy is not None and strategy[0] == "construn":
+			# Every store after the first loses its boundary to the group's
+			# single window. Each entry is (load, store) and the store's
+			# address is its third field.
+			for _load, store in strategy[1][1:]:
+				swallowed.add(store[2])
 		if strategy is not None and strategy[0] == "zerorun":
 			# Every store after the first loses its boundary to the group's
 			# single window. Its address is the third field of the entry.

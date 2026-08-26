@@ -59,6 +59,7 @@ HEADER_SIZE = 0x400
 # does not care which section the target is in -- Starfield's own are into
 # `.data`, and its `.text` is not writable.
 CODE = 0xE0000020		# CODE | EXECUTE | READ | WRITE
+CODE_READONLY = 0x60000020	# CODE | EXECUTE | READ
 DATA = 0x40000040		# INITIALIZED_DATA | READ
 
 # The programs. Each exists to exercise a piece of the REWRITER, not to
@@ -1124,6 +1125,10 @@ hundred:	.float 100.0
 # is what every program before this one did.
 FRAMES = {"rspcopy": 104}
 
+# Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
+# constant in it is one. See `build`.
+READONLY = {"constant", "constloop"}
+
 
 # 24. A 256-bit load and store too far apart for one window, carried by a
 # reserved register.
@@ -1255,6 +1260,111 @@ sink:	.long 0, 0, 0, 0
 """)
 
 
+# 32. A 256-bit constant, loaded once and stored a long way from the load,
+# with a 128-bit read of the same register in between. Every one of those is
+# a reason `long_pair_stores` refuses a site -- it reserves a register from
+# the load to the store, so the distance costs it and any use of the low half
+# ends it. A constant costs neither: the store's stub loads both halves again
+# from `source`, which cannot have changed, so nothing has to be carried.
+#
+# `.text` is mapped without IMAGE_SCN_MEM_WRITE for this sample (see
+# `READONLY`), which is what makes `source` a constant rather than a variable
+# the program has not written yet. The scratch is therefore on the stack.
+#
+# The poison is the test, as it is in `zerofill`: 0x5a5a5a5a everywhere the
+# stores must land, and five lanes added back. A truncated store leaves
+# poison at 60(%rsp) and an off-by-sixteen leaves it at 32(%rsp), and either
+# blows the low byte of the sum well past 73.
+PROGRAMS["constant"] = (73, """
+	.text
+	.globl _start
+_start:
+	subq	$136, %rsp
+	vzeroupper
+	movl	$0x5a5a5a5a, 32(%rsp)
+	movl	$0x5a5a5a5a, 36(%rsp)
+	movl	$0x5a5a5a5a, 40(%rsp)
+	movl	$0x5a5a5a5a, 44(%rsp)
+	movl	$0x5a5a5a5a, 48(%rsp)
+	movl	$0x5a5a5a5a, 52(%rsp)
+	movl	$0x5a5a5a5a, 56(%rsp)
+	movl	$0x5a5a5a5a, 60(%rsp)
+	movl	$0x5a5a5a5a, 96(%rsp)
+	movl	$0x5a5a5a5a, 100(%rsp)
+	movl	$0x5a5a5a5a, 104(%rsp)
+	movl	$0x5a5a5a5a, 108(%rsp)
+	vmovups	source(%rip), %ymm0	/* 1 2 3 8 / 16 5 6 40 */
+	vmovups	%xmm0, 96(%rsp)		/* a 128-bit READ of the low half */
+	vmovups	%ymm0, 32(%rsp)		/* and the whole of it, 32 bytes */
+	movl	32(%rsp), %eax		/* 1  -- low half, first lane */
+	addl	44(%rsp), %eax		/* 8  -- low half, last lane */
+	addl	48(%rsp), %eax		/* 16 -- HIGH half, first lane */
+	addl	60(%rsp), %eax		/* 40 -- HIGH half, last lane */
+	addl	108(%rsp), %eax		/* 8  -- the 128-bit read, last lane */
+	addq	$136, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 8
+	.long 16, 5, 6, 40
+""")
+
+
+
+# 33. The same constant, but the stores are inside a loop and the load is
+# outside it. This is the shape Starfield stops on at 0x1408284C7: MSVC hoists
+# a 256-bit constant out of a loop that fills a structure with it.
+#
+# Nothing can carry a register across it. The loop head is a branch target, so
+# a run's window may not span it and a reserved shadow would hold whatever the
+# last iteration left. What makes it lowerable is that the value is decided
+# outside and never touched inside, which is `value_survives_loop`'s induction
+# reached through `reaching_definition` -- the same argument Finding 83 made
+# for a zero, and it does not care which value it is about.
+#
+# **The first store is four bytes on purpose**, which is the whole of the
+# second half of the problem. A 256-bit store with no displacement does not
+# reach five bytes, so its window has to widen -- and it can widen neither
+# way here: backwards is refused because the site is a branch target and
+# cannot vanish into the middle of a window, forwards would have to swallow
+# another 256-bit store and `moved_instruction` refuses those. The two are
+# taken as one window instead, which is `store_run` and is Finding 81's
+# answer reused. Without it this program still dies, at the loop head.
+PROGRAMS["constloop"] = (82, """
+	.text
+	.globl _start
+_start:
+	subq	$200, %rsp
+	vzeroupper
+	movq	%rsp, %rax
+	movl	$40, %edx
+poison:
+	movl	$0x5a5a5a5a, 32(%rax)
+	addq	$4, %rax
+	subl	$1, %edx
+	jne	poison
+	vmovups	source(%rip), %ymm0	/* 1 2 3 8 / 16 5 6 40 */
+	movl	$2, %edx
+	leaq	32(%rsp), %rcx
+loop:
+	vmovups	%ymm0, (%rcx)		/* four bytes, and a branch target */
+	vmovups	%ymm0, 32(%rcx)		/* five, and inside the first one's window */
+	addq	$64, %rcx
+	subl	$1, %edx
+	jne	loop
+	movl	32(%rsp), %eax		/* 1  -- first store, low half */
+	addl	60(%rsp), %eax		/* 40 -- first store, HIGH half */
+	addl	128(%rsp), %eax		/* 1  -- last store, low half */
+	addl	156(%rsp), %eax		/* 40 -- last store, HIGH half */
+	addq	$200, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 8
+	.long 16, 5, 6, 40
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:
@@ -1286,7 +1396,7 @@ def align(value, to):
 	return (value + to - 1) // to * to
 
 
-def build(path, text, code_size, handler=None, frame=0):
+def build(path, text, code_size, handler=None, frame=0, readonly=False):
 	"""Write a PE whose entry point is the start of `text`."""
 	# .xdata first, because .pdata points into it. A minimal UNWIND_INFO:
 	# version 1, no flags, no prolog, no unwind codes. Nothing here ever
@@ -1324,7 +1434,15 @@ def build(path, text, code_size, handler=None, frame=0):
 	sections = []
 	rva = SECTION_ALIGNMENT
 	offset = HEADER_SIZE
-	for name, body, flags in ((b".text", text, CODE),
+	# **`.text` is writable here so that a sample can keep its scratch buffer
+	# in it**, which most of them do -- `sink(%rip)` is simpler to read back
+	# than a stack offset. A program testing a READ-ONLY constant cannot have
+	# that: `constant_ymm` decides on the section flag, so a writable section
+	# is not a constant pool and the strategy would decline the very thing
+	# the program exists to exercise. Those samples say so in `READONLY` and
+	# keep their scratch on the stack.
+	for name, body, flags in ((b".text", text,
+	                           CODE_READONLY if readonly else CODE),
 	                          (b".xdata", xdata, DATA),
 	                          (b".pdata", None, DATA)):
 		if name == b".pdata":
@@ -1414,7 +1532,7 @@ def main(argv):
 	text, symbols = assemble(source)
 	code_size = symbols["func_end"]
 	sections = build(output, text, code_size, symbols.get("handler"),
-	                 FRAMES.get(name, 0))
+	                 FRAMES.get(name, 0), name in READONLY)
 	print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
 	      f"function is {code_size} of them, expected exit code {expected}")
 	return 0
