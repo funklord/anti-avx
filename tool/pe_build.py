@@ -1410,6 +1410,57 @@ func_end:
 """)
 
 
+# 35. A broadcast and every store that follows it, which is Finding 108's
+# shape with the lesson of Findings 105 and 106 applied to it: a store does
+# not end the value's life. MSVC emits the insert once and then fills eight
+# consecutive fields with it, and only the first store was being taken.
+#
+# The three stores are 4, 5 and 5 bytes. The first cannot widen its window
+# forwards -- the neighbour is another 256-bit store, which
+# `moved_instruction` refuses -- so without the group it is refused and the
+# two after it are refused for having no known upper half. They do have one:
+# it is the same sixteen bytes as the low half, which is what the insert
+# means.
+#
+# The poison is 96 bytes over exactly the three stores' extent, and the read
+# back takes the LAST dword of each store's high half and the first of each
+# low half -- six lanes, three stores, both halves of each. A store the run
+# dropped leaves 0x5a5a5a5a in two of them.
+PROGRAMS["splatrun"] = (87, """
+	.text
+	.globl _start
+_start:
+	subq	$200, %rsp
+	vzeroupper
+	movq	%rsp, %rax
+	movl	$24, %edx
+poison:
+	movl	$0x5a5a5a5a, 32(%rax)
+	addq	$4, %rax
+	subl	$1, %edx
+	jne	poison
+	leaq	32(%rsp), %rcx		/* before the insert: the store after it
+					   must be the very next instruction */
+	vmovups	source(%rip), %xmm0	/* 1 2 3 8 */
+	vinsertf128 $0x1, %xmm0, %ymm0, %ymm0	/* both halves now 1 2 3 8 */
+	vmovups	%ymm0, (%rcx)		/* four bytes, and the run's head */
+	vmovups	%ymm0, 0x20(%rcx)
+	vmovups	%ymm0, 0x40(%rcx)
+	movl	60(%rsp), %eax		/* 8 -- first store, HIGH half, lane 3 */
+	addl	92(%rsp), %eax		/* 8 -- second store, HIGH half */
+	addl	124(%rsp), %eax		/* 8 -- third store, HIGH half */
+	addl	32(%rsp), %eax		/* 1 -- first store, low half, lane 0 */
+	addl	64(%rsp), %eax		/* 1 -- second store, low half */
+	addl	96(%rsp), %eax		/* 1 -- third store, low half */
+	addl	$60, %eax		/* 27 + 60 = 87 */
+	addq	$200, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 8
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

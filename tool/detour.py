@@ -2687,6 +2687,25 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			return None, 0
 		return close_stub(body, displaced, stub_address, pool, spill_base,
 		                  reasons, start, window), 0
+	if kind == "splatrun":
+		# A broadcast and every store that follows it. The insert emits
+		# nothing -- the value it builds is already in the register the
+		# lowered program keeps -- and each store becomes two 128-bit stores
+		# of the same xmm.
+		#
+		# **These are `lower_zero_run`'s bytes exactly**, for the reason
+		# Finding 108 gave when the single-store form borrowed
+		# `lower_ymm_zero_store`: a splat has the zero's property one step
+		# weaker, both halves being the same register rather than both being
+		# zero. Identical bytes, different justification, and the strategy is
+		# named separately so that the justification stays readable.
+		body = lower_zero_run(strategy[1], stub_address)
+		if body is None:
+			if reasons is not None:
+				reasons["the splat run would not lower"] += 1
+			return None, 0
+		return close_stub(body, displaced, stub_address, pool, spill_base,
+		                  reasons, start, window), 0
 	if kind == "construn":
 		# Consecutive stores of read-only constants, taken together for the
 		# reason the zero run below is taken together: a four-byte store at
@@ -3029,7 +3048,39 @@ def collect(binary, listing):
 			splat = splat_pair(instructions[index], following)
 			if splat is not None and following[0] == address + len(encoding) \
 					and following[0] not in blocked:
+				# **A store does not end the value's life, and this is the
+				# third time that has been the finding.** Finding 105 learned
+				# it for the long pair and Finding 106 for the zero run;
+				# `splat_pair` takes the insert and the ONE store after it,
+				# and MSVC broadcasts a constant into eight consecutive
+				# fields at a time. The rest were refused for having no known
+				# upper half, which they do -- it is the same sixteen bytes
+				# as the low one, which is the whole point of the insert.
+				#
+				# Nothing between the stores can disturb the register because
+				# there is nothing between them: `store_run` takes only
+				# address-adjacent members. So the predicate has just one
+				# question to ask. Finding 113.
+				held = inplace.split_operands(operands)[3]
+				group = store_run(instructions, index + 1, blocked,
+				                  lambda _position, name: name == held)
 				window = len(encoding) + len(following[1])
+				if group is not None:
+					members, last = group
+					tail_entry = instructions[last]
+					span = tail_entry[0] + len(tail_entry[1]) - address
+					entries = []
+					for position in members:
+						one = instructions[position]
+						one_vex = inplace.decode_vex(one[1])
+						entries.append((one_vex, one[1][one_vex["length"]:],
+						                one[0], len(one[1])))
+					if inplace.covered_by(ranges, address, span) \
+							and lower_zero_run(entries, address) is not None:
+						candidates.append(
+							(address, encoding, operands, mnemonic, span,
+							 [], None, [], ("splatrun", entries)))
+						continue
 				if inplace.covered_by(ranges, address, window) \
 						and lower_ymm_zero_store(*splat, at=address) \
 						is not None:
@@ -4544,6 +4595,11 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			entries = strategy[1][1]
 			for entry in entries[1:]:
 				swallowed.add(entry[4])
+		if strategy is not None and strategy[0] == "splatrun":
+			# The insert keeps the window's first byte and every store after
+			# it loses its boundary. Each entry's third field is its address.
+			for entry in strategy[1]:
+				swallowed.add(entry[2])
 		if strategy is not None and strategy[0] == "construn":
 			# Every store after the first loses its boundary to the group's
 			# single window. Each entry is (load, store) and the store's

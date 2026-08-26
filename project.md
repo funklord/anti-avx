@@ -6676,6 +6676,77 @@ by name, and then the `.pdata` group is a redundant belt rather than the only on
 is worth doing for its own sake, because the tree currently depends on a property no file
 records and no check enforces.
 
+### Finding 113 -- a store does not end the value's life, for the third time
+
+`splat_pair` takes a `vinsertf128 $0x1,%xmmA,%ymmA,%ymmA` and the one store after it.
+MSVC does not write one store. It broadcasts a constant into a run of consecutive fields:
+
+```
+1406a8da8:  vinsertf128 $0x1,%xmm0,%ymm0,%ymm0
+1406a8dae:  vmovups %ymm0,(%rcx)          taken
+1406a8db2:  vmovups %ymm0,0x20(%rcx)      refused: ymm value has no known upper half
+1406a8db7:  vmovups %ymm0,0x40(%rcx)      refused
+   ... 0x60, 0x80, 0xa0, 0xc0, 0xe0 -- eight in all
+```
+
+The seven refusals say the value has no known upper half. It has one: **the same sixteen
+bytes as the low half**, which is what the insert means and what the first store was
+already lowered on.
+
+This is the third time the finding has been the same sentence. Finding 105 learned it for
+the long pair -- "a store does not end the value's life, and stopping at the first one
+cost the executed path directly". Finding 106 learned it for the zero run. Both times the
+fix was to keep walking; both times the walk was written for one store because one store
+was the shape in front of it.
+
+#### It needed no new machinery, which is the point
+
+`store_run` was `zero_run` until Finding 109 took the predicate out of it, on the grounds
+that "nothing above is about which value it is: the competition for padding is a property
+of four-byte stores standing next to each other". A splat passes a third predicate, and
+it is the simplest of the three -- **the members are address-adjacent by construction, so
+nothing can lie between them to disturb the register**, and the only question left is
+whether the store names the register the insert built.
+
+The emitted bytes are `lower_zero_run`'s, unchanged. That is Finding 108's observation
+one level up: a splat has the zero's property one step weaker, both halves being the same
+register rather than both being zero, and two 128-bit stores of one xmm serve either. The
+strategy is named `splatrun` rather than reusing `zerorun` so that the justification stays
+readable in `place_stubs` and in the census.
+
+#### Forty-five sites and not one detour
+
+Counted over the whole listing, with objdump's continuation lines joined -- the thing
+Finding 112 got wrong:
+
+```
+splats followed by at least one store       40
+their stores, in total                      85
+stores beyond the first                     45
+
+stores per splat    1 -> 17 splats
+                    2 -> 19
+                    3 ->  1
+                    9 ->  3
+```
+
+```
+VEX in .text      9,171 ->   9,126       796,005 removed, 98.9%
+detours         201,013 -> 201,013
+frontier   0x1428D1492 -> 0x1428D1492
+```
+
+**Forty-five sites and not one detour**, because a run is one stub whether it covers one
+store or nine -- the window grows and the jump already written at its head serves all of
+it. The independent scan and the rewriter agree to the site, which is the only reason to
+believe either.
+
+**The frontier did not move**, and saying so is the honest half. These forty-five are
+somewhere else in the binary; the site the game stops on is still the zero store of
+Finding 112, still refused by a chained `.pdata` record between it and its `vpxor`. An
+increment that does not move the frontier is worth having and is not progress on the thing
+being measured, and the two are easy to confuse when the percentage moves.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7539,7 +7610,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **795,960 of 805,131 VEX sites, 98.9%** (Findings 24 to 110), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,005 of 805,131 VEX sites, 98.9%** (Findings 24 to 113), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -7677,7 +7748,7 @@ size of it.** Finding 74 put the rewritten binary 866 bytes past where the origi
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. That number was the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 9,171 that remain has to go before any of this can be
+immediately, and every one of the 9,126 that remain has to go before any of this can be
 soaked.
 
 **What the run adds is a measuring instrument, and it has been the better half of the
