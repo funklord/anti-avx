@@ -6442,34 +6442,29 @@ RUNTIME_FUNCTION entries        236,427
   primary                       180,158
 
 each chained start, by what precedes it
-  an instruction that falls through   42,184
+  an instruction that falls through   46,739
   a ret, jmp, int3 or ud                9,522
-  nothing that decoded                  4,555
   not in the listing at all                 8
 ```
 
-**Three-quarters are fallen into, and what would make those safe to unblock is the code
-rather than the unwind data.** A fragment reached by falling into it is a continuation of
-straight-line code, and everything that could ALSO reach it -- a direct branch, a switch
-table, a relocation, a PC-relative `lea`, a scope table's handler or its resume target --
-is enumerated separately and would stay in `blocked`. The tool already trusts exactly
-that enumeration for the byte before the fragment starts. A fragment start fallen into is
-an address in the middle of a function like any other.
+**Five-sixths are fallen into**, which is what a continuation of straight-line code looks
+like -- and everything that could ALSO reach one, a direct branch, a switch table, a
+relocation, a PC-relative `lea`, a scope table's handler or its resume target, is
+enumerated separately and would stay in `blocked` whatever happened to the `.pdata`
+group. The tool already trusts exactly that enumeration for the byte before the fragment
+starts.
 
-**The quarter that is not fallen into is where the hazard lives, and naming it is why the
-change is not made here.** A C++ catch funclet is entered by the unwinder, no instruction
-names it, and `scope_targets` says in as many words that it does not parse the `FuncInfo`
-a C++ EH function carries where a `__try`/`__except` carries a `SCOPE_TABLE`. For those,
-`.pdata` is the only thing between a funclet's first instruction and a window that would
-swallow it. Funclets are preceded by padding or by the end of the function above, which
-is what the 9,522 and the 4,555 are -- so the fall-through test excludes them here. **"It
-excludes them in this binary" is a weaker claim than "it cannot include one", and the
-difference is the whole of the risk.**
+**The counts above are the second reading, and the first was wrong.** It said 42,184
+fallen into and 4,555 with "nothing that decoded before it", and the 4,555 were an
+artifact of the instrument: the scan matched a listing line only when it carried a
+mnemonic, so objdump's continuation line for an instruction longer than seven bytes was
+skipped and the instruction before the fragment measured short of it. **That trap is
+written down four sections above, in "Practical things that cost time to learn", and the
+scan was written anyway.** There are no genuine gaps: every chained fragment in the
+listing is preceded by an instruction that reaches its first byte.
 
-What would close it is parsing `FuncInfo` far enough to enumerate catch funclets, the way
-`scope_targets` already does for `__except`, under the same rule it states: parse
-permissively, validate every field against `.text`, and be wrong in the direction that
-costs a refused site.
+Whether the idea is worth anything, and whether it is safe, are two questions, and it
+loses on the first. See Finding 112.
 
 ### Finding 111 -- two defects that had never fired, and one that could not
 
@@ -6569,6 +6564,117 @@ The two substring cases are `%ymm1` matching inside `%ymm13` and `%ymm14`, in
 direction that refuses a site rather than accepting a bad one -- the two tests beside it
 are exact comparisons on split fields -- so it costs two sites and no correctness, and it
 is recorded rather than changed.
+
+### Finding 112 -- forty-six thousand addresses unblocked, and eleven sites
+
+The frontier stopped on a 256-bit store of a register `vpxor %xmm0,%xmm0,%xmm0` had
+emptied six instructions above it, refused because `0x1428D1479` lies between the two and
+is in `blocked`. That address is the `begin` of a chained `RUNTIME_FUNCTION` --
+`[0x1428d1479, 0x1428d151e)`, `UNW_FLAG_CHAININFO` set -- and **nothing else names it**:
+not `.reloc`, not an `.xdata` handler or scope target, and not one of the 17.1 million
+lines of disassembly branches there.
+
+So the obvious move is to take chained fragments out of the `.pdata` group. A chained
+record is a statement about stack layout over an address range, not a claim that control
+arrives at its first byte, and treating one as an entry point is a category error rather
+than caution. That argument is right, and it does not matter.
+
+#### What it is worth, before what it costs
+
+Measured by removing the 46,731 fallen-into chained begins from the `pdata` group alone --
+leaving every other group intact, and leaving `collect`'s own scan free to put any direct
+branch target back -- and running the real collector:
+
+```
+                                                 before   unblocked
+ymm value has no known upper half                10,086      10,084
+next instruction is a branch target                 202         193
+256-bit: no store before a control transfer         159         159
+outside .pdata                                      321         427
+256-bit: no store before 256-bit arithmetic         404         410
+no register free across the ymm run                 213         216
+──────────────────────────────────────────────────────────────────
+not inside any accepted window                    7,143       7,153
+```
+
+**Eleven sites gained, and the residue goes up.** 46,731 addresses came out of the set and
+eleven refusals changed, because a blocked address has to sit exactly inside a window or
+exactly on a proof's path to be costing anything, and almost none of them does.
+
+The 106 that moved into `outside .pdata` are the instructive half. `outside.leaf_ranges`
+consults the same set for a different question -- not "can control arrive here" but "is
+this address referenced, so is it a function" -- and trimming the set made it recover 106
+fewer leaf functions. **One set was answering two questions**, which a proper version
+would separate; doing so would take the change from -10 to +11, and eleven is still the
+ceiling.
+
+#### The safety argument was also wrong, in the direction that flatters it
+
+The record said funclets are excluded by the fall-through test because they are preceded
+by padding or by the end of the function above. Measured over all 489 catch funclets in
+the binary: 273 are preceded by `int3`, 151 by `jmp`, 1 by `ret` -- and **64 by a
+single-byte `nop`, which falls through.** At `0x14375fcc0` the funclet above ends in a
+`call` to the throw thunk, one `0x90` of padding follows, and then the funclet begins.
+The fall-through test would have called that one a continuation.
+
+What actually keeps catch funclets safe is something else entirely: **not one of the 489
+is a chained entry.** They live in one contiguous region at the top of `.text`,
+`0x143759d60` to `0x14387d390`, which holds 6,056 `RUNTIME_FUNCTION` begins and no
+chained record among them. The discriminator that works is the population, not the
+predecessor -- and the discriminator that was written down would have let sixty-four
+funclets through if they had ever been in that population.
+
+#### What the tool's own header says about this, and why it is not true here
+
+`targets.py` opens by naming its four sources and saying which are sound. Of `.reloc`:
+"Every absolute address stored anywhere in the image has a base relocation... So vtables,
+function pointers, **C++ EH handler addresses** and TLS callbacks are all here. This is
+COMPLETE for absolute targets."
+
+The reasoning is right and the example is a 32-bit one. On x64 every exception structure
+is image-relative: `UNWIND_INFO`'s handler slot, `FuncInfo`'s `dispOfHandler`, the scope
+table's `Handler` and `JumpTarget` are all RVAs, and **an RVA needs no fixup when the
+image moves, so the loader records nothing for it.** Measured: of the 29 handler and
+scope addresses the tool recovers from `.xdata`, `.reloc` names **zero**.
+
+What that leaves is worth stating plainly, because nothing in the tree stated it:
+
+```
+.pdata entries carrying EHANDLER/UHANDLER      85,878
+  distinct handler routines                         6
+    __CxxFrameHandler4                         85,139
+    __GSHandlerCheck_EH4                          353
+    __GSHandlerCheck                              264
+    __CxxFrameHandler3                             68
+    __GSHandlerCheck_EH                            33
+    __C_specific_handler                           21
+
+catch funclet entry points                        489
+  named by any source other than .pdata             1
+```
+
+**Four hundred and eighty-eight catch funclets are in `blocked` for exactly one reason,
+and it is the group this finding proposed to trim.** They are safe today because a
+funclet is a primary record, so trimming the chained ones would not have touched them --
+but that was luck rather than the design, and the design's own header says the cover
+comes from somewhere it does not.
+
+#### The decision
+
+**Not made, and not because it is dangerous.** It is worth eleven sites, one of which is
+the site the game stops on; Finding 80 is the standing argument that such a site can be
+worth the whole difference, and it is a real argument. Against it: the change rests on an
+enumeration built for this measurement, whose author could not validate two branches of
+the format and did not enumerate destructor funclets at all, and its failure mode is a
+value silently wrong rather than an instruction that faults. **Eleven sites is not enough
+to buy a silent failure mode**, and the frontier has better roads open -- the register
+representation is 3,186.
+
+What would change the answer is the enumeration becoming the tool's rather than a
+probe's: parse `FuncInfo` and `FuncInfo4` in `targets.py`, put every funclet in the set
+by name, and then the `.pdata` group is a redundant belt rather than the only one. That
+is worth doing for its own sake, because the tree currently depends on a property no file
+records and no check enforces.
 
 ## Picking this up again
 

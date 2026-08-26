@@ -11,13 +11,31 @@ is which of them is sound:
 
   .reloc   Every absolute address stored anywhere in the image has a base
            relocation, because the loader has to fix it up if the image
-           moves. So vtables, function pointers, C++ EH handler addresses
-           and TLS callbacks are all here. This is COMPLETE for absolute
-           targets -- not a heuristic -- and it is the reason the problem
-           is tractable at all.
+           moves. So vtables, function pointers and TLS callbacks are all
+           here. This is COMPLETE for absolute targets -- not a heuristic --
+           and it is the reason the problem is tractable at all.
+
+           It does NOT cover exception handling on x64, and this used to say
+           it did. Every EH structure there is image-relative: UNWIND_INFO's
+           handler slot, FuncInfo's dispOfHandler, and the scope table's
+           Handler and JumpTarget are all RVAs, and an RVA needs no fixup
+           when the image moves, so the loader records nothing for one.
+           Measured on Starfield: of the 29 handler and scope addresses
+           recovered from .xdata below, .reloc names zero. The claim was
+           true of a 32-bit image and was carried across. See project.md,
+           Finding 112.
 
   .pdata   Every function with unwind data, which is every non-leaf
            function. Complete for what it covers.
+
+           It is also the ONLY thing covering a C++ catch funclet, which is
+           worth knowing before anyone trims it. 85,139 of this binary's
+           functions name __CxxFrameHandler4, whose FuncInfo holds the
+           funclet addresses, and nothing here parses that -- see
+           scope_targets. Of the 489 catch funclets in the image, 488 are in
+           the set for this reason and no other: no relocation names them,
+           no branch does, no lea does. So trimming this group is not the
+           local change it looks like.
 
   .xdata   Exception handler and funclet addresses, stored as RVAs and
            reachable from .pdata's unwind information.
@@ -165,6 +183,15 @@ def scope_targets(data, at, base, text):
 	before any of it is believed. Getting that wrong in the generous
 	direction costs a refused site; getting it wrong in the other direction
 	costs correctness.
+
+	**What refusing `FuncInfo` costs is measured now, and it is not
+	nothing.** The 21 functions using `__C_specific_handler` are the ones
+	this reads; 85,593 use a C++ handler and are skipped, and the 489 catch
+	funclets they hold are then known to the rewriter only because each is a
+	`.pdata` function start. Parsing `FuncInfo` and its compressed
+	`FuncInfo4` form would make that a redundancy rather than a sole
+	dependency, and it is the thing to build before anyone reconsiders the
+	`.pdata` group. Finding 112.
 	"""
 	if at + 4 > len(data):
 		return set()
