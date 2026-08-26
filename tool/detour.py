@@ -3295,7 +3295,10 @@ def collect(binary, listing):
 			continue
 		fields = inplace.split_operands(operands)
 		registers = [o for o in fields if not o.startswith("$")]
-		if not needs_sequence and len(registers) not in (2, 3):
+		# One operand is `vldmxcsr` and `vstmxcsr` and nothing else here; the
+		# in-place classifier takes those now, so this only matters for one
+		# that could not be patched where it stood. Finding 110.
+		if not needs_sequence and len(registers) not in (1, 2, 3):
 			skipped["operand shape not A/B/C"] += 1
 			declined[address] = "operand shape not A/B/C"
 			continue

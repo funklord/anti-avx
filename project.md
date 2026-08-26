@@ -6353,6 +6353,86 @@ and for three and falls off the end, and `collect` refuses `operand shape not A/
 the same rule -- so a form neither was written against is refused twice and named once.
 That bucket is nine sites, all nine of them these, and the game is standing on one.
 
+### Finding 110 -- nine sites with a rule, a correct encoding, and no way in
+
+The frontier named this one, which is the whole argument for having it. After Finding 109
+the game stopped on `vstmxcsr 0x178(%rsp)` at `0x14235008F` -- not a 256-bit instruction,
+not a three-operand one, and not hard.
+
+Everything needed was already here. `lower.py` has carried a rule for `vldmxcsr` and
+`vstmxcsr` since its first table; `has_direct_sse_form` says yes to both; `sse_encoding`
+turns the nine-byte VEX form into `0f ae 9c 24 78 01 00 00`, which disassembles as
+`stmxcsr 0x178(%rsp)` and is a byte shorter, so it fits where it stands with a nop to
+spare. `make verify` has been assembling both of them and finding no VEX left, on every
+run, for as long as that check has existed.
+
+**What refused them is an operand count.** `patch.classify` tests for two operands and
+for three and falls off the end returning `None`; `collect` refuses `operand shape not
+A/B/C` for any count that is not two or three. Neither was written against a form with
+one operand, and a one-operand VEX instruction is uncommon enough that the omission
+reads as deliberate until you look for the line that made it. There is no such line.
+
+```
+one-operand VEX in .text
+  vstmxcsr        5
+  vldmxcsr        4
+```
+
+Nine, and that is the entire `operand shape not A/B/C` bucket -- a count matching to the
+site, which is what made it worth chasing before any code was read.
+
+The one-operand case makes the same `vvvv` test the two-operand case makes, and for the
+same reason: VEX.vvvv is required to be 1111b where it is unused, so anything else means
+the instruction is not the form it appears to be.
+
+#### Two checks whose union had a hole neither could see
+
+`make verify` proves every lowering rule assembles and leaves no VEX behind. It builds
+its own operands -- `sample_operands` returns `["(%rsp)"]` for exactly these two -- so it
+never asks a classifier anything, and it passed. The classifiers never asked the rule
+table anything, and they refused. **The rule was provably correct and unreachable at the
+same time.**
+
+That is Finding 52's shape at one remove. There the checker and the checked shared a
+function; here two checks are genuinely independent and the gap is between them, which no
+amount of strengthening either one would have closed. What closes it is a program that
+goes through the whole path: `check-pe`'s `mxcsr` toggles FTZ, loads the word back, reads
+it again, and requires the difference to be exactly that bit -- a round trip rather than a
+comparison against a constant, because what MXCSR holds when a process starts belongs to
+the runtime and not to the test.
+
+#### Nine sites for two lines
+
+```
+VEX in .text      9,180 ->   9,171       795,960 removed, 98.9%
+in-place        547,707 -> 547,716
+detours         201,013 -> 201,013
+frontier   0x14235008F -> 0x1428D1492
+```
+
+Nine sites for two lines, and the game is past them.
+
+#### What the frontier names now
+
+`0x1428D1492` is `vmovdqu %ymm0,0x28(%rsp)` -- a 256-bit store of a register that
+`vpxor %xmm0,%xmm0,%xmm0` emptied six instructions above it. `zeroed_ymm` is written for
+exactly this and refuses it, because `0x1428D1479` lies in between and is in `blocked`.
+
+It is not a branch target. `targets.py` reports it from the `pdata` group: the binary
+declares a `RUNTIME_FUNCTION` beginning there, and every function start is treated as
+somewhere control can arrive, which is correct for an entry point and is the conservative
+answer for anything else. Sitting four instructions into a straight-line run, between a
+`mov` and a `lea`, it is far more likely to be a chained fragment -- a region of the
+enclosing function with its own unwind record and no separate entry -- than a function
+anybody calls.
+
+**That is a measurement, not a guess to act on.** `UNW_FLAG_CHAININFO` in the unwind
+info distinguishes the two, and Findings 48, 68 and 70 already read fragment unwind data
+for other reasons. What it would take is a reason to believe nothing reaches a fragment
+except by falling into it, and the direct branches are already enumerated separately, so
+the question is what the indirect ones do. Loosening `blocked` is the most load-bearing
+assumption in the tool, and it is not a change to make while passing.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7162,7 +7242,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **795,951 of 805,131 VEX sites, 98.9%** (Findings 24 to 109), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **795,960 of 805,131 VEX sites, 98.9%** (Findings 24 to 110), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -7300,16 +7380,15 @@ size of it.** Finding 74 put the rewritten binary 866 bytes past where the origi
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. That number was the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 9,180 that remain has to go before any of this can be
+immediately, and every one of the 9,171 that remain has to go before any of this can be
 soaked.
 
 **What the run adds is a measuring instrument, and it has been the better half of the
 method since.** Each fault address names the next site, that site has named a strategy
-four times running -- Findings 106, 107, 108 and 109 -- and twice it named something the
-census had filed under the wrong cause. The frontier is at `0x14235008F` now, 305 modules
-in, and it names a one-operand `vstmxcsr`: nine sites, an SSE form a byte shorter than
-the VEX one, and two operand-shape tests neither of which was written against a form
-with one operand.
+five times running -- Findings 106 to 110 -- and twice it named something the census had
+filed under the wrong cause. The frontier is at `0x1428D1492` now, 305 modules in, and it
+names a 256-bit store of a register a `vpxor` emptied six instructions above it, refused
+because a `.pdata` function start lies in between.
 
 Reproduce the measurements with:
 

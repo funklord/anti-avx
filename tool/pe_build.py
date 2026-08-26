@@ -1365,6 +1365,51 @@ source:	.long 1, 2, 3, 8
 """)
 
 
+# 34. The two one-operand VEX instructions, which are not a 256-bit problem
+# and had been refused since the beginning. `vstmxcsr` writes the control and
+# status word to memory and `vldmxcsr` reads it back; neither has a
+# destination register, and both the in-place classifier and the collector
+# tested for two operands and for three and fell off the end.
+#
+# The test is a round trip rather than a comparison against a constant,
+# because what MXCSR holds when a process starts is the runtime's business
+# and not this program's. Toggle FTZ -- the one bit nothing else here reads
+# -- put it back, read it again, and the difference must be exactly that
+# bit. Then restore the original, because a program that leaves the FPU in a
+# different mode than it found it is a bad neighbour even when nothing is
+# looking.
+#
+# 55 only if both instructions executed and the value went round; 11 if the
+# store wrote nothing, if the load took nothing, or if the poison survived.
+PROGRAMS["mxcsr"] = (55, """
+	.text
+	.globl _start
+_start:
+	subq	$56, %rsp
+	vzeroupper
+	movl	$0x5a5a5a5a, 8(%rsp)
+	movl	$0x5a5a5a5a, 12(%rsp)
+	movl	$0x5a5a5a5a, 16(%rsp)
+	vstmxcsr 8(%rsp)		/* whatever the process is running with */
+	movl	8(%rsp), %eax
+	xorl	$0x8000, %eax		/* toggle FTZ; bits 16-31 stay zero */
+	movl	%eax, 12(%rsp)
+	vldmxcsr 12(%rsp)
+	vstmxcsr 16(%rsp)
+	vldmxcsr 8(%rsp)		/* leave it as it was found */
+	movl	16(%rsp), %eax
+	xorl	8(%rsp), %eax
+	cmpl	$0x8000, %eax
+	movl	$55, %eax
+	movl	$11, %ecx
+	cmovne	%ecx, %eax
+	addq	$56, %rsp
+	ret
+func_end:
+	.p2align 5
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

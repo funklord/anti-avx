@@ -379,6 +379,19 @@ def classify(mnemonic, vex, operands, direct, nds):
 		return None
 
 	registers = [o for o in operands if not o.startswith("$")]
+	if len(registers) == 1:
+		# **A one-operand form, and this binary has exactly two of them**:
+		# `vldmxcsr` and `vstmxcsr` name a memory operand and nothing else.
+		# VEX.vvvv is unused and required to be 1111b, which is the same
+		# test the two-operand case makes and for the same reason.
+		#
+		# The tests below were both written against a form with a
+		# destination register, so these fell off the end -- and so did the
+		# collector's own `len(registers) not in (2, 3)`, which is a
+		# separate copy of the same assumption. Nine sites refused twice and
+		# named once, with a lowering rule and a correct encoding waiting
+		# for them the whole time. Finding 110.
+		return "A" if vex["vvvv"] == 0 else None
 	if len(registers) == 2:
 		# A genuine two-operand form. vvvv is unused and must be encoded
 		# 1111b, which decodes to zero here; anything else means this is
