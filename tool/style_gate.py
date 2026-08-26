@@ -845,8 +845,17 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 				                 f"non-ASCII byte 0x{raw[offset]:02x}")]
 			else:
 				found = []
-		if found:
-			return found
+		# ASCII findings JOIN the rest rather than returning early. The
+		# return here cost an order of magnitude once: a tree adopting the
+		# gate read 371 indentation findings across 7 files, spelled its em
+		# dashes out, and read 3347 across 48 -- the 7 were exactly the
+		# files that happened to be pure ASCII already, and both runs
+		# printed one summary line of the same shape. A count that depends
+		# on which OTHER rule has fired first is not a count, and the first
+		# number was quotable as measured fact. The fixer-level check below
+		# still stands down for a file the lexer refused, which is the one
+		# case where continuing would report nonsense rather than findings.
+		problems.extend(found or [])
 
 	text = raw.decode("utf-8", errors="replace")
 	if raw and not raw.endswith(b"\n"):
