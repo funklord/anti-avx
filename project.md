@@ -6433,6 +6433,105 @@ except by falling into it, and the direct branches are already enumerated separa
 the question is what the indirect ones do. Loosening `blocked` is the most load-bearing
 assumption in the tool, and it is not a change to make while passing.
 
+### Finding 111 -- two defects that had never fired, and one that could not
+
+Findings 109 and 110 were read adversarially before anything was built on them, with the
+question put as "find another one" rather than "check this". It found two, and the
+interesting property they share is that **neither has ever happened in this binary**.
+Every structural check passes today and would have gone on passing.
+
+#### A strategy stub deleted the instruction its window swallowed
+
+`place_stubs` may hand any stub a `displaced` list. The Finding 36 extension takes the
+next candidate along when its site sits exactly at the window's end, grows the window
+over it, and retires that candidate as rescued. The plain path emits it at the end of the
+stub. **The six strategy paths -- `run`, `pair`, `longload`, `longstore`, `splat` and now
+`construn` and `zerorun` -- wrote their own body and jumped straight home**, so the
+passenger vanished.
+
+Nothing could see it. `place_stubs` records the passenger's boundary in `swallowed`, so
+`verify`'s "every lost boundary was deliberate" is satisfied. The stub holds no VEX. The
+census's "nothing survives inside a committed window" stays zero **because the
+instruction does not survive at all** -- it is neither in the stub nor in `.text`, which
+is the one state a reconciliation between those two places cannot notice.
+
+Measured on the real binary by wrapping `build_stub` and running the real selection once:
+**zero occurrences.** The extension needs a backward-widened candidate beginning inside
+the carrier's window with its site exactly at the end of it, and no 256-bit window in
+Starfield has one. Latent rather than live, and the same class as `scope_targets`'
+latent hazard: closed because closing it costs nothing.
+
+`close_stub` is the fix -- the displaced list and the jump home, written once, called by
+all six. The unit case builds a `pair` stub with a passenger and looks for the
+passenger's bytes in it. **It was run against a copy of the tool with the `pair` branch
+put back the way it was, and it fails there**, which is the only reason to believe it is
+checking anything.
+
+#### `vzeroupper` writes an upper half and names nobody
+
+`reaching_definition` decides what wrote a register by reading operand text. Its comment
+said `vzeroall` was the one instruction that writes an xmm without naming it and that
+there are none in `.text` -- true of `vzeroall`, and the wrong instruction. **There are
+19,253 `vzeroupper`**, each of which clears bits [255:128] of every ymm, and the scan
+walked straight past all of them.
+
+For a constant that is wrong bytes: the upper half is zero at the store and the stub
+would write the constant's high sixteen. `long_pair_stores` has the same hole from the
+other direction -- its break test is `register in text`, and a `vzeroupper` has no text.
+
+Measured, twice and in both directions, over the whole listing:
+
+```
+256-bit loads seen                              10,791
+  a vzeroupper before the value closes           2,490
+  a store reached with one in between                0
+
+zero stores the same scan reaches               10,933
+  a store reached with a vzeroupper in between        0
+```
+
+**The instruction is everywhere and the shape is nowhere**, because MSVC emits
+`vzeroupper` immediately before a call or a return and the backward walk stops at either.
+So the blunt fix -- treat it as a write and let both callers refuse -- costs zero sites
+while being right about the constant, and the shape is guarded by a unit case because
+no execution test can reach a shape the input does not contain.
+
+#### The one-operand form was admitted in one place and refused in the other
+
+Finding 110 taught `patch.classify` the one-operand shape and taught `collect` the same,
+and `lower_vex` was not told. Its operand dispatch ends `elif len(registers) != 2`, so a
+`vstmxcsr` that could not be patched where it stood became a candidate whose stub can
+never build, counted under `lower: a four-operand form`. No site was lost -- all nine are
+patched in place -- and the accounting was wrong, which is how a bucket stops meaning
+what it says. One operand sets nothing up, so admitting it is one line and `sse_encoding`
+is the whole lowering.
+
+#### What the 182 refused constants actually are
+
+The bucket Finding 109 named was measured by instrumenting `upper_half_read_later` to
+record which of its six refusals fired, and running the real collector once. The answer
+is not the walk's limits:
+
+```
+a 256-bit read that is genuinely not a store         164
+  vfmadd231ps 42, vpand 38, vmulps 18, vxorps 8, vpaddd 6, ...
+a 256-bit store the backward proof refused             7
+the register is not named at all -- a substring match  2
+the path budget exhausted                              0
+a branch the walk could not resolve                    0
+```
+
+**Not one of the 182 is blocked by a bound.** Finding 80 raised the path budget to
+400,000 for eleven sites and worried about the cost; on this bucket the budget and the
+branch walk between them account for nothing at all, and 164 of 182 are arithmetic on a
+hoisted constant -- the Y1 register representation, and nothing else.
+
+The two substring cases are `%ymm1` matching inside `%ymm13` and `%ymm14`, in
+`upper_half_read_later`'s `if register not in operands` pre-filter. It is wrong in the
+direction that refuses a site rather than accepting a bad one -- the two tests beside it
+are exact comparisons on split fields -- so it costs two sites and no correctness, and it
+is recorded rather than changed.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -6539,6 +6638,15 @@ The corollary is that measuring first has repeatedly changed the plan, and twice
 saved building the wrong thing: the scratch scan needed branch following rather than
 a wider window (Finding 27), and the gapped ymm pair looked like the obvious next
 increment and is worth 68 sites (Finding 39).
+
+**And there is a third kind, which neither the oracle nor the executable cases can
+reach: a defect whose shape the input does not contain.** A strategy stub that deleted
+the instruction its window swallowed, and a `vzeroupper` the backward walk scanned past
+-- both real, both wrong, and both at zero occurrences in this binary, so every check
+passed and would have gone on passing. What found them was reading the change
+adversarially with the question put as "find another one", and what keeps them found is
+a unit case run against a copy of the tool with the fix taken back out. **A test you
+have not seen fail is a test you have not seen.** Finding 111.
 
 ### Estimated cost of a translated binary
 

@@ -830,10 +830,15 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 			body += encode_movaps(destination, source)
 	elif len(registers) == 3:
 		pass				# destination already holds the first source
-	elif len(registers) != 2:
+	elif len(registers) not in (1, 2):
 		if reasons is not None:
 			reasons["lower: a four-operand form"] += 1
 		return None			# four-operand forms are not Class A/B/C
+	# One operand sets nothing up: `vldmxcsr` and `vstmxcsr` name a memory
+	# operand and no register, so `sse_encoding` below is the whole lowering.
+	# Admitting the shape in `collect` without admitting it here turned a
+	# counted decline into a stub that could never build, under a reason
+	# naming a four-operand form. Finding 111.
 
 	operation = inplace.sse_encoding(vex, tail)
 	if operation is None:
@@ -1357,6 +1362,17 @@ def moved_instruction(entry, at, pool=0, reasons=None):
 
 
 YMM_MOVES = frozenset("vmovups vmovaps vmovdqu vmovdqa vmovupd vmovapd".split())
+
+# **The two instructions that write an upper half without naming a register.**
+# `vzeroupper` clears bits [255:128] of every ymm and `vzeroall` clears all of
+# them, and neither has an operand -- so any scan that decides what wrote a
+# register by reading operand text walks straight past both. There are 19,253
+# `vzeroupper` in this `.text` and no `vzeroall`.
+#
+# `reaching_definition`'s comment named `vzeroall` as the one instruction with
+# this property and said there were none, which is true of `vzeroall` and was
+# never the point. Finding 111.
+UPPER_HALF_KILLERS = frozenset(("vzeroupper", "vzeroall"))
 
 
 def rip_operand(tail):
@@ -1977,6 +1993,8 @@ def value_survives_loop(instructions, index, register, blocked, sources,
 		if at in blocked:
 			return False		# the body is enterable somewhere other than
 						# its head
+		if mnemonic in UPPER_HALF_KILLERS:
+			return False		# the body clears every upper half
 		fields = inplace.split_operands(operands)
 		if fields and fields[-1] in (narrow, register):
 			return False		# the body writes it
@@ -2056,6 +2074,16 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 		if mnemonic.startswith(CONTROL_PREFIXES) \
 				and not conditional_branch(mnemonic):
 			return None
+		if mnemonic in UPPER_HALF_KILLERS:
+			# It decides the upper half and names nothing, so the operand
+			# test below cannot see it. Returning its position refuses both
+			# callers, which is right for `constant_ymm` -- the upper half is
+			# no longer the constant's -- and costs `zeroed_ymm` nothing it
+			# was measured to have: zero of the 10,933 zero stores this scan
+			# reaches have one between the idiom and the store, because MSVC
+			# emits `vzeroupper` before a call or a return and the walk stops
+			# at either.
+			return position
 		if narrow in operands or register in operands:
 			# In AT&T the destination is the last operand, and the one family
 			# that writes a non-last one is `vgather*`, which zeroes its mask.
@@ -2527,6 +2555,8 @@ def long_pair_stores(instructions, index, blocked, end):
 			break
 		if name.startswith(CONTROL_PREFIXES) or name in ("call", "callq"):
 			break
+		if name in UPPER_HALF_KILLERS:
+			break			# it clears the half the shadow is carrying
 		what = wide_move(bits, name, text)
 		if what is not None and what[0] == "store" and what[1] == register:
 			found.append(position)
@@ -2534,6 +2564,39 @@ def long_pair_stores(instructions, index, blocked, end):
 		if register in (text or "") or "%xmm" + number in (text or ""):
 			break
 	return found or None
+
+
+def close_stub(body, displaced, stub_address, pool, spill_base, reasons,
+               start, window):
+	"""Whatever the window swallowed, then the jump home. Bytes, or None.
+
+	**A stub that returns before this has deleted its passengers.** Every
+	strategy branch in `build_stub` writes its own body and jumped straight
+	home, and `place_stubs` may hand any of them a `displaced` list: the
+	Finding 36 extension takes the next candidate along when its site sits
+	exactly at the window's end, grows the window over it and retires its
+	own candidate. The plain path emits it; the six strategy paths did not,
+	so the instruction vanished with its boundary recorded as deliberate and
+	every structural check satisfied -- the byte is not in the stub, and it
+	does not survive in `.text` either, so neither `verify` nor `census` has
+	anything to see. Finding 111.
+
+	Measured on this binary at zero occurrences, which is why it had not
+	been noticed: the passenger has to be a backward-widened candidate
+	beginning inside a 256-bit window. Latent rather than live, and closed
+	because it costs nothing to close.
+	"""
+	out = bytearray(body)
+	for entry in displaced:
+		fixed = emit_swallowed(entry, out, stub_address, pool, spill_base,
+		                       reasons)
+		if fixed is None:
+			if reasons is not None:
+				reasons["a displaced instruction will not move"] += 1
+			return None
+		out += fixed
+	return bytes(out) + encode_jump(stub_address + len(out) + 5,
+	                                start + window)
 
 
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
@@ -2586,8 +2649,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 					reasons["the run borrow could not be restored"] += 1
 				return None, 0
 			out += restored
-		return bytes(out) + encode_jump(stub_address + len(out) + 5,
-		                                start + window), 0
+		return close_stub(out, displaced, stub_address, pool, spill_base,
+		                  reasons, start, window), 0
 	if kind == "pair":
 		# A 256-bit copy: both instructions become four 128-bit moves, so
 		# neither is lowered on its own.
@@ -2596,8 +2659,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			if reasons is not None:
 				reasons["the pair would not lower"] += 1
 			return None, 0
-		return bytes(body) + encode_jump(stub_address + len(body) + 5,
-		                                 start + window), 0
+		return close_stub(body, displaced, stub_address, pool, spill_base,
+		                  reasons, start, window), 0
 	if kind == "longload" or kind == "longstore":
 		# One end of a long pair. The load's stub writes the upper half into
 		# a reserved register and the store's reads it back, so the two are
@@ -2610,8 +2673,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			if reasons is not None:
 				reasons["the long pair would not lower"] += 1
 			return None, 0
-		return bytes(body) + encode_jump(stub_address + len(body) + 5,
-		                                 start + window), 0
+		return close_stub(body, displaced, stub_address, pool, spill_base,
+		                  reasons, start, window), 0
 	if kind == "splat":
 		# A `vinsertf128` that broadcasts the low half, and the store that
 		# follows it. The insert itself emits nothing -- both halves are
@@ -2622,8 +2685,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			if reasons is not None:
 				reasons["the splat store would not lower"] += 1
 			return None, 0
-		return bytes(body) + encode_jump(stub_address + len(body) + 5,
-		                                 start + window), 0
+		return close_stub(body, displaced, stub_address, pool, spill_base,
+		                  reasons, start, window), 0
 	if kind == "construn":
 		# Consecutive stores of read-only constants, taken together for the
 		# reason the zero run below is taken together: a four-byte store at
@@ -2635,8 +2698,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			if reasons is not None:
 				reasons["the constant run would not lower"] += 1
 			return None, 0
-		return bytes(body) + encode_jump(stub_address + len(body) + 5,
-		                                 start + window), 0
+		return close_stub(body, displaced, stub_address, pool, spill_base,
+		                  reasons, start, window), 0
 	if kind == "zerorun":
 		# Consecutive stores of an all-zero register, taken together so that
 		# none of them has to widen its window over another. See `zero_run`.
@@ -2645,8 +2708,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			if reasons is not None:
 				reasons["the zero run would not lower"] += 1
 			return None, 0
-		return bytes(body) + encode_jump(stub_address + len(body) + 5,
-		                                 start + window), 0
+		return close_stub(body, displaced, stub_address, pool, spill_base,
+		                  reasons, start, window), 0
 
 	body = bytearray()
 	prologue = 0
@@ -3856,6 +3919,7 @@ def selftest():
 	failures += borrow_selftest()
 	failures += splat_selftest()
 	failures += constant_selftest()
+	failures += passenger_selftest()
 
 	if failures:
 		print(f"selftest: {failures} of {len(SELFTEST)} lowerings are wrong",
@@ -4014,11 +4078,71 @@ def constant_selftest():
 			print(f"selftest: {what}: constant_load said {got}, "
 			      f"want {expected}", file=sys.stderr)
 			failures += 1
+
+	# **A `vzeroupper` between the load and the store takes the upper half
+	# away, and names nothing while doing it.** The backward walk decides
+	# what wrote a register by reading operand text, so without a test on
+	# the mnemonic it scans straight past and the store's stub writes the
+	# constant's high sixteen bytes where the program wrote zeros.
+	#
+	# There are none of these in the binary -- measured at zero, of 10,791
+	# 256-bit loads and 10,933 zero stores, because MSVC emits `vzeroupper`
+	# before a call or a return and the walk stops at either. A shape the
+	# input does not contain is one no execution test can reach.
+	load = site(0x140002000, "c5fc1005", "0x0(%rip),%ymm3")
+	killer = (0x140001008, bytes.fromhex("c5f877"), "vzeroupper", "", None)
+	store = (0x140001010, bytes.fromhex("c5fc291f"), "vmovaps",
+	         "%ymm3,(%rdi)", None)
+	if constant_ymm([load, store], 1, "%ymm3", set(), readonly) is None:
+		print("selftest: a plain load and store was refused", file=sys.stderr)
+		failures += 1
+	if constant_ymm([load, killer, store], 2, "%ymm3", set(),
+	                readonly) is not None:
+		print("selftest: a vzeroupper between the two was scanned past",
+		      file=sys.stderr)
+		failures += 1
+
 	if not failures:
 		accepted = sum(1 for _w, _i, e in cases if e)
 		print(f"selftest: {len(cases)} constant shapes, {accepted} accepted "
-		      f"and {len(cases) - accepted} refused")
+		      f"and {len(cases) - accepted} refused, and a vzeroupper "
+		      f"between the ends is not")
 	return failures
+
+
+def passenger_selftest():
+	"""Prove a strategy stub emits the instruction its window swallowed.
+
+	`place_stubs` may hand any stub a `displaced` list -- the Finding 36
+	extension grows a window over the next candidate along and retires that
+	candidate -- and every strategy branch used to jump home without
+	emitting it. The instruction vanished, its boundary was recorded as
+	deliberate, and no structural check could see the loss: it is not in the
+	stub and it does not survive in `.text` either.
+
+	Measured at zero occurrences on the real binary, so this is the only
+	thing standing between the defect and its return. Finding 111.
+	"""
+	load = bytes.fromhex("c5fc1006")		# vmovups (%rsi),%ymm0
+	store = bytes.fromhex("c5fc1107")		# vmovups %ymm0,(%rdi)
+	pair = ((inplace.decode_vex(load), load[2:], 0x140001000, len(load)),
+	        (inplace.decode_vex(store), store[2:], 0x140001004, len(store)))
+	# vmovaps %xmm1,%xmm0, which lowers to movaps %xmm1,%xmm0 -- 0f 28 c1.
+	carried = (0x140001008, bytes.fromhex("c5f828c1"), None, "%xmm1,%xmm0",
+	           "vmovaps", None)
+	body, _prologue = build_stub(
+		0x140001000, load, "(%rsi),%ymm0", "vmovups", 12, [carried],
+		0x141000000, strategy=("pair", pair))
+	if body is None:
+		print("selftest: the pair stub with a passenger would not build",
+		      file=sys.stderr)
+		return 1
+	if bytes.fromhex("0f28c1") not in body:
+		print("selftest: a strategy stub dropped the instruction its window "
+		      "swallowed", file=sys.stderr)
+		return 1
+	print("selftest: a strategy stub emits the passenger its window took")
+	return 0
 
 
 def borrow_selftest():
