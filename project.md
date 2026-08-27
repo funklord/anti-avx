@@ -7071,6 +7071,81 @@ answer is to order `spill_candidates` volatile-first. The complete one is to emi
 operation the x64 ABI explicitly sanctions inside a chained fragment** -- and which needs
 this finding's slot to exist first, because the code describes one register at one offset.
 
+### Finding 119 -- the AVX host was here all along, and it is qemu
+
+*"The differential harness still has no AVX host"* has stood in the open questions since
+milestone 1. `make verify` proves the emitted SSE assembles; `make check-lowering` proves
+it agrees with GCC compiling the equivalent intrinsic. **Neither compares the lowering
+against the instruction it replaces**, and the reason recorded was that it would need a
+machine with AVX or a software model of the VEX semantics.
+
+It needs neither. **`qemu-x86_64` translates rather than dispatches**, so it executes VEX
+on a host that has none -- and `qemu-user` was already installed on this machine. The
+whole gap was a machine nobody had asked the right question of.
+
+```
+make check-vex
+   the VEX binary on this CPU: exit -4 (SIGILL -- this host has no AVX)
+   233 cases x 7 patterns = 1631 comparisons of 15 registers each
+   identical                        1588
+   Class F, two roundings (expected) 15
+   both operands NaN (oracle defect) 28
+   UNEXPLAINED                       0
+```
+
+Each case runs the ORIGINAL VEX encoding under qemu and `lower_vex`'s bytes natively, and
+compares all sixteen xmm registers -- because a lowering that computes the right answer
+and clobbers a bystander is still wrong.
+
+#### The case list is not written twice
+
+`lowering_cases.build()` is called and `detour.lower_vex` is wrapped to record the
+encoding it was handed, so the originals and the lowerings come out of **one pass over one
+list, in one order**, and the count is asserted. There is no second copy of the operand
+shapes to drift from the first, which is the failure `evidence.md` names and which this
+project has paid for twice.
+
+#### Two exemptions, and each is asserted rather than excused
+
+**Class F.** `vfmadd*` becomes a multiply and an add: two roundings where the hardware did
+one, and the only rule in the design that is not semantics-preserving. A Class F case that
+differs is recorded -- and a Class F mnemonic that **never** differs is reported too,
+because an exemption nothing exercises is an exemption nobody checked.
+
+That report earned itself immediately. The first run exempted four Class F cases as
+expected divergence and **every one of them was the all-NaN pattern**: the two-roundings
+difference the exemption exists for had never once been observed, so it was excusing
+something other than what it names. Two float triples were searched for -- 600,000
+candidates -- that diverge under all twelve combinations of operand assignment, negation
+and subtract. With those in the pattern set, **all ten Class F mnemonics differ**, and
+Finding 4 is measured rather than asserted for the first time.
+
+**The oracle's own defect.** qemu's softfloat returns SRC2's NaN where Intel returns
+SRC1's, and only when BOTH operands are NaN -- measured with a probe, and identical for
+the SSE and the VEX encodings, so it is qemu's arithmetic and not its VEX decoder. The
+exemption is narrowed twice: it applies only on the pattern where both operands are NaN by
+construction, and only when every differing element is a quiet NaN on both sides.
+
+#### Absent, skipped and passed are three different things
+
+`require_oracle` exits **77**, not 0, when qemu is missing or reports no avx2 model. A
+harness that treats its own absence as a pass is the vacuous check `evidence.md` opens
+with; one that treats it as a failure makes every machine without qemu-user look broken.
+It says which.
+
+And the harness has been watched failing. `SABOTAGE=n` flips one bit of case *n*'s lowered
+bytes; with `SABOTAGE=0` the run reports three UNEXPLAINED rows and exits 1. **A test
+nobody has seen fail is a test nobody has seen.**
+
+#### What it does not settle
+
+The arithmetic is corroborated against real silicon -- the same mnemonics at 128 bits
+agree with this Westmere on 445 of 459 comparisons, the other 14 being the NaN defect. The
+**lane structure** rests on qemu, which is an independent implementation and demonstrably
+distinguishes cross-lane cases, but is not silicon. A machine with AVX2 would settle it
+outright. Short of that the residual risk is qemu being wrong about one mnemonic's lanes
+in exactly the way that would agree with a misreading of the manual.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7964,7 +8039,7 @@ crash at an unpredictable moment.
 |---|---|---|---|
 | 0 | Full VEX inventory across all 58 MB of `.text` | Scope | **DONE** — see Measurements |
 | 0.5 | Operand-level re-measurement on the unpacked binary (`tool/vex_scan.py`) | Lowering rules can be costed and scoped from measured operand shapes, not a mnemonic histogram | **DONE** — Findings 5-8 |
-| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **PARTLY** — rules in `tool/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. Class A/B/C lowerings are now **executed** and checked against GCC's SSE intrinsics (Finding 31), which is the differential harness this row asked for, minus the AVX host: the reference is the compiler rather than the original instruction, because no AVX exists here to run. |
+| 1 | Lowering rules + unit test harness, no rewriting | Semantics are right | **DONE** (Finding 119). `make check-vex` runs the ORIGINAL VEX under `qemu-x86_64`, which translates rather than dispatches and so executes it on a host with no AVX, against `lower_vex`'s bytes running natively -- 1,631 comparisons over all sixteen registers, 0 unexplained. That is the differential harness this row asked for, with the instruction itself as the reference rather than the compiler. The AVX host was never needed; the emulator was already installed. Previously: **PARTLY** — rules in `tool/lower.py`, **100% coverage**, every lowering assembles with no VEX left. F16C is implemented and exhaustively tested. Class A/B/C lowerings are now **executed** and checked against GCC's SSE intrinsics (Finding 31), which is the differential harness this row asked for, minus the AVX host: the reference is the compiler rather than the original instruction, because no AVX exists here to run. |
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
@@ -8064,10 +8139,12 @@ the project's largest risk.
   reference, and that reference checked against CPython's binary16. The one part
   still unverified is NaN *payload* behaviour, which needs F16C hardware — see
   Finding 10.
-- **New: the differential harness still has no AVX host.** `tool/lower.py verify`
-  proves the emitted SSE assembles and contains no VEX; it does **not** prove the
-  SSE computes what the VEX did. That needs either a machine with AVX or a software
-  model of the VEX semantics, and until one exists milestone 1 is only half done.
+- ~~**New: the differential harness still has no AVX host.**~~ **Resolved: it does,
+  and it was installed.** `qemu-x86_64` translates rather than dispatches, so it runs
+  VEX on a machine that has none. `make check-vex` executes the original instruction
+  under it and the lowering natively, comparing all sixteen registers: 1,631
+  comparisons, 0 unexplained. Finding 119. What is corroborated against silicon is the
+  arithmetic; the lane structure rests on qemu.
 - ~~Does Starfield ship a Steam DRM wrapper?~~ **Resolved: yes.** `.bind`, 234 KB,
   owns the PE entry point. See "The hard parts" §4.
 - Is any of `.text` hand-written assembly or JIT-generated? Both break assumptions.

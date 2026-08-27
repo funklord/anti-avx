@@ -73,7 +73,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census check-spill check-unwind \
+        census check-spill check-unwind check-vex \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -113,6 +113,21 @@ check-aliasing:
 # machine has no AVX, so it can execute the output but never the input.
 check-lowering: $(BUILD_DIR)/lowering_test
 	$(BUILD_DIR)/lowering_test
+
+# Execute the ORIGINAL VEX instruction and the lowering that replaces it, and
+# compare all sixteen registers. qemu-x86_64 translates rather than
+# dispatches, so it runs VEX on a host that has none -- which is the AVX
+# oracle this project has been without since milestone 1. The case list is
+# tool/lowering_cases.py's, read in one pass, so the originals and the
+# lowerings cannot drift apart.
+#
+# NOT part of `check`: it needs qemu-user, and it says SKIPPED rather than
+# passing where that is absent.
+#
+# Termination: two static binaries, each a counted loop over the case table,
+# both under a timeout inside the harness.
+check-vex: | $(BUILD_DIR)
+	$(PYTHON) tool/vex_oracle.py $(BUILD_DIR)
 
 # -- the software F16C conversions -------------------------------------------
 
