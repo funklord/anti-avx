@@ -5,8 +5,10 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** design, measurement, and the lowering rules. The translator itself is not
-written. `src/f16c.c` is the only compiled code and is complete.
+**Status:** the rewriter works. `tool/detour.py` rewrites **796,091 of 805,131 VEX
+sites -- 98.9%** -- through 201,004 detours, and every `make detour-verify` invariant
+holds on the result. 9,040 sites are left, and the rewritten binary loads 305 modules
+under Proton before the frontier at `0x1428D1492` stops it.
 
 ---
 
@@ -7146,6 +7148,57 @@ distinguishes cross-lane cases, but is not silicon. A machine with AVX2 would se
 outright. Short of that the residual risk is qemu being wrong about one mnemonic's lanes
 in exactly the way that would agree with a misreading of the manual.
 
+### Finding 120 -- three numbers in milestone 0 that measure nothing
+
+Finding 6 flagged milestone 0's three-operand count rather than resolving it, on the
+grounds that "the answer decides which document is wrong". The answer is that milestone 0
+is, three times over.
+
+**208,054 is not a count of anything.** Measured under nine definitions -- registers only,
+with immediates and without, SIMD registers only, memory `src2` in or out, 256-bit in or
+out -- and no combination reaches it:
+
+```
+3 operands after dropping an immediate (vex_scan.py's own)   275,586
+three registers, immediate allowed                           210,500
+three registers, no immediate                                184,260
+three SIMD registers, immediate allowed                      204,479
+three SIMD registers, no immediate                           178,311
+memory src2, no immediate                                     62,883
+```
+
+The nearest measurable neighbours bracket it at 204,479 and 210,500.
+
+**126,576 is not merely unmatched, it is impossible beside it.** Any 208,054-site subset of
+the 210,500 all-register population carries at least 131,912 extra movs, because removing
+2,446 sites can remove at most 2,446 movs. Growing the 184,260 no-immediate population up
+to 208,054 must add immediate register forms or memory-`src2` forms, and both have a
+*higher* extra-mov rate than the population they join. 126,576 of 208,054 needs a 39.16%
+`dst == src1` share, which is above every population measured.
+
+**And the 23.6%/76.4% split is wrong independently.** Class B measures 30.3% of 275,586,
+36.2% of 210,500 and 37.7% of 184,260. Never 23.6%.
+
+So the milestone 0 lines are retired and Finding 6's replace them -- which reproduce to
+the digit: 275,586 three-operand, B 83,461, C 183,123, C-alias 9,002, the alias split
+4,318 commutative and 4,684 needing a scratch, and the per-mnemonic tail `vsubss` 1,210,
+`vmaxss` 806, `vdivss` 717.
+
+**Finding 6's own bracketing numbers are slightly low**, and saying so is the point of
+re-measuring rather than re-quoting: its "register-only triples number 178,306" measures
+178,311, and its "memory src2 add 62,773 more" measures 62,883. The 110 is not a narrower
+operand shape -- all 62,883 have a base or index register, none is absolute, none has a
+non-SIMD destination or `src1`.
+
+#### Why this took three years of findings to settle
+
+Nothing depended on it. The cost model was rebuilt from measured operand shapes in
+*Estimated cost of a translated binary*, the milestone 4 row counts real sites, and every
+strategy since Finding 14 has been costed against `detour.py plan`. **A number nothing
+reads can be wrong indefinitely**, which is the argument for retiring it rather than
+correcting it in place: a corrected number nothing reads is a number that will drift
+again.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8045,7 +8098,7 @@ crash at an unpredictable moment.
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
 | 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,091 of 805,131 VEX sites, 98.9%** (Findings 24 to 118), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
-| 6 | Y2 shadow + Class H helpers | Completeness | |
+| 6 | Y2 shadow + Class H helpers | Completeness | **PART-BUILT, and the two halves are at different stages.** The Class H helpers are written and exhaustively tested -- `src/f16c.c`, `src/permil.c`, `src/permd.c`, `src/fmaddsub.c`, through `make check-f16c`, `check-f16c-oracle`, `check-permil`, `check-permd` and `check-fmaddsub`, all in `make check` -- but **the rewriter calls none of them and nothing links one into a PE**. The one Class H form `tool/detour.py` does lower is `vpermilps` with a control vector, and it is *inlined* as the `pshufb` sequence rather than called (`lower_permilps`, because a `call` inside a stub pushes a return address into code with no `.pdata`); `make check-pe`'s `permilps` fixture runs that lowering under wine. `vpermd`, `vperm2f128`, `vpermq`, `vpermpd`, `vcvtph2ps`/`vcvtps2ph` and `vfmsubadd*` all reach `lower: no direct SSE form and not a sequence` and are refused. In `tool/lower.py` the rules are thinner than the helpers: `vpermd` emits a bare `call permd` with no operand marshalling, and both F16C mnemonics are class `HELPER` with **no body at all**, so `make verify` never assembles them. **The Y2 shadow does not exist anywhere.** Two rules name it -- `Y2/extract` and `Y2/insert`, emitting the pseudo-operand `shadow(%reg)` -- and `verify` rewrites that to `(%rsp)` before assembling, so no shadow slot has ever been allocated, written or executed. `tool/detour.py` has no shadow area: its `shadow` is a helper *register* for Finding 50's gapped copy, and `lower_ymm_pair` states in terms that what it leaves behind **is** the Y2 case. Finding 7's 574 sites are untouched. |
 
 **Milestone 3 was the go/no-go, and the project routed around it.** That sentence stood
 for a design in which every rewrite went through a reassembleable IR, and it was right for
@@ -8128,10 +8181,18 @@ the project's largest risk.
 - **New: are there other dispatched ISA paths?** There are 32 `cpuid` sites and 2
   `xgetbv` sites in `.text`. Only one dispatcher has been read. If a library selects an
   AVX2 path behind a check the rewriter perturbs, the same risk applies at 256 bits.
-- **New: what is milestone 0's 208,054 3-operand count actually counting?** It sits
-  between the register-only figure (178,306) and the full one (275,586), and its stated
-  76.4% Class C share disagrees with its own 126,576 extra-mov figure. Flagged in
-  Finding 6 rather than resolved, because the answer decides which document is wrong.
+- ~~**New: what is milestone 0's 208,054 3-operand count actually counting?**~~
+  **Resolved: nothing.** Re-measured under nine definitions -- registers only, immediates
+  admitted or not, SIMD registers only, memory src2 included or not, 256-bit in or out --
+  and no combination produces 208,054; the nearest measurable neighbours bracket it at
+  204,479 and 210,500. Its companion 126,576 is not merely unmatched but arithmetically
+  impossible beside it: any 208,054-site subset of the 210,500 all-register population
+  has at least 131,912 extra movs, and every way of growing the 184,260 no-immediate
+  population up to 208,054 raises the extra-mov share rather than lowering it. The stated
+  23.6%/76.4% split is wrong too -- Class B measures 30.3%, 36.2% or 37.7% depending on
+  the definition, never 23.6%. **Milestone 0's three-operand lines are wrong and Finding
+  6's replace them**; Finding 6's own bracketing figures are 5 and 110 low (178,311 and
+  62,883 measured). Finding 120.
 - Does anything depend on exact FP reproducibility? Class F breaks bit-exactness, and
   `vfmaddsub`/`vfmsubadd` (28 sites) break *correctness* if lowered as plain FMA.
 - ~~**Who writes the F16C software routine, and is it correct at the edges?**~~
