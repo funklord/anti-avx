@@ -7731,6 +7731,10 @@ a frame register                                   13
     own frame, at the end of a session that has twice had to withdraw a confident piece
     of reasoning about this same area.
 
+    **Both of these bullets ask the wrong question, and Finding 131 says why.** "One
+    comparison per instruction" and "per-position taint" both assume the borrow is
+    confined to its bracket. It is not: the region's contents do not survive it.
+
 The measurement is the deliverable. Whoever takes this next knows that the bucket is
 854 + 556 + 139 rather than 1,594, that the largest part of it is a taint problem and not
 a spill problem, and that the leaves are a different question entirely.
@@ -7878,6 +7882,69 @@ locals without a word, so all sixteen `encode_spill` shapes were assembled with 
 compared byte for byte -- reading the objdump listing by eye would not have done, since
 the eight-byte encodings run onto a continuation line.
 
+### Finding 131 -- the region does not survive the borrow, so the question is liveness
+
+Findings 129 and 130 both left the same next step: the whole-body refusals -- a function
+that addresses its home space anywhere, or copies `rsp` anywhere -- want a per-position
+answer, because the borrow bracket holds one instruction and nothing can reach the region
+while it is live. **That reasoning is wrong, and the disassembly of `shadowspill` is the
+proof.** The borrow is:
+
+```
+	movups %xmm2,0x30(%rsp)     <- the region's contents are gone here
+	...the lowering...
+	movups 0x30(%rsp),%xmm2     <- xmm2 is restored; the region is NOT
+```
+
+The register is saved and restored. **The region is overwritten and never put back**, and
+there is nowhere to put it back from: holding both the borrowed value and the region's
+old contents at once needs a second register, which is the thing there was none of. So
+the whole-body check is not a conservatism that a tighter bracket would relax. It is
+load-bearing, and every plan to narrow it to the bracket is a plan to corrupt a local.
+
+**What is actually being asked is liveness, and that is a much better question.** The
+region's contents are destroyed from the site onward, so the borrow is safe exactly when
+nothing reads them after it -- not when nothing touches them anywhere. Priced against the
+577 sites refused by `addresses its own caller shadow`, with a sound cheap rule (every
+reference is earlier in address order, and no branch crosses the site backwards, so no
+loop can carry one forward):
+
+```
+  a branch crosses the site backwards             354
+  REGION DEAD FROM THE SITE                       153
+  referenced at or after the site                  46
+  also copies rsp                                  24
+```
+
+**Only 46 of 577 genuinely read the region after the site.** The other 507 are refused by
+a question nobody needed to ask. The 354 are refused by the cheap rule rather than by the
+program: a backward branch means address order is not reachability, and following the
+edges is what would settle them.
+
+#### Why it is not built here
+
+The walk wanted is the shape of `upper_half_read_later` -- forward, both edges, `visiting`
+for cycles, a budget -- with two differences that stop it being a parameter away:
+
+  * **A `call` does not end a region's life.** It ends an upper half's, because Win64
+    makes every ymm upper half volatile; our shadow sits above our frame and the callee
+    gets its own below, so execution comes back and later instructions may still read
+    ours. The walk has to continue through a call, which removes the pressure that keeps
+    that one terminating cheaply.
+  * **Liveness is per site; the map is per function.** `shadow_depths` memoises a depth
+    map per function and `home_space_map` answers per function. A liveness answer belongs
+    to the site, so `borrow_offset` would run a path walk per starved site rather than a
+    dictionary lookup.
+
+Neither is hard. Together they are a piece of work with its own budget behaviour and its
+own failure mode, not an addition to the end of Finding 130 -- and this is the machinery
+that writes into the translated program's own frame, where being nearly right is
+indistinguishable from being right until something crashes hours in.
+
+So it is priced and left: **up to 507 sites of the shadow's 577, and the same question
+asked of the callee home space's refusals on top of that**, against a walk that has to be
+written carefully rather than borrowed.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7976,12 +8043,9 @@ analysis will free them and the only mechanisms that reach them are ones that br
 their own memory: static TLS (740 sites, priced, file-format half proven under wine) or
 a stack allocation described to the unwinder.
 
-Finding 129's other two thirds survive in a different shape. The `rsp`-copy refusal is
-still a whole-body answer where a per-position one would do, and the direct-operand
-refusal still condemns a function for addressing `[rsp+0..31]` anywhere when what matters
-is whether the stub's own instructions do -- both now stated against the shadow region as
-well as the callee one, and both still unbuilt for the same reason: the ratio, against a
-new silent failure mode in the machinery that writes into the translated program's frame.
+Finding 129's other two thirds survive, and **Finding 131 shows the work they were
+ranked for was the wrong work**: the question is not taint but liveness. Read that before
+starting on either.
 
 **And 180 of the survivors are not instructions.** Of the c4/c5-prefixed lines in the
 rewritten `.text`, objdump calls 180 of them `(bad)` -- they sit inside Finding 8's 744
