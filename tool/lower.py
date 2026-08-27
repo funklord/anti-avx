@@ -137,7 +137,23 @@ SSE_PREDICATES = ("eq", "lt", "le", "unord", "neq", "nlt", "nle", "ord")
 # predicate at all**; the eight it has are listed above. A greater-than must
 # become a less-than with the operands exchanged, which is a real rewrite
 # and changes which operand the destination has to hold.
+# **`gt` and `ge` without a suffix are AVX-only too**, and that is not
+# obvious from the spelling: objdump writes imm8 0x0E as `gt` and 0x0D as
+# `ge`, which are GT_OS and GE_OS -- the SIGNALLING forms. Exchanging the
+# operands turns GT_OS into LT_OS and GE_OS into LE_OS, which are exactly
+# SSE's `cmplt` and `cmple`, so unlike the `_oq` entries below these two
+# lose nothing at all: the quiet/signalling behaviour matches on both sides.
+#
+# There are four `vcmpgtps` in this binary and no bare `ge`. All four are
+# 256-bit, so nothing is gained here today; what is fixed is the flag, which
+# said they were SSE-compatible. See `compare_predicate`.
 AVX_PREDICATES = {
+	"gt": ("lt", True, "SSE HAS NO GT PREDICATE -- lowers to lt with the "
+	                    "operands exchanged; GT_OS and LT_OS agree on "
+	                    "signalling, so nothing is lost"),
+	"ge": ("le", True, "SSE has no GE predicate -- lowers to le with the "
+	                    "operands exchanged; GE_OS and LE_OS agree on "
+	                    "signalling"),
 	"nle_uq": ("nle", False, "quiet variant of nle; identical result with "
 	                          "exceptions masked"),
 	"le_oq": ("le", False, "quiet variant of le; identical result with "
@@ -280,7 +296,17 @@ def compare_predicate(mnemonic):
 				return name, True
 			if name in SSE_PREDICATES:
 				return name, False
-			return name, name in AVX_PREDICATES
+			# **SSE has eight predicates and they are all listed above**, so
+			# a name in neither table is AVX-only whether or not there is a
+			# rewrite for it here. This line used to read
+			# `return name, name in AVX_PREDICATES`, which is False by
+			# construction -- the AVX case returned two lines up -- so a bare
+			# `vcmpgtps` came back flagged SSE-compatible. Nothing acted on
+			# it: `has_direct_sse_form` ands the flag with a second test that
+			# refused the site anyway, so the answer was right by the other
+			# half. A flag that is wrong and reached by luck is the shape
+			# `evidence.md` is about. Finding 115.
+			return name, True
 	return None
 
 
@@ -888,9 +914,19 @@ def verify():
 	# mnemonic change an assembler will obviously accept, while a blend or
 	# an FMA is several instructions with register constraints, and those
 	# are the ones worth putting through a toolchain.
+	#
+	# **The compares were not in this set, and they are the rules most worth
+	# assembling.** An SSE predicate is a mnemonic change; an AVX one is an
+	# operand exchange that changes which register the destination has to
+	# hold, which is a real rewrite and was going through no toolchain at
+	# all. `verify`'s own first sentence is that a rule which has not been
+	# through an assembler is a guess. Finding 115.
+	compares = {f"vcmp{name}{suffix}"
+	            for suffix in ("ss", "sd", "ps", "pd")
+	            for name in tuple(SSE_PREDICATES) + tuple(AVX_PREDICATES)}
 	covered = sorted(
 		DIRECT_MNEMONICS | NDS_MNEMONICS
-		| set(SEQUENCE_MNEMONICS) | set(FMA_SAMPLES)
+		| set(SEQUENCE_MNEMONICS) | set(FMA_SAMPLES) | compares
 	)
 	samples = []
 	skipped = []

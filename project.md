@@ -6814,6 +6814,101 @@ of them touches. **The percentage and the frontier are measuring different thing
 the honest reading is that these 102 sites are progress towards a binary that runs and no
 progress at all towards knowing what breaks next.
 
+### Finding 115 -- the 320-site estimate was 4, and the check that never checked
+
+Findings 113 and 114 came off a scoping pass that ranked the residue into rungs. Its
+second rung was the largest single thing on the list: let `ymm_run` carry a 256-bit ALU
+instruction whose ymm sources the run already tracks, rather than stopping at it. That
+refusal, `256-bit: arithmetic rather than a copy`, is 1,993 sites and the estimate put the
+rung at 320, of which 216 could be given a helper.
+
+**It is four.**
+
+Re-measured by replaying `ymm_run`, `lifetimes` and `assign_helpers` over the 309 `.pdata`
+functions holding 1,948 of the 1,993 -- calling the tree's own `free_across`,
+`span_keeps_rsp`, `home_space_free` and `upper_half_read_later` rather than a second
+implementation of them:
+
+```
+256-bit non-moves a walk reaches with every ymm source tracked   169
+  of which are genuine arithmetic                                 83
+  of which are 256-bit reloads of a tracked register              86
+genuine ALU sites that survive to a store, i.e. inside a window   28
+  accepted -- helpers found, upper-half guard passed               4
+  refused: the value is loaded and never stored                   13
+  refused: no register free and no home space                      9
+  refused: ymm run upper half read later                           2
+```
+
+**The estimate counted qualifying positions.** A position qualifies when the mnemonic is
+lane-safe and its sources are tracked; a *site* is taken when the run it belongs to also
+reaches a store, gets helpers for every lifetime, and passes the upper-half guard at its
+end. 56 of the 83 sit in a run that never reaches a store at all -- `load / arithmetic /
+arithmetic / ...` with the result consumed rather than written back, and a run's product
+is a store. A further 102 reached positions have an untracked ymm source: 52 of those are
+another 256-bit instruction, which is a chain, which is the representation.
+
+That is the third time a number has had to be re-taken in two days -- the 4,555 of Finding
+112, the 42,184 of the same, and now this -- and the pattern is the same each time: **a
+count of things that look right, quoted as a count of things that work.**
+
+#### What the re-measurement found instead, and it is not costed either
+
+Two adjacent populations, both larger, and both stated here as *reached* rather than as
+gained, which is the distinction this finding is about:
+
+  * **`vextractf128 $1,%ymmS,%xmmD` where the source is tracked -- 113 reached**, of 383 in
+    the binary. Once the halves are in separate registers this is `movaps H(S),%xmmD` and
+    nothing else. It is not the two-halves rule and must not be folded into it: it is
+    cross-lane by definition, and it becomes trivial for the opposite reason, that the
+    lanes have already been separated.
+  * **A 256-bit reload of an already-tracked register -- 86 reached.** Finding 77 rekeyed
+    `lifetimes` on position rather than register for exactly this, "before the thing that
+    needs it". This is that thing.
+
+And one that needs no new rule at all: **`assign_helpers` is asked for a span reaching the
+run's last store, and only that one.** Retrying at each earlier store instead is worth
+318 accepted runs to 325, and 656 covered 256-bit sites to 670, on its own. It also has
+to be there before the ALU rule can be: carrying an ALU lengthens a run, a longer run is
+harder to give helpers to, and without a fallback to the plain walk the change *loses*
+runs -- measured at 318 down to 303.
+
+#### A flag that was wrong and was reached by luck
+
+`compare_predicate` returns `(name, avx_only)`. Its last line read
+
+```
+			return name, name in AVX_PREDICATES
+```
+
+which is `False` by construction: the AVX case returned two lines above it. So a bare
+`vcmpgtps` -- objdump's spelling of `GT_OS`, and there are four in `.text` -- came back
+flagged SSE-compatible. **Nothing acted on it.** `has_direct_sse_form` ands the flag with
+`name in SSE_PREDICATES`, which is False for `gt`, so the site was refused anyway and the
+answer was right by the other half of an `and`.
+
+SSE has eight predicates and they are all in `SSE_PREDICATES`, so a name in neither table
+is AVX-only whether or not there is a rewrite for it. `gt` and `ge` now have one:
+exchanging the operands turns `GT_OS` into `LT_OS` and `GE_OS` into `LE_OS`, which are
+exactly SSE's `cmplt` and `cmple` -- and unlike the `_oq` entries beside them **these two
+lose nothing at all**, the signalling behaviour agreeing on both sides. All four
+`vcmpgtps` here are 256-bit, so no site is gained; what is fixed is a table about
+correctness that was wrong.
+
+#### `make verify` did not cover the compares
+
+`verify`'s first sentence is that a rule which has not been through an assembler is a
+guess. Its `covered` set was `DIRECT_MNEMONICS | NDS_MNEMONICS | SEQUENCE_MNEMONICS |
+FMA_SAMPLES`, and **no compare is in any of those** -- objdump folds the predicate into
+the mnemonic, so `vcmpltps` is not a table entry anywhere. Every predicate rewrite in the
+tree, including the operand exchange that changes which register the destination has to
+hold, had gone through no toolchain at all.
+
+They do now: sixty-four compare mnemonics, and the count of assembled lowerings goes from
+439 to 567. All of them pass, which is the good outcome and not the interesting one --
+the interesting one is that a check quoted for two months as proving every rule was
+silently proving 439 of 567.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -6865,31 +6960,31 @@ code quickly.
 
 ### Where the residue actually is
 
-Measured on the binary the tool produces after Finding 111. `make detour-plan` names
-every refusal; these are the buckets that matter, with the count outside any accepted
-window beside the total, because a site inside one has already been taken by whatever
-strategy claimed that window.
+Measured after Finding 115. `make detour-plan` names every refusal; these are the buckets
+that matter, with the count outside any accepted window beside the total, because a site
+inside one has already been taken by whatever strategy claimed that window.
 
 ```
                                              total   outside
-256-bit: arithmetic rather than a copy       1,993     1,884
+ymm value has no known upper half           10,086     1,238
 no home space to borrow                      2,517     1,876
-ymm value has no known upper half           10,086     1,302
+256-bit: arithmetic rather than a copy       1,974     1,846
+256-bit: no store before 256-bit arithmetic    404       360
 outside .pdata                                 321       321
 no register free across the ymm run            213       213
 next instruction is a branch target            202       202
 the constant is read by something that
   will not reload it                           182       182
                                                        -----
-everything left, all buckets                           7,134
+everything left, all buckets                           7,032
 ```
 
-**Three-fifths of what is left is one piece of work.** `arithmetic rather than a copy`
-and `ymm value has no known upper half` are both decision 2 above: the first is a 256-bit
+**Three-fifths of what is left is one piece of work.** `arithmetic rather than a copy` and
+`ymm value has no known upper half` are both decision 2 above: the first is a 256-bit
 operation on a value, and the second is 10,023 `vmovups`, 50 `vmovdqu` and 13 `vmovupd`,
-every one of them with a memory operand. Together they are 3,186 of the 7,134, and the
-182 constants refused in Finding 109 are the same thing again -- 164 of those are blocked
-by 256-bit arithmetic reading the hoisted value.
+every one of them with a memory operand. Together they are 3,084 of the 7,032, and the 182
+constants refused in Finding 109 are the same thing again -- 164 of those are blocked by
+256-bit arithmetic reading the hoisted value.
 
 **`no home space to borrow` is half a real absence and half a proof gap**, which is worth
 knowing before anyone attacks it. Classified with the tool's own predicates: 1,110 of the
@@ -6900,13 +6995,47 @@ describe -- 54% a real absence. The other 1,154 are functions that copy `rsp` so
 which is Finding 96's result holding on the current bucket rather than a fresh
 disappointment.
 
-**And 180 of the survivors are not instructions.** Of the 9,223 lines in the rewritten
-`.text` whose first byte is `c4` or `c5`, objdump calls 180 of them `(bad)` -- they sit
-inside Finding 8's 744 undecodable islands, `decode_vex` reads their bytes as a prefix,
-and they are then counted as refused sites in a bucket that reads like work. `census`
-already files 81 of them under "undecodable, never classified"; the rest are spread
-through the named buckets. The residue is about two per cent smaller than its headline,
-and nothing needs doing about it except knowing.
+**And 180 of the survivors are not instructions.** Of the c4/c5-prefixed lines in the
+rewritten `.text`, objdump calls 180 of them `(bad)` -- they sit inside Finding 8's 744
+undecodable islands, `decode_vex` reads their bytes as a prefix, and they are then counted
+as refused sites in a bucket that reads like work. `census` already files 81 of them under
+"undecodable, never classified"; the rest are spread through the named buckets. The residue
+is about two per cent smaller than its headline, and nothing needs doing about it except
+knowing.
+
+### What is worth building next, with the number behind each
+
+Ranked by what was measured rather than by what looks large, and every count here is
+**sites reached**, not sites gained -- Finding 115 is about the difference:
+
+```
+retry assign_helpers at each earlier store, not only the last     +14
+  318 accepted runs -> 325, 656 covered 256-bit sites -> 670.
+  No new rule, and it has to be in place before the next two:
+  a longer run is harder to give helpers to, and without a
+  fallback to the plain walk, carrying anything LOSES runs.
+
+vextractf128 $1 with a tracked source                        113 reached
+  `movaps H(S),%xmmD` and nothing else, once the halves are
+  in separate registers. 383 in the binary.
+
+a 256-bit reload of an already-tracked register               86 reached
+  What Finding 77 rekeyed `lifetimes` on position for.
+
+carry a lane-safe 256-bit ALU inside a run                      4 accepted
+  Costed at 320 by a scoping pass and measured at 4. Build it
+  for what the representation work will need, not for the count.
+```
+
+**And the wall behind all of them.** In the six functions holding 822 of the refused
+256-bit sites, all sixteen xmm are named, twelve to sixteen ymm are live at the peak,
+`function_scope` lends nothing and four of the six cannot lend home space. `find_scratch`
+finds a register at 45.7% of the 3,186 against 89.3% for sites already taken in the same
+functions, so the residue is the adversarial tail of that distribution. **The next real
+question is not an allocator but where a spill can live**, and that was closed on unwind
+grounds -- `--spill=stack` hands the unwinder a frame sixteen bytes wrong, `--spill=pool`
+cannot be made thread-safe, `--spill=home` is 32 bytes. Re-opening it is a decision, not a
+piece of coding.
 
 ### What each tool is for
 
