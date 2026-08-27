@@ -7677,6 +7677,64 @@ So the binding constraint is the upper-half guard and not the stranding rule, an
 smarter truncation would gain nothing it does not already have. Recorded rather than
 built.
 
+### Finding 129 -- what a borrow bracket may hold, and who is left who cannot lend
+
+Two things, both about the same 32 bytes.
+
+#### The bracket rule covers every control transfer now, not just a call
+
+Finding 127 refused a borrow bracket that would wrap a `call`, because
+`copy_reaches_home` leans on nothing else running between the save and the restore. A
+**branch** is the other half and it is worse: control leaving the bracket means the
+restore never runs at all, and the borrowed register stays clobbered for the rest of the
+program -- not a wrong value in one place but a wrong register everywhere after it.
+
+Neither can happen today. `ymm_run` breaks on every control transfer and `emit_swallowed`
+brackets a single lowering, so the refusal has never fired and the artifact is unchanged
+by it. That is the point: the property is refused rather than relied upon, and a future
+strategy that widens a bracket meets a check instead of a docstring.
+
+#### The second-largest bucket, decomposed
+
+`no home space to borrow` is 1,594 sites outside any accepted window, second only to the
+register representation. It is not one problem:
+
+```
+a leaf: there is no home space to lend            854
+an rsp copy the walk cannot follow                556
+a direct [rsp+0..31] operand                      139
+both                                               10
+outside every .pdata range                         22
+a frame register                                   13
+                                                -----
+                                                1,594
+```
+
+**The three need three different things**, and only one of them is cheap:
+
+  * **The 854 leaves have no 32 bytes to lend.** No argument about what runs inside a
+    bracket reaches them; a leaf never reserved a callee home space at all. What reaches
+    them is a different region or a different mechanism -- static TLS, priced at 740 sites
+    with the file-format half proven, or the caller's own shadow at `[entry_rsp+8, +40)`,
+    which is usable at 245 sites of which **all 150 outside any window are leaves**, and
+    which writes on parameters rather than locals.
+  * **The 556 unfollowable copies want per-position taint.** `copy_reaches_home` answers
+    for a whole body, and the precise question is narrower: does anything *inside the
+    bracket* reach the region. Answering it needs the taint map at each position rather
+    than collapsed to a boolean -- a real piece of work, and the largest single thing in
+    this bucket.
+  * **The 139 direct operands want one comparison per instruction**, and are the cheap
+    case: a function that addresses `[rsp+0..31]` somewhere is refused entirely, when
+    what matters is whether the instructions the stub emits do. It is not built, and the
+    reason is the ratio rather than the difficulty. **139 sites is not enough to buy a
+    new silent failure mode** in the machinery that writes into the translated program's
+    own frame, at the end of a session that has twice had to withdraw a confident piece
+    of reasoning about this same area.
+
+The measurement is the deliverable. Whoever takes this next knows that the bucket is
+854 + 556 + 139 rather than 1,594, that the largest part of it is a taint problem and not
+a spill problem, and that the leaves are a different question entirely.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7754,14 +7812,14 @@ every one of them with a memory operand. Together they are 3,084 of the 7,032, a
 constants refused in Finding 109 are the same thing again -- 164 of those are blocked by
 256-bit arithmetic reading the hoisted value.
 
-**`no home space to borrow` is half a real absence and half a proof gap**, which is worth
-knowing before anyone attacks it. Classified with the tool's own predicates: 1,110 of the
-2,517 are in leaf functions, which never reserved a home space to lend, 218 more are in
-functions that address `[rsp+0..31]` themselves, and 35 are in code `.pdata` does not
-describe -- 54% a real absence. The other 1,154 are functions that copy `rsp` somewhere
-`copy_reaches_home` loses it, and **in not one of them does the copy land in the region**,
-which is Finding 96's result holding on the current bucket rather than a fresh
-disappointment.
+**`no home space to borrow` is three problems, not one**, and Finding 129 decomposes it
+after Finding 127 took 364 out of it. Of the 1,594 outside any window: **854 are leaves**
+with no 32 bytes to lend at all, which no argument about a borrow bracket reaches and
+which want static TLS (740 sites, priced) or the caller's own shadow (150, every one of
+them a leaf); **556 are an `rsp` copy the walk cannot follow**, which wants per-position
+taint rather than the whole-body answer `copy_reaches_home` gives; and **139 are a direct
+`[rsp+0..31]` operand somewhere in the function**, which wants one comparison per emitted
+instruction and is the cheap case. 22 are outside `.pdata` and 13 have a frame register.
 
 **And 180 of the survivors are not instructions.** Of the c4/c5-prefixed lines in the
 rewritten `.text`, objdump calls 180 of them `(bad)` -- they sit inside Finding 8's 744

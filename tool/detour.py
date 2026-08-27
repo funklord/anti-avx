@@ -2751,16 +2751,18 @@ def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons):
 	window turns out to hold. See `swallowed_borrow`. Finding 93.
 	"""
 	borrowing = len(entry) > 6 and entry[6]
-	# **Nothing between a save and its restore may be a call.** That is what
-	# `copy_reaches_home` leans on to lend the home space to a function
-	# whose `rsp` copy escaped: an escaped pointer cannot be dereferenced
-	# while the borrow is live, because nothing else runs. The bracket here
-	# is one instruction, so the check is one comparison -- and a swallowed
-	# `call` re-emitted by Finding 86 is exactly the instruction it must
-	# never wrap. Finding 127.
-	if borrowing and (entry[4] or "").startswith(("call", "callq")):
+	# **Nothing between a save and its restore may transfer control.** A
+	# call is the case `copy_reaches_home` leans on -- an escaped pointer
+	# cannot be dereferenced while the borrow is live, because nothing else
+	# runs -- and a swallowed `call` re-emitted by Finding 86 is exactly the
+	# instruction that would break it. A swallowed BRANCH is the other half
+	# and is worse: control leaving between the save and the restore means
+	# the restore never runs at all, and the borrowed register stays
+	# clobbered for the rest of the program. Neither can happen today, which
+	# is why this is a refusal rather than a repair. Findings 127 and 129.
+	if borrowing and (entry[4] or "").startswith(CONTROL_PREFIXES):
 		if reasons is not None:
-			reasons["a borrow bracket would wrap a call"] += 1
+			reasons["a borrow bracket would wrap a control transfer"] += 1
 		return None
 	out = bytearray()
 	if borrowing:
@@ -2952,10 +2954,10 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# is now refused rather than relied upon. See `emit_swallowed`.
 		if borrowed and any(
 				entry[6] is not None
-				and (entry[6][4] or "").startswith(("call", "callq"))
+				and (entry[6][4] or "").startswith(CONTROL_PREFIXES)
 				for entry in strategy[1][1] if entry[0] == "plain"):
 			if reasons is not None:
-				reasons["a run borrow would wrap a call"] += 1
+				reasons["a run borrow would wrap a control transfer"] += 1
 			return None, 0
 		if len(borrowed) * SLOT > HOME_SPACE:
 			# The home space is what the ABI reserved and nothing says what
