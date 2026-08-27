@@ -387,7 +387,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              fallthrough pastread swallowed gapped interleaved permilps \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
-             mxcsr splatrun splatop extract shadowspill
+             mxcsr splatrun splatop extract shadowspill regionlive
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
@@ -481,7 +481,9 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 # Termination: one wine invocation per mode, each under a timeout.
 check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
              $(BUILD_DIR)/pe-homespill.exe $(BUILD_DIR)/pe-homespill.asm \
-             $(BUILD_DIR)/pe-shadowspill.exe $(BUILD_DIR)/pe-shadowspill.asm
+             $(BUILD_DIR)/pe-shadowspill.exe $(BUILD_DIR)/pe-shadowspill.asm \
+             $(BUILD_DIR)/pe-regionlive.exe $(BUILD_DIR)/pe-regionlive.asm \
+             $(BUILD_DIR)/pe-regionread.exe $(BUILD_DIR)/pe-regionread.asm
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-spill: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
@@ -553,7 +555,32 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 			exit 1; \
 		fi; \
 	done; \
-	echo "check-spill: and a LEAF lends the shadow its own caller reserved"
+	echo "check-spill: and a LEAF lends the shadow its own caller reserved"; \
+	want=`$(PYTHON) tool/pe_build.py names | \
+	      awk '$$1 == "regionlive" { print $$2 }'`; \
+	for name in regionlive regionread; do \
+		for mode in whole live; do \
+			$(PYTHON) tool/detour.py --region=$$mode apply \
+				$(BUILD_DIR)/pe-$$name.exe $(BUILD_DIR)/pe-$$name.asm \
+				$(BUILD_DIR)/sse-$$name-$$mode.exe >/dev/null; \
+			$(WINE_ENV) timeout 120 wine \
+				$(BUILD_DIR)/sse-$$name-$$mode.exe \
+				>/dev/null 2>&1 && got=0 || got=$$?; \
+			echo "check-spill: $$name --region=$$mode returned $$got"; \
+			if [ "$$name/$$mode" = "regionlive/live" ]; then \
+				if [ "$$got" != "$$want" ]; then \
+					echo "check-spill: a region dead from the site was"; \
+					echo "             not lent -- want $$want"; exit 1; \
+				fi; \
+			elif [ "$$got" = "$$want" ]; then \
+				echo "check-spill: $$name --region=$$mode answered $$want,"; \
+				echo "             so the borrow was taken when the region"; \
+				echo "             was still live, or was never the case"; \
+				exit 1; \
+			fi; \
+		done; \
+	done; \
+	echo "check-spill: a region dead from the site is lent and a live one is not"
 
 # Can an exception be dispatched from inside a stub? Two programs that fault
 # on purpose, both registering a handler through .pdata -- which is how a PE

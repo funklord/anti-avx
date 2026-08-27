@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **797,160 of 805,131 VEX
-sites -- 99.0%** -- through 201,686 detours, and every `make detour-verify` invariant
-holds on the result. 7,971 sites are left, and the rewritten binary loads 305 modules
+**Status:** the rewriter works. `tool/detour.py` rewrites **797,574 of 805,131 VEX
+sites -- 99.1%** -- through 201,887 detours, and every `make detour-verify` invariant
+holds on the result. 7,557 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
 ---
@@ -7921,29 +7921,98 @@ a question nobody needed to ask. The 354 are refused by the cheap rule rather th
 program: a backward branch means address order is not reachability, and following the
 edges is what would settle them.
 
-#### Why it is not built here
+#### Built, and not as a walk per site
 
-The walk wanted is the shape of `upper_half_read_later` -- forward, both edges, `visiting`
-for cycles, a budget -- with two differences that stop it being a parameter away:
+**7,971 -> 7,557 sites, measured on the binary.** 414 removed, 201,887 detours, and the
+first run to pass 99.1%.
 
-  * **A `call` does not end a region's life.** It ends an upper half's, because Win64
-    makes every ymm upper half volatile; our shadow sits above our frame and the callee
-    gets its own below, so execution comes back and later instructions may still read
-    ours. The walk has to continue through a call, which removes the pressure that keeps
-    that one terminating cheaply.
-  * **Liveness is per site; the map is per function.** `shadow_depths` memoises a depth
-    map per function and `home_space_map` answers per function. A liveness answer belongs
-    to the site, so `borrow_offset` would run a path walk per starved site rather than a
-    dictionary lookup.
+The first sketch was a forward walk from each site, in the shape of
+`upper_half_read_later`. That is the wrong shape twice over: a `call` does not end a
+region's life the way it ends an upper half's -- execution comes back -- so the walk
+loses the thing that keeps that one cheap, and it would run once per starved site.
 
-Neither is hard. Together they are a piece of work with its own budget behaviour and its
-own failure mode, not an addition to the end of Finding 130 -- and this is the machinery
-that writes into the translated program's own frame, where being nearly right is
-indistinguishable from being right until something crashes hours in.
+**Backward from the readers is the same answer for much less.** The reference set is
+small and fixed while the sites asking about it are many, so `readers_reachable` builds
+the function's CFG once, seeds the positions that reference the region, and propagates
+along predecessors to a fixpoint. One pass per function, memoised, and a set membership
+test per site.
 
-So it is priced and left: **up to 507 sites of the shadow's 577, and the same question
-asked of the callee home space's refusals on top of that**, against a walk that has to be
-written carefully rather than borrowed.
+Every edge it cannot resolve is seeded as reaching a reader -- a fall-through off the end
+of the range, a branch into the middle of an instruction. **An indirect branch is the one
+exception and it had to be**: seeding it as reaching every position is sound and useless,
+because a function with a switch table then refuses its whole body, and in this binary
+that is most of the large ones. It goes to `targets.py`'s set restricted to the function
+instead, which is the same set the whole detour scheme already trusts to say where a
+window may not swallow an instruction.
+
+A `lea` stays a whole-function refusal, and the distinction is the point. A direct
+operand is a read or a write AT a place, so reachability answers it. A `lea` forms a
+POINTER, which can be stored, passed and dereferenced somewhere no walk over this
+function's own instructions can see.
+
+#### The fixture pair, and why one of them is not in `check-pe`
+
+`regionlive` keeps a local in its caller's shadow, reads it back, and never touches it
+again; `regionread` is the same program with that read moved after the site. Neither uses
+an indirect jump to starve the scratch, as `homespill` and `shadowspill` do, and the
+reason is this analysis working correctly: the entry point is a branch target, so an
+indirect branch inside the function reaches the top of it and every reference with it.
+Both make all six volatile registers live across the site instead.
+
+```
+check-spill: regionlive --region=whole returned 29
+check-spill: regionlive --region=live  returned 121
+check-spill: regionread --region=whole returned 29
+check-spill: regionread --region=live  returned 29
+```
+
+29 is the illegal-instruction death of a surviving VEX site. The first pair is the gain;
+the second is the safety, and it is the one that could not go in `check-pe`, whose rule is
+that every sample returns its number -- here the correct outcome is that the site is
+refused and the program dies. **The assertion still discriminates**: a borrow wrongly
+taken would lower the site, remove the VEX, fault nothing, and return 110 plus the bits
+of `%xmm2` read as an integer. Refusing is the only route to 29.
+
+#### Three defects found on the way, and two of them were shipped
+
+**The entry-relative sign was inverted.** `copy_reaches_home` computes a landing as
+`depth + displacement`; Finding 130's new scan computed `displacement - depth`. Those are
+the same number at depth zero -- which is where MSVC's prologue spills its register
+parameters, so the common case agreed, every fixture passed, and `check-spill` went green.
+Below the frame allocation they diverge, which is exactly where a function writes its
+shadow through a settled `rsp`. **The binary built at `d7ba7a3` could therefore lend the
+shadow of a function that uses it.** The scan is `region_references` now, extracted so it
+can be tested, and `REFERENCE_CASES` puts every case but one at a non-zero depth.
+
+**Two of the three `emit_swallowed` call sites never got the displacement.** Finding 130
+threaded `base` through `close_stub`; `build_stub` calls `emit_swallowed` twice more, for
+the instructions a backward-widened window carries and for those a forward-widened one
+displaces, and both took the default of zero. So a swallowed neighbour saved itself into a
+leaf's own frame while the site beside it used the shadow -- visible in one line of the
+`regionlive` stub and in nothing else. `slot` and `base` have no defaults now: this is the
+second time an optional parameter on `encode_spill` was missed at a call site and
+corrupted a local silently, Finding 118 being the first, and a missing argument is a
+`TypeError`.
+
+**And `selftest` reported every failure as a wrong lowering.** Each sub-test adds to one
+counter and the summary said "N of 18 lowerings are wrong", which sent a reader to
+`SELFTEST` for a bad case in `REFERENCE_CASES`. It says how many cases failed now.
+
+#### What the sabotage runs proved
+
+Four ways of getting the reachability wrong, each caught:
+
+```
+gives up on any backward branch                   1 failure
+indirect branch treated as reaching nothing       1 failure
+a range that falls off its end treated as ending  2 failures
+address order instead of reachability             3 failures
+```
+
+The first is the cheap rule this finding priced with, and two of the nine cases exist to
+separate it from the real thing: a loop closing above the reference must refuse and one
+closing below it must not. A rule that gave up on backward branches passes the first and
+fails the second while looking careful.
 
 ## Picking this up again
 
@@ -8043,9 +8112,9 @@ analysis will free them and the only mechanisms that reach them are ones that br
 their own memory: static TLS (740 sites, priced, file-format half proven under wine) or
 a stack allocation described to the unwinder.
 
-Finding 129's other two thirds survive, and **Finding 131 shows the work they were
-ranked for was the wrong work**: the question is not taint but liveness. Read that before
-starting on either.
+Finding 129's other two thirds are answered by **Finding 131**, which found the work
+they were ranked for was the wrong work -- the question is not taint but liveness -- and
+then built it. The bucket is 1,620 now.
 
 **And 180 of the survivors are not instructions.** Of the c4/c5-prefixed lines in the
 rewritten `.text`, objdump calls 180 of them `(bad)` -- they sit inside Finding 8's 744
@@ -8096,12 +8165,12 @@ one for several sessions.
 
 What is left divides cleanly, and the two halves want different work:
 
-  * **4,729 sites are 256-bit** and want the register representation, which
+  * **4,451 sites are 256-bit** and want the register representation, which
     `project.md`'s ladder has always described as a different kind of work from anything
     done so far. `ymm value has no known upper half` (1,140 outside a window) and
     `256-bit: arithmetic rather than a copy` (1,818) are one problem stated twice.
-  * **3,062 are 128-bit** (and 180 are undecodable bytes rather than instructions --
-    see below), and after Finding 130 their largest causes are a shadow the
+  * **2,926 are 128-bit** (and 180 are undecodable bytes rather than instructions --
+    see below), and after Findings 130 and 131 their largest causes are a shadow the
     function genuinely uses (which wants memory of our own -- static TLS is priced at 740
     sites), `outside .pdata` at 325, and `next instruction is a branch target` at 209.
 

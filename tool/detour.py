@@ -578,7 +578,7 @@ def spill_register(registers):
 	return candidates[0] if candidates else None
 
 
-def encode_spill(borrowed, save, at, spill_base, slot=0, base=0):
+def encode_spill(borrowed, save, at, spill_base, slot, base):
 	"""Save or restore a borrowed register. `save` picks the direction.
 
 	**`movups`, not `movaps`.** Win64 guarantees `rsp` is 16-byte aligned at
@@ -598,6 +598,15 @@ def encode_spill(borrowed, save, at, spill_base, slot=0, base=0):
 	`base` is which home space. Zero is the one this function reserves for
 	its own callees, at `(%rsp)`; anything else is the shadow its caller
 	reserved for it, a whole frame higher. See `borrow_offset`.
+
+	**Neither `slot` nor `base` has a default, and that is the whole point.**
+	Both arrived as optional parameters and both were then missed at a call
+	site -- `slot` in Finding 118, where two borrows shared sixteen bytes,
+	and `base` at two of the three `emit_swallowed` calls, where a
+	swallowed neighbour saved itself into a leaf's own frame while the site
+	beside it used the shadow. Each was silent, each assembled, each
+	verified, and each corrupted a local. A missing argument is a
+	`TypeError` now.
 	"""
 	opcode = b"\x0f\x11" if save else b"\x0f\x10"
 	if SPILL == SPILL_POOL:
@@ -1066,6 +1075,114 @@ def rsp_depths(rows, frame, after_prologue):
 	return seen, body
 
 
+# `--region=` decides what a direct reference to a home space costs.
+# `whole` refuses the function for one anywhere in it, which is what
+# Findings 72 to 130 shipped; `live` asks whether the reference can still be
+# reached from the site. Keep `whole` reachable: a borrow that clobbers a
+# local the function still reads does not fault, so comparing two binaries is
+# the only way to test for it. See Finding 131.
+REGION_WHOLE, REGION_LIVE = "whole", "live"
+REGION_RULE = REGION_LIVE
+
+
+def readers_reachable(plain, first, last, refs, inside_targets):
+	"""Positions in `[first, last)` from which some position in `refs` can
+	still be reached. `refs` must not be empty.
+
+	**Why reachability and not a bracket.** A borrow writes the register
+	into the region and reads it back; it never puts the region's own
+	contents back, and there is nowhere to put them back from. So the
+	region is destroyed from the site onward, and the question a site has
+	to answer is not "does this function touch the region" -- which refuses
+	507 of 577 sites for nothing -- but "can anything that reads it still
+	run". Finding 131.
+
+	One fixpoint per function, then a lookup per site, rather than a walk
+	per site: the reference set is small and fixed while the sites asking
+	about it are many.
+
+	**An indirect branch goes to `inside_targets` and nowhere else.** That
+	is `targets.py`'s set restricted to this function -- switch tables,
+	relocations, addresses taken by `lea` -- and it is the same set the
+	whole detour scheme already trusts to say where a window may not
+	swallow an instruction. Seeding an indirect branch as reaching every
+	position instead is sound and useless: a function with a switch table
+	then refuses its whole body, which in this binary is most of the large
+	ones.
+
+	**Every other edge this cannot resolve reaches everything.** A
+	fall-through off the end of the range, or a branch into the middle of
+	an instruction, means control could arrive at a reader by a route not
+	modelled, so the position is seeded as though it did. That is the
+	direction that costs sites rather than the one that corrupts a frame.
+	"""
+	successors, unresolved = {}, set()
+	for position in range(first, last):
+		address, _encoding, mnemonic, operands = plain[position]
+		operands = operands or ""
+		if mnemonic.startswith("ret"):
+			successors[position] = ()
+			continue
+		following = position + 1
+		if mnemonic.startswith(("j", "loop")):
+			target, first_field = None, operands.split()[0] if operands else ""
+			if first_field.startswith("0x"):
+				try:
+					target = int(first_field, 16)
+				except ValueError:
+					target = None
+			if target is None:
+				# Indirect. It can only land where something can be
+				# branched to, and this function's share of that set is
+				# `inside_targets`.
+				successors[position] = inside_targets
+				continue
+			inside = plain[first][0] <= target < plain[last - 1][0] + 1 \
+				if last > first else False
+			edges = []
+			if inside:
+				at = bisect.bisect_left(plain, (target,), first, last)
+				if at < last and plain[at][0] == target:
+					edges.append(at)
+				else:
+					# A branch into the middle of an instruction is not
+					# something this can model. Refuse to model the rest.
+					unresolved.add(position)
+			# A conditional falls through as well; an unconditional does
+			# not, and one leaving the range takes its edge with it.
+			if not mnemonic.startswith("jmp"):
+				if following < last:
+					edges.append(following)
+				else:
+					unresolved.add(position)
+			successors[position] = tuple(edges)
+			continue
+		# Everything else falls through, `call` included: it comes back,
+		# and a callee cannot read this frame's home space.
+		if following < last:
+			successors[position] = (following,)
+		else:
+			# Off the end of the range with no terminator. Where control
+			# goes is the range's business and the range may be wrong.
+			unresolved.add(position)
+			successors[position] = ()
+
+	predecessors = {}
+	for position, edges in successors.items():
+		for edge in edges:
+			predecessors.setdefault(edge, []).append(position)
+
+	reaching = set(refs) | unresolved
+	work = list(reaching)
+	while work:
+		position = work.pop()
+		for earlier in predecessors.get(position, ()):
+			if earlier not in reaching:
+				reaching.add(earlier)
+				work.append(earlier)
+	return reaching
+
+
 def copy_reaches_home(rows, frame, region=None):
 	"""True if a copy of `rsp` could reach a home space, or cannot be
 	followed. Refusing is the answer to every doubt.
@@ -1197,7 +1314,7 @@ def copy_reaches_home(rows, frame, region=None):
 	return False
 
 
-def home_space_map(binary, plain, ranges):
+def home_space_map(binary, plain, ranges, blocked):
 	"""Which functions can lend their callee home space to a stub.
 
 	Three conditions, and each is read off the binary rather than assumed:
@@ -1236,8 +1353,17 @@ def home_space_map(binary, plain, ranges):
 
 	starts = [start for start, _end in ranges]
 	calls = [False] * len(ranges)
-	touches = [False] * len(ranges)
-	copies = [False] * len(ranges)
+	# **Which addresses reference the region, not merely whether one does.**
+	# A direct operand used to refuse the whole function; it names a
+	# position now, and `borrow_offset` asks whether that position is still
+	# reachable from the site. See `readers_reachable` and Finding 131.
+	direct = {}
+	# A `lea` stays a whole-function refusal, and the difference is the
+	# point. A direct operand is a read or a write AT a place; a `lea` forms
+	# a POINTER, which can be stored, passed, and dereferenced somewhere no
+	# reachability over this function's own instructions can see.
+	pointed = set()
+	copies = set()
 	for address, _encoding, mnemonic, operands in plain:
 		i = bisect.bisect_right(starts, address) - 1
 		if i < 0 or address >= ranges[i][1]:
@@ -1247,67 +1373,143 @@ def home_space_map(binary, plain, ranges):
 		for match in RSP_MEMORY.finditer(operands):
 			text = match.group(1)
 			if 0 <= (int(text, 16) if text else 0) < HOME_SPACE:
-				touches[i] = True
-		# **A direct operand is not the only way to reach it.** A function
-		# that computes the address of its own frame bottom can write there
-		# through the result, and the scan above would see nothing. Taking
-		# the address of anything inside the region is refused outright.
-		if mnemonic == "lea":
-			match = RSP_MEMORY.search(operands)
-			if match:
-				text = match.group(1)
-				if 0 <= (int(text, 16) if text else 0) < HOME_SPACE:
-					touches[i] = True
+				if mnemonic == "lea":
+					pointed.add(i)
+				else:
+					direct.setdefault(i, []).append(address)
 		# **A copy of `rsp` is noted, and where it points decides.** The
 		# blanket refusal this replaces was measured to protect no function
 		# in the binary -- see Finding 96 and `copy_reaches_home` -- and
-		# `--rsp=blanket` restores it for comparison.
+		# `--rsp=blanket` restores it for comparison. It is followed
+		# lazily: only a function holding a starved site is ever asked.
 		if RSP_COPY.match(operands):
-			copies[i] = True
+			copies.add(i)
 
-	if RSP_RULE == RSP_BLANKET:
-		for i in range(len(ranges)):
-			if copies[i]:
-				touches[i] = True
-	else:
-		# Only the functions a copy would otherwise refuse are worth
-		# following, so the bodies are collected for those alone rather
-		# than for all of them.
-		wanted = {i for i in range(len(ranges))
-		          if copies[i] and not touches[i] and calls[i]
-		          and ranges[i][0] in fixed_frame}
-		bodies = {i: [] for i in wanted}
-		for address, _encoding, mnemonic, operands in plain:
-			i = bisect.bisect_right(starts, address) - 1
-			if i in bodies and address < ranges[i][1]:
-				bodies[i].append((mnemonic, operands))
-		for i in wanted:
-			if copy_reaches_home(bodies[i],
-			                     prologue_frame(data, unwind_at,
-			                                    ranges[i][0])):
-				touches[i] = True
-
-	# The shadow is worked out per function, on demand, because it is only
-	# ever asked about the few hundred that hold a starved site and the walk
-	# wants the function's whole instruction list. `plain` is in address
-	# order, so a function's rows are a slice of it and nothing is copied.
-	shadow = {"plain": plain, "unwind": unwind_at, "prologue": prologue_end,
-	          "data": data, "cache": {}}
+	# Both regions are worked out per function, on demand, because only the
+	# few hundred functions holding a starved site are ever asked and each
+	# walk wants that function's whole instruction list. `plain` is in
+	# address order, so a function's rows are found by bisection.
+	state = {"plain": plain, "unwind": unwind_at, "prologue": prologue_end,
+	         "data": data, "cache": {}, "home_cache": {},
+	         "direct": direct, "copies": copies, "blocked": blocked}
 	return (starts, ranges,
-	        [calls[i] and not touches[i] and ranges[i][0] in fixed_frame
+	        [calls[i] and i not in pointed and ranges[i][0] in fixed_frame
 	         for i in range(len(ranges))],
-	        shadow)
+	        state)
+
+
+def function_rows(state, ranges, i, with_address=True):
+	"""One function's instructions, by bisection into `plain`."""
+	start, end = ranges[i]
+	plain, rows = state["plain"], []
+	for position in range(bisect.bisect_left(plain, (start,)), len(plain)):
+		address, _encoding, mnemonic, operands = plain[position]
+		if address >= end:
+			break
+		rows.append((address, mnemonic, operands or "") if with_address
+		            else (mnemonic, operands or ""))
+	return rows
+
+
+def region_readers(state, ranges, i, refs):
+	"""Addresses from which one of `refs` can still be reached, memoised
+	per function. An empty `refs` gives an empty answer.
+	"""
+	if not refs:
+		return frozenset()
+	plain = state["plain"]
+	start, end = ranges[i]
+	first = bisect.bisect_left(plain, (start,))
+	last = bisect.bisect_left(plain, (end,), first)
+	blocked = state["blocked"]
+	inside = tuple(position for position in range(first, last)
+	               if plain[position][0] in blocked)
+	wanted = {bisect.bisect_left(plain, (address,), first, last)
+	          for address in refs}
+	reaching = readers_reachable(plain, first, last, wanted, inside)
+	return frozenset(plain[position][0] for position in reaching)
+
+
+def home_readers(home, i):
+	"""Where the callee home space is still live in function `i`, or None
+	if the function cannot lend it at all.
+
+	The `rsp` copy is followed here rather than in `home_space_map` so that
+	only a function actually asked about pays for it -- and so that a
+	direct reference no longer excuses the walk, now that a direct
+	reference is not a refusal by itself.
+	"""
+	_starts, ranges, _usable, state = home
+	if i in state["home_cache"]:
+		return state["home_cache"][i]
+	if i in state["copies"]:
+		if RSP_RULE == RSP_BLANKET:
+			return state["home_cache"].setdefault(i, None)
+		rows = function_rows(state, ranges, i, with_address=False)
+		if copy_reaches_home(rows, prologue_frame(state["data"],
+		                                          state["unwind"],
+		                                          ranges[i][0])):
+			return state["home_cache"].setdefault(i, None)
+	refs = state["direct"].get(i, ())
+	if refs and REGION_RULE == REGION_WHOLE:
+		return state["home_cache"].setdefault(i, None)
+	return state["home_cache"].setdefault(
+		i, region_readers(state, ranges, i, refs))
+
+
+def region_references(rows, depths, region):
+	"""`(addresses referencing `region`, whether a pointer was formed)`.
+
+	`region` is entry-relative and `depths` says where `rsp` stands at each
+	address, so an operand `k(%rsp)` at depth `d` lands at **`d + k`** --
+	the same arithmetic `copy_reaches_home` calls `landing`, and the one
+	`borrow_offset` inverts to place a save.
+
+	**Subtracting instead is right at depth zero and wrong below it.** That
+	is where MSVC's prologue spills its register parameters, so the common
+	case agreed, every fixture passed, and the check read the wrong 32
+	bytes for a day -- missing exactly the functions that write their
+	shadow through a settled `rsp`. `REFERENCE_CASES` is what tests it now.
+
+	An unknown depth counts as a reference: it is the one case where
+	nothing can be said about where the operand lands, which is the same
+	answer as landing inside.
+
+	A `lea` is reported separately because it forms a POINTER, which can be
+	stored and dereferenced where no reachability over this function's own
+	instructions could see it. That stays a whole-function refusal while a
+	direct reference does not. Finding 131.
+	"""
+	low, high = region
+	refs, pointed = [], False
+	for address, mnemonic, operands in rows:
+		here = depths.get(address)
+		for match in RSP_MEMORY.finditer(operands or ""):
+			text = match.group(1)
+			landing = None if here is None \
+				else here + (int(text, 16) if text else 0)
+			if landing is None or low <= landing < high:
+				if mnemonic == "lea":
+					pointed = True
+				else:
+					refs.append(address)
+	return refs, pointed
 
 
 def shadow_depths(home, i):
-	"""`{address: depth}` for function `i` if it can lend its caller's
-	shadow, or None. Memoised; see `rsp_depths` and `CALLER_SHADOW`.
+	"""`({address: depth}, addresses where the shadow is still read)` for
+	function `i`, or None if it can lend nothing. Memoised; see
+	`rsp_depths`, `CALLER_SHADOW` and `region_readers`.
 
-	Three questions, and the first two are the ones `home_space_map` already
-	asks of the other region -- does the function address it directly, and
-	can a copy of `rsp` reach it. The third is new and is what the shadow
-	costs: `rsp` must have a known value at the site, since the shadow is
-	addressed across a whole frame rather than from its bottom.
+	Three questions, and the first two are the ones `home_space_map` also
+	asks of the other region -- does the function reference it, and can a
+	copy of `rsp` reach it. The third is what the shadow costs: `rsp` must
+	have a known value at the site, since the shadow is addressed across a
+	whole frame rather than from its bottom.
+
+	A direct reference no longer refuses the function, only the positions
+	from which it is still reachable. A `lea` still refuses outright,
+	because a pointer leaves what this can see. Finding 131.
 	"""
 	_starts, ranges, _usable, state = home
 	if i in state["cache"]:
@@ -1336,34 +1538,21 @@ def shadow_depths(home, i):
 	frame = prologue_frame(data, state["unwind"], start)
 	if frame is None:
 		return state["cache"].setdefault(i, None)	# a frame register
-	# Index rather than slice: `plain[first:]` copies every remaining
-	# instruction, and there are millions.
-	rows = []
-	for position in range(bisect.bisect_left(plain, (start,)), len(plain)):
-		address, _encoding, mnemonic, operands = plain[position]
-		if address >= end:
-			break
-		rows.append((address, mnemonic, operands or ""))
-	seen, body = rsp_depths(rows, frame,
-	                        state["prologue"].get(start))
+	rows = function_rows(state, ranges, i)
+	seen, _body = rsp_depths(rows, frame, state["prologue"].get(start))
 	if seen is None:
 		return state["cache"].setdefault(i, None)
-	low, high = CALLER_SHADOW
-	for address, _mnemonic, operands in rows:
-		here = seen.get(address)
-		for match in RSP_MEMORY.finditer(operands):
-			text = match.group(1)
-			# An unknown depth is not an excuse to let an operand past: it
-			# is the one case where nothing can be said about where it
-			# lands, which is the same answer as landing inside.
-			if here is None or low <= (int(text, 16) if text else 0) - here \
-					< high:
-				return state["cache"].setdefault(i, None)
+	refs, pointed = region_references(rows, seen, CALLER_SHADOW)
+	if pointed:
+		return state["cache"].setdefault(i, None)
 	if any(RSP_COPY.match(operands) for _a, _m, operands in rows) \
 			and copy_reaches_home([(m, o) for _a, m, o in rows], None,
 			                      CALLER_SHADOW):
 		return state["cache"].setdefault(i, None)
-	return state["cache"].setdefault(i, seen)
+	if refs and REGION_RULE == REGION_WHOLE:
+		return state["cache"].setdefault(i, None)
+	return state["cache"].setdefault(
+		i, (seen, region_readers(state, ranges, i, refs)))
 
 
 def borrow_offset(home, address):
@@ -1376,17 +1565,22 @@ def borrow_offset(home, address):
 	"""
 	if home is None:
 		return None
-	if home_space_free(home, address):
-		return 0
-	if SHADOW_RULE == SHADOW_OFF:
-		return None
 	starts, ranges, _usable, _state = home
 	i = bisect.bisect_right(starts, address) - 1
 	if i < 0 or address >= ranges[i][1]:
 		return None
-	seen = shadow_depths(home, i)
-	if seen is None:
+	if home_space_free(home, address):
+		readers = home_readers(home, i)
+		if readers is not None and address not in readers:
+			return 0
+	if SHADOW_RULE == SHADOW_OFF:
 		return None
+	found = shadow_depths(home, i)
+	if found is None:
+		return None
+	seen, readers = found
+	if address in readers:
+		return None		# the shadow is still read from here
 	depth = seen.get(address)
 	return None if depth is None else CALLER_SHADOW[0] - depth
 
@@ -1406,7 +1600,7 @@ def window_borrow(home, start, window):
 		return offset
 	starts, ranges, _usable, state = home
 	i = bisect.bisect_right(starts, start) - 1
-	seen = shadow_depths(home, i)
+	seen = shadow_depths(home, i)[0]
 	plain = state["plain"]
 	here = seen.get(start)
 	for position in range(bisect.bisect_left(plain, (start,)), len(plain)):
@@ -2979,7 +3173,7 @@ def upper_half_read_later(instructions, index, register, limit=40,
 
 
 def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons,
-                   base=0):
+                   base):
 	"""One swallowed instruction, bracketed by a save and restore if it
 	borrowed a register. Returns the bytes, or None.
 
@@ -3131,7 +3325,7 @@ def long_pair_stores(instructions, index, blocked, end):
 
 
 def close_stub(body, displaced, stub_address, pool, spill_base, reasons,
-               start, window, base=0):
+               start, window, base):
 	"""Whatever the window swallowed, then the jump home. Bytes, or None.
 
 	**A stub that returns before this has deleted its passengers.** Every
@@ -3337,7 +3531,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	prologue = 0
 	for entry in preceding:
 		fixed = emit_swallowed(entry, body, stub_address, pool,
-		                       spill_base, reasons)
+		                       spill_base, reasons, base)
 		if fixed is None:
 			if reasons is not None:
 				reasons["a preceding instruction will not move"] += 1
@@ -3424,7 +3618,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 
 	for entry in displaced:
 		fixed = emit_swallowed(entry, body, stub_address, pool,
-		                       spill_base, reasons)
+		                       spill_base, reasons, base)
 		if fixed is None:
 			if reasons is not None:
 				reasons["a displaced instruction will not move"] += 1
@@ -3606,8 +3800,8 @@ def collect(binary, listing):
 	# Written when the load commits, read when the store is reached.
 	long_shadow = {}
 	# Which functions can lend their callee home space, if asked to.
-	home = home_space_map(binary, plain, ranges) if SPILL == SPILL_HOME \
-		else None
+	home = home_space_map(binary, plain, ranges, blocked) \
+		if SPILL == SPILL_HOME else None
 	# Where a 256-bit load can be taken at its word. Only the headers are
 	# read: the ranges come from the section table, and the bytes inside them
 	# are the CPU's business rather than this tool's.
@@ -4616,6 +4810,7 @@ def selftest():
 
 	failures += reach_selftest()
 	failures += shadow_selftest()
+	failures += reader_selftest()
 	failures += borrow_selftest()
 	failures += splat_selftest()
 	failures += constant_selftest()
@@ -4625,7 +4820,11 @@ def selftest():
 	failures += spill_slot_selftest()
 
 	if failures:
-		print(f"selftest: {failures} of {len(SELFTEST)} lowerings are wrong",
+		# **Not "lowerings".** Every selftest above adds to this counter,
+		# so a failure in any of them was reported as a wrong lowering --
+		# which sent a reader to `SELFTEST` for a bad case in
+		# `REFERENCE_CASES`. The failing case has already printed itself.
+		print(f"selftest: {failures} case(s) failed, listed above",
 		      file=sys.stderr)
 		return 1
 	print(f"selftest: {len(SELFTEST)} lowerings, none reads a register it "
@@ -5002,7 +5201,7 @@ def spill_slot_selftest():
 	value, and every structural check was clean. Finding 118.
 	"""
 	failures = 0
-	saved = [encode_spill(2, True, 0, 0, slot) for slot in (0, 1)]
+	saved = [encode_spill(2, True, 0, 0, slot, 0) for slot in (0, 1)]
 	if saved[0] == saved[1]:
 		print("selftest: two spill slots encode identically", file=sys.stderr)
 		failures += 1
@@ -5015,8 +5214,8 @@ def spill_slot_selftest():
 	# the two encodings differ in the opcode byte and nowhere else.
 	for register in (2, 9):
 		for slot in (0, 1):
-			store = encode_spill(register, True, 0, 0, slot)
-			load = encode_spill(register, False, 0, 0, slot)
+			store = encode_spill(register, True, 0, 0, slot, 0)
+			load = encode_spill(register, False, 0, 0, slot, 0)
 			apart = sum(1 for a, b in zip(store, load) if a != b)
 			if len(store) != len(load) or apart != 1:
 				print(f"selftest: xmm{register} slot {slot} restores from a "
@@ -5122,6 +5321,76 @@ DEPTH_CASES = [
 ]
 
 
+# One instruction per row, four bytes apart, in the shape `plain` holds.
+# The reference is always at 0x14, the site always at 0x20, and what
+# changes is the control flow between and around them. `expected` is
+# whether the SITE can still reach the reference -- True means refuse.
+def _row(address, mnemonic, operands=""):
+	return (address, b"\x90", mnemonic, operands)
+
+
+READER_CASES = [
+	("a reference before the site, straight through",
+	 [_row(0x10, "mov", "%rcx,%rax"), _row(0x14, "mov", "%rcx,0x8(%rsp)"),
+	  _row(0x18, "mov", "0x8(%rsp),%rdx"), _row(0x20, "vaddss", "%xmm0"),
+	  _row(0x24, "ret")], (), False),
+	("a reference after the site",
+	 [_row(0x10, "mov", "%rcx,%rax"), _row(0x20, "vaddss", "%xmm0"),
+	  _row(0x24, "mov", "0x8(%rsp),%rdx"), _row(0x28, "ret")],
+	 (), True),
+	("a loop that carries the reference back over the site",
+	 [_row(0x10, "mov", "%rcx,%rax"), _row(0x14, "mov", "%rcx,0x8(%rsp)"),
+	  _row(0x20, "vaddss", "%xmm0"), _row(0x24, "jne", "0x14"),
+	  _row(0x28, "ret")], (), True),
+	("a loop that closes below the reference",
+	 [_row(0x10, "mov", "%rcx,%rax"), _row(0x14, "mov", "%rcx,0x8(%rsp)"),
+	  _row(0x18, "nop"), _row(0x20, "vaddss", "%xmm0"),
+	  _row(0x24, "jne", "0x18"), _row(0x28, "ret")], (), False),
+	("a forward conditional that steps over the reference",
+	 [_row(0x10, "je", "0x20"), _row(0x14, "mov", "%rcx,0x8(%rsp)"),
+	  _row(0x20, "vaddss", "%xmm0"), _row(0x24, "ret")], (), False),
+	("an indirect branch that can reach the reference",
+	 [_row(0x10, "mov", "%rcx,%rax"), _row(0x14, "mov", "%rcx,0x8(%rsp)"),
+	  _row(0x20, "vaddss", "%xmm0"), _row(0x24, "jmp", "*%rax"),
+	  _row(0x28, "ret")], (0x14,), True),
+	("an indirect branch whose targets are all past the reference",
+	 [_row(0x10, "mov", "%rcx,%rax"), _row(0x14, "mov", "%rcx,0x8(%rsp)"),
+	  _row(0x20, "vaddss", "%xmm0"), _row(0x24, "jmp", "*%rax"),
+	  _row(0x28, "ret")], (0x28,), False),
+	("a range that falls off its own end",
+	 [_row(0x10, "mov", "%rcx,0x8(%rsp)"), _row(0x20, "vaddss", "%xmm0"),
+	  _row(0x24, "nop")], (), True),
+	("a tail call, which takes its edge out of the function",
+	 [_row(0x10, "mov", "%rcx,0x8(%rsp)"), _row(0x20, "vaddss", "%xmm0"),
+	  _row(0x24, "jmp", "0x900000")], (), False),
+]
+
+
+# `(rows, depths, expected references, expected pointer)`, against
+# `CALLER_SHADOW` at entry-relative [8, 40). **Every case but the first
+# sits at a NON-ZERO depth**, because that is the only place the sign of
+# the arithmetic shows: at depth zero `d + k` and `k - d` are the same
+# number, which is why a wrong one passed every fixture in the tree.
+REFERENCE_CASES = [
+	("the prologue spill, at depth zero",
+	 [(0x10, "mov", "%rcx,0x8(%rsp)")], {0x10: 0}, [0x10], False),
+	("the same shadow byte through a settled frame",
+	 [(0x20, "mov", "%rcx,0x30(%rsp)")], {0x20: -0x28}, [0x20], False),
+	("a local at the bottom of the frame, which is not the shadow",
+	 [(0x20, "mov", "%rcx,0x8(%rsp)")], {0x20: -0x28}, [], False),
+	("one past the top of the shadow",
+	 [(0x20, "mov", "%rcx,0x50(%rsp)")], {0x20: -0x28}, [], False),
+	("the top byte of the shadow, which is inside it",
+	 [(0x20, "mov", "%rcx,0x4c(%rsp)")], {0x20: -0x28}, [0x20], False),
+	("the return address, one below the shadow",
+	 [(0x20, "mov", "%rcx,0x28(%rsp)")], {0x20: -0x28}, [], False),
+	("a lea forming a pointer into it",
+	 [(0x20, "lea", "0x30(%rsp),%rbx")], {0x20: -0x28}, [], True),
+	("an unknown depth, which could be anywhere",
+	 [(0x20, "mov", "%rcx,0x30(%rsp)")], {0x20: None}, [0x20], False),
+]
+
+
 def reach_selftest():
 	"""Prove `copy_reaches_home` still discriminates. Failures, or 0.
 
@@ -5144,6 +5413,42 @@ def reach_selftest():
 	if not failures:
 		print(f"selftest: {len(REACH_CASES)} rsp-copy cases, caught in both "
 		      f"directions")
+	return failures
+
+
+def reader_selftest():
+	"""Prove `readers_reachable` refuses exactly what can still read the
+	region. Failures, or 0.
+
+	The reference sits at 0x14 and the site at 0x20 in every case, so what
+	is being tested is the control flow and nothing else. **Two of the
+	cases exist to fail in opposite directions**: a loop closing above the
+	reference must refuse and one closing below it must not, and a rule
+	that gave up on backward branches would pass the first and fail the
+	second while looking careful.
+	"""
+	failures = 0
+	for what, rows, targets, expected in READER_CASES:
+		site = next(i for i, row in enumerate(rows) if row[0] == 0x20)
+		refs = {i for i, row in enumerate(rows)
+		        if "0x8(%rsp)" in (row[3] or "")}
+		if not refs:
+			print(f"selftest: {what}: the case names no reference",
+			      file=sys.stderr)
+			failures += 1
+			continue
+		inside = tuple(i for i, row in enumerate(rows) if row[0] in targets)
+		reaching = readers_reachable(rows, 0, len(rows), refs, inside)
+		got = site in reaching
+		if got != expected:
+			print(f"selftest: {what}: the site "
+			      f"{'reaches' if got else 'does not reach'} the reference, "
+			      f"want {'reaches' if expected else 'does not'}",
+			      file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(READER_CASES)} region-reader shapes, "
+		      f"refused and allowed in both directions")
 	return failures
 
 
@@ -5182,6 +5487,13 @@ def shadow_selftest():
 			      f"{'' if seen is not None else f' (refused: {body})'}",
 			      file=sys.stderr)
 			failures += 1
+	for what, rows, depths, refs, pointer in REFERENCE_CASES:
+		got, formed = region_references(rows, depths, CALLER_SHADOW)
+		if got != refs or formed != pointer:
+			print(f"selftest: {what}: region_references said "
+			      f"{[hex(a) for a in got]}/{formed}, want "
+			      f"{[hex(a) for a in refs]}/{pointer}", file=sys.stderr)
+			failures += 1
 	# The displacement the shadow needs, against the two encodings it uses.
 	for base, want in ((0, "0f110c24"), (0x20, "0f114c2420"),
 	                   (0x1234, "0f118c2434120000")):
@@ -5192,8 +5504,9 @@ def shadow_selftest():
 			      file=sys.stderr)
 			failures += 1
 	if not failures:
-		print(f"selftest: {len(SHADOW_CASES)} shadow reaches and "
-		      f"{len(DEPTH_CASES)} rsp depths, both directions")
+		print(f"selftest: {len(SHADOW_CASES)} shadow reaches, "
+		      f"{len(DEPTH_CASES)} rsp depths and "
+		      f"{len(REFERENCE_CASES)} shadow references, both directions")
 	return failures
 
 
@@ -5298,8 +5611,17 @@ def main(argv):
 	# evaluation switch rather than a tuning knob: the default refuses the
 	# site, as it always has, and the other two exist so that all three can
 	# be built and compared. See Finding 46.
-	global SPILL, RSP_RULE, SHADOW_RULE
+	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE
 	argv = list(argv)
+	for i, item in enumerate(argv):
+		if item.startswith("--region="):
+			REGION_RULE = item.split("=", 1)[1]
+			if REGION_RULE not in (REGION_WHOLE, REGION_LIVE):
+				print(f"detour.py: unknown region rule {REGION_RULE!r}",
+				      file=sys.stderr)
+				return 2
+			del argv[i]
+			break
 	for i, item in enumerate(argv):
 		if item.startswith("--shadow="):
 			SHADOW_RULE = item.split("=", 1)[1]

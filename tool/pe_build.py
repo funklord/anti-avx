@@ -1128,7 +1128,8 @@ hundred:	.float 100.0
 # terminator and refuses a branch taken anywhere else, so a sample whose
 # unwind codes claim a frame of zero has its `jmp` refused at -40 and the
 # borrow it exists to test never happens.
-FRAMES = {"rspcopy": 104, "shadowspill": 40}
+FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
+          "regionread": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -1427,6 +1428,95 @@ func_end:
 	.p2align 4
 three:	.float 3.0
 ten:	.float 10.0
+hundred:	.float 100.0
+""")
+
+
+# 38. The region is dead from the site onward, so the borrow is safe --
+# Finding 131. A leaf again, so only the caller's shadow can lend, and this
+# one USES its shadow: it keeps a local there, reads it back, and never
+# touches it again. The whole-function rule refuses the site for that
+# reference alone; the liveness rule asks whether the reference can still be
+# reached from the site, and it cannot.
+#
+# `0x30(%rsp)` is the shadow because `rsp` sits 40 bytes below entry here:
+# entry-relative that is -40 + 48 = 8, the shadow's first byte. Writing it
+# is legitimate -- it belongs to this function by the ABI -- which is what
+# makes it a local worth keeping there.
+#
+# 118 = 107 + 11, and only if BOTH survived: the borrow gave %xmm2 back, and
+# the local was read before the borrow destroyed it. A borrow taken when the
+# local was still live returns 107 plus whatever %xmm2's bits look like as
+# an integer.
+PROGRAMS["regionlive"] = (121, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp		/* a frame, and no call: this is a leaf */
+	vzeroupper
+	movl	$11, 48(%rsp)		/* a local, kept in the caller's shadow */
+	movl	48(%rsp), %ecx		/* read back here, and never again */
+	vmovss	three(%rip), %xmm0
+	vmovss	ten(%rip), %xmm1
+	vmovss	hundred(%rip), %xmm2
+	vmovss	one(%rip), %xmm3
+	vmovss	one(%rip), %xmm4
+	vmovss	one(%rip), %xmm5
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, and every volatile is live */
+	vaddss	%xmm2, %xmm0, %xmm0	/* 7 + 100 */
+	vaddss	%xmm3, %xmm0, %xmm0
+	vaddss	%xmm4, %xmm0, %xmm0
+	vaddss	%xmm5, %xmm0, %xmm0	/* + 3 = 110 */
+	vcvttss2si %xmm0, %eax
+	addl	%ecx, %eax		/* + 11, only if the local was read first */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+one:	.float 1.0
+hundred:	.float 100.0
+""")
+
+
+# 39. The same program with the read moved AFTER the site, which must still
+# be refused. It is not in PE_NAMES: the correct outcome is that the site
+# keeps its VEX and the program dies of an illegal instruction on a CPU
+# without AVX, which `check-pe`'s "every sample returns its number" cannot
+# express. `check-spill` asserts 29 instead.
+#
+# **The assertion discriminates because a wrong answer is not 29.** If the
+# liveness rule wrongly allowed the borrow, the site would lower, the VEX
+# would be gone, nothing would fault, and the program would return 107 plus
+# the bits of %xmm2 read as an integer. Refusing is the only route to 29.
+PROGRAMS["regionread"] = (121, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	movl	$11, 48(%rsp)		/* the same local in the shadow */
+	vmovss	three(%rip), %xmm0
+	vmovss	ten(%rip), %xmm1
+	vmovss	hundred(%rip), %xmm2
+	vmovss	one(%rip), %xmm3
+	vmovss	one(%rip), %xmm4
+	vmovss	one(%rip), %xmm5
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased; a borrow here destroys it */
+	vaddss	%xmm2, %xmm0, %xmm0
+	vaddss	%xmm3, %xmm0, %xmm0
+	vaddss	%xmm4, %xmm0, %xmm0
+	vaddss	%xmm5, %xmm0, %xmm0
+	vcvttss2si %xmm0, %eax
+	addl	48(%rsp), %eax		/* read AFTER the site: still live */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+one:	.float 1.0
 hundred:	.float 100.0
 """)
 
