@@ -6,8 +6,8 @@ Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
 **Status:** the rewriter works. `tool/detour.py` rewrites **796,232 of 805,131 VEX
-sites -- 98.9%** -- through 201,145 detours, and every `make detour-verify` invariant
-holds on the result. 8,899 sites are left, and the rewritten binary loads 305 modules
+sites -- 99.0%** -- through 201,411 detours, and every `make detour-verify` invariant
+holds on the result. 8,450 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
 ---
@@ -7562,6 +7562,72 @@ thing that gets quoted later as though it had been weighed.
 says which bucket a refusal landed in.** That is what it is good at, and it is not the same
 question.
 
+### Finding 127 -- the argument was sound, so it was made checkable
+
+`copy_reaches_home` refuses to lend a function's home space when a copy of `rsp` is stored
+to memory: the pointer leaves this function's text, and nothing here can say where it is
+dereferenced. Its own docstring already contained the counter-argument and declined it:
+
+> The escape case is refused although no borrow window can contain a call -- the swallowed
+> bracket admits nothing between its save and restore, and `ymm_run` breaks on every
+> control transfer -- so nothing could dereference an escaped pointer while the borrow is
+> live. That argument is sound and is deliberately not leaned on: it is second-order,
+> resting on a property asserted in two docstrings rather than enforced by a check, and it
+> is worth 113 sites.
+
+It is worth 702 now, and the objection was never to the argument. It was to where the
+argument lived. So the property was made a check.
+
+```
+VEX in .text      8,899 ->   8,450       796,681 removed, 99.0%
+detours         201,145 -> 201,411
+refused             741 ->     676
+```
+
+**Four hundred and forty-nine sites**, and the first time this has been above 99%.
+
+#### The check found its own author out first
+
+The property was written as "no stub may contain a call" and asserted over the
+disassembled stub section. It failed on its first run against the real binary: **384 call
+instructions**, every one a swallowed `call` re-emitted at its new address by Finding 86's
+path, which is the rewriter working exactly as designed.
+
+The claim had been invented rather than measured. What anything rests on is narrower --
+*no call between a borrow's save and its restore* -- and that is now enforced where the
+bytes are emitted, in `emit_swallowed` and in `build_stub`'s run branch, both of which
+refuse rather than assume. Neither has fired: `ymm_run` breaks on every control transfer
+and the swallowed bracket wraps one lowering, so the property held all along. It is
+refused now instead of relied upon.
+
+#### And the reconciliation found it out twice
+
+Narrowed to "every call in the stub is one a window swallowed", it failed again: 384
+against 294. The ninety were backward-widened windows whose FIRST instruction is a call --
+re-emitted like every other instruction the window covers, and deliberately not in
+`swallowed`, because the window's first byte keeps its boundary. The jump is written
+there.
+
+The set that reconciles is every instruction a placed window covers, and it does, exactly:
+384 against 384.
+
+**Two wrong versions of one check, both caught by running it.** That is the whole argument
+for putting a property in a check rather than a docstring, and it is not the argument
+usually given. A docstring's claim is never tested, so being wrong costs nothing and shows
+nothing; a check's claim is tested on every run, so being wrong is loud and immediate. The
+first version of this check was wrong about the binary within twenty minutes of being
+written. The docstring it replaced had been wrong about nothing for a hundred findings,
+because it never said anything falsifiable.
+
+#### What did not change
+
+Where the pointer is stored is a dereference like any other, and the walk still refuses it
+if it lands in `[rsp+0..31]`. What is now allowed is only that the pointer goes somewhere
+this scan cannot follow. The selftest case that asserted the old answer is inverted with
+its reason rewritten, and a new case sits beside it -- a copy stored *through* a pointer
+into the region, which must still be refused and is the boundary the relaxation must not
+cross.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8501,7 +8567,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,232 of 805,131 VEX sites, 98.9%** (Findings 24 to 125), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,681 of 805,131 VEX sites, 99.0%** (Findings 24 to 127), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | **PART-BUILT, and the two halves are at different stages.** The Class H helpers are written and exhaustively tested -- `src/f16c.c`, `src/permil.c`, `src/permd.c`, `src/fmaddsub.c`, through `make check-f16c`, `check-f16c-oracle`, `check-permil`, `check-permd` and `check-fmaddsub`, all in `make check` -- but **the rewriter calls none of them and nothing links one into a PE**. The one Class H form `tool/detour.py` does lower is `vpermilps` with a control vector, and it is *inlined* as the `pshufb` sequence rather than called (`lower_permilps`, because a `call` inside a stub pushes a return address into code with no `.pdata`); `make check-pe`'s `permilps` fixture runs that lowering under wine. `vpermd`, `vperm2f128`, `vpermq`, `vpermpd`, `vcvtph2ps`/`vcvtps2ph` and `vfmsubadd*` all reach `lower: no direct SSE form and not a sequence` and are refused. In `tool/lower.py` the rules are thinner than the helpers: `vpermd` emits a bare `call permd` with no operand marshalling, and both F16C mnemonics are class `HELPER` with **no body at all**, so `make verify` never assembles them. **The Y2 shadow does not exist anywhere.** Two rules name it -- `Y2/extract` and `Y2/insert`, emitting the pseudo-operand `shadow(%reg)` -- and `verify` rewrites that to `(%rsp)` before assembling, so no shadow slot has ever been allocated, written or executed. `tool/detour.py` has no shadow area: its `shadow` is a helper *register* for Finding 50's gapped copy, and `lower_ymm_pair` states in terms that what it leaves behind **is** the Y2 case. Finding 7's 574 sites are untouched. |
 
@@ -8652,7 +8718,7 @@ size of it.** Finding 74 put the rewritten binary 866 bytes past where the origi
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. That number was the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 8,899 that remain has to go before any of this can be
+immediately, and every one of the 8,450 that remain has to go before any of this can be
 soaked.
 
 **What the run adds is a measuring instrument, and it has been the better half of the

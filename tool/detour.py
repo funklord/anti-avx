@@ -1046,7 +1046,27 @@ def copy_reaches_home(rows, frame):
 				continue
 		if len(fields) == 2 and fields[0].startswith("%") \
 				and canonical(fields[0]) in taint and "(" in fields[1]:
-			return True			# stored to memory
+			# **The copy is stored to memory and that is no longer a
+			# refusal.** The pointer leaves this function's text, so nothing
+			# here can say where it is dereferenced -- but it cannot be
+			# dereferenced while a borrow is live, because nothing else
+			# runs: `emit_swallowed` brackets one lowering, `ymm_run` breaks
+			# on every control transfer, and `span_keeps_rsp` refuses a span
+			# that moves `rsp`. After the restore the region holds what it
+			# held before, so a later dereference sees what it would have
+			# seen.
+			#
+			# That argument was in this docstring and declined in the same
+			# breath -- "second-order, resting on a property asserted in two
+			# docstrings rather than enforced by a check". It is enforced
+			# now: `verify` disassembles the stub section and fails on a
+			# single `call` instruction anywhere in it. Finding 127.
+			#
+			# The WRITE is still checked. Where the pointer is stored is a
+			# dereference like any other and the loop above refuses it if it
+			# lands in the region; what is allowed is only that the pointer
+			# goes somewhere this scan cannot follow.
+			continue
 		if fields and fields[-1].startswith("%") \
 				and mnemonic not in FLAGS_ONLY:
 			name = fields[-1].lstrip("%")
@@ -2731,6 +2751,17 @@ def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons):
 	window turns out to hold. See `swallowed_borrow`. Finding 93.
 	"""
 	borrowing = len(entry) > 6 and entry[6]
+	# **Nothing between a save and its restore may be a call.** That is what
+	# `copy_reaches_home` leans on to lend the home space to a function
+	# whose `rsp` copy escaped: an escaped pointer cannot be dereferenced
+	# while the borrow is live, because nothing else runs. The bracket here
+	# is one instruction, so the check is one comparison -- and a swallowed
+	# `call` re-emitted by Finding 86 is exactly the instruction it must
+	# never wrap. Finding 127.
+	if borrowing and (entry[4] or "").startswith(("call", "callq")):
+		if reasons is not None:
+			reasons["a borrow bracket would wrap a call"] += 1
+		return None
 	out = bytearray()
 	if borrowing:
 		saved = encode_spill(entry[5], True, stub_address + len(body),
@@ -2915,6 +2946,17 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# it**, so the bracket encloses the whole span -- which is why
 		# `span_keeps_rsp` had to vouch for it. See Finding 95.
 		borrowed = sorted(strategy[1][2]) if len(strategy[1]) > 2 else []
+		# The run's bracket encloses the whole span, so the same rule
+		# applies over every member. `ymm_run` breaks on every control
+		# transfer, so this cannot fire -- which is the point: the property
+		# is now refused rather than relied upon. See `emit_swallowed`.
+		if borrowed and any(
+				entry[6] is not None
+				and (entry[6][4] or "").startswith(("call", "callq"))
+				for entry in strategy[1][1] if entry[0] == "plain"):
+			if reasons is not None:
+				reasons["a run borrow would wrap a call"] += 1
+			return None, 0
 		if len(borrowed) * SLOT > HOME_SPACE:
 			# The home space is what the ABI reserved and nothing says what
 			# lies past it. Refuse rather than reach. Finding 118.
@@ -4362,9 +4404,22 @@ REACH_CASES = [
 	("an indexed access through the copy",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
 	  ("mov", "%rcx,(%rax,%rdx,1)")], True),
-	("the copy stored to memory",
+	# **This case answered True until Finding 127 and now answers False.**
+	# The pointer escapes, so nothing here can say where it is
+	# dereferenced -- and it cannot be dereferenced while a borrow is live,
+	# because nothing else runs between the save and the restore. That
+	# argument was declined for as long as it rested on two docstrings;
+	# `verify` fails on a single `call` in the stub section now, so it
+	# rests on the artifact.
+	("the copy stored to memory, which no longer escapes the argument",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
-	  ("mov", "%rax,(%rdi)")], True),
+	  ("mov", "%rax,(%rdi)")], False),
+	# What did NOT change: where the pointer is stored is a dereference
+	# like any other. Storing it THROUGH a copy that lands in the region is
+	# still refused, and that is the case the relaxation must not reach.
+	("the copy stored through a pointer into the region",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
+	  ("mov", "%rax,-0x28(%rax)")], True),
 	# `cmp` needs BOTH directions: giving up and reaching the region both
 	# answer True, so a single case would pass while the walk was aborting.
 	("a cmp writes no register, and the copy stays clear of the region",
@@ -5238,6 +5293,24 @@ def apply_all(binary, listing, output):
 	return 0
 
 
+def is_call(data, at):
+	"""True if a near call begins at this file offset.
+
+	Read from the bytes rather than from a disassembly, so that counting
+	the swallowed calls costs nothing beside a pass this function already
+	makes. `e8` is call rel32; `ff` with a modrm reg field of 2 is the
+	indirect form, and either may carry a REX prefix.
+	"""
+	while at < len(data) and 0x40 <= data[at] <= 0x4F:
+		at += 1				# REX, which carries no opcode
+	if at >= len(data):
+		return False
+	if data[at] == 0xE8:
+		return True
+	return data[at] == 0xFF and at + 1 < len(data) \
+		and ((data[at + 1] >> 3) & 7) == 2
+
+
 def verify(original, patched, listing=None):
 	a = open(original, "rb").read()
 	b = open(patched, "rb").read()
@@ -5339,7 +5412,7 @@ def verify(original, patched, listing=None):
 	_patches, candidates, _stats, _skipped, _declined = collect(original,
 	                                                           listing)
 	# The same call apply makes, so the two cannot drift apart.
-	_placed, _blob, swallowed, _overlapped, _refused = place_stubs(
+	placed, _blob, swallowed, _overlapped, _refused = place_stubs(
 		candidates, stub_base_of(open(original, "rb").read()))
 	groups = target_set.collect(original)
 	reachable = set()
@@ -5428,6 +5501,45 @@ def verify(original, patched, listing=None):
 	               if len(line.split("\t")) >= 3
 	               and line.split("\t")[1].split()[:1] in (["c4"], ["c5"]))
 	jumps = done.stdout.count("\tjmp ")
+	# **Every call in the stub section is a swallowed one, and this counts
+	# them rather than forbidding them.** The first version of this check
+	# asserted that no stub contains a call at all, which is a stronger
+	# claim than anything rests on and is false: a window widened over a
+	# `call` re-emits it at its new address, which is Finding 86 working,
+	# and 384 of them are in the section. The check failed on its first run
+	# against the real binary, on a claim its author had made up rather than
+	# measured. It is kept, narrowed to what is true, because a count that
+	# reconciles is worth more than a prohibition that does not hold.
+	#
+	# What actually matters is narrower still and is enforced where the
+	# bytes are emitted rather than here: no call may lie between a borrow's
+	# save and its restore. See `emit_swallowed` and `build_stub`'s run
+	# branch. Finding 127.
+	stub_calls = sum(1 for line in done.stdout.splitlines()
+	                 if len(line.split("\t")) >= 3
+	                 and line.split("\t")[2].split()[:1] in (["call"],
+	                                                          ["callq"]))
+	# Against the WINDOWS, not against `swallowed`. A window's first
+	# instruction is re-emitted like every other one it covers, and it keeps
+	# its boundary -- the jump is written there -- so it is deliberately not
+	# in `swallowed`. Reconciling against that set said 384 against 294 and
+	# the ninety were backward-widened windows whose first instruction is a
+	# call. The set that matters is every instruction a placed window
+	# covers.
+	covered = set()
+	for start, window, _at, _size, _prologue in placed:
+		covered.update(range(start, start + window))
+	window_calls = sum(1 for address in before_bounds & covered
+	                   if is_call(a, raddr + (address - vaddr)))
+	if stub_calls != window_calls:
+		print(f"verify: FAILED -- {stub_calls:,} call instruction(s) in the "
+		      f"stub section against {window_calls:,} inside a placed "
+		      f"window; every one should be a re-emitted swallowed transfer",
+		      file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: {stub_calls:,} call(s) in the stub section, every "
+		      f"one an instruction a window covered and re-emitted")
 	# **This number is reported, not asserted, and it stopped meaning "one
 	# jump back per detour" the moment a window could swallow a branch.** It
 	# equalled the detour count for as long as every stub held exactly one
