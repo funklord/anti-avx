@@ -941,6 +941,7 @@ def convert_c(text: str, width: int) -> str:
 	virtual = 0			# open braceless bodies: real levels, no braces
 	linkage_extern = False		# saw `extern`, watching for its linkage string
 	linkage_spec = False		# saw `extern "C"`, awaiting the `{`
+	namespace_spec = False		# saw `namespace`, awaiting the `{`
 	await_body = False		# an `else`/`do` whose body shape is not yet known
 	stmt_level = 0			# level of the line the current statement began on
 
@@ -957,6 +958,29 @@ def convert_c(text: str, width: int) -> str:
 		-- a wrapped parameter list, say -- and none on lines starting at
 		column 0, so it surfaced as scattered findings in headers rather
 		than as a whole block being wrong.
+
+		`namespace N { ... }` is the same brace-without-a-level and was
+		missed, for eight months and in every C++ tree here. It failed the
+		same way and hid for the same reason: a flush line at column 0 takes
+		the `lead_cols < width * level` branch below and is left alone, so
+		namespace contents written flush -- which is what all of them are --
+		looked accepted, while any line carrying ALIGNMENT had columns
+		enough to take the other branch and collected a phantom tab.
+
+		The measurement that settled it: across the fifteen projects, of the
+		94 places a gated C or C++ file opens a namespace, 94 write the
+		contents flush and none indents them. (A first count said one tree
+		indented 576 times and another once; the 576 were vendored files no
+		gate reads, and the one was this scanner reading a block comment's
+		` *` continuation as indentation. Both were the instrument.)
+
+		What it cost is the reason to record it rather than just fix it.
+		`code-style.md`'s own worked example for this rule conformed when
+		saved verbatim and reported two violations when a namespace was
+		wrapped round it -- so the document and the tool that enforces it
+		disagreed, and the trees had been converted to the tool's answer.
+		A rule learned from the tool rather than from the document is the
+		wrong way round.
 		"""
 		return sum(1 for f in frames if not f[4])
 
@@ -1079,6 +1103,8 @@ def convert_c(text: str, width: int) -> str:
 						linkage_extern = False
 					if was_ident == "extern":
 						linkage_extern = True
+					if was_ident == "namespace":
+						namespace_spec = True
 					if was_ident in CTRL_HEADS:
 						head_paren = paren	# body begins when this unwinds
 					elif was_ident in ("else", "do"):
@@ -1148,10 +1174,11 @@ def convert_c(text: str, width: int) -> str:
 					# statement rather than never taken, which is what made it
 					# look like an indentation fault in the file.
 					stack.append([pending_switch, False, paren, virtual,
-					              linkage_spec])
+					              linkage_spec or namespace_spec])
 					pending_switch = False
 					linkage_extern = False
 					linkage_spec = False
+					namespace_spec = False
 				elif counting and c == "}":
 					if stack:
 						stack.pop()
@@ -1159,6 +1186,7 @@ def convert_c(text: str, width: int) -> str:
 					await_body = False
 					linkage_extern = False
 					linkage_spec = False
+					namespace_spec = False
 				elif counting and c == ";" and paren == (stack[-1][2] if stack else 0):
 					# End of a statement closes every braceless body that was
 					# waiting on it -- `if (a) if (b) x;` opened two -- but
@@ -1170,6 +1198,13 @@ def convert_c(text: str, width: int) -> str:
 					# `extern "C" int f(void);` declares rather than opens.
 					linkage_extern = False
 					linkage_spec = False
+					# `using namespace std;` and `namespace a = b::c;` both
+					# name a namespace and open no block. Without this the
+					# flag stays armed and the NEXT brace in the file -- a
+					# struct, a function -- is made transparent, which is the
+					# expensive direction to be wrong in: a whole body then
+					# reads one level too shallow.
+					namespace_spec = False
 				i += 1
 			elif state == "block_comment":
 				if c == "*" and i + 1 < n and line[i + 1] == "/":
