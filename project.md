@@ -7199,6 +7199,95 @@ reads can be wrong indefinitely**, which is the argument for retiring it rather 
 correcting it in place: a corrected number nothing reads is a number that will drift
 again.
 
+### Finding 121 -- seven dispatchers, not one, and now a check that says so
+
+Finding 5 found a CPUID/XGETBV-dispatched AVX-512 kernel and left two questions open:
+whether the rewriter preserves the dispatcher exactly, and whether there are others. Both
+are answered, and the second answer is larger than the question expected.
+
+**There are seven ISA dispatchers, in ten functions holding all 32 `cpuid` and 2 `xgetbv`
+sites.** Finding 5 read one. The other six record AVX, AVX2, F16C, FMA and the AVX-512
+feature bits into five different structures -- a bool table at `0x145fac180`, a mask field
+in two near-identical CPU-info constructors, a level 0-4 in the FMA module's own
+`0x142dfa9d0`, a packed feature word in Havok's `hkHardwareInfo`, and the MSVC CRT's
+`__isa_available` -- and **four of them check no OSXSAVE bit and no XCR0 state at all.**
+They are safe on a Westmere because the CPUID bits themselves are zero, not because an
+OS-state check says so.
+
+Two more are vendor tests and two are informational: a `cmove` clamping a worker count on
+`AuthenticAMD`, Havok warning on an unknown vendor, and two brand-string loops feeding a
+telemetry field and a display struct.
+
+#### The rewrite left every one of them alone
+
+Compared instruction by instruction over the whole of each of the ten functions -- 1,346
+instructions, not a window around each `cpuid`:
+
+```
+eight of ten functions          byte-identical
+the two informational ones      24 instructions differ, every one VEX
+no cpuid, no xgetbv, no AND mask, no CMP immediate, no bt, no setcc, no jcc
+the two named consumers         byte-identical, 728 bytes
+all 181 EVEX-prefixed instructions  byte-identical
+```
+
+So no feature bit is computed rather than read, no branch target moved, and the AVX-512
+selection chain is intact end to end: `0x1434d3d50` reads the struct `0x1434ddd40` fills
+and is the only place the four EVEX kernels' addresses are loaded.
+
+#### And the dispatchers are more load-bearing than Finding 5 assumed
+
+Two things the audit turned up, both of which raise the stakes rather than settle them:
+
+  * **The rewrite has changed what the AVX-512 path would compute.** Inside the five
+    EVEX-bearing functions there are 122 VEX instructions and **84 were lowered**.
+    `vpxor %xmm6,%xmm6,%xmm6` at `0x1434d8808` became `pxor %xmm6,%xmm6`, which zeroes
+    only bits 127:0 -- and three instructions later `vpxorq %zmm1,%zmm6,%zmm6` reads all
+    512. So if that gate were ever satisfied the symptom would be a silently wrong
+    checksum, not the `#UD` Finding 5 anticipated.
+  * **The gated paths still hold un-lowered VEX.** The AVX2-gated kernels keep 49, the
+    AVX512F-gated 7, the AVX512_VNNI-gated 31. Every one would `#UD` here. The
+    dispatchers are keeping 179 EVEX *and* 87 surviving VEX unexecuted.
+
+#### The check, and what makes its pass mean anything
+
+`tool/isa_guard.py`, called from `detour.py verify`. **The invariant is narrow enough to be
+exact: inside a function that holds a feature test, only a VEX-encoded instruction may
+differ.** That is not a guess about the rewriter but what its own guarantee reduces to --
+a same-length lowering touches its site and nothing else, a detour writes five bytes over
+a site already five bytes long, and a *widened* window is the one shape that reaches past
+its site. Reaching past a site inside a feature test is exactly what this refuses.
+
+Six things have to hold, and each closes a way a comparison can be green having compared
+nothing: the site count must match the manifest; every site is re-read from the
+**original's** bytes; a site in no `RUNTIME_FUNCTION` is a failure rather than a skip;
+every instruction's listing encoding must match the original, so being handed a listing of
+the *patched* image fails instead of passing trivially; the named consumers must match
+recorded digests, so a stale manifest is loud; and **the comparison is run against a
+deliberately corrupted copy first and must reject it**.
+
+That last one is the point. It flips one byte of the `jae` at `0x1434ddd88` -- the branch
+that keeps 179 instructions unexecuted -- in an in-memory copy, and if the comparison
+cannot see that, the check fails rather than passing. Three external controls were fired
+too, one at a time: the AVX-512 XCR0 mask `$0xe6` to `$0xe7`, one byte of the `lea` that
+loads an AVX-512 kernel's address, and an EVEX prefix `62` to `63`. All three were caught
+with the offending bytes printed.
+
+**It says when it does not apply.** The manifest is one image's; on any other binary the
+generic invariant still holds and the counts do not, so the image is recognised by its
+consumers' digests and the run says plainly which half it is doing. A binary with no
+`cpuid` at all reports that there is nothing to guard rather than passing silently.
+
+#### What it cannot say
+
+Consumers hold no `cpuid`, so they cannot be discovered -- the two named are the whole
+chain from the AVX-512 bit to the EVEX kernels, and a consumer of the other six
+dispatchers would go unchecked. And a future strategy that detours a *span* inside one of
+these ten functions will trip this check even if it re-emits everything correctly. That is
+a correct stop rather than a false positive: a rewrite window crossing a feature test's
+control flow deserves a human look, and the answer is a narrow exemption with its
+reasoning written down, not a weaker rule.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8174,13 +8263,16 @@ the project's largest risk.
   emitted. The JIT half of the question is still open.
 - ~~Is the Y2 shadow path needed at all, or does Y1 cover every 256-bit site?~~
   **Resolved: needed, 574 sites (4.38% of ymm defs).** Finding 7.
-- **New: does the rewriter preserve the ISA dispatcher exactly?** Finding 5 makes this
-  load-bearing. 179 AVX-512 instructions are unreachable *only because* the feature
-  detection at `0x1434ddd40` says so on a Westmere. This is a failure mode the design
-  did not previously have, and it needs a verification check of its own.
-- **New: are there other dispatched ISA paths?** There are 32 `cpuid` sites and 2
-  `xgetbv` sites in `.text`. Only one dispatcher has been read. If a library selects an
-  AVX2 path behind a check the rewriter perturbs, the same risk applies at 256 bits.
+- ~~**New: does the rewriter preserve the ISA dispatcher exactly?**~~ **Resolved:
+  yes, and it is checked now.** Every one of the ten functions holding a feature test
+  was compared instruction by instruction; eight are byte-identical and the two that
+  differ are informational, differing only at VEX sites. `tool/isa_guard.py` runs from
+  `detour.py verify` and rejects a corrupted copy before it will pass. Finding 121.
+- ~~**New: are there other dispatched ISA paths?**~~ **Resolved: seven of them.** All
+  32 `cpuid` and 2 `xgetbv` sites are read and classified -- seven ISA dispatchers, two
+  vendor tests, two informational. Four of the seven check no OSXSAVE bit and no XCR0
+  state, so they are safe here because the CPUID bits are zero rather than because an
+  OS-state check says so. Finding 121.
 - ~~**New: what is milestone 0's 208,054 3-operand count actually counting?**~~
   **Resolved: nothing.** Re-measured under nine definitions -- registers only, immediates
   admitted or not, SIMD registers only, memory src2 included or not, 256-bit in or out --

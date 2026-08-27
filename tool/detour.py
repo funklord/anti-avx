@@ -53,6 +53,7 @@ from collections import Counter
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import lower
+import isa_guard
 import outside
 import patch as inplace
 import scratch as scratch_finder
@@ -5246,6 +5247,20 @@ def verify(original, patched, listing=None):
 		problems += 1
 	else:
 		print("verify: every section after .text is byte-identical")
+
+	# **The feature tests, which decide what the CPU is asked to run.** 179
+	# EVEX instructions in this image are unreachable only because a runtime
+	# CPUID/XGETBV test says so, and nothing checked that the rewrite left
+	# that test alone -- the failure it would cause looks like a crash
+	# somewhere else entirely. Finding 5 named the risk and Finding 121
+	# closes it. `isa_guard` runs its own control before it is allowed to
+	# pass, and says so when the image is not the one its manifest names.
+	if listing is None:
+		print("verify: NOT RUN -- the dispatcher check needs the listing",
+		      file=sys.stderr)
+		problems += 1
+	else:
+		problems += isa_guard.check(original, patched, listing)
 
 	before_bounds, before_vex = inplace.disassemble(original)
 	after_bounds, after_vex = inplace.disassemble(patched)
