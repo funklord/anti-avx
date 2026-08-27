@@ -1505,17 +1505,29 @@ def splat_pair(site, following):
 # horizontal is here (`vhaddps` combines neighbours), nothing cross-lane
 # (`vperm2f128`), and nothing whose result depends on the other half.
 #
-# **Two of these occur in this binary**, `vandps` and `vmulps`, so the rest
-# are reasoned rather than executed -- which is why the list is by ISA
-# behaviour rather than by what a scan happened to find. A mnemonic missing
-# from it costs a site; one wrongly on it costs correctness, which is
-# `scratch.py`'s FULL_WRITE rule and the reason this is not open-ended.
+# **Every one of these is executed, not reasoned.** `make check-lanes` runs
+# the 256-bit form under qemu against the two 128-bit halves natively and
+# requires them to agree bit for bit, and it fails if this set gains a
+# mnemonic the harness does not execute -- so the list and the evidence
+# cannot drift apart. Two of them occur in this binary, `vandps` and
+# `vmulps`; the rest are here because a list of two is a list nobody can
+# check, and they are now a list somebody has run.
+#
+# `vpsadbw`, `vphsubd` and `vpblendw` were held out of it deliberately: they
+# are lane-wise by the manual and occur 5, 1 and 2 times, which is too rare
+# for `check-pe` to catch a misreading. The oracle settled them, so they are
+# in. Finding 122.
+#
+# A mnemonic missing from this set costs a site; one wrongly on it costs
+# correctness, which is `scratch.py`'s FULL_WRITE rule and the reason it is
+# not open-ended.
 LANE_WISE = frozenset("""
 	vandps vandpd vandnps vandnpd vorps vorpd vxorps vxorpd
 	vaddps vaddpd vsubps vsubpd vmulps vmulpd vdivps vdivpd
 	vminps vminpd vmaxps vmaxpd
 	vpand vpandn vpor vpxor
 	vpaddb vpaddw vpaddd vpaddq vpsubb vpsubw vpsubd vpsubq
+	vpsadbw vphsubd vpblendw
 """.split())
 
 

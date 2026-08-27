@@ -7288,6 +7288,72 @@ a correct stop rather than a false positive: a rewrite window crossing a feature
 control flow deserves a human look, and the answer is a narrow exemption with its
 reasoning written down, not a weaker rule.
 
+### Finding 122 -- LANE_WISE was reasoned; now it is run
+
+`LANE_WISE` is the whole safety argument of Finding 114: an operation on a splat's two
+identical halves can be done once per half **only if the operation is the same operation
+in each 128-bit lane**, and nothing in an operand list says whether it is. The set was
+written from the manual, and its own comment admitted the cost -- two of its entries occur
+in this binary, so the other thirty were reasoned and never executed.
+
+`make check-lanes` executes all of them. For each mnemonic it runs
+
+```
+op %ymm2,%ymm1,%ymm0                      under qemu
+op (src2+0),(src1+0) then (src2+16),(src1+16)   natively
+```
+
+and requires them to agree bit for bit over all 32 bytes -- no forgiveness for NaN
+payloads, because both sides run the same elementwise operation on the same bits and a
+payload that differs is a real difference.
+
+**Every one of the thirty-five is lane-wise under execution.** That includes the three
+that were deliberately held out -- `vpsadbw`, `vphsubd` and `vpblendw`, lane-wise by the
+manual and occurring 5, 1 and 2 times, which is far too rare for `check-pe` to catch a
+misreading. They are in the set now because something ran them.
+
+#### Three controls, because a harness that agrees with itself proves nothing
+
+  * **Is qemu a blind lane-splitter?** Five genuinely cross-lane AVX2 instructions run
+    under it against a model computed here from the ISA definition: 45 of 45 match, and
+    the lane-split rival answer -- which is well defined and different for
+    `vpbroadcastd` and `vpmovzxbw` -- was produced zero times. So a lane-wise verdict is
+    qemu's per-instruction implementation and not the shape of its interpreter.
+  * **Is qemu's arithmetic real?** Every case also runs its VEX.128 form under qemu
+    against the plain SSE form on this Westmere: 445 of 459 bit-identical, and all 14
+    differences are the both-operands-NaN defect Finding 119 measured.
+  * **Can it tell a right split from a wrong one?** Each mnemonic's 128-bit side is
+    rebuilt wrong twice -- halves swapped, and the low half used for both -- and **both
+    sabotages must be rejected for every mnemonic in the set.** A mnemonic whose sabotage
+    passes was asked with inputs too symmetric to answer, and its verdict would be
+    unearned whichever way it came out. None was.
+
+The negative controls fire as well: `vpslld` and `vpsrlq` are reported NOT lane-wise. That
+control was itself vacuous at first -- random 64-bit shift counts are all at least 32, so
+both halves shifted everything to zero and the wrong split "agreed" by producing zero
+twice. A pattern with counts of 3 and 7 in the two halves fixed it.
+
+#### The list is a second witness, and it is made to stay one
+
+`evidence.md` says two documents agreeing are one witness if the same hand wrote both, so
+the set is **copied** into the harness rather than imported -- importing it would make the
+check agree with the code by construction. But a copy that drifts silently is worse than
+no copy, so `detour.LANE_WISE` **is** imported, for one purpose: to demand that every
+entry in it appears in the harness. Adding a mnemonic to the rewriter and not executing it
+is a failed check rather than a forgotten one, which is how it was tested -- adding
+`vphaddw` to a copy of `detour.py` fails the run by name.
+
+#### Twelve more are available and not taken
+
+The harness also settles `vhaddps`, `vhsubps`, `vphaddd`, `vpshufb`, `vpalignr`, the packs
+and five others as lane-wise. They are not in `LANE_WISE`, because none of them appears in
+a splat triple in this binary and a set is a liability rather than an asset until
+something reads it. **The comment above the set was also wrong about why**: it gave
+"nothing horizontal is here (`vhaddps` combines neighbours)" as a reason, and horizontal
+is a statement about elements while the set's requirement is about lanes. AVX horizontal
+operations are defined per 128-bit lane, so they qualify. The exclusion was safe by
+conservatism and wrong by its stated reason.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

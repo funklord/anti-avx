@@ -73,7 +73,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census check-spill check-unwind check-vex \
+        census check-spill check-unwind check-vex check-lanes \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -128,6 +128,21 @@ check-lowering: $(BUILD_DIR)/lowering_test
 # both under a timeout inside the harness.
 check-vex: | $(BUILD_DIR)
 	$(PYTHON) tool/vex_oracle.py $(BUILD_DIR)
+
+# Settle LANE_WISE by executing it. Each mnemonic's 256-bit form runs under
+# qemu and its two 128-bit halves run natively, and they must agree bit for
+# bit -- with two sabotaged splits per mnemonic that must be rejected, and a
+# control proving qemu is not itself a blind lane-splitter. It fails if
+# detour.LANE_WISE gains a mnemonic this harness does not execute, so the
+# list and the evidence cannot drift apart.
+#
+# NOT part of `check`: it needs qemu-user, and says SKIPPED where that is
+# absent.
+#
+# Termination: four static binaries, each a counted loop over the case
+# table, all under a timeout inside the harness.
+check-lanes: | $(BUILD_DIR)
+	$(PYTHON) tool/lane_oracle.py $(BUILD_DIR)
 
 # -- the software F16C conversions -------------------------------------------
 
