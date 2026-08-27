@@ -6909,6 +6909,94 @@ They do now: sixty-four compare mnemonics, and the count of assembled lowerings 
 the interesting one is that a check quoted for two months as proving every rule was
 silently proving 439 of 567.
 
+### Finding 116 -- the run asked for one span, and the extract that rides in it
+
+Two changes to `ymm_run`, and the first exists so that the second cannot cost anything.
+
+#### The span was the last store's, and only that one
+
+`assign_helpers` asks `free_across` for a register dead from the load to the run's **last**
+store. A long span is harder to serve than a short one, so a run refused for want of a
+helper may have a prefix that is not -- and the prefix stores real bytes either way. The
+run simply ends earlier and whatever followed detours on its own account.
+
+`run_prefixes` offers every valid truncation, longest first, so a run that needs none is
+untouched and the first prefix offered is exactly what `ymm_run` returned. A truncation is
+`ymm_run`'s own two conditions applied to less of the walk: it ends at a store, because a
+run's product is a store, and it leaves nothing loaded and unstored.
+
+**It is worth three sites.** A scoping pass costed it at fourteen, measured over an
+extracted subset with its own `blocked` set; on the whole binary the residue goes 7,032 to
+7,029 and `no register free across the ymm run` goes 213 to 211. It stays because it can
+only add -- and because the second change would otherwise cost runs, a longer run being
+harder to give a register to.
+
+#### `vextractf128` is cross-lane, which is why it is free here
+
+`vextractf128 $0x1,%ymmS,%xmmD` moves the upper 128 bits into an xmm. It is cross-lane by
+definition and the run walk stopped dead at it. Once the run is holding that half in a
+helper, the whole instruction is
+
+```
+14000403e:  movaps %xmm1,%xmm2
+```
+
+**and that is the entire lowering.** The lanes have already been separated; the
+instruction that asks for one of them is asking for a register the stub is holding.
+
+What it must not be, and each is a way the trick fails:
+
+  * `$0x0`, which takes the LOW half -- handing over the helper would be the wrong
+    sixteen bytes and nothing downstream would look wrong. There are none in this binary,
+    so it is a unit case;
+  * a destination that is itself tracked, because writing its xmm destroys the low half
+    the run still owes a store;
+  * a source outside the run, which has no helper to hand over;
+  * an extract whose source's lifetime ended before it. The helper physically still holds
+    those bytes and the model says the lifetime is over, so `assign_helpers` refuses the
+    run rather than believing otherwise -- which is Finding 77's silent wrongness coming
+    back in a new costume.
+
+The memory form -- `vextractf128 $0x1,%ymmS,mem`, a store of the upper half -- is not
+claimed. 375 register-form extracts in the binary against 20 memory ones, and the register
+form is the one that needs no operand arithmetic at all.
+
+**The destination's upper half is left stale on purpose**, because the original zeroed it
+as every VEX.128 write does and a `movaps` does not. The run's existing
+`upper_half_read_later` guard covers it: the member records the DESTINATION spelled as a
+ymm precisely so that `held_open` includes it.
+
+#### What they are worth
+
+```
+VEX in .text      9,069 ->   9,016       796,115 removed, 98.9%
+detours         201,032 -> 201,008
+skipped, overlap 38,620 ->  38,657
+frontier   0x1428D1492 -> 0x1428D1492
+```
+
+**Fifty-three sites and twenty-four fewer detours**, which is the shape of the change
+rather than an oddity: a run that carries an extract is a longer run, so it swallows what
+would otherwise have been detoured beside it. Bigger stubs, fewer of them, and 37 more
+sites skipped for overlap because a longer window covers them.
+
+#### A shadowed name, caught by the fixture and not by any check
+
+The first version mapped an extract to its lifetime's helper with
+
+```python
+	for kind, position, _register in members:
+		...
+		if inplace.split_operands(plain[position][3])[1] == _register:
+```
+
+inside `for _register, load_at, stores in spans:`. The inner unpack shadows the outer, so
+the comparison asked whether the extract's source equalled the extract's own destination
+-- always false, so no extract was ever mapped, so the guard below refused every run that
+held one. It failed safe, which is why nothing caught it: `selftest` passed, `check-pe`
+passed, and the only symptom was a PE sample that produced no detour at all. The name is
+`register` and `_held` now, and the fixture is what found it.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7806,7 +7894,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,062 of 805,131 VEX sites, 98.9%** (Findings 24 to 114), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,115 of 805,131 VEX sites, 98.9%** (Findings 24 to 116), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -7944,7 +8032,7 @@ size of it.** Finding 74 put the rewritten binary 866 bytes past where the origi
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. That number was the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 9,069 that remain has to go before any of this can be
+immediately, and every one of the 9,016 that remain has to go before any of this can be
 soaked.
 
 **What the run adds is a measuring instrument, and it has been the better half of the

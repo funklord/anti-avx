@@ -1795,6 +1795,43 @@ def note(why, reason):
 		why.append(reason)
 
 
+def extract_upper(encoding, mnemonic, operands, tracked):
+	"""Where an extract's result lands, if a run can carry it, else None.
+
+	`vextractf128 $0x1,%ymmS,%xmmD` takes the upper half of a 256-bit value
+	into an xmm. It is cross-lane by definition -- which is exactly why it
+	becomes trivial once a run is holding that half in a helper: the lanes
+	have already been separated, and the whole instruction is
+	`movaps H(S),%xmmD`.
+
+	Returns the destination spelled as a **ymm**, because that is what
+	`held_open` has to guard. The original zeroes bits [255:128] of the
+	destination, as every VEX.128 write does, and a `movaps` does not -- so
+	a later 256-bit read of it would see a stale half, and the run's
+	existing `upper_half_read_later` check is what stops that.
+
+	Refused where the destination is itself tracked: writing its xmm would
+	destroy the low half the run still owes a store, and nothing downstream
+	would look wrong. Refused for `$0x0`, which takes the LOW half; there
+	are none in this binary, so it is a unit case rather than an execution
+	one. 375 register-form extracts here, every one of them `$0x1`.
+	Finding 117.
+	"""
+	if mnemonic not in ("vextractf128", "vextracti128"):
+		return None
+	vex = inplace.decode_vex(encoding)
+	if vex is None or not vex["L"]:
+		return None
+	fields = inplace.split_operands(operands)
+	if len(fields) != 3 or fields[0] != "$0x1":
+		return None
+	source, destination = fields[1], fields[2]
+	if source not in tracked or not destination.startswith("%xmm"):
+		return None
+	held = "%ymm" + destination[len("%xmm"):]
+	return None if held in tracked else held
+
+
 def ymm_run(instructions, index, blocked, limit=48, why=None):
 	"""A stretch of 256-bit copies whose halves all lie inside it.
 
@@ -1873,6 +1910,12 @@ def ymm_run(instructions, index, blocked, limit=48, why=None):
 			at = next_address + len(bits)
 			continue
 		if vex is not None and vex["L"]:
+			pulled = extract_upper(bits, name, text, tracked)
+			if pulled is not None:
+				# It reads a helper and owns none. See `extract_upper`.
+				members.append(("extract", position, pulled))
+				at = next_address + len(bits)
+				continue
 			stopped = "256-bit arithmetic on the value"
 			break			# a 256-bit instruction that is not a copy half
 		if any(r in text or "%xmm" + r[len("%ymm"):] in text
@@ -1900,6 +1943,36 @@ def ymm_run(instructions, index, blocked, limit=48, why=None):
 		note(why, "256-bit: loaded and never stored before " + stopped)
 		return None		# a register loaded and never stored has no use
 	return members, members[-1][1]
+
+
+def run_prefixes(held, members):
+	"""Every valid truncation of a run, longest first.
+
+	**`assign_helpers` is asked for the span reaching the run's LAST store,
+	and only that one.** A long span is harder to give a register to than a
+	short one -- `free_across` wants a register dead from the load all the
+	way to the last store -- so a run refused for want of a helper may well
+	have a prefix that is not, and the prefix stores real bytes either way.
+	The run simply ends earlier and whatever followed detours on its own
+	account.
+
+	A truncation has to satisfy `ymm_run`'s own two conditions applied to
+	less of the walk: it ends at a store, because a run's product is a
+	store; and it leaves nothing loaded and unstored, or a value the run
+	took responsibility for goes nowhere.
+
+	Longest first, so a run that needs no truncation is unaffected and the
+	first prefix offered is exactly what `ymm_run` returned. Finding 116.
+	"""
+	for end in range(len(members), 0, -1):
+		if members[end - 1][0] != "store":
+			continue
+		prefix = members[:end]
+		loaded = {held} | {r for kind, _p, r in prefix if kind == "load"}
+		stored = {r for kind, _p, r in prefix if kind == "store"}
+		if loaded - stored:
+			continue
+		yield prefix, prefix[-1][1]
 
 
 def free_across(plain, positions, definition, until, site_registers):
@@ -2012,7 +2085,7 @@ def assign_helpers(plain, positions, index, members, lendable=False):
 	if spans is None:
 		return None
 	taken, out, borrowed = set(), {}, set()
-	for _register, load_at, stores in spans:
+	for register, load_at, stores in spans:
 		if not stores:
 			return None
 		own = scratch_finder.xmm_numbers(plain[load_at][3])
@@ -2038,6 +2111,27 @@ def assign_helpers(plain, positions, index, members, lendable=False):
 		out[load_at] = chosen
 		for position in stores:
 			out[position] = chosen
+		# **An extract reads a helper without owning one.** It needs to know
+		# where its source's upper half is living at its own position, which
+		# is this lifetime's helper when it falls inside this lifetime -- and
+		# which lifetime that is matters, because one register can hold two
+		# values in one run. See `lifetimes` and Finding 77.
+		for kind, position, _held in members:
+			if kind != "extract" or not load_at < position <= stores[-1]:
+				continue
+			# The extract's SOURCE, which is the lifetime this asks about --
+			# the member carries its DESTINATION, because that is what
+			# `held_open` guards.
+			if inplace.split_operands(plain[position][3])[1] == register:
+				out[position] = chosen
+	# **An extract whose source's lifetime ended before it gets nothing.**
+	# The helper physically still holds those bytes, but the model says the
+	# lifetime is over and a later one may take the register, so believing
+	# otherwise is how Finding 77's silent wrongness comes back. Refuse the
+	# run; `run_prefixes` will offer a shorter one that does not reach here.
+	for kind, position, _held in members:
+		if kind == "extract" and position not in out:
+			return None
 	return out, borrowed
 
 
@@ -2055,6 +2149,13 @@ def lower_ymm_run(strategy, at, pool):
 			if fixed is None:
 				return None
 			body += fixed
+			continue
+		if kind == "extract":
+			# The upper half is already in a register: hand it over. The
+			# destination is the encoding's `rm` field and the source its
+			# `reg` field, which is the opposite way round from every other
+			# instruction here -- `vextractf128` stores to r/m.
+			body += encode_movaps((vex["B"] << 3) | (tail[1] & 7), helper)
 			continue
 		high_vex, high_tail = retarget(vex, tail, helper)
 		for one_vex, one_tail, delta in ((vex, tail, 0),
@@ -3268,77 +3369,89 @@ def collect(binary, listing):
 		if vex["L"]:
 			found = ymm_run(instructions, index, blocked, why=y_reason)
 			if found is not None:
-				members, last = found
-				tail_entry = instructions[last]
-				window = tail_entry[0] + len(tail_entry[1]) - address
-				# The borrow is offered only where the function can lend
-				# and the span leaves `rsp` alone -- see `span_keeps_rsp`
-				# for why the second matters here and did not in Finding 93.
-				lendable = (SPILL == SPILL_HOME
-				            and home_space_free(home, address)
-				            and span_keeps_rsp(instructions, index, last))
-				assigned = assign_helpers(plain, positions, index, members,
-				                          lendable)
-				helpers, borrowed = assigned if assigned else (None, set())
-				if helpers is None:
-					refusal = held_back(
-						pair_reason,
-						"no register free across the ymm run")
-					skipped[refusal] += 1
-					declined[address] = refusal
-					continue
-				# **A run leaves every one of its ymms with a stale upper
-				# half**, exactly as a pair does: the low half is in the
-				# register's own xmm and the high half is in a helper the
-				# original code knows nothing about. The pair strategy has
-				# guarded that since Finding 38 and the run did not, which
-				# was a live defect for as long as runs have existed --
-				# a later 256-bit read of any register in the run would take
-				# whatever was left in its upper half. Finding 64.
-				# Over the run's ymm registers, which `helpers` no longer keys
-				# on: it keys on the position of each load and store, so that
-				# one register can hold two values. See `lifetimes`.
-				held_open = {operands.rpartition(",")[2]}
-				held_open |= {r for _k, _p, r in members if r is not None}
-				if any(upper_half_read_later(instructions, last, register,
-				                             positions=positions)
-				       for register in held_open):
-					refusal = held_back(pair_reason,
-					                    "ymm run upper half read later")
-					skipped[refusal] += 1
-					declined[address] = refusal
-					continue
-				if not inplace.covered_by(ranges, address, window):
-					refusal = held_back(pair_reason, "outside .pdata")
-					skipped[refusal] += 1
-					declined[address] = refusal
-					continue
-				entries = [("load", helpers[index], vex,
-				            encoding[vex["length"]:], address, len(encoding),
-				            None)]
-				for kind, position, register in members:
-					entry = instructions[position]
-					if kind == "plain":
-						entries.append((
-							"plain", None, None, None, entry[0], len(entry[1]),
-							(entry[0], entry[1], entry[4], entry[3], entry[2],
-							 swallowed_scratch(plain, position, entry[0],
-							                   entry[1], entry[3], entry[2],
-							                   scope))))
+				# **The whole run first, then shorter ones.** `free_across`
+				# wants a register dead from the load to the LAST store, so
+				# a long span is harder to serve than a short one -- and a
+				# run refused for want of a helper often has a prefix that
+				# is not. See `run_prefixes`. The reason recorded is the
+				# longest prefix's, because that is the run the walk found
+				# and the one a reader of the census would go looking for.
+				anchor = operands.rpartition(",")[2]
+				taken, refusal = None, None
+				for members, last in run_prefixes(anchor, found[0]):
+					tail_entry = instructions[last]
+					window = tail_entry[0] + len(tail_entry[1]) - address
+					# The borrow is offered only where the function can lend
+					# and the span leaves `rsp` alone -- see `span_keeps_rsp`
+					# for why the second matters here and did not in
+					# Finding 93.
+					lendable = (SPILL == SPILL_HOME
+					            and home_space_free(home, address)
+					            and span_keeps_rsp(instructions, index, last))
+					assigned = assign_helpers(plain, positions, index,
+					                          members, lendable)
+					helpers, borrowed = assigned if assigned else (None, set())
+					if helpers is None:
+						refusal = refusal \
+							or "no register free across the ymm run"
 						continue
-					one = inplace.decode_vex(entry[1])
-					entries.append((kind, helpers[position], one,
-					                entry[1][one["length"]:], entry[0],
-					                len(entry[1]), None))
-				run = (helpers, entries, borrowed)
-				if lower_ymm_run(run, address, address) is None:
-					refusal = held_back(pair_reason,
-					                    "ymm run operand cannot be moved")
-					skipped[refusal] += 1
-					declined[address] = refusal
+					# **A run leaves every one of its ymms with a stale upper
+					# half**, exactly as a pair does: the low half is in the
+					# register's own xmm and the high half is in a helper the
+					# original code knows nothing about. The pair strategy
+					# has guarded that since Finding 38 and the run did not,
+					# which was a live defect for as long as runs have
+					# existed -- a later 256-bit read of any register in the
+					# run would take whatever was left in its upper half.
+					# Finding 64.
+					# Over the run's ymm registers, which `helpers` no longer
+					# keys on: it keys on the position of each load and
+					# store, so that one register can hold two values. See
+					# `lifetimes`.
+					held_open = {anchor}
+					held_open |= {r for _k, _p, r in members if r is not None}
+					if any(upper_half_read_later(instructions, last, register,
+					                             positions=positions)
+					       for register in held_open):
+						refusal = refusal or "ymm run upper half read later"
+						continue
+					if not inplace.covered_by(ranges, address, window):
+						refusal = refusal or "outside .pdata"
+						continue
+					entries = [("load", helpers[index], vex,
+					            encoding[vex["length"]:], address,
+					            len(encoding), None)]
+					for kind, position, register in members:
+						entry = instructions[position]
+						if kind == "plain":
+							entries.append((
+								"plain", None, None, None, entry[0],
+								len(entry[1]),
+								(entry[0], entry[1], entry[4], entry[3],
+								 entry[2],
+								 swallowed_scratch(plain, position, entry[0],
+								                   entry[1], entry[3],
+								                   entry[2], scope))))
+							continue
+						one = inplace.decode_vex(entry[1])
+						entries.append((kind, helpers[position], one,
+						                entry[1][one["length"]:], entry[0],
+						                len(entry[1]), None))
+					run = (helpers, entries, borrowed)
+					if lower_ymm_run(run, address, address) is None:
+						refusal = refusal or "ymm run operand cannot be moved"
+						continue
+					taken = (address, encoding, operands, mnemonic, window,
+					         [], None, [], ("run", run))
+					break
+				if taken is not None:
+					candidates.append(taken)
 					continue
-				candidates.append((address, encoding, operands, mnemonic,
-				                   window, [], None, [], ("run", run)))
+				refusal = held_back(
+					pair_reason,
+					refusal or "no register free across the ymm run")
+				skipped[refusal] += 1
+				declined[address] = refusal
 				continue
 		if pair_reason is not None:
 			skipped[pair_reason] += 1
@@ -4122,6 +4235,8 @@ def selftest():
 	failures += splat_selftest()
 	failures += constant_selftest()
 	failures += passenger_selftest()
+	failures += prefix_selftest()
+	failures += extract_selftest()
 
 	if failures:
 		print(f"selftest: {failures} of {len(SELFTEST)} lowerings are wrong",
@@ -4403,6 +4518,80 @@ def passenger_selftest():
 		return 1
 	print("selftest: a strategy stub emits the passenger its window took")
 	return 0
+
+
+def prefix_selftest():
+	"""Prove `run_prefixes` offers the whole run first and nothing invalid.
+
+	It emits no bytes of its own -- `lower_ymm_run` does that, and the run
+	samples in `check-pe` execute it -- so what is worth testing is which
+	truncations it is willing to hand back.
+	"""
+	# load %ymm0 (the anchor, not in members), store it, load %ymm1, store
+	# it. Truncating after the first store is valid; truncating between
+	# %ymm1's load and its store is not, and neither is a truncation that
+	# does not end at a store.
+	members = [("store", 1, "%ymm0"), ("load", 2, "%ymm1"),
+	           ("plain", 3, None), ("store", 4, "%ymm1")]
+	offered = list(run_prefixes("%ymm0", members))
+	failures = 0
+	if [last for _m, last in offered] != [4, 1]:
+		print(f"selftest: run_prefixes offered {[l for _m, l in offered]}, "
+		      f"want [4, 1]", file=sys.stderr)
+		failures += 1
+	if offered and offered[0][0] != members:
+		print("selftest: the longest prefix is not the run itself",
+		      file=sys.stderr)
+		failures += 1
+	# A run whose anchor is never stored has no valid prefix at all, which
+	# is `ymm_run`'s own condition and must survive truncation.
+	if list(run_prefixes("%ymm3", members)):
+		print("selftest: a prefix was offered that never stores the anchor",
+		      file=sys.stderr)
+		failures += 1
+	if not failures:
+		print("selftest: run_prefixes offers the whole run, then the one "
+		      "valid shorter end")
+	return failures
+
+
+def extract_selftest():
+	"""Prove `extract_upper` takes only the shape a run can hand a helper to.
+
+	Every one of the 375 register-form extracts in this binary is `$0x1`
+	into a register the run does not track, so the refusals below are shapes
+	no execution test here can reach.
+	"""
+	encoding = bytes.fromhex("c4e37d19c201")	# vextractf128 $0x1,%ymm0,%xmm2
+	cases = [
+		("the shape as it occurs", "$0x1,%ymm0,%xmm2", {"%ymm0"}, "%ymm2"),
+		# $0x0 takes the LOW half; handing over the helper would be the
+		# wrong sixteen bytes and nothing downstream would look wrong.
+		("$0x0, which takes the low half", "$0x0,%ymm0,%xmm2",
+		 {"%ymm0"}, None),
+		("a source the run does not track", "$0x1,%ymm3,%xmm2",
+		 {"%ymm0"}, None),
+		# Writing a tracked register's xmm destroys the low half the run
+		# still owes a store.
+		("the destination is the source", "$0x1,%ymm0,%xmm0",
+		 {"%ymm0"}, None),
+		("the destination is another tracked register", "$0x1,%ymm0,%xmm1",
+		 {"%ymm0", "%ymm1"}, None),
+		# The memory form is a store of the upper half; 20 of those here and
+		# this rule does not claim them.
+		("a memory destination", "$0x1,%ymm0,0x10(%rsp)", {"%ymm0"}, None),
+	]
+	failures = 0
+	for what, operands, tracked, expected in cases:
+		got = extract_upper(encoding, "vextractf128", operands, tracked)
+		if got != expected:
+			print(f"selftest: {what}: extract_upper said {got!r}, "
+			      f"want {expected!r}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(cases)} extract shapes, one accepted and "
+		      f"{len(cases) - 1} refused")
+	return failures
 
 
 def borrow_selftest():

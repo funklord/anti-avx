@@ -1512,6 +1512,50 @@ source:	.long 1, 2, 3, 8
 """)
 
 
+# 37. `vextractf128 $0x1` inside a run. The instruction is cross-lane by
+# definition -- it moves the upper 128 bits into the low half of an xmm --
+# and that is exactly why it becomes trivial once a run is holding the upper
+# half in a helper: the lanes have already been separated, and the whole
+# thing is `movaps H(S),%xmmD`.
+#
+# The run needs a store to be a run at all, so the ymm is stored whole as
+# well; the extracted half is stored separately by a 128-bit move the
+# patcher takes in place.
+#
+# **Both halves of the constant are different and both are read back**, at
+# lane 0 of the low half and lane 3 of the high, from the 32-byte store and
+# again from the extracted 16 bytes. An extract that handed over the low
+# half, or the wrong helper, changes two of the four.
+PROGRAMS["extract"] = (97, """
+	.text
+	.globl _start
+_start:
+	subq	$200, %rsp
+	vzeroupper
+	movq	%rsp, %rax
+	movl	$20, %edx
+poison:
+	movl	$0x5a5a5a5a, 32(%rax)
+	addq	$4, %rax
+	subl	$1, %edx
+	jne	poison
+	vmovups	source(%rip), %ymm0	/* 1 2 3 8 / 16 5 6 40 */
+	vextractf128 $0x1, %ymm0, %xmm2	/* the HIGH half into xmm2 */
+	vmovups	%ymm0, 32(%rsp)		/* the store the run needs */
+	vmovups	%xmm2, 96(%rsp)		/* 128-bit, patched in place */
+	movl	32(%rsp), %eax		/* 1  -- the store's low half */
+	addl	60(%rsp), %eax		/* 40 -- the store's HIGH half */
+	addl	96(%rsp), %eax		/* 16 -- the extract, lane 0 */
+	addl	108(%rsp), %eax		/* 40 -- the extract, lane 3 */
+	addq	$200, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 8
+	.long 16, 5, 6, 40
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:
