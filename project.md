@@ -7628,6 +7628,55 @@ its reason rewritten, and a new case sits beside it -- a copy stored *through* a
 into the region, which must still be refused and is the boundary the relaxation must not
 cross.
 
+### Finding 128 -- the two built rungs, priced against the binary at last
+
+Finding 126 left an item open in as many words: Finding 116's headline 53 is a `verify`
+number and stands, but **the split inside it -- the prefix retry at +3 and `vextractf128`
+at +50 -- came from two `plan` runs and could be apportioned differently in the binary.**
+Both are taken against the binary now, by disabling each in a copy of the tool and
+rebuilding.
+
+```
+                                  plan, when built   the binary, now
+retry assign_helpers at an
+  earlier store                             +3                   +2
+vextractf128 with a tracked source         +50                  +50
+```
+
+`8,452 -> 8,450` for the retry and `8,500 -> 8,450` for the extract. The extract's
+number was right; the retry's was one high and has since lost another to the regimes
+that changed under it -- Finding 125's fall-through and Finding 127's home space both
+reach sites the retry used to be the only way to.
+
+**They do not add to 53 and should not be expected to.** Disabling one changes what the
+other reaches, and two regime changes have intervened; 52 against 53 is the interaction,
+not an error in either. What the exercise settles is that neither number was materially
+wrong, which is worth knowing precisely because Finding 126 could not rule it out.
+
+#### The gap in `run_prefixes` that is not one
+
+A truncation must leave nothing loaded and unstored, so a run holding two registers can
+only be cut after both are stored. Where the second register's store is what the run
+cannot get a helper for, the cut that would have saved the first is never offered --
+`load A, load B, store A, store B` has no valid cut but the full one, because cutting
+after `store A` strands B's load inside the window.
+
+Measured: **93 sites** where a prefix was suppressed that way and the site was then
+declined, 83 of them for `no register free across the ymm run`. That looked like a
+population worth a smarter truncation, one that drops the stranded load rather than only
+taking prefixes.
+
+**It is closed by a guard that is already there.** Truncating with B stranded is not
+unsafe -- B's low half is loaded correctly, its upper half goes to a helper nobody reads,
+and B's own store is refused afterwards for having no known upper half, so it stays VEX
+and faults rather than computing wrongly. But `held_open` includes B, and B's store
+downstream is a 256-bit read of it, so `upper_half_read_later` refuses the prefix before
+any of that can happen. Eight of the 93 are already declined with exactly that reason.
+
+So the binding constraint is the upper-half guard and not the stranding rule, and a
+smarter truncation would gain nothing it does not already have. Recorded rather than
+built.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7751,8 +7800,12 @@ no longer forecloses.
 **And the ladder's numbers are the collector's, not the binary's.** Finding 126 rebuilt
 the reload rung and found it costs 49 sites where `detour-plan` said it gained 51 -- a
 longer run collides with neighbours that would each have been placed, which `plan` cannot
-see. The two built rungs' totals were verified against the binary and stand; the split
-between them was not. Cost the next one with `make detour`.
+see. Cost the next one with `make detour`.
+
+The two built rungs have since been priced the same way, by disabling each in a copy and
+rebuilding: **the retry is worth 2 and the extract 50**, against 3 and 50 from `plan`.
+Neither was materially wrong, and they do not add to Finding 116's verified 53 because
+disabling one changes what the other reaches. Finding 128.
 
 **And the wall behind all of it is unchanged.** In the six functions holding 822 of the
 refused 256-bit sites, all sixteen xmm are named, twelve to sixteen ymm are live at the
