@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **796,232 of 805,131 VEX
-sites -- 99.0%** -- through 201,411 detours, and every `make detour-verify` invariant
-holds on the result. 8,450 sites are left, and the rewritten binary loads 305 modules
+**Status:** the rewriter works. `tool/detour.py` rewrites **797,160 of 805,131 VEX
+sites -- 99.0%** -- through 201,686 detours, and every `make detour-verify` invariant
+holds on the result. 7,971 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
 ---
@@ -7735,6 +7735,149 @@ The measurement is the deliverable. Whoever takes this next knows that the bucke
 854 + 556 + 139 rather than 1,594, that the largest part of it is a taint problem and not
 a spill problem, and that the leaves are a different question entirely.
 
+### Finding 130 -- the caller's shadow, which a leaf has and a leaf could not lend
+
+**8,450 -> 7,971 sites, measured on the binary.** 479 removed, 201,686 detours, 587
+refused, every `detour-verify` invariant holding.
+
+#### The residue was not what this document said it was
+
+Finding 129 ended by ranking the leaves behind the taint problem. That ranking came from
+the refusal buckets, which count sites the collector *declined*; what survives in `.text`
+is a different set, and nobody had asked it directly. Counting the survivors by mnemonic
+says:
+
+```
+  256-bit           4,737
+  128-bit           3,533
+```
+
+(After this change: 4,729 and 3,062, plus the same 180 undecodable.)
+
+**Three and a half thousand of the survivors were 128-bit** -- 507 `vaddss`, 346
+`vmulss`, 306 `vsubss`, 172 `vmaxss`, 171 `vdivss` -- ordinary scalar float arithmetic
+whose destination aliases its second source. Crossed against `declined`, 1,916 of them
+are `no home space to borrow`, which makes it the **largest named cause anywhere in the
+residue**, ahead of `256-bit: arithmetic rather than a copy` at 1,878. The session had
+been reasoning as though the register representation were the whole of what was left.
+
+#### What a leaf has that `home_space_map` never offered it
+
+There are two home spaces and `copy_reaches_home`'s docstring has named both since
+Finding 96: the 32 bytes a function reserves for **its own callees**, at the bottom of
+its frame, and the 32 bytes **its caller reserved for it**, at entry `[rsp+8..40)`, above
+the pushed return address. Win64 makes the caller allocate the second whatever the
+callee's arity and lets the callee use it for anything.
+
+`home_space_map` lends only the first, so it needs `calls[i]` -- a function that calls
+nothing reserves nothing -- and a leaf can lend nothing at all. The shadow is the other
+half of that sentence, and it does not care whether the function calls anything.
+
+The analysis is the same walk with a different region: `copy_reaches_home` takes
+`region` now, and `CALLER_SHADOW` is what the shadow path passes. That matters more than
+it looks. The **MSVC prologue idiom** -- `mov %rsp,%rax` before the pushes, then
+`mov %rcx,0x8(%rax)` -- is `REACH_CASES` case 3, where it asserts **False**: Finding 96
+rests on that copy not reaching the callee home space. The same rows must assert **True**
+against the shadow, because reaching the shadow is the entire reason the compiler writes
+that idiom. One walk, two regions, opposite answers, and a region parameter that did
+nothing would pass one and fail the other. `shadow_selftest` runs both.
+
+#### The new thing the shadow needs, and the two rules that make it sound
+
+The callee home space is at `(%rsp)` for every instruction in the function, because
+`home_space_map` lends only functions whose `rsp` does not move. The shadow is a whole
+frame higher, so lending it needs `rsp`'s **value**, not merely a promise that it has not
+moved. `rsp_depths` walks the function tracking it, and two rules are what let a linear
+walk be trusted in code full of branches:
+
+  * **Every `ret` must be reached at depth zero.** A return unwinds the frame completely,
+    so this is the model checking itself against the code; a function whose returns do
+    not balance is one whose frame this tool has misread, and it lends nothing. 45 of the
+    starved sites are refused by it.
+  * **A branch taken at any other depth refuses the function.** A branch carries its
+    depth to a target the walk reaches by falling into it, so this is the only thing
+    standing between a linear walk and a guess. 77 sites.
+
+An unknown depth is block-local rather than fatal, and that distinction was worth 1,122
+sites on its own -- see below.
+
+#### Four rules that were wrong before one was right
+
+Each was measured, and each is the same mistake in a different coat: a rule that looks
+like a safety property and is actually a proxy for something else.
+
+  * **"nothing moves `rsp` after the prologue"** refused 184,724 of 260,729 functions.
+    That is not a property about frames; it is "the function has an epilogue".
+  * **making an unknown depth fatal** refused 1,122 more. MSVC restores a large frame
+    with `mov %r11,%rsp`, which no walk can follow -- and which every site in the
+    function precedes. The unknown ends at the terminator, since the block after it is
+    entered by a branch and every branch source has just been checked.
+  * **the refusal cases in the new selftest passed vacuously.** They asserted
+    `seen.get(None) is None`, which is true of a refusal and equally true of a walk that
+    refused nothing. Taking the `ret` check out and re-running caught it; the cases check
+    the refusal *reason* now. This is `evidence.md`'s first rule arriving in the very
+    test written to satisfy it.
+  * **`plain[first:]` copies the list.** Slicing a 4.5-million-element list per call
+    turned a bounded analysis into an O(n^2) one and took `apply` past twenty minutes
+    with nothing printed to say why. Walk by index.
+
+#### What is refused, and one thing refused on purpose
+
+Of the 2,153 sites in the bucket, 417 are lendable and the rest divide honestly:
+
+```
+  a copy of rsp reaches the shadow                981
+  addresses its own caller shadow                 579
+  SHADOW LENDABLE                                 417
+  a branch leaves at an unmodelled depth           77
+  a return does not balance the frame              45
+  not inside a known function                      32
+  frame register or no unwind codes                22
+```
+
+The first two are 1,560 functions that genuinely use their shadow, which is what it is
+for: MSVC spills register parameters there. That is not a gap to close.
+
+**Only a function `.pdata` describes may lend**, which costs 3 sites and is not a
+tidiness rule. `outside.py` recovers a range on its being bracketed by `int3` and entered
+by a call **or a jump**, and a range entered by a jump is not a function entry: `rsp`
+there stands wherever the jumping code left it, so "entry + 8" is not the shadow and the
+save lands in live locals. `rsp_depths` can model a frameless leaf and is tested doing
+so; what it cannot do is tell a leaf from the tail of somebody else's function.
+
+#### The evidence, on hardware
+
+`shadowspill` is `homespill` with one instruction removed -- the `call helper` that
+exists for no reason but to make its own callee home space real. `check-spill` runs it
+both ways on this Westmere:
+
+```
+check-spill: shadowspill --shadow=off returned 29, want 107
+check-spill: shadowspill --shadow=on  returned 107, want 107
+```
+
+29 is the illegal-instruction death of a surviving VEX site. The **off** half is what
+makes the **on** half mean anything, which is why `--shadow=` exists at all -- the same
+reason `--rsp=blanket` does: a borrow written at the wrong displacement corrupts a live
+local rather than faulting, so comparing two binaries is the only way to test for it.
+
+The stub itself says the rest. `_start` allocates 40 bytes and the site sits inside that
+frame, so the shadow is at 8 + 40:
+
+```
+	0f 11 54 24 30    movups %xmm2,0x30(%rsp)
+	0f 28 d0          movaps %xmm0,%xmm2
+	0f 28 c1          movaps %xmm1,%xmm0
+	f3 0f 5c c2       subss  %xmm2,%xmm0
+	0f 10 54 24 30    movups 0x30(%rsp),%xmm2
+```
+
+257 of the 417 sites need the disp32 form of that, against 160 with disp8, because MSVC
+frames run to thousands of bytes. A disp8 would have wrapped them into somebody else's
+locals without a word, so all sixteen `encode_spill` shapes were assembled with `gas` and
+compared byte for byte -- reading the objdump listing by eye would not have done, since
+the eight-byte encodings run onto a continuation line.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7812,14 +7955,33 @@ every one of them with a memory operand. Together they are 3,084 of the 7,032, a
 constants refused in Finding 109 are the same thing again -- 164 of those are blocked by
 256-bit arithmetic reading the hoisted value.
 
-**`no home space to borrow` is three problems, not one**, and Finding 129 decomposes it
-after Finding 127 took 364 out of it. Of the 1,594 outside any window: **854 are leaves**
-with no 32 bytes to lend at all, which no argument about a borrow bracket reaches and
-which want static TLS (740 sites, priced) or the caller's own shadow (150, every one of
-them a leaf); **556 are an `rsp` copy the walk cannot follow**, which wants per-position
-taint rather than the whole-body answer `copy_reaches_home` gives; and **139 are a direct
-`[rsp+0..31]` operand somewhere in the function**, which wants one comparison per emitted
-instruction and is the cheap case. 22 are outside `.pdata` and 13 have a frame register.
+**`no home space to borrow` is now 1,737 sites (1,313 outside any window)**, and the
+half of it Finding 129 called the leaves is answered: Finding 130 lends them the 32 bytes
+their own caller reserved, and the bucket fell from 2,153. What refuses the rest was
+measured against the 2,153 as it stood:
+
+```
+  a copy of rsp reaches the shadow                981
+  addresses its own caller shadow                 579
+  (lendable, and now taken)                       417
+  a branch leaves at an unmodelled depth           77
+  a return does not balance the frame              45
+  not inside a known function                      32
+  frame register or no unwind codes                22
+```
+
+**The first two are not a gap.** 1,560 of these functions genuinely use their shadow --
+spilling register parameters into it is exactly what the ABI reserves it for -- so no
+analysis will free them and the only mechanisms that reach them are ones that bring
+their own memory: static TLS (740 sites, priced, file-format half proven under wine) or
+a stack allocation described to the unwinder.
+
+Finding 129's other two thirds survive in a different shape. The `rsp`-copy refusal is
+still a whole-body answer where a per-position one would do, and the direct-operand
+refusal still condemns a function for addressing `[rsp+0..31]` anywhere when what matters
+is whether the stub's own instructions do -- both now stated against the shadow region as
+well as the callee one, and both still unbuilt for the same reason: the ratio, against a
+new silent failure mode in the machinery that writes into the translated program's frame.
 
 **And 180 of the survivors are not instructions.** Of the c4/c5-prefixed lines in the
 rewritten `.text`, objdump calls 180 of them `(bad)` -- they sit inside Finding 8's 744
@@ -7859,6 +8021,25 @@ no longer forecloses.
 the reload rung and found it costs 49 sites where `detour-plan` said it gained 51 -- a
 longer run collides with neighbours that would each have been placed, which `plan` cannot
 see. Cost the next one with `make detour`.
+
+**The ladder was also asking the wrong list.** Every rung above is a 256-bit rung,
+because the residue was assumed to be the register representation. It was not: at 8,450
+sites, 3,533 of the survivors were 128-bit, and their largest single cause was a scalar
+`vaddss` in a leaf that had no 32 bytes to borrow. Finding 130 took 479 of those. **Count
+the survivors by mnemonic before ranking anything** -- the refusal buckets count what the
+collector declined, which is a different set, and it had been standing in for the real
+one for several sessions.
+
+What is left divides cleanly, and the two halves want different work:
+
+  * **4,729 sites are 256-bit** and want the register representation, which
+    `project.md`'s ladder has always described as a different kind of work from anything
+    done so far. `ymm value has no known upper half` (1,140 outside a window) and
+    `256-bit: arithmetic rather than a copy` (1,818) are one problem stated twice.
+  * **3,062 are 128-bit** (and 180 are undecodable bytes rather than instructions --
+    see below), and after Finding 130 their largest causes are a shadow the
+    function genuinely uses (which wants memory of our own -- static TLS is priced at 740
+    sites), `outside .pdata` at 325, and `next instruction is a branch target` at 209.
 
 The two built rungs have since been priced the same way, by disabling each in a copy and
 rebuilding: **the retry is worth 2 and the extract 50**, against 3 and 50 from `plan`.

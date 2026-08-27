@@ -1123,7 +1123,12 @@ hundred:	.float 100.0
 # The prologue allocation each program really makes, where a test depends on
 # the unwind codes saying so. Everything absent here declares nothing, which
 # is what every program before this one did.
-FRAMES = {"rspcopy": 104}
+# **A declared frame is what makes the depth walk possible, not just the
+# home-space arithmetic.** `rsp_depths` resets to the body depth after every
+# terminator and refuses a branch taken anywhere else, so a sample whose
+# unwind codes claim a frame of zero has its `jmp` refused at -40 and the
+# borrow it exists to test never happens.
+FRAMES = {"rspcopy": 104, "shadowspill": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -1381,6 +1386,51 @@ source:	.long 1, 2, 3, 8
 #
 # 55 only if both instructions executed and the value went round; 11 if the
 # store wrote nothing, if the load took nothing, or if the poison survived.
+# 37. A LEAF with an aliased site: the caller's shadow, and the first
+# borrow that does not come out of a home space this function allocated.
+#
+# `homespill` above is the same arithmetic and differs in one instruction --
+# it calls `helper` for no reason but to make its own callee home space
+# exist. Take the call away and `home_space_map` has nothing to lend, since
+# the 32 bytes it lends are the ones a function reserves for ITS callees and
+# a leaf reserves none. That refusal is `no home space to borrow`, the
+# largest named cause anywhere in the residue.
+#
+# What this borrows instead is the 32 bytes its own caller reserved for it,
+# at entry `[rsp+8..40)` -- always allocated by the Win64 caller, whatever
+# the callee's arity, and the callee's to use for anything. Here the caller
+# is the loader, and `rsp` sits 40 bytes below entry at the site, so the
+# save is written at `0x30(%rsp)`.
+#
+# The A/B is the same as `homespill`'s and is the whole point: 107 only if
+# %xmm2 came back holding 100.0. A borrow written at the wrong displacement
+# returns something else, or faults; a site refused for want of a home space
+# keeps its VEX and dies on a CPU without AVX.
+PROGRAMS["shadowspill"] = (107, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp		/* a frame, and no call: this is a leaf */
+	vzeroupper
+	vmovss	ten(%rip), %xmm1
+	vmovss	three(%rip), %xmm0
+	vmovss	hundred(%rip), %xmm2	/* the register the borrow will take */
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, and no register is dead */
+	leaq	after(%rip), %rax
+	jmp	*%rax			/* indirect: nothing forward is provable */
+after:
+	vaddss	%xmm2, %xmm0, %xmm0	/* 7 + 100, only if xmm2 came back */
+	vcvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+hundred:	.float 100.0
+""")
+
+
 PROGRAMS["mxcsr"] = (55, """
 	.text
 	.globl _start

@@ -387,7 +387,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              fallthrough pastread swallowed gapped interleaved permilps \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
-             mxcsr splatrun splatop extract
+             mxcsr splatrun splatop extract shadowspill
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
@@ -480,7 +480,8 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 #
 # Termination: one wine invocation per mode, each under a timeout.
 check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
-             $(BUILD_DIR)/pe-homespill.exe $(BUILD_DIR)/pe-homespill.asm
+             $(BUILD_DIR)/pe-homespill.exe $(BUILD_DIR)/pe-homespill.asm \
+             $(BUILD_DIR)/pe-shadowspill.exe $(BUILD_DIR)/pe-shadowspill.asm
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-spill: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
@@ -528,7 +529,31 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 			echo "check-spill: the home space did not round-trip"; exit 1; \
 		fi; \
 	done; \
-	echo "check-spill: and the callee home space lends a register with no rsp"
+	echo "check-spill: and the callee home space lends a register with no rsp"; \
+	want=`$(PYTHON) tool/pe_build.py names | \
+	      awk '$$1 == "shadowspill" { print $$2 }'`; \
+	for mode in off on; do \
+		$(PYTHON) tool/detour.py --shadow=$$mode apply \
+			$(BUILD_DIR)/pe-shadowspill.exe \
+			$(BUILD_DIR)/pe-shadowspill.asm \
+			$(BUILD_DIR)/sse-shadowspill-$$mode.exe >/dev/null; \
+		$(WINE_ENV) timeout 120 wine \
+			$(BUILD_DIR)/sse-shadowspill-$$mode.exe \
+			>/dev/null 2>&1 && got=0 || got=$$?; \
+		echo "check-spill: shadowspill --shadow=$$mode returned $$got, want $$want"; \
+		if [ "$$mode" = "off" ]; then \
+			if [ "$$got" = "$$want" ]; then \
+				echo "check-spill: --shadow=off answered $$want, so the"; \
+				echo "             site was never a leaf starved of a home"; \
+				echo "             space and the shadow proves nothing"; \
+				exit 1; \
+			fi; \
+		elif [ "$$got" != "$$want" ]; then \
+			echo "check-spill: the caller shadow did not round-trip"; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "check-spill: and a LEAF lends the shadow its own caller reserved"
 
 # Can an exception be dispatched from inside a stub? Two programs that fault
 # on purpose, both registering a handler through .pdata -- which is how a PE

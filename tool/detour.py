@@ -503,6 +503,14 @@ HOME_SPACE = 32
 # not fault, so comparing two binaries is the only way to test for it.
 RSP_BLANKET, RSP_FOLLOWED = "blanket", "followed"
 RSP_RULE = RSP_FOLLOWED
+# `--shadow=off` takes the caller's shadow away and leaves only the callee
+# home space, which is every borrow this tool wrote before Finding 130. It is
+# kept reachable for the same reason `--rsp=blanket` is: a borrow at the
+# wrong displacement corrupts a live local rather than faulting, so comparing
+# two binaries is the only way to test for it -- and `check-pe` does exactly
+# that with `shadowspill`, whose site is refused outright when this is off.
+SHADOW_OFF, SHADOW_ON = "off", "on"
+SHADOW_RULE = SHADOW_ON
 
 
 def encode_rip(prefix, opcode, reg, target, at):
@@ -570,7 +578,7 @@ def spill_register(registers):
 	return candidates[0] if candidates else None
 
 
-def encode_spill(borrowed, save, at, spill_base, slot=0):
+def encode_spill(borrowed, save, at, spill_base, slot=0, base=0):
 	"""Save or restore a borrowed register. `save` picks the direction.
 
 	**`movups`, not `movaps`.** Win64 guarantees `rsp` is 16-byte aligned at
@@ -586,11 +594,17 @@ def encode_spill(borrowed, save, at, spill_base, slot=0):
 	program computes with a register the caller owns. There are two slots
 	because the home space is 32 bytes; `build_stub` refuses a third rather
 	than reaching past what the ABI reserved. Finding 118.
+
+	`base` is which home space. Zero is the one this function reserves for
+	its own callees, at `(%rsp)`; anything else is the shadow its caller
+	reserved for it, a whole frame higher. See `borrow_offset`.
 	"""
 	opcode = b"\x0f\x11" if save else b"\x0f\x10"
 	if SPILL == SPILL_POOL:
 		return encode_rip(None, opcode, borrowed, spill_base + slot * SLOT,
 		                  at)
+	if base < 0:
+		return None
 	# The home space and the stack spill address the same place -- `(%rsp)`
 	# -- and differ only in whether `rsp` was moved to make room first. The
 	# home space needs no room made.
@@ -598,14 +612,22 @@ def encode_spill(borrowed, save, at, spill_base, slot=0):
 	if borrowed >= 8:
 		out.append(0x44)			# REX.R
 	out += opcode
-	offset = slot * SLOT
-	if offset:
-		out.append(0x40 | ((borrowed & 7) << 3) | 4)	# mod 01, disp8
-		out.append(0x24)			# base rsp, no index
-		out.append(offset)
-	else:
+	offset = base + slot * SLOT
+	if not offset:
 		out.append(((borrowed & 7) << 3) | 4)	# mod 00, rm 100 -- SIB
 		out.append(0x24)
+	elif -128 <= offset < 128:
+		out.append(0x40 | ((borrowed & 7) << 3) | 4)	# mod 01, disp8
+		out.append(0x24)			# base rsp, no index
+		out.append(offset & 0xFF)
+	else:
+		# The caller's shadow sits a whole frame above `rsp`, and MSVC
+		# frames run to thousands of bytes. 257 of the 417 sites the shadow
+		# unblocks need this form; a disp8 would have wrapped them into
+		# somebody else's locals without a word.
+		out.append(0x80 | ((borrowed & 7) << 3) | 4)	# mod 10, disp32
+		out.append(0x24)
+		out += struct.pack("<i", offset)
 	return bytes(out)
 
 
@@ -966,9 +988,94 @@ def prologue_frame(data, unwind_at, start, depth=0):
 	return total
 
 
-def copy_reaches_home(rows, frame):
-	"""True if a copy of `rsp` could reach `[rsp+0..31]`, or cannot be
+# **The caller's shadow: the other 32 bytes, and the ones a leaf has.**
+# Win64 makes the CALLER allocate 32 bytes for the callee to spill its
+# register parameters into, above the pushed return address. It is always
+# allocated, whatever the callee's arity, and the callee may use it for
+# anything -- so it is a second borrowable region, and unlike the one
+# `home_space_map` lends it does not require the function to call anything.
+#
+# That matters because a leaf can lend nothing today. `home_space_map` needs
+# `calls[i]`, since the 32 bytes it lends are the ones this function reserves
+# for ITS callees and a leaf reserves none. `no home space to borrow` is the
+# largest named cause anywhere in the residue -- 1,916 of the 3,533 surviving
+# 128-bit sites -- and it is mostly scalar float arithmetic whose destination
+# aliases its second source.
+#
+# Entry-relative, the return address is at `[0,8)` and the shadow at `[8,40)`.
+# `copy_reaches_home`'s own docstring has named both regions since Finding 96
+# and said only the callee one was at risk; this is the other half of that
+# sentence.
+CALLER_SHADOW = (8, 8 + HOME_SPACE)
+
+
+def rsp_depths(rows, frame, after_prologue):
+	"""Where `rsp` stands at each address, entry-relative, or a refusal.
+
+	Returns `({address: depth or None}, body_depth)`, or `(None, reason)`.
+
+	The shadow is addressed from `rsp`, so lending it needs `rsp`'s VALUE at
+	the save -- not merely, as the callee home space needs, the promise that
+	it has not moved since the prologue. The first attempt asked for the
+	weaker-looking property "nothing moves `rsp` after the prologue" and
+	refused 184,724 of 260,729 functions, because that is not a property
+	about frames at all: it is "the function has an epilogue".
+
+	**The model checks itself at every `ret`.** A return is reached with the
+	frame fully unwound, so the depth there must be exactly zero; a function
+	whose returns do not balance is one whose frame this has misread, and it
+	lends nothing. That check is the whole reason this is allowed to walk
+	linearly through code with branches in it.
+
+	The other half of that permission is the branch rule. A branch carries
+	its depth to a target the walk reaches by falling into it, so a branch
+	taken anywhere but at the body depth or at a fully unwound frame would
+	make its target's depth a guess. Refuse the function rather than guess.
+
+	An unknown depth is block-local rather than fatal. MSVC restores a large
+	frame with `mov %r11,%rsp`, which no walk can follow, and that is an
+	epilogue every site in the function precedes -- 1,122 starved sites sat
+	behind one. The unknown ends at the terminator, since the block after it
+	is entered by a branch and every branch source was just checked.
+	"""
+	body, depth, seen = -frame, 0, {}
+	for address, mnemonic, operands in rows:
+		seen[address] = depth
+		if mnemonic.startswith(("j", "loop")) and depth not in (body, 0):
+			return None, "a branch leaves at an unmodelled depth"
+		if mnemonic in ("ret", "retq"):
+			if depth is not None and depth != 0:
+				return None, "a return does not balance the frame"
+			depth = body
+			continue
+		if mnemonic in ("push", "pushq"):
+			depth = None if depth is None else depth - 8
+		elif mnemonic in ("pop", "popq"):
+			depth = None if depth is None else depth + 8
+		elif RSP_WRITTEN.search(operands or "") \
+				and not RSP_COPY.match(operands or ""):
+			step = immediate_step(mnemonic, operands, "%rsp")
+			depth = None if step is None or depth is None else depth + step
+		elif mnemonic in ("jmp", "jmpq"):
+			depth = body
+	if after_prologue is None and any(seen.values()):
+		# No unwind data at all. The ABI permits that only for a leaf that
+		# never moves `rsp`, so the frame was taken as zero above -- and
+		# this is where the code is asked whether it agrees.
+		return None, "no unwind data and rsp moves"
+	return seen, body
+
+
+def copy_reaches_home(rows, frame, region=None):
+	"""True if a copy of `rsp` could reach a home space, or cannot be
 	followed. Refusing is the answer to every doubt.
+
+	`region` is the entry-relative half-open range at risk, and it exists
+	because there are two of them. Left out, it is the callee home space
+	this function reserves, which is what every caller wanted until the
+	shadow borrow arrived; `CALLER_SHADOW` asks the same question of the 32
+	bytes this function's own caller reserved. One walk, two regions --
+	rather than a second copy of a hundred lines that would drift.
 
 	**There are two home spaces and only one is at risk.** The 32 bytes this
 	function's caller reserved sit above the return address; the 32 it
@@ -1002,9 +1109,11 @@ def copy_reaches_home(rows, frame):
 	on a property asserted in two docstrings rather than enforced by a
 	check, and it is worth 113 sites.
 	"""
-	if frame is None:
-		return True
-	low, high = -frame, -frame + HOME_SPACE
+	if region is None:
+		if frame is None:
+			return True
+		region = (-frame, -frame + HOME_SPACE)
+	low, high = region
 	taint, depth = {}, 0
 	for mnemonic, operands in rows:
 		operands = operands or ""
@@ -1111,7 +1220,7 @@ def home_space_map(binary, plain, ranges):
 	rva, size = struct.unpack_from("<II", data, pe + 24 + 112 + 3 * 8)
 	at = rva_to_offset(data, rva) if rva and size else None
 	fixed_frame = set()
-	unwind_at = {}
+	unwind_at, prologue_end = {}, {}
 	if at is not None:
 		for i in range(size // 12):
 			begin, end, unwind = struct.unpack_from("<III", data, at + i * 12)
@@ -1121,6 +1230,7 @@ def home_space_map(binary, plain, ranges):
 			if off is None or off + 4 > len(data):
 				continue
 			unwind_at[base + begin] = (off, base)
+			prologue_end[base + begin] = base + begin + data[off + 1]
 			if not data[off + 3] & 0xF:		# no frame register
 				fixed_frame.add(base + begin)
 
@@ -1177,16 +1287,142 @@ def home_space_map(binary, plain, ranges):
 			                                    ranges[i][0])):
 				touches[i] = True
 
+	# The shadow is worked out per function, on demand, because it is only
+	# ever asked about the few hundred that hold a starved site and the walk
+	# wants the function's whole instruction list. `plain` is in address
+	# order, so a function's rows are a slice of it and nothing is copied.
+	shadow = {"plain": plain, "unwind": unwind_at, "prologue": prologue_end,
+	          "data": data, "cache": {}}
 	return (starts, ranges,
 	        [calls[i] and not touches[i] and ranges[i][0] in fixed_frame
-	         for i in range(len(ranges))])
+	         for i in range(len(ranges))],
+	        shadow)
+
+
+def shadow_depths(home, i):
+	"""`{address: depth}` for function `i` if it can lend its caller's
+	shadow, or None. Memoised; see `rsp_depths` and `CALLER_SHADOW`.
+
+	Three questions, and the first two are the ones `home_space_map` already
+	asks of the other region -- does the function address it directly, and
+	can a copy of `rsp` reach it. The third is new and is what the shadow
+	costs: `rsp` must have a known value at the site, since the shadow is
+	addressed across a whole frame rather than from its bottom.
+	"""
+	_starts, ranges, _usable, state = home
+	if i in state["cache"]:
+		return state["cache"][i]
+	start, end = ranges[i]
+	plain, data = state["plain"], state["data"]
+	# **Only a function `.pdata` describes may lend its shadow**, which is
+	# the same restriction the callee home space has always had -- that one
+	# tests `ranges[i][0] in fixed_frame`, and `fixed_frame` is built from
+	# `.pdata` alone.
+	#
+	# The reason is that "entry `rsp`" has to mean something. A range
+	# `outside.py` recovered is admitted on being bracketed by `int3` and
+	# **entered by a call OR A JUMP**, and a range entered by a jump is not
+	# a function entry at all: `rsp` there stands wherever the jumping code
+	# left it, so the shadow is not 8 bytes above the walk's zero and the
+	# save lands in somebody's live locals. `.pdata` is the binary's own
+	# statement that a range is a function, and it is the only one worth
+	# having here.
+	#
+	# It costs 3 of the 2,153 starved sites, measured. `rsp_depths` can
+	# still model a frameless leaf and is tested doing so; what it cannot do
+	# is tell a leaf from the tail of somebody else's function.
+	if start not in state["unwind"]:
+		return state["cache"].setdefault(i, None)
+	frame = prologue_frame(data, state["unwind"], start)
+	if frame is None:
+		return state["cache"].setdefault(i, None)	# a frame register
+	# Index rather than slice: `plain[first:]` copies every remaining
+	# instruction, and there are millions.
+	rows = []
+	for position in range(bisect.bisect_left(plain, (start,)), len(plain)):
+		address, _encoding, mnemonic, operands = plain[position]
+		if address >= end:
+			break
+		rows.append((address, mnemonic, operands or ""))
+	seen, body = rsp_depths(rows, frame,
+	                        state["prologue"].get(start))
+	if seen is None:
+		return state["cache"].setdefault(i, None)
+	low, high = CALLER_SHADOW
+	for address, _mnemonic, operands in rows:
+		here = seen.get(address)
+		for match in RSP_MEMORY.finditer(operands):
+			text = match.group(1)
+			# An unknown depth is not an excuse to let an operand past: it
+			# is the one case where nothing can be said about where it
+			# lands, which is the same answer as landing inside.
+			if here is None or low <= (int(text, 16) if text else 0) - here \
+					< high:
+				return state["cache"].setdefault(i, None)
+	if any(RSP_COPY.match(operands) for _a, _m, operands in rows) \
+			and copy_reaches_home([(m, o) for _a, m, o in rows], None,
+			                      CALLER_SHADOW):
+		return state["cache"].setdefault(i, None)
+	return state["cache"].setdefault(i, seen)
+
+
+def borrow_offset(home, address):
+	"""Where a borrow at `address` writes, as a displacement from `rsp`, or
+	None if this function will lend nothing.
+
+	Zero is the callee home space at `(%rsp)`, which is what every borrow
+	used before the shadow existed and is returned unchanged. Anything else
+	is the caller's shadow, a whole frame higher up.
+	"""
+	if home is None:
+		return None
+	if home_space_free(home, address):
+		return 0
+	if SHADOW_RULE == SHADOW_OFF:
+		return None
+	starts, ranges, _usable, _state = home
+	i = bisect.bisect_right(starts, address) - 1
+	if i < 0 or address >= ranges[i][1]:
+		return None
+	seen = shadow_depths(home, i)
+	if seen is None:
+		return None
+	depth = seen.get(address)
+	return None if depth is None else CALLER_SHADOW[0] - depth
+
+
+def window_borrow(home, start, window):
+	"""`borrow_offset` for a whole window, or None if it is not one number.
+
+	A stub's save and its restore are written once, so the displacement has
+	to be right for every instruction the window covers. The callee home
+	space is at `(%rsp)` throughout by construction -- the function it
+	belongs to does not move `rsp` at all -- while the shadow's displacement
+	moves with `rsp`, so a window holding a `push` would restore from
+	somewhere the save never wrote. Finding 130.
+	"""
+	offset = borrow_offset(home, start)
+	if offset in (None, 0):
+		return offset
+	starts, ranges, _usable, state = home
+	i = bisect.bisect_right(starts, start) - 1
+	seen = shadow_depths(home, i)
+	plain = state["plain"]
+	here = seen.get(start)
+	for position in range(bisect.bisect_left(plain, (start,)), len(plain)):
+		address = plain[position][0]
+		if address >= start + window:
+			break
+		if seen.get(address) != here:
+			return None
+	return offset
 
 
 def home_space_free(home, address):
 	"""True if the function containing `address` can lend its home space."""
 	if home is None:
 		return False
-	starts, ranges, usable = home
+	starts, ranges, usable = home[0], home[1], home[2]
 	i = bisect.bisect_right(starts, address) - 1
 	if i < 0 or address >= ranges[i][1]:
 		return False
@@ -1219,7 +1455,7 @@ def swallowed_borrow(plain, address, encoding, operands, mnemonic, home):
 	The site's own spill block and this one cannot overlap either: `preceding`
 	is emitted before it and `displaced` after.
 	"""
-	if SPILL != SPILL_HOME or not home_space_free(home, address):
+	if SPILL != SPILL_HOME or borrow_offset(home, address) is None:
 		return None
 	fields = inplace.split_operands(operands)
 	registers = [o for o in fields if not o.startswith("$")]
@@ -2742,7 +2978,8 @@ def upper_half_read_later(instructions, index, register, limit=40,
 	return False
 
 
-def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons):
+def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons,
+                   base=0):
 	"""One swallowed instruction, bracketed by a save and restore if it
 	borrowed a register. Returns the bytes, or None.
 
@@ -2764,10 +3001,14 @@ def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons):
 		if reasons is not None:
 			reasons["a borrow bracket would wrap a control transfer"] += 1
 		return None
+	if borrowing and base is None:
+		if reasons is not None:
+			reasons["the window will not hold one borrow displacement"] += 1
+		return None
 	out = bytearray()
 	if borrowing:
 		saved = encode_spill(entry[5], True, stub_address + len(body),
-		                     spill_base)
+		                     spill_base, 0, base)
 		if saved is None:
 			if reasons is not None:
 				reasons["the swallowed borrow could not be saved"] += 1
@@ -2780,7 +3021,8 @@ def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons):
 	out += fixed
 	if borrowing:
 		restored = encode_spill(entry[5], False,
-		                        stub_address + len(body) + len(out), spill_base)
+		                        stub_address + len(body) + len(out),
+		                        spill_base, 0, base)
 		if restored is None:
 			if reasons is not None:
 				reasons["the swallowed borrow could not be restored"] += 1
@@ -2889,7 +3131,7 @@ def long_pair_stores(instructions, index, blocked, end):
 
 
 def close_stub(body, displaced, stub_address, pool, spill_base, reasons,
-               start, window):
+               start, window, base=0):
 	"""Whatever the window swallowed, then the jump home. Bytes, or None.
 
 	**A stub that returns before this has deleted its passengers.** Every
@@ -2911,7 +3153,7 @@ def close_stub(body, displaced, stub_address, pool, spill_base, reasons,
 	out = bytearray(body)
 	for entry in displaced:
 		fixed = emit_swallowed(entry, out, stub_address, pool, spill_base,
-		                       reasons)
+		                       reasons, base)
 		if fixed is None:
 			if reasons is not None:
 				reasons["a displaced instruction will not move"] += 1
@@ -2923,7 +3165,7 @@ def close_stub(body, displaced, stub_address, pool, spill_base, reasons,
 
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
                stub_address, scratch=None, pool=0, preceding=(),
-               strategy=None, spill_base=0, reasons=None):
+               strategy=None, spill_base=0, reasons=None, home=None):
 	"""The stub body for one window, placed at stub_address.
 
 	`start` is the window's first byte, which is the site's own address
@@ -2939,6 +3181,12 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	borrowing register n and giving it back.
 	"""
 	kind = strategy[0] if strategy is not None else None
+	# Where a borrow in this stub saves and restores, as a displacement from
+	# `rsp`. Zero is the callee home space, which is at `(%rsp)` for every
+	# instruction in the window because the function lending it does not
+	# move `rsp` at all. None means no borrow can be written here, and it
+	# only matters where the strategy wants one.
+	base = window_borrow(home, start, window) if home is not None else 0
 	if kind == "run":
 		# A run of 256-bit copies and whatever lies between them, all in one
 		# stub. It carries its own instruction list rather than using
@@ -2959,6 +3207,10 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			if reasons is not None:
 				reasons["a run borrow would wrap a control transfer"] += 1
 			return None, 0
+		if borrowed and base is None:
+			if reasons is not None:
+				reasons["the run will not hold one borrow displacement"] += 1
+			return None, 0
 		if len(borrowed) * SLOT > HOME_SPACE:
 			# The home space is what the ABI reserved and nothing says what
 			# lies past it. Refuse rather than reach. Finding 118.
@@ -2968,7 +3220,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		head = bytearray()
 		for slot, register in enumerate(borrowed):
 			saved = encode_spill(register, True, stub_address + len(head),
-			                     spill_base, slot)
+			                     spill_base, slot, base)
 			if saved is None:
 				if reasons is not None:
 					reasons["the run borrow could not be saved"] += 1
@@ -2982,14 +3234,15 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		out = bytearray(head) + body
 		for slot, register in enumerate(borrowed):
 			restored = encode_spill(register, False,
-			                        stub_address + len(out), spill_base, slot)
+			                        stub_address + len(out), spill_base, slot,
+			                        base)
 			if restored is None:
 				if reasons is not None:
 					reasons["the run borrow could not be restored"] += 1
 				return None, 0
 			out += restored
 		return close_stub(out, displaced, stub_address, pool, spill_base,
-		                  reasons, start, window), 0
+		                  reasons, start, window, base), 0
 	if kind == "pair":
 		# A 256-bit copy: both instructions become four 128-bit moves, so
 		# neither is lowered on its own.
@@ -2999,7 +3252,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the pair would not lower"] += 1
 			return None, 0
 		return close_stub(body, displaced, stub_address, pool, spill_base,
-		                  reasons, start, window), 0
+		                  reasons, start, window, base), 0
 	if kind == "longload" or kind == "longstore":
 		# One end of a long pair. The load's stub writes the upper half into
 		# a reserved register and the store's reads it back, so the two are
@@ -3013,7 +3266,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the long pair would not lower"] += 1
 			return None, 0
 		return close_stub(body, displaced, stub_address, pool, spill_base,
-		                  reasons, start, window), 0
+		                  reasons, start, window, base), 0
 	if kind == "splat":
 		# A `vinsertf128` that broadcasts the low half, and the store that
 		# follows it. The insert itself emits nothing -- both halves are
@@ -3025,7 +3278,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the splat store would not lower"] += 1
 			return None, 0
 		return close_stub(body, displaced, stub_address, pool, spill_base,
-		                  reasons, start, window), 0
+		                  reasons, start, window, base), 0
 	if kind == "splatop":
 		# A broadcast, one lane-wise operation on it, and the store of the
 		# result -- six instructions, no helper register, and the insert
@@ -3036,7 +3289,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the splat operation would not lower"] += 1
 			return None, 0
 		return close_stub(body, displaced, stub_address, pool, spill_base,
-		                  reasons, start, window), 0
+		                  reasons, start, window, base), 0
 	if kind == "splatrun":
 		# A broadcast and every store that follows it. The insert emits
 		# nothing -- the value it builds is already in the register the
@@ -3055,7 +3308,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the splat run would not lower"] += 1
 			return None, 0
 		return close_stub(body, displaced, stub_address, pool, spill_base,
-		                  reasons, start, window), 0
+		                  reasons, start, window, base), 0
 	if kind == "construn":
 		# Consecutive stores of read-only constants, taken together for the
 		# reason the zero run below is taken together: a four-byte store at
@@ -3068,7 +3321,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the constant run would not lower"] += 1
 			return None, 0
 		return close_stub(body, displaced, stub_address, pool, spill_base,
-		                  reasons, start, window), 0
+		                  reasons, start, window, base), 0
 	if kind == "zerorun":
 		# Consecutive stores of an all-zero register, taken together so that
 		# none of them has to widen its window over another. See `zero_run`.
@@ -3078,7 +3331,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the zero run would not lower"] += 1
 			return None, 0
 		return close_stub(body, displaced, stub_address, pool, spill_base,
-		                  reasons, start, window), 0
+		                  reasons, start, window, base), 0
 
 	body = bytearray()
 	prologue = 0
@@ -3097,6 +3350,10 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# save has to come before the lowering and the restore after it, so
 		# neither can live inside lower_vex.
 		borrowed = strategy[1]
+		if base is None:
+			if reasons is not None:
+				reasons["the site will not hold one borrow displacement"] += 1
+			return None, 0
 		if SPILL == SPILL_STACK:
 			body += STACK_OPEN
 			# Where the allocation is complete, which is what the unwind
@@ -3105,7 +3362,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			# instructions first.
 			prologue = len(body)
 		saved = encode_spill(borrowed, True, stub_address + len(body),
-		                     spill_base)
+		                     spill_base, 0, base)
 		if saved is None:
 			if reasons is not None:
 				reasons["the borrowed register could not be saved"] += 1
@@ -3119,7 +3376,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			return None, 0
 		body += lowered
 		restored = encode_spill(borrowed, False, stub_address + len(body),
-		                        spill_base)
+		                        spill_base, 0, base)
 		if restored is None:
 			if reasons is not None:
 				reasons["the borrowed register could not be restored"] += 1
@@ -3507,7 +3764,7 @@ def collect(binary, listing):
 					# for why the second matters here and did not in
 					# Finding 93.
 					lendable = (SPILL == SPILL_HOME
-					            and home_space_free(home, address)
+					            and borrow_offset(home, address) is not None
 					            and span_keeps_rsp(instructions, index, last))
 					assigned = assign_helpers(plain, positions, index,
 					                          members, lendable)
@@ -3832,7 +4089,7 @@ def collect(binary, listing):
 				# space is the one that has to ask permission, because it
 				# belongs to the function rather than to the rewriter.
 				if SPILL == SPILL_HOME \
-						and not home_space_free(home, address):
+						and borrow_offset(home, address) is None:
 					skipped["no home space to borrow"] += 1
 					declined[address] = "no home space to borrow"
 					continue
@@ -3953,7 +4210,7 @@ def collect(binary, listing):
 			continue
 		candidates.append((start, encoding, operands, mnemonic, window,
 		                   displaced, scratch, preceding, strategy))
-	return patches, candidates, stats, skipped, declined
+	return patches, candidates, stats, skipped, declined, home
 
 
 EXCEPTION_DIRECTORY = 3			# index into the data directory
@@ -4358,6 +4615,7 @@ def selftest():
 				failures += 1
 
 	failures += reach_selftest()
+	failures += shadow_selftest()
 	failures += borrow_selftest()
 	failures += splat_selftest()
 	failures += constant_selftest()
@@ -4814,6 +5072,56 @@ def borrow_selftest():
 	return failures
 
 
+# The rows of `REACH_CASES` are reused here on purpose. The MSVC prologue
+# idiom is the one that makes the point: `copy_reaches_home` proves it does
+# NOT reach the callee home space -- which is what Finding 96 rests on -- and
+# the same rows, the same walk, must say it DOES reach the caller's shadow,
+# because reaching the shadow is the whole reason the compiler writes it. A
+# region parameter that did nothing would pass one of these and fail the
+# other.
+SHADOW_CASES = [
+	("the MSVC idiom writing the caller's shadow",
+	 [("mov", "%rsp,%rax"), ("mov", "%rcx,0x8(%rax)"), ("push", "%rbx"),
+	  ("sub", "$0x20,%rsp"), ("mov", "%rcx,0x10(%rax)")], True),
+	("a store into the callee home space, a frame below the shadow",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
+	  ("mov", "%rcx,-0x28(%rax)")], False),
+	("a copy that walks up into the shadow",
+	 [("mov", "%rsp,%rax"), ("add", "$0x10,%rax"),
+	  ("mov", "%rcx,(%rax)")], True),
+	("a copy that stops below the return address",
+	 [("mov", "%rsp,%rax"), ("mov", "%rcx,(%rax)")], False),
+]
+
+# `rsp_depths` walks straight through branches, so what makes it sound is
+# the pair of rules that refuse the cases where walking straight through
+# would be a guess. Each case below is one of those rules, plus the two
+# shapes it must NOT refuse: MSVC's large-frame epilogue, which no walk can
+# follow and which every site precedes, and a leaf with no unwind data.
+DEPTH_CASES = [
+	("a plain frame, known throughout",
+	 [(0x10, "sub", "$0x28,%rsp"), (0x14, "vaddss", "%xmm0,%xmm1,%xmm0"),
+	  (0x18, "add", "$0x28,%rsp"), (0x1c, "ret", "")], 0x28, 0x14, -0x28),
+	("a return that does not balance the frame",
+	 [(0x10, "sub", "$0x28,%rsp"), (0x14, "ret", "")], 0x28, None,
+	 "a return does not balance the frame"),
+	("a branch taken at a depth the walk never modelled",
+	 [(0x10, "sub", "$0x28,%rsp"), (0x14, "push", "%rbx"),
+	  (0x18, "jne", "0x10")], 0x28, None,
+	 "a branch leaves at an unmodelled depth"),
+	("MSVC restoring a large frame from r11, which ends at the return",
+	 [(0x10, "vaddss", "%xmm0,%xmm1,%xmm0"), (0x14, "mov", "%r11,%rsp"),
+	  (0x18, "ret", ""), (0x1c, "vmulss", "%xmm0,%xmm1,%xmm0")],
+	 0x28, 0x1c, -0x28),
+	("a leaf with no unwind data, which must not move rsp",
+	 [(0x10, "vaddss", "%xmm0,%xmm1,%xmm0"), (0x14, "ret", "")],
+	 0, 0x10, 0),
+	("no unwind data and a push, which the ABI does not permit",
+	 [(0x10, "push", "%rbx"), (0x14, "pop", "%rbx"), (0x18, "ret", "")],
+	 0, None, "no unwind data and rsp moves"),
+]
+
+
 def reach_selftest():
 	"""Prove `copy_reaches_home` still discriminates. Failures, or 0.
 
@@ -4836,6 +5144,56 @@ def reach_selftest():
 	if not failures:
 		print(f"selftest: {len(REACH_CASES)} rsp-copy cases, caught in both "
 		      f"directions")
+	return failures
+
+
+def shadow_selftest():
+	"""Prove the shadow is a second region and the depth walk is sound.
+
+	Failures, or 0. See `CALLER_SHADOW` and `rsp_depths`.
+	"""
+	failures = 0
+	for what, rows, expected in SHADOW_CASES:
+		got = copy_reaches_home(rows, None, CALLER_SHADOW)
+		if got != expected:
+			print(f"selftest: {what}: the shadow walk said {got}, "
+			      f"want {expected}", file=sys.stderr)
+			failures += 1
+	for what, rows, frame, address, expected in DEPTH_CASES:
+		# A frame of zero stands for a function with no unwind data, which
+		# is the case `rsp_depths` checks the code agrees with.
+		seen, body = rsp_depths(rows, frame, None if not frame else rows[0][0])
+		# **A refusal is checked by its reason, not by a missing depth.**
+		# Asking `seen.get(address)` for a case that must be refused reads
+		# None from a refusal and None from an address the walk simply does
+		# not hold, so it passed with the balance check taken out -- caught
+		# by sabotaging the check the case exists to prove.
+		if isinstance(expected, str):
+			if seen is not None or body != expected:
+				print(f"selftest: {what}: the walk returned "
+				      f"{'a depth map' if seen is not None else repr(body)}, "
+				      f"want the refusal {expected!r}", file=sys.stderr)
+				failures += 1
+			continue
+		got = None if seen is None else seen.get(address)
+		if got != expected:
+			print(f"selftest: {what}: depth at {address:#x} was {got}, "
+			      f"want {expected}"
+			      f"{'' if seen is not None else f' (refused: {body})'}",
+			      file=sys.stderr)
+			failures += 1
+	# The displacement the shadow needs, against the two encodings it uses.
+	for base, want in ((0, "0f110c24"), (0x20, "0f114c2420"),
+	                   (0x1234, "0f118c2434120000")):
+		got = encode_spill(1, True, 0, 0, 0, base)
+		if got is None or got.hex() != want:
+			print(f"selftest: a borrow at {base:#x} encoded "
+			      f"{got.hex() if got else None}, want {want}",
+			      file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(SHADOW_CASES)} shadow reaches and "
+		      f"{len(DEPTH_CASES)} rsp depths, both directions")
 	return failures
 
 
@@ -4872,9 +5230,10 @@ def census(binary, listing, patched):
 	surviving address against a set of window *starts* missed every site
 	whose window began on the instruction before it.
 	"""
-	_patches, candidates, _stats, _skipped, declined = collect(binary, listing)
+	_patches, candidates, _stats, _skipped, declined, home = collect(
+		binary, listing)
 	placed, _blob, swallowed, overlapped, refused = place_stubs(
-		candidates, stub_base_of(open(binary, "rb").read()))
+		candidates, stub_base_of(open(binary, "rb").read()), home=home)
 	rewritten = {address for address, _window, *_rest in placed}
 	covered = set()
 	for address, window, *_rest in placed:
@@ -4939,8 +5298,17 @@ def main(argv):
 	# evaluation switch rather than a tuning knob: the default refuses the
 	# site, as it always has, and the other two exist so that all three can
 	# be built and compared. See Finding 46.
-	global SPILL, RSP_RULE
+	global SPILL, RSP_RULE, SHADOW_RULE
 	argv = list(argv)
+	for i, item in enumerate(argv):
+		if item.startswith("--shadow="):
+			SHADOW_RULE = item.split("=", 1)[1]
+			if SHADOW_RULE not in (SHADOW_OFF, SHADOW_ON):
+				print(f"detour.py: unknown shadow rule {SHADOW_RULE!r}",
+				      file=sys.stderr)
+				return 2
+			del argv[i]
+			break
 	for i, item in enumerate(argv):
 		if item.startswith("--rsp="):
 			RSP_RULE = item.split("=", 1)[1]
@@ -4968,7 +5336,7 @@ def main(argv):
 		return census(argv[1], argv[2], argv[3])
 
 	if mode == "plan":
-		_patches, candidates, stats, skipped, declined = \
+		_patches, candidates, stats, skipped, declined, _home = \
 			collect(argv[1], argv[2])
 		print(f"detour candidates (A/B/C) {len(candidates):>10,}")
 		# **A refusal inside an accepted window is not a residue.** A run is
@@ -5025,7 +5393,7 @@ def stub_base_of(data):
 
 
 def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
-                detail=None):
+                detail=None, home=None):
 	"""Choose and build the stubs. (placed, blob, swallowed, overlap, refused)
 
 	**One selection rule, executed once and used by both apply and verify.**
@@ -5114,7 +5482,7 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			body, prologue = build_stub(
 				start, encoding, operands, mnemonic, window + grew,
 				list(displaced) + extra, stub_address, scratch, pool,
-				preceding, strategy, spill_base)
+				preceding, strategy, spill_base, home=home)
 			if body is None:
 				# The extended stub would not build. Fall back to the plain
 				# one rather than lose both -- taking a passenger along must
@@ -5135,7 +5503,7 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			body, prologue = build_stub(
 				start, encoding, operands, mnemonic, window, displaced,
 				stub_address, scratch, pool, preceding, strategy, spill_base,
-				per if per is not None else reasons)
+				per if per is not None else reasons, home)
 			if per is not None:
 				if reasons is not None:
 					reasons.update(per)
@@ -5202,8 +5570,8 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 
 
 def apply_all(binary, listing, output):
-	patches, candidates, _stats, _skipped, _declined = collect(binary,
-	                                                          listing)
+	patches, candidates, _stats, _skipped, _declined, home = collect(
+		binary, listing)
 	data = bytearray(open(binary, "rb").read())
 	vaddr, raddr, _size = inplace.text_mapping(binary)
 
@@ -5236,7 +5604,7 @@ def apply_all(binary, listing, output):
 	# Every failure path names itself now. Finding 88.
 	stub_reasons = Counter()
 	placed, blob, _swallowed, overlapped, refused = place_stubs(
-		candidates, stub_base, spill_base, stub_reasons)
+		candidates, stub_base, spill_base, stub_reasons, home=home)
 
 	for site, window, stub_address, _length, _prologue in placed:
 		offset = raddr + (site - vaddr)
@@ -5411,11 +5779,12 @@ def verify(original, patched, listing=None):
 			       "to check they were swallowed deliberately")
 		return 1 if problems else 0
 
-	_patches, candidates, _stats, _skipped, _declined = collect(original,
+	_patches, candidates, _stats, _skipped, _declined, home = collect(
+		original,
 	                                                           listing)
 	# The same call apply makes, so the two cannot drift apart.
 	placed, _blob, swallowed, _overlapped, _refused = place_stubs(
-		candidates, stub_base_of(open(original, "rb").read()))
+		candidates, stub_base_of(open(original, "rb").read()), home=home)
 	groups = target_set.collect(original)
 	reachable = set()
 	for values in groups.values():

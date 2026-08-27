@@ -94,7 +94,7 @@ def main(argv):
 		loops.append((target, address + len(encoding)))
 
 	# Where the detours are.
-	patches, candidates, _stats, _skipped, _declined = detour.collect(
+	patches, candidates, _stats, _skipped, _declined, _home = detour.collect(
 		binary, listing)
 	committed = 0
 	detoured = []
