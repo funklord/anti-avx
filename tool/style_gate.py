@@ -1180,9 +1180,33 @@ def convert_c(text: str, width: int) -> str:
 					linkage_spec = False
 					namespace_spec = False
 				elif counting and c == "}":
+					# A closing brace ends a statement exactly as `;` does,
+					# so it closes the braceless bodies opened inside this
+					# block and restores the enclosing frame's floor -- the
+					# count still open AROUND the block. Zeroing it here
+					# dropped that floor, and the fault needed a braceless
+					# loop whose body is itself a block containing one:
+					#
+					#     for (int y = 0; y < rows; ++y)
+					#             for (int x = 0; x < cols; ++x) {
+					#                     for (int i = 0; i < n; ++i) {
+					#                             ...
+					#                     }
+					#                     if (ok) return {x, y};
+					#             }
+					#
+					# The innermost `}` lost the outer `for`'s body, so every
+					# following line was reported a tab too deep. It cost
+					# more than a false finding: qtty's findText had been
+					# indented two tabs and four spaces to silence it, which
+					# is the mixed indent code-style.md rule 2 forbids and
+					# which this gate accepts, counting leading tabs and
+					# reading the spaces as alignment. The tool rejected
+					# correct code, the code was bent to satisfy the tool,
+					# and the tool went quiet.
 					if stack:
 						stack.pop()
-					virtual = 0
+					virtual = stack[-1][3] if stack else 0
 					await_body = False
 					linkage_extern = False
 					linkage_spec = False
