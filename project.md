@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **796,091 of 805,131 VEX
-sites -- 98.9%** -- through 201,004 detours, and every `make detour-verify` invariant
-holds on the result. 9,040 sites are left, and the rewritten binary loads 305 modules
+**Status:** the rewriter works. `tool/detour.py` rewrites **796,232 of 805,131 VEX
+sites -- 98.9%** -- through 201,145 detours, and every `make detour-verify` invariant
+holds on the result. 8,899 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
 ---
@@ -7430,6 +7430,64 @@ belongs to also reaches a store, gets a distinct helper for every lifetime, pass
 upper-half guard, and does not take the site from a strategy that already had it. The last
 of those is new here and is the one that turned a gain into a loss.
 
+### Finding 125 -- a strategy that cannot lower a site was consuming it
+
+Finding 123 measured the reload rung at minus four and named the cause: `ymm_run` is tried
+before `long_pair_stores`, so a run that succeeds takes work the long pair was doing. It
+proposed changing the order the strategies are tried in.
+
+**The order was not the fault.** The fault was one `continue`.
+
+When every prefix of a run failed, `collect` recorded a reason and moved to the next
+instruction. So the site was *declined* -- and the zero store, the long pair, the constant
+store and the ordinary path never saw it. The pair did the same one level up: a site with
+a `pair_reason` was declined before any of them ran. **Two strategies that could not lower
+a site were each entitled to end its chances.**
+
+The reason machinery for exactly this already existed. `held_back` was written in Finding
+75 so that a pair's refusal would be recorded only if the run declined too -- "its reason
+is held back and only recorded if the run declines too", in the collector's own words. It
+was doing that for the reason and not for the site.
+
+Now the reason is carried past every strategy that follows and recorded only where the
+site finally lands.
+
+```
+                                            before   after
+ymm upper half read later                      106      40
+ymm value has no known upper half           10,086  10,015
+no register free across the ymm run            212     203
+ymm run upper half read later                   37      30
+the long pair store would not lower             20      28
+outside .pdata                                 321     325
+────────────────────────────────────────────────────────
+not inside any accepted window               6,979   6,838
+```
+
+**A hundred and forty-one sites.** Sixty-six of them are the `ymm upper half read later`
+bucket, which is the pair saying "I cannot do this" and, until now, also saying "and
+nobody else may try". The long pair gains work rather than losing it -- its own refusal
+bucket rises from 20 to 28, which is what a strategy being *offered* more sites looks
+like.
+
+#### Why it took a hundred findings to see
+
+Every strategy here was added by measuring what it could take, and each was added at the
+front of the chain where its own shape is cheapest to recognise. Nobody measured what a
+strategy *costs the ones behind it* -- and the cost is invisible from inside the strategy,
+because a declined site looks identical whether it was declined by the last strategy or
+the first.
+
+The census could not show it either. `skipped` counts a reason per site, so a site
+declined early is one line and a site declined late is one line, and the two are
+indistinguishable. What made it visible was Finding 123 measuring a change that made
+things *worse* and asking where the sites went.
+
+**The generalisation is worth more than the 141.** Four strategies are tried in an order
+nothing has ever justified, and this closes only the two exits that were unconditional.
+Whether `ymm_run` should be tried before `long_pair_stores` at all is still unmeasured;
+what is fixed is that failing no longer forecloses.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7544,10 +7602,11 @@ last one is what turned the reload from a gain into a loss: `ymm_run` is tried b
 `long_pair_stores`, so a longer run swallows loads the long pair was claiming and then
 fails for want of a second helper. See Finding 123.
 
-So the next thing is not another rung. It is the **order** the strategies are tried in,
-which nothing has ever measured: `ymm_run` first, then the zero store, then the long pair,
-then the ordinary path. The reload rung would pay if the run deferred to the long pair
-rather than out-running it, and that is a property of the order rather than of any walk.
+So the next thing was not another rung, and it was not the order either. **A strategy
+that could not lower a site was declining it**, so the three behind it never saw it --
+one `continue`, worth 141 sites. Finding 125. What is still unmeasured is whether
+`ymm_run` should be tried before `long_pair_stores` at all; what is fixed is that failing
+no longer forecloses.
 
 **And the wall behind all of it is unchanged.** In the six functions holding 822 of the
 refused 256-bit sites, all sixteen xmm are named, twelve to sixteen ymm are live at the
@@ -8349,7 +8408,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,091 of 805,131 VEX sites, 98.9%** (Findings 24 to 118), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,232 of 805,131 VEX sites, 98.9%** (Findings 24 to 125), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | **PART-BUILT, and the two halves are at different stages.** The Class H helpers are written and exhaustively tested -- `src/f16c.c`, `src/permil.c`, `src/permd.c`, `src/fmaddsub.c`, through `make check-f16c`, `check-f16c-oracle`, `check-permil`, `check-permd` and `check-fmaddsub`, all in `make check` -- but **the rewriter calls none of them and nothing links one into a PE**. The one Class H form `tool/detour.py` does lower is `vpermilps` with a control vector, and it is *inlined* as the `pshufb` sequence rather than called (`lower_permilps`, because a `call` inside a stub pushes a return address into code with no `.pdata`); `make check-pe`'s `permilps` fixture runs that lowering under wine. `vpermd`, `vperm2f128`, `vpermq`, `vpermpd`, `vcvtph2ps`/`vcvtps2ph` and `vfmsubadd*` all reach `lower: no direct SSE form and not a sequence` and are refused. In `tool/lower.py` the rules are thinner than the helpers: `vpermd` emits a bare `call permd` with no operand marshalling, and both F16C mnemonics are class `HELPER` with **no body at all**, so `make verify` never assembles them. **The Y2 shadow does not exist anywhere.** Two rules name it -- `Y2/extract` and `Y2/insert`, emitting the pseudo-operand `shadow(%reg)` -- and `verify` rewrites that to `(%rsp)` before assembling, so no shadow slot has ever been allocated, written or executed. `tool/detour.py` has no shadow area: its `shadow` is a helper *register* for Finding 50's gapped copy, and `lower_ymm_pair` states in terms that what it leaves behind **is** the Y2 case. Finding 7's 574 sites are untouched. |
 
@@ -8500,7 +8559,7 @@ size of it.** Finding 74 put the rewritten binary 866 bytes past where the origi
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. That number was the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 9,040 that remain has to go before any of this can be
+immediately, and every one of the 8,899 that remain has to go before any of this can be
 soaked.
 
 **What the run adds is a measuring instrument, and it has been the better half of the

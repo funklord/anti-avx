@@ -3342,6 +3342,11 @@ def collect(binary, listing):
 
 		strategy = None
 		y_reason = []
+		# What a Y strategy said when it could not lower this site. **A
+		# strategy that cannot lower a site must not consume it**, so the
+		# reason is carried past the strategies that follow and recorded
+		# only if none of them takes the site either. See Finding 125.
+		carried = None
 		# A 256-bit copy through one ymm, taken as a unit. Both halves of
 		# it are refused individually -- there is no SSE form of either --
 		# so this has to be seen before either is considered alone.
@@ -3522,16 +3527,17 @@ def collect(binary, listing):
 				if taken is not None:
 					candidates.append(taken)
 					continue
-				refusal = held_back(
+				# This declined the site outright, so the zero store, the
+				# long pair, the constant and the ordinary path never saw
+				# it -- and Finding 123 measured the same fault from the
+				# other side, where a run that SUCCEEDED took work the long
+				# pair was doing. Carry the reason instead; `held_back`
+				# already does exactly this for the pair one level up.
+				carried = held_back(
 					pair_reason,
 					refusal or "no register free across the ymm run")
-				skipped[refusal] += 1
-				declined[address] = refusal
-				continue
-		if pair_reason is not None:
-			skipped[pair_reason] += 1
-			declined[address] = pair_reason
-			continue
+		if carried is None:
+			carried = pair_reason
 
 		# A 256-bit store of a register a VEX.128 zeroing idiom emptied.
 		# Both halves are zero, so it is two 128-bit stores of the same
@@ -3546,8 +3552,10 @@ def collect(binary, listing):
 					if lower_ymm_zero_store(vex, encoding[vex["length"]:],
 					                        address, len(encoding),
 					                        address) is None:
-						skipped["ymm store operand cannot be offset"] += 1
-						declined[address] = "ymm store operand cannot be offset"
+						told = carried or \
+							"ymm store operand cannot be offset"
+						skipped[told] += 1
+						declined[address] = told
 						continue
 					# **Consecutive zero stores compete for the same
 					# padding**, so take the group as one window before
@@ -3603,8 +3611,9 @@ def collect(binary, listing):
 							 ("longstore", (vex, tail,
 							                long_shadow[address]))))
 						continue
-					skipped["the long pair store would not lower"] += 1
-					declined[address] = "the long pair store would not lower"
+					told = carried or "the long pair store would not lower"
+					skipped[told] += 1
+					declined[address] = told
 					continue
 				else:
 					# **The value may be a constant, and then the store can
@@ -3613,14 +3622,16 @@ def collect(binary, listing):
 					# from the read-only bytes the register was loaded from,
 					# so a call, a loop or a branch target in between costs
 					# nothing. See `constant_ymm`.
-					held = constant_ymm(instructions, index, fields[0],
-					                    blocked, readonly, sources=sources)
-					if held is None:
-						skipped["ymm value has no known upper half"] += 1
-						declined[address] = \
+					constant = constant_ymm(instructions, index, fields[0],
+					                        blocked, readonly,
+					                        sources=sources)
+					if constant is None:
+						told = carried or \
 							"ymm value has no known upper half"
+						skipped[told] += 1
+						declined[address] = told
 						continue
-					strategy = ("conststore", held)
+					strategy = ("conststore", constant)
 					# **Consecutive constant stores compete for the same
 					# padding**, and harder than the zero stores of Finding
 					# 81 do: the one Starfield stops in is at the head of a
@@ -3737,8 +3748,8 @@ def collect(binary, listing):
 			# The reason comes from `ymm_run` itself rather than from a
 			# second walk beside it: two code paths answering one question
 			# is how a collector and an encoder come to disagree.
-			told = (y_reason[0] if y_reason
-			        else "256-bit, no Y strategy took it")
+			told = carried or (y_reason[0] if y_reason
+			                   else "256-bit, no Y strategy took it")
 			skipped[told] += 1
 			declined[address] = told
 			continue
