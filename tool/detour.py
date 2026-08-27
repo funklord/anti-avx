@@ -540,7 +540,7 @@ def spill_candidates(registers):
 	used = set()
 	for operand in registers:
 		used.update(scratch_finder.xmm_numbers(operand))
-	return [number for number in range(16) if number not in used]
+	return [number for number in VOLATILE_XMM if number not in used]
 
 
 def borrow_that_lowers(address, encoding, operands, mnemonic, at, pool=0):
@@ -611,6 +611,25 @@ def encode_spill(borrowed, save, at, spill_base, slot=0):
 
 # One saved register, and how many of them the home space holds.
 SLOT = 16
+
+# **Only a volatile register may be borrowed, and this used to be luck.**
+# Win64 makes xmm0-xmm5 volatile and xmm6-xmm15 the callee's to preserve. A
+# borrow saves and restores, so within the stub either kind is fine -- and a
+# borrow bracket cannot contain a call, because `ymm_run` breaks on every
+# control transfer and `swallowed_borrow` brackets one instruction. The only
+# way out of a live bracket is a FAULT, and there the unwinder restores
+# xmm6-xmm15 from the primary's `UWOP_SAVE_XMM128` codes, which a primary
+# that never used the register does not have. The caller's value is sitting
+# in the home space at that moment and is lost.
+#
+# `spill_candidates` returned `range(16)`, lowest first, so it reached a
+# nonvolatile register only when every volatile one was named -- and
+# measured over the whole binary, that never happens: of 29,712 saves, xmm0
+# takes 16,474, xmm1 10,611, xmm2 1,940, xmm3 640, xmm4 36, xmm5 11, and
+# **xmm6 to xmm15 take none**. So the restriction costs nothing here and
+# turns safe-by-accident into safe-by-construction. A binary that needs one
+# gets a named refusal rather than a silent risk. Finding 124.
+VOLATILE_XMM = tuple(range(6))
 
 # sub $16,%rsp and add $16,%rsp, which the pool spill does not need.
 STACK_OPEN = bytes([0x48, 0x83, 0xEC, 0x10])
@@ -1937,6 +1956,24 @@ def ymm_run(instructions, index, blocked, limit=48, why=None):
 			at = next_address + len(bits)
 			continue
 		if what is not None and what[0] == "load" and what[1] not in tracked:
+			# **A reload is refused, and it was measured rather than
+			# assumed.** `lifetimes` has been ready for one since Finding 77
+			# rekeyed it from the register to the position, and letting the
+			# walk carry on through a reload is four lines. It costs four
+			# sites.
+			#
+			# Where they go is the interesting part. A run that continues
+			# through a reload swallows loads `long_pair_stores` used to
+			# claim -- `ymm_run` is tried first -- and then fails for want of
+			# a second helper, so the site is lost both ways: `loaded and
+			# never stored` falls by 47 and `no register free across the ymm
+			# run` rises by 56, `the long pair store would not lower` falls
+			# from 20 to 8, and 46 more stores land in `no known upper half`.
+			# Net 6,979 to 6,983.
+			#
+			# What would make it pay is deferring to the long pair rather
+			# than out-running it, which is a change to the order of the
+			# strategies and not to this walk. Finding 123.
 			tracked.add(what[1])
 			members.append(("load", position, what[1]))
 			at = next_address + len(bits)
@@ -2130,7 +2167,7 @@ def assign_helpers(plain, positions, index, members, lendable=False):
 			# does not itself name. Finding 95.
 			if not lendable:
 				return None
-			free = set(range(16)) - taken - set(own)
+			free = set(VOLATILE_XMM) - taken - set(own)
 			for position in list(stores) + [load_at]:
 				free -= set(scratch_finder.xmm_numbers(plain[position][3]))
 			if not free:

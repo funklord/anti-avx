@@ -7354,6 +7354,82 @@ is a statement about elements while the set's requirement is about lanes. AVX ho
 operations are defined per 128-bit lane, so they qualify. The exclusion was safe by
 conservatism and wrong by its stated reason.
 
+### Finding 123 -- the borrow was volatile-only by luck, and the reload rung costs four
+
+Two changes measured together and separated afterwards, because measuring them together
+said the wrong thing about both.
+
+#### Only a volatile register may be borrowed
+
+Win64 makes xmm0-xmm5 volatile and xmm6-xmm15 the callee's to preserve. A borrow saves and
+restores, so inside the stub either kind is fine -- and a borrow bracket cannot contain a
+call, since `ymm_run` breaks on every control transfer and `swallowed_borrow` brackets one
+instruction. **The only way out of a live bracket is a fault**, and there the unwinder
+restores xmm6-xmm15 from the primary's `UWOP_SAVE_XMM128` codes, which a primary that
+never used the register does not have. The caller's value is in the home space at that
+moment and is lost.
+
+`spill_candidates` returned `range(16)`, lowest first, so it reached a nonvolatile register
+only when every volatile one was named. Measured over the whole binary by wrapping
+`encode_spill`:
+
+```
+saves of a volatile register (xmm0-5)      29,712
+saves of a nonvolatile register (xmm6-15)       0
+
+  xmm0 16,474   xmm1 10,611   xmm2 1,940   xmm3 640   xmm4 36   xmm5 11
+```
+
+**Zero.** So the restriction costs nothing, and the plan run confirms it to the site: with
+`VOLATILE_XMM` reverted the candidate count, the residue and every bucket are identical.
+What changes is that a property held by accident is now held by construction, and a binary
+that needs a nonvolatile borrow gets a named refusal rather than a silent risk.
+
+#### The reload rung is worth minus four
+
+`ymm_run` stopped when a load targeted a register it already tracked. `lifetimes` has been
+ready for that since Finding 77 rekeyed it from the register to the position "before the
+thing that needs it", and letting the walk carry on is four lines. A scoping pass costed it
+at 86 reached.
+
+```
+                                                    before   after
+ymm value has no known upper half                   10,086  10,132
+no register free across the ymm run                    212     268
+256-bit: loaded and never stored before arithmetic      59      12
+the long pair store would not lower                     20       8
+────────────────────────────────────────────────────────────────
+not inside any accepted window                       6,979   6,983
+```
+
+**It takes work away from a strategy that was succeeding.** `ymm_run` is tried before
+`long_pair_stores`, so a run that carries on through a reload swallows loads the long pair
+used to claim -- and then fails for want of a second helper, losing the site both ways. 47
+sites leave `loaded and never stored` and 56 arrive in `no register free`; the long pair
+falls from 20 to 8 and 46 more stores land in `no known upper half`.
+
+Reverted, with the measurement kept in the code beside the condition it explains. **What
+would make it pay is deferring to the long pair rather than out-running it**, which is a
+change to the order in which strategies are tried and not to this walk.
+
+#### Three estimates, three measurements
+
+The ladder that came out of the scoping pass is now measured end to end, and the pattern
+is worth naming rather than repeating:
+
+```
+                                       estimated   measured
+retry assign_helpers at earlier stores        14         +3
+vextractf128 with a tracked source           113        +50
+a 256-bit reload of a tracked register        86         -4
+carry a lane-safe ALU inside a run           320    +4 (unbuilt)
+```
+
+Every estimate counted **positions that qualify**. A site is gained only when the run it
+belongs to also reaches a store, gets a distinct helper for every lifetime, passes the
+upper-half guard, and does not take the site from a strategy that already had it. The last
+of those is new here and is the one that turned a gain into a loss.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7448,39 +7524,61 @@ as refused sites in a bucket that reads like work. `census` already files 81 of 
 is about two per cent smaller than its headline, and nothing needs doing about it except
 knowing.
 
-### What is worth building next, with the number behind each
+### What is worth building next, and what the ladder cost to find out
 
-Ranked by what was measured rather than by what looks large, and every count here is
-**sites reached**, not sites gained -- Finding 115 is about the difference:
+The scoping pass that produced this list ranked four rungs by what a walk *reaches*. All
+four are measured now, and the estimates did not survive:
 
 ```
-retry assign_helpers at each earlier store, not only the last     +14
-  318 accepted runs -> 325, 656 covered 256-bit sites -> 670.
-  No new rule, and it has to be in place before the next two:
-  a longer run is harder to give helpers to, and without a
-  fallback to the plain walk, carrying anything LOSES runs.
-
-vextractf128 $1 with a tracked source                        113 reached
-  `movaps H(S),%xmmD` and nothing else, once the halves are
-  in separate registers. 383 in the binary.
-
-a 256-bit reload of an already-tracked register               86 reached
-  What Finding 77 rekeyed `lifetimes` on position for.
-
-carry a lane-safe 256-bit ALU inside a run                      4 accepted
-  Costed at 320 by a scoping pass and measured at 4. Build it
-  for what the representation work will need, not for the count.
+                                            estimated   measured
+retry assign_helpers at earlier stores             14         +3   built
+vextractf128 with a tracked source                113        +50   built
+a 256-bit reload of a tracked register             86         -4   reverted
+carry a lane-safe ALU inside a run                320         +4   not built
 ```
 
-**And the wall behind all of them.** In the six functions holding 822 of the refused
-256-bit sites, all sixteen xmm are named, twelve to sixteen ymm are live at the peak,
-`function_scope` lends nothing and four of the six cannot lend home space. `find_scratch`
-finds a register at 45.7% of the 3,186 against 89.3% for sites already taken in the same
-functions, so the residue is the adversarial tail of that distribution. **The next real
-question is not an allocator but where a spill can live**, and that was closed on unwind
-grounds -- `--spill=stack` hands the unwinder a frame sixteen bytes wrong, `--spill=pool`
-cannot be made thread-safe, `--spill=home` is 32 bytes. Re-opening it is a decision, not a
-piece of coding.
+**Every estimate counted positions that qualify.** A site is gained only when the run it
+belongs to also reaches a store, gets a distinct helper for every lifetime, passes the
+upper-half guard -- and does not take the site from a strategy that already had it. That
+last one is what turned the reload from a gain into a loss: `ymm_run` is tried before
+`long_pair_stores`, so a longer run swallows loads the long pair was claiming and then
+fails for want of a second helper. See Finding 123.
+
+So the next thing is not another rung. It is the **order** the strategies are tried in,
+which nothing has ever measured: `ymm_run` first, then the zero store, then the long pair,
+then the ordinary path. The reload rung would pay if the run deferred to the long pair
+rather than out-running it, and that is a property of the order rather than of any walk.
+
+**And the wall behind all of it is unchanged.** In the six functions holding 822 of the
+refused 256-bit sites, all sixteen xmm are named, twelve to sixteen ymm are live at the
+peak, `function_scope` lends nothing and four of the six cannot lend home space.
+`find_scratch` finds a register at 45.7% of the 3,186 against 89.3% for sites already
+taken in the same functions. **The next real question is where a spill can live**, and
+Finding 123's companion measured every road:
+
+  * `--spill=stack` is closed by the ABI's own sentence rather than by a corpus count --
+    a chained fragment's fixed allocation must equal its primary's, and four unwind
+    encodings all hand the handler a frame that tracks `rsp`. Finding 49's "re-run this
+    the day a Windows host exists" can be retired: a Windows host cannot change it.
+  * **Static TLS is feasible and priced.** Raising the TLS directory's `SizeOfZeroFill`
+    from 0 to 32 is a four-byte field edit; the loader then allocates and zeroes 32 bytes
+    per thread at block offset 12,896, which is 16-aligned. Proven under wine, including
+    the discriminating pair that shows the block really is that big and that writing it
+    leaves the image template untouched. Addressing costs one general-purpose register and
+    three instructions, and restricted to r8-r11 -- none of which any x86-64 instruction
+    implicitly reads -- `function_scope`'s own whole-function argument reaches **740 of
+    the 1,876** starved sites, or 226 for a two-register form. Its failure mode is the
+    only one here that is not silent corruption: the bytes belong to nobody but the
+    rewriter.
+  * The 1,154 `rsp`-copy refusals are three problems, not one: 702 store the copy to
+    memory, 317 index through it, 135 do arithmetic on it. The first 702 are the largest
+    single lever and need no analysis at all -- no borrow window can contain a call, so
+    nothing can dereference an escaped pointer while a borrow is live, which is Finding
+    98's argument at 702 sites rather than the 113 that made it not worth enforcing.
+  * The caller's shadow -- the 32 bytes `[entry_rsp+8, entry_rsp+40)` that this function's
+    own caller reserved -- reaches 245 sites, 150 of them outside any window, and all 150
+    are leaf functions. Reported and not built: it writes on parameters rather than
+    locals.
 
 ### What each tool is for
 
