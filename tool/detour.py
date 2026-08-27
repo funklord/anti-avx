@@ -569,17 +569,27 @@ def spill_register(registers):
 	return candidates[0] if candidates else None
 
 
-def encode_spill(borrowed, save, at, spill_base):
+def encode_spill(borrowed, save, at, spill_base, slot=0):
 	"""Save or restore a borrowed register. `save` picks the direction.
 
 	**`movups`, not `movaps`.** Win64 guarantees `rsp` is 16-byte aligned at
 	a call boundary and says nothing about an arbitrary instruction in the
 	middle of a function, so an aligned move here would fault on exactly the
 	sites that are hardest to reproduce.
+
+	**`slot` is which sixteen bytes, and it used to be nowhere.** Every save
+	emitted `(%rsp)` -- no displacement, whatever the register -- and a run
+	that borrows two helpers saves both to the same sixteen bytes and
+	restores both from them, so the first register comes back holding the
+	second's value. It assembles, it verifies, the census is clean, and the
+	program computes with a register the caller owns. There are two slots
+	because the home space is 32 bytes; `build_stub` refuses a third rather
+	than reaching past what the ABI reserved. Finding 118.
 	"""
 	opcode = b"\x0f\x11" if save else b"\x0f\x10"
 	if SPILL == SPILL_POOL:
-		return encode_rip(None, opcode, borrowed, spill_base, at)
+		return encode_rip(None, opcode, borrowed, spill_base + slot * SLOT,
+		                  at)
 	# The home space and the stack spill address the same place -- `(%rsp)`
 	# -- and differ only in whether `rsp` was moved to make room first. The
 	# home space needs no room made.
@@ -587,10 +597,19 @@ def encode_spill(borrowed, save, at, spill_base):
 	if borrowed >= 8:
 		out.append(0x44)			# REX.R
 	out += opcode
-	out.append(((borrowed & 7) << 3) | 4)	# mod 00, rm 100 -- SIB follows
-	out.append(0x24)			# base rsp, no index
+	offset = slot * SLOT
+	if offset:
+		out.append(0x40 | ((borrowed & 7) << 3) | 4)	# mod 01, disp8
+		out.append(0x24)			# base rsp, no index
+		out.append(offset)
+	else:
+		out.append(((borrowed & 7) << 3) | 4)	# mod 00, rm 100 -- SIB
+		out.append(0x24)
 	return bytes(out)
 
+
+# One saved register, and how many of them the home space holds.
+SLOT = 16
 
 # sub $16,%rsp and add $16,%rsp, which the pool spill does not need.
 STACK_OPEN = bytes([0x48, 0x83, 0xEC, 0x10])
@@ -2849,10 +2868,16 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# it**, so the bracket encloses the whole span -- which is why
 		# `span_keeps_rsp` had to vouch for it. See Finding 95.
 		borrowed = sorted(strategy[1][2]) if len(strategy[1]) > 2 else []
+		if len(borrowed) * SLOT > HOME_SPACE:
+			# The home space is what the ABI reserved and nothing says what
+			# lies past it. Refuse rather than reach. Finding 118.
+			if reasons is not None:
+				reasons["the run borrows more than the home space holds"] += 1
+			return None, 0
 		head = bytearray()
-		for register in borrowed:
+		for slot, register in enumerate(borrowed):
 			saved = encode_spill(register, True, stub_address + len(head),
-			                     spill_base)
+			                     spill_base, slot)
 			if saved is None:
 				if reasons is not None:
 					reasons["the run borrow could not be saved"] += 1
@@ -2864,9 +2889,9 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the run would not lower"] += 1
 			return None, 0
 		out = bytearray(head) + body
-		for register in borrowed:
+		for slot, register in enumerate(borrowed):
 			restored = encode_spill(register, False,
-			                        stub_address + len(out), spill_base)
+			                        stub_address + len(out), spill_base, slot)
 			if restored is None:
 				if reasons is not None:
 					reasons["the run borrow could not be restored"] += 1
@@ -4237,6 +4262,7 @@ def selftest():
 	failures += passenger_selftest()
 	failures += prefix_selftest()
 	failures += extract_selftest()
+	failures += spill_slot_selftest()
 
 	if failures:
 		print(f"selftest: {failures} of {len(SELFTEST)} lowerings are wrong",
@@ -4591,6 +4617,48 @@ def extract_selftest():
 	if not failures:
 		print(f"selftest: {len(cases)} extract shapes, one accepted and "
 		      f"{len(cases) - 1} refused")
+	return failures
+
+
+def spill_slot_selftest():
+	"""Prove two borrowed registers do not share sixteen bytes.
+
+	They did. `encode_spill` emitted `(%rsp)` with no displacement whatever
+	the register, so a run borrowing two helpers saved both to the same slot
+	and restored both from it -- the first came back holding the second's
+	value, and every structural check was clean. Finding 118.
+	"""
+	failures = 0
+	saved = [encode_spill(2, True, 0, 0, slot) for slot in (0, 1)]
+	if saved[0] == saved[1]:
+		print("selftest: two spill slots encode identically", file=sys.stderr)
+		failures += 1
+	# mod 01 with a disp8 of 16, base rsp: 0f 11 54 24 10.
+	if saved[1] != bytes.fromhex("0f11542410"):
+		print(f"selftest: slot 1 encodes {saved[1].hex()}, want 0f11542410",
+		      file=sys.stderr)
+		failures += 1
+	# The restore must address the same bytes as the save it pairs with, so
+	# the two encodings differ in the opcode byte and nowhere else.
+	for register in (2, 9):
+		for slot in (0, 1):
+			store = encode_spill(register, True, 0, 0, slot)
+			load = encode_spill(register, False, 0, 0, slot)
+			apart = sum(1 for a, b in zip(store, load) if a != b)
+			if len(store) != len(load) or apart != 1:
+				print(f"selftest: xmm{register} slot {slot} restores from a "
+				      f"different address ({apart} bytes apart)",
+				      file=sys.stderr)
+				failures += 1
+	# Two slots is what the home space holds; a third would reach past what
+	# the ABI reserved, and `build_stub` refuses rather than encoding it.
+	if HOME_SPACE // SLOT != 2:
+		print(f"selftest: the home space holds {HOME_SPACE // SLOT} slots, "
+		      f"and the refusal in build_stub says two", file=sys.stderr)
+		failures += 1
+	if not failures:
+		print("selftest: two borrowed registers get two slots, and a third "
+		      "is refused")
 	return failures
 
 

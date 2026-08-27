@@ -6997,6 +6997,80 @@ held one. It failed safe, which is why nothing caught it: `selftest` passed, `ch
 passed, and the only symptom was a PE sample that produced no detour at all. The name is
 `register` and `_held` now, and the fixture is what found it.
 
+### Finding 118 -- forty-two stubs saved two registers to the same sixteen bytes
+
+`encode_spill` emitted `movups %xmm,(%rsp)` -- mod 00, no displacement -- for every
+borrowed register, and `build_stub`'s run path loops over the borrowed set calling it once
+per register. **Two helpers therefore saved to the same sixteen bytes and restored from
+them, and the first register came back holding the second's value.**
+
+Measured on the binary as built, by wrapping `build_stub` and running the real selection:
+
+```
+run stubs borrowing 0 registers    1,741
+                    1                138
+                    2                 38
+                    3                  4
+```
+
+**Forty-two.** Not a latent shape this time: 42 stubs in the image that has been rebuilt,
+verified and run under Proton five times were writing a caller's live register into a slot
+another save had already taken. `0x140615c9c` borrows xmm0 and xmm1; `0x1406a8510` borrows
+xmm0, xmm1 and xmm2.
+
+#### Everything passed
+
+This is the fourth defect here to produce silently wrong output while every structural
+check stayed green, and it is the purest of them. The bytes assemble. No VEX survives. The
+census reconciles. `verify` finds every lost boundary deliberate and every branch target
+still an instruction. **The borrow is invisible to all of it by construction** -- a
+borrowed register is one the original program never named, so nothing in the tool's model
+of the original has an opinion about what is in it, and the save and the restore are a
+matched pair whatever address they name. Two pairs naming one address is a fact about
+arithmetic, not about shape, and shape is all these checks see.
+
+What would have caught it is the thing this project keeps arriving at: asking what the
+code computes. No `check-pe` sample borrows twice -- `homespill` borrows one register, and
+one register is always correct.
+
+#### The fix, and the refusal that comes with it
+
+`encode_spill` takes a `slot` now, and the run path enumerates the borrowed registers into
+slots. The home space is 32 bytes, so it holds two; **a third is refused** rather than
+reaching past what the ABI reserved:
+
+```
+placed        201,008 -> 201,004
+refused           737 ->     741
+VEX in .text    9,016 ->   9,040
+```
+
+Exactly the four three-register runs, which is the count agreeing with itself from two
+directions -- the wrapper counted four before the fix and `place_stubs` refuses four
+after.
+
+**The fix costs twenty-four sites**, and that is the right sign. Those twenty-four were
+being lowered by stubs that overwrote a saved register, so they were not translated
+sites; they were wrong ones. The residue going up is the count becoming honest.
+
+The 38 two-register runs keep working and now write 32 bytes rather than 16 of the home
+space. That is still inside the region Win64 reserves for the callee and still below any
+frame the function built, so the argument of Finding 73 is unchanged in kind; what changes
+is that it now uses the whole of what it was already entitled to.
+
+#### Two things this did not fix, named because they are the same region
+
+A borrowed **nonvolatile** register -- xmm6 to xmm15 -- is a second question, and it is
+open. `spill_candidates` returns `range(16)` minus the names the site uses, and the run's
+fallback is `min(range(16) - taken - own - the run's registers)`; both can pick xmm7. While
+the borrow is live the caller's value is in the home space, and if the lowering faults
+there, the unwinder restores nonvolatile xmm registers only from the primary's
+`UWOP_SAVE_XMM128` codes -- which a primary that never used xmm7 does not have. The cheap
+answer is to order `spill_candidates` volatile-first. The complete one is to emit
+`UWOP_SAVE_XMM128 <register>, 0` in the stub's own chained fragment, which is **the one
+operation the x64 ABI explicitly sanctions inside a chained fragment** -- and which needs
+this finding's slot to exist first, because the code describes one register at one offset.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7894,7 +7968,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,115 of 805,131 VEX sites, 98.9%** (Findings 24 to 116), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,091 of 805,131 VEX sites, 98.9%** (Findings 24 to 118), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -8032,7 +8106,7 @@ size of it.** Finding 74 put the rewritten binary 866 bytes past where the origi
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. That number was the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 9,016 that remain has to go before any of this can be
+immediately, and every one of the 9,040 that remain has to go before any of this can be
 soaked.
 
 **What the run adds is a measuring instrument, and it has been the better half of the

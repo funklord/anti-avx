@@ -19,7 +19,7 @@ performance argument against this approach does not hold.
 
 A translated binary that is 99.99% correct is worthless: the remaining 0.01%
 is a crash at an unpredictable moment. So the number to watch is not how much
-is translated but how much is left, and 9,016 sites are left.
+is translated but how much is left, and 9,040 sites are left.
 
 **Starfield has now been run, under Proton, and each run names the next site
 to work on.** The original dies on the first AVX instruction it executes.
@@ -31,7 +31,7 @@ frontier moving, not a game starting.
 
 Nothing here is Starfield-specific except a Makefile default. The tools take
 the binary as an argument, read its PE headers, `.pdata` and relocations, and
-have been exercised end to end on thirty-two small PEs this project builds
+have been exercised end to end on thirty-one small PEs this project builds
 itself. Starfield is the corpus, not the target.
 
 Read [`project.md`](project.md). It is the authoritative record of intent and
@@ -91,7 +91,7 @@ binary. `make clean` removes what it wrote, by name.
 
 ```sh
 make check        the gate: style, the lowering proof, and the C tests
-make check-pe     thirty-two PEs built here, rewritten, under wine
+make check-pe     thirty-one PEs built here, rewritten, under wine
 make check-spill  the three ways a stub can get a scratch register
 make check-unwind whether an exception can be dispatched from inside a stub
 make hooks        install the commit-msg hook into .git/hooks
