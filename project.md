@@ -7488,6 +7488,63 @@ nothing has ever justified, and this closes only the two exits that were uncondi
 Whether `ymm_run` should be tried before `long_pair_stores` at all is still unmeasured;
 what is fixed is that failing no longer forecloses.
 
+### Finding 126 -- `detour-plan` and the binary disagreed, and the binary is right
+
+The reload rung -- letting `ymm_run` carry on when a load targets a register it already
+tracks -- has now been measured three times and reverted twice.
+
+```
+                                        detour-plan   the built binary
+Finding 123, before the fall-through          6,983   not built
+Finding 126, after it                         6,787   8,948 VEX, from 8,899
+```
+
+Finding 125 stopped a failed strategy declining its site, and re-measuring the same four
+lines took them from minus four to **plus fifty-one**. That was a `plan` number. The
+rebuilt binary went the other way: **8,899 VEX to 8,948**, with 44 more stubs refused and
+404 more skipped for overlap.
+
+**`detour-plan` does not model `place_stubs`.** It runs `collect` and counts what the
+collector declined; it does not choose windows, does not commit them, and cannot see one
+window swallowing the site of another. A run that carries on through a reload is a longer
+run, so it collides with neighbours that would each have been placed -- which is exactly
+the lesson `zero_run`'s caller already carries ("one long window collides with
+neighbouring candidates that would each have been placed... the overlap count rose by
+2,199 and said so"), arriving here from a strategy rather than from a grouping.
+
+So the collector gained 51 sites and the placer lost 100.
+
+#### The instrument was fine and the reading was not
+
+`plan` is not wrong. It answers "what did the collector refuse", exactly and cheaply, and
+for a change that does not alter window lengths its answer and the binary's agree to the
+site -- Finding 116's 53 and Finding 125's 141 each match `verify` exactly. **What it
+cannot answer is "how many sites got rewritten", and that is the question every one of
+these findings is really asking.**
+
+`CLAUDE.md` states the rule this violates: *check the artifact, not a fresh measurement of
+where it came from.* An eight-minute `plan` against a twenty-minute rebuild is a real
+temptation, and it was taken all session.
+
+#### What that costs the record
+
+Two numbers here are `plan`-derived and are marked so rather than quietly kept:
+
+  * **Finding 116's split.** Its headline 53 is a `verify` number and stands. The split
+    inside it -- the prefix retry at +3 and `vextractf128` at +50 -- came from two `plan`
+    runs and could be apportioned differently in the binary. The total is right; the
+    halves are the collector's view of it.
+  * **Finding 123's minus four.** Also `plan`, also never built. The reload rung's real
+    cost under the old behaviour is unmeasured; what is measured is that it costs 49 under
+    the current one.
+
+Neither changes a decision -- the rung is reverted either way -- and both are the kind of
+thing that gets quoted later as though it had been weighed.
+
+**From here a rung is costed by `make detour` and `make detour-verify`, and `plan` is what
+says which bucket a refusal landed in.** That is what it is good at, and it is not the same
+question.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7608,6 +7665,12 @@ one `continue`, worth 141 sites. Finding 125. What is still unmeasured is whethe
 `ymm_run` should be tried before `long_pair_stores` at all; what is fixed is that failing
 no longer forecloses.
 
+**And the ladder's numbers are the collector's, not the binary's.** Finding 126 rebuilt
+the reload rung and found it costs 49 sites where `detour-plan` said it gained 51 -- a
+longer run collides with neighbours that would each have been placed, which `plan` cannot
+see. The two built rungs' totals were verified against the binary and stand; the split
+between them was not. Cost the next one with `make detour`.
+
 **And the wall behind all of it is unchanged.** In the six functions holding 822 of the
 refused 256-bit sites, all sixteen xmm are named, twelve to sixteen ymm are live at the
 peak, `function_scope` lends nothing and four of the six cannot lend home space.
@@ -7668,6 +7731,15 @@ placement.py      where detours land; icache_bench.c what they cost
   about 30 seconds and 0.9 GB.
 - **`apply` takes about ten minutes** on the real binary, `census` and `verify`
   similar. Run them in the background and do not poll them tightly.
+- **`detour-plan` is not the measure of a change, and it is eight minutes against
+  twenty.** It runs `collect` and counts what the COLLECTOR refused; it does not
+  choose windows, does not commit them, and cannot see one window swallowing the
+  site of another. For a change that does not alter window lengths its answer and
+  the binary's agree to the site. For one that does, they can point opposite ways --
+  the reload rung gained 51 by `plan` and lost 49 in the built binary, because a
+  longer run collides with neighbours that would each have been placed. Cost a
+  change with `make detour` and `make detour-verify`; use `plan` to say which
+  bucket a refusal landed in. Finding 126.
 - **Never compare a disassembly against a binary rebuilt after it.** That cost half
   an hour once. The same rule as `build-and-commit.md`'s about stale test binaries,
   and it applies to `objdump` output too. Delete the output before a run so a crash

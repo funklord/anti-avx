@@ -1956,24 +1956,21 @@ def ymm_run(instructions, index, blocked, limit=48, why=None):
 			at = next_address + len(bits)
 			continue
 		if what is not None and what[0] == "load" and what[1] not in tracked:
-			# **A reload is refused, and it was measured rather than
-			# assumed.** `lifetimes` has been ready for one since Finding 77
-			# rekeyed it from the register to the position, and letting the
-			# walk carry on through a reload is four lines. It costs four
-			# sites.
+			# **A reload is refused, and it took three measurements to be
+			# sure.** `lifetimes` has been ready for one since Finding 77
+			# rekeyed it on position, and letting the walk carry on is this
+			# condition. It measured at minus four sites, then -- after
+			# Finding 125 stopped a failed strategy declining its site --
+			# at plus fifty-one by `detour-plan`. Both were `plan` numbers.
 			#
-			# Where they go is the interesting part. A run that continues
-			# through a reload swallows loads `long_pair_stores` used to
-			# claim -- `ymm_run` is tried first -- and then fails for want of
-			# a second helper, so the site is lost both ways: `loaded and
-			# never stored` falls by 47 and `no register free across the ymm
-			# run` rises by 56, `the long pair store would not lower` falls
-			# from 20 to 8, and 46 more stores land in `no known upper half`.
-			# Net 6,979 to 6,983.
-			#
-			# What would make it pay is deferring to the long pair rather
-			# than out-running it, which is a change to the order of the
-			# strategies and not to this walk. Finding 123.
+			# The BUILT binary went the other way: 8,899 VEX to 8,948, with
+			# 44 more stubs refused and 404 more skipped for overlap. A run
+			# that carries on through a reload is a longer run, and a longer
+			# window collides with neighbours that would each have been
+			# placed -- which is the lesson `zero_run`'s caller already
+			# carries, arriving here from a strategy rather than from a
+			# grouping. `plan` does not model `place_stubs` and cannot see
+			# it. Finding 126.
 			tracked.add(what[1])
 			members.append(("load", position, what[1]))
 			at = next_address + len(bits)
