@@ -1477,6 +1477,97 @@ def splat_pair(site, following):
 	return (store_vex, store[store_vex["length"]:], store_address, len(store))
 
 
+# **Operations that are the same operation on each 128-bit lane**, so doing
+# one of them twice reproduces the 256-bit form exactly. Every entry is
+# element-wise by definition: a bitwise op combines corresponding bits, an
+# add or a multiply combines corresponding elements, and a min or a max
+# chooses between corresponding elements with the same rule in each. Nothing
+# horizontal is here (`vhaddps` combines neighbours), nothing cross-lane
+# (`vperm2f128`), and nothing whose result depends on the other half.
+#
+# **Two of these occur in this binary**, `vandps` and `vmulps`, so the rest
+# are reasoned rather than executed -- which is why the list is by ISA
+# behaviour rather than by what a scan happened to find. A mnemonic missing
+# from it costs a site; one wrongly on it costs correctness, which is
+# `scratch.py`'s FULL_WRITE rule and the reason this is not open-ended.
+LANE_WISE = frozenset("""
+	vandps vandpd vandnps vandnpd vorps vorpd vxorps vxorpd
+	vaddps vaddpd vsubps vsubpd vmulps vmulpd vdivps vdivpd
+	vminps vminpd vmaxps vmaxpd
+	vpand vpandn vpor vpxor
+	vpaddb vpaddw vpaddd vpaddq vpsubb vpsubw vpsubd vpsubq
+""".split())
+
+
+def splat_operation(site, following, third):
+	"""(operation, store) if a lane-wise op on a splat is stored, or None.
+
+	**A splat's two halves are the same sixteen bytes**, so an operation
+	whose only ymm source is the splat register can be done once per half
+	with no helper register at all: move the splat's xmm into the
+	destination, apply the operation to the half of memory that belongs
+	there, store that half. Twice, high half first, so the destination ends
+	holding the low sixteen -- the same order and the same reason as
+	`lower_ymm_pair`.
+
+	Each condition is a way the trick fails rather than a tidiness rule:
+
+	  * the operation must be lane-wise, or two 128-bit instructions are not
+	    the 256-bit one;
+	  * its other source must be memory, because a second ymm source has an
+	    upper half nobody knows -- that is the register representation, not
+	    this;
+	  * its destination must not be the splat register, or computing the
+	    high half destroys the value the low half needs;
+	  * the store must be of that destination and must follow at once, so
+	    that nothing between them can be reordered across a half.
+
+	19 of these in the binary, 17 `vandps` and 2 `vmulps`, and all three
+	instructions of each are refused today: the insert for having no store
+	after it, the operation for being arithmetic, the store for having no
+	known upper half. Finding 114.
+	"""
+	address, encoding, mnemonic, operands, _c = site
+	fields = inplace.split_operands(operands)
+	if mnemonic not in ("vinsertf128", "vinserti128") or len(fields) != 4:
+		return None
+	immediate, source, keep, held = fields
+	if immediate != "$0x1" or keep != held:
+		return None
+	if not source.startswith("%xmm") or not held.startswith("%ymm"):
+		return None
+	if source[len("%xmm"):] != held[len("%ymm"):]:
+		return None
+	if following[0] != address + len(encoding):
+		return None
+
+	op_address, op_encoding, op_mnemonic, op_operands, _d = following
+	if op_mnemonic not in LANE_WISE \
+			or not inplace.has_direct_sse_form(op_mnemonic):
+		return None
+	parts = inplace.split_operands(op_operands)
+	if len(parts) != 3 or parts[1] != held or "(" not in parts[0]:
+		return None
+	destination = parts[2]
+	if not destination.startswith("%ymm") or destination == held:
+		return None
+	op_vex = inplace.decode_vex(op_encoding)
+	if op_vex is None or not op_vex["L"]:
+		return None
+
+	store_address, store, store_mnemonic, store_operands, _e = third
+	if store_address != op_address + len(op_encoding):
+		return None
+	move = wide_move(store, store_mnemonic, store_operands)
+	if move is None or move[0] != "store" or move[1] != destination:
+		return None
+	store_vex = inplace.decode_vex(store)
+	return ((op_vex, op_encoding[op_vex["length"]:], op_address,
+	         len(op_encoding)),
+	        (store_vex, store[store_vex["length"]:], store_address,
+	         len(store)))
+
+
 def ymm_pair(site, following):
 	"""(load, store) if these two are a 256-bit copy through one ymm.
 
@@ -1528,6 +1619,37 @@ def lower_ymm_pair(pair, at):
 	for half, delta in ((load, 16), (store, 16), (load, 0), (store, 0)):
 		vex, tail, address, length = half
 		piece = narrow_piece(vex, tail, delta, address, length,
+		                     at + len(body))
+		if piece is None:
+			return None
+		body += piece
+	return bytes(body)
+
+
+def lower_splat_operation(operation, store, at):
+	"""Six instructions for a splat, an operation on it, and a store.
+
+	Two per half: the splat's xmm into the destination, the operation
+	against the half of memory that belongs there, and the store of it. The
+	insert itself emits nothing -- the value it built is already in the
+	register the lowered program keeps -- and the splat's own xmm is never
+	written, so it is still there for the second half.
+
+	**High half first**, which is what leaves the destination holding the low
+	sixteen when the sequence ends. See `lower_ymm_pair`, where the order is
+	the whole trick for the same reason.
+	"""
+	op_vex, op_tail, op_address, op_length = operation
+	destination, source = registers_of(op_vex, op_tail)
+	body = bytearray()
+	for delta in (16, 0):
+		body += encode_movaps(destination, source)
+		piece = narrow_piece(op_vex, op_tail, delta, op_address, op_length,
+		                     at + len(body))
+		if piece is None:
+			return None
+		body += piece
+		piece = narrow_piece(store[0], store[1], delta, store[2], store[3],
 		                     at + len(body))
 		if piece is None:
 			return None
@@ -2687,6 +2809,17 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			return None, 0
 		return close_stub(body, displaced, stub_address, pool, spill_base,
 		                  reasons, start, window), 0
+	if kind == "splatop":
+		# A broadcast, one lane-wise operation on it, and the store of the
+		# result -- six instructions, no helper register, and the insert
+		# emitting nothing. See `splat_operation`.
+		body = lower_splat_operation(*strategy[1], at=stub_address)
+		if body is None:
+			if reasons is not None:
+				reasons["the splat operation would not lower"] += 1
+			return None, 0
+		return close_stub(body, displaced, stub_address, pool, spill_base,
+		                  reasons, start, window), 0
 	if kind == "splatrun":
 		# A broadcast and every store that follows it. The insert emits
 		# nothing -- the value it builds is already in the register the
@@ -3088,6 +3221,24 @@ def collect(binary, listing):
 						(address, encoding, operands, mnemonic, window,
 						 [], None, [], ("splat", splat)))
 					continue
+			# The splat used by one lane-wise operation and then stored.
+			# All three instructions are refused today and none of them
+			# needs a helper. See `splat_operation`.
+			if index + 2 < len(instructions):
+				third = instructions[index + 2]
+				triple = splat_operation(instructions[index], following,
+				                         third)
+				if triple is not None and following[0] not in blocked \
+						and third[0] not in blocked:
+					window = (third[0] + len(third[1])) - address
+					if inplace.covered_by(ranges, address, window) \
+							and lower_splat_operation(*triple, at=address) \
+							is not None:
+						candidates.append(
+							(address, encoding, operands, mnemonic, window,
+							 [], None, [], ("splatop", triple)))
+						continue
+
 			pair = ymm_pair(instructions[index], following)
 			if pair is not None:
 				window = len(encoding) + len(following[1])
@@ -4077,9 +4228,67 @@ def splat_selftest():
 		print("selftest: a store of another ymm was taken as the splat's",
 		      file=sys.stderr)
 		failures += 1
+	failures += splat_operation_selftest()
 	if not failures:
 		print(f"selftest: {len(cases) + 1} splat shapes, one accepted and "
 		      f"four refused")
+	return failures
+
+
+def splat_operation_selftest():
+	"""Prove `splat_operation` takes the triple and nothing resembling it.
+
+	The binary contains nineteen of these and every one is the same shape --
+	a lane-wise operation against memory, into a register the splat does not
+	name. So the refusals below are shapes no execution test here can reach,
+	which is Finding 108's rule and the reason they are unit cases.
+	"""
+	insert = (0x140001000, bytes.fromhex("c4e36d18d201"), "vinsertf128",
+	          "$0x1,%xmm2,%ymm2,%ymm2", 0)
+	operation = (0x140001006, bytes.fromhex("c5ec54442440"), "vandps",
+	             "0x40(%rsp),%ymm2,%ymm0", 0)
+	store = (0x14000100c, bytes.fromhex("c5fc11442460"), "vmovups",
+	         "%ymm0,0x60(%rsp)", 0)
+
+	def altered(entry, **fields):
+		address, encoding, mnemonic, operands, comment = entry
+		return (fields.get("address", address),
+		        fields.get("encoding", encoding),
+		        fields.get("mnemonic", mnemonic),
+		        fields.get("operands", operands), comment)
+
+	cases = [
+		("the triple as it occurs", insert, operation, store, True),
+		# The destination is the splat: computing the high half destroys the
+		# sixteen bytes the low half still needs.
+		("the destination aliases the splat", insert,
+		 altered(operation, operands="0x40(%rsp),%ymm2,%ymm2"),
+		 altered(store, operands="%ymm2,0x60(%rsp)"), False),
+		# A second ymm source has an upper half nobody knows.
+		("a second register source", insert,
+		 altered(operation, operands="%ymm3,%ymm2,%ymm0"), store, False),
+		# Horizontal: the upper half of the result depends on both halves.
+		("an operation that is not lane-wise", insert,
+		 altered(operation, mnemonic="vhaddps"), store, False),
+		# The splat feeds it but something else is stored.
+		("a store of another register", insert, operation,
+		 altered(store, operands="%ymm1,0x60(%rsp)"), False),
+		# A gap: something between could be reordered across a half.
+		("the operation is not adjacent to the insert", insert,
+		 altered(operation, address=0x140001008), store, False),
+		("the store is not adjacent to the operation", insert, operation,
+		 altered(store, address=0x14000100e), False),
+	]
+	failures = 0
+	for what, one, two, three, expected in cases:
+		got = splat_operation(one, two, three) is not None
+		if got != expected:
+			print(f"selftest: {what}: splat_operation said {got}, "
+			      f"want {expected}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(cases)} splat-operation shapes, one accepted "
+		      f"and {len(cases) - 1} refused")
 	return failures
 
 
@@ -4595,6 +4804,12 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			entries = strategy[1][1]
 			for entry in entries[1:]:
 				swallowed.add(entry[4])
+		if strategy is not None and strategy[0] == "splatop":
+			# The insert keeps the window's first byte; the operation and
+			# the store both lose theirs. Each half of the strategy is
+			# (vex, tail, address, length).
+			for entry in strategy[1]:
+				swallowed.add(entry[2])
 		if strategy is not None and strategy[0] == "splatrun":
 			# The insert keeps the window's first byte and every store after
 			# it loses its boundary. Each entry's third field is its address.

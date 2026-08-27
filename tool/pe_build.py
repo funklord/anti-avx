@@ -1461,6 +1461,57 @@ source:	.long 1, 2, 3, 8
 """)
 
 
+# 36. A broadcast, one lane-wise operation against memory, and the store of
+# the result -- the shape at 0x140454762 and eighteen more. All three
+# instructions are refused today: the insert for having no store after it,
+# the operation for being arithmetic on a 256-bit value, the store for
+# having no known upper half.
+#
+# It needs no helper. Both halves of the splat are the same sixteen bytes,
+# so the operation is done twice against the two halves of its memory
+# operand, high half first, and the destination ends holding the low one.
+#
+# **The mask is the test.** Its two halves are different, so an operation
+# that read the wrong half of memory, or a store that wrote the wrong half
+# of the destination, changes the answer rather than hiding in it: the low
+# half keeps only lane 0 and the high half keeps only lane 3.
+PROGRAMS["splatop"] = (69, """
+	.text
+	.globl _start
+_start:
+	subq	$200, %rsp
+	vzeroupper
+	movl	$0xffffffff, 64(%rsp)	/* mask, low half: keep lane 0 */
+	movl	$0, 68(%rsp)
+	movl	$0, 72(%rsp)
+	movl	$0, 76(%rsp)
+	movl	$0, 80(%rsp)		/* mask, high half: keep lane 3 */
+	movl	$0, 84(%rsp)
+	movl	$0, 88(%rsp)
+	movl	$0xffffffff, 92(%rsp)
+	movl	$0x5a5a5a5a, 96(%rsp)	/* poison the whole destination */
+	movl	$0x5a5a5a5a, 100(%rsp)
+	movl	$0x5a5a5a5a, 104(%rsp)
+	movl	$0x5a5a5a5a, 108(%rsp)
+	movl	$0x5a5a5a5a, 112(%rsp)
+	movl	$0x5a5a5a5a, 116(%rsp)
+	movl	$0x5a5a5a5a, 120(%rsp)
+	movl	$0x5a5a5a5a, 124(%rsp)
+	vmovups	source(%rip), %xmm2	/* 1 2 3 8 */
+	vinsertf128 $0x1, %xmm2, %ymm2, %ymm2	/* both halves 1 2 3 8 */
+	vandps	64(%rsp), %ymm2, %ymm0
+	vmovups	%ymm0, 96(%rsp)
+	movl	96(%rsp), %eax		/* 1 -- low half, lane 0 */
+	addl	124(%rsp), %eax		/* 8 -- HIGH half, lane 3 */
+	addl	$60, %eax		/* 9 + 60 = 69 */
+	addq	$200, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 8
+""")
+
+
 def assemble(source):
 	"""(raw .text bytes, offset of func_end) for one assembly source."""
 	with tempfile.TemporaryDirectory() as tmp:

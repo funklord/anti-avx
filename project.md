@@ -6747,6 +6747,73 @@ Finding 112, still refused by a chained `.pdata` record between it and its `vpxo
 increment that does not move the frontier is worth having and is not progress on the thing
 being measured, and the two are easy to confuse when the percentage moves.
 
+### Finding 114 -- the splat used once, which needs no register either
+
+Finding 113 took the splat's stores. The shape next to it is the splat used by one
+operation and then stored:
+
+```
+140454762:  vinsertf128 $0x1,%xmm2,%ymm2,%ymm2
+140454768:  vandps 0x240(%rsp),%ymm2,%ymm0
+140454771:  vmovups %ymm0,0x200(%rsp)
+```
+
+All three were refused, each for a different reason and none of them the real one: the
+insert for having no store after it, the `vandps` for being `256-bit: arithmetic rather
+than a copy`, the store for having no known upper half.
+
+**The same fact answers all three.** Both halves of `ymm2` are the same sixteen bytes, so
+the operation can be done once per half against the two halves of its memory operand, and
+the splat's own xmm is never written -- it is still there for the second half. Six
+instructions, no helper register, no liveness question:
+
+```
+1400040 30:  movaps %xmm2,%xmm0
+1400040 33:  andps  0x50(%rsp),%xmm0      the high half of the memory operand
+1400040 38:  movups %xmm0,0x70(%rsp)      the high half of the destination
+1400040 3d:  movaps %xmm2,%xmm0
+1400040 40:  andps  0x40(%rsp),%xmm0
+1400040 45:  movups %xmm0,0x60(%rsp)
+```
+
+High half first, so the destination's xmm ends holding the low sixteen -- the order is
+`lower_ymm_pair`'s and the reason is the same one Finding 38 gave.
+
+#### What has to hold, and the one that is an ISA fact rather than a scan
+
+Three of the four conditions are shape and the scan can see them: the other source must be
+memory, because a second ymm source has an upper half nobody knows; the destination must
+not be the splat register, or computing the high half destroys what the low half needs;
+and the store must be of that destination and follow at once.
+
+The fourth is not a shape. **The operation must be the same operation on each 128-bit
+lane**, or two 128-bit instructions are not the 256-bit one -- and no amount of looking at
+the operand list says whether it is. `vhaddps` has exactly this shape and adds neighbours;
+`vperm2f128` has it and crosses lanes. So `LANE_WISE` is a list by ISA behaviour, and it is
+the whole of the safety argument. **Two of its entries occur here**, `vandps` seventeen
+times and `vmulps` twice, which means the other thirty are reasoned and not executed. That
+is the wrong way round for this project and there is no way to make it the right way round
+from one binary: `scratch.py`'s rule applies unchanged, one missing costs a site and one
+wrongly present costs correctness.
+
+#### Nineteen triples, fifty-seven sites
+
+```
+VEX in .text      9,126 ->   9,069       796,062 removed, 98.9%
+detours         201,013 -> 201,032
+frontier   0x1428D1492 -> 0x1428D1492
+```
+
+Nineteen triples, nineteen detours, **fifty-seven sites** -- and the scan and the rewriter
+agree exactly, which is what makes the count worth quoting. Every instruction of every
+triple went, because the shape is only lowerable whole.
+
+The frontier is where it was. That is now three increments in a row -- 45, then 57 -- and
+none of them has moved it, because the site the game stops on is refused by something none
+of them touches. **The percentage and the frontier are measuring different things**, and
+the honest reading is that these 102 sites are progress towards a binary that runs and no
+progress at all towards knowing what breaks next.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -7610,7 +7677,7 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,005 of 805,131 VEX sites, 98.9%** (Findings 24 to 113), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,062 of 805,131 VEX sites, 98.9%** (Findings 24 to 114), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
 | 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
 | 6 | Y2 shadow + Class H helpers | Completeness | |
 
@@ -7748,7 +7815,7 @@ size of it.** Finding 74 put the rewritten binary 866 bytes past where the origi
 through four lowerings and one stub, with wine's unwinder validating the rebuilt function
 table independently of the tool that wrote it. That number was the point: the residue is
 not a tail of exotic cases waiting at the end of a long run, it is dense enough to be hit
-immediately, and every one of the 9,126 that remain has to go before any of this can be
+immediately, and every one of the 9,069 that remain has to go before any of this can be
 soaked.
 
 **What the run adds is a measuring instrument, and it has been the better half of the
