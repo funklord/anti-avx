@@ -7526,6 +7526,23 @@ these findings is really asking.**
 where it came from.* An eight-minute `plan` against a twenty-minute rebuild is a real
 temptation, and it was taken all session.
 
+**Two details are what make this worth writing down rather than filing under carelessness,
+and neither is in the rule.**
+
+The first is that **it agreed twice before it disagreed.** A proxy that diverged on first
+use would have been discarded on first use; nobody quotes a number they have just watched
+be wrong. It is the run of agreement that earns the trust, and the trust is then spent on
+the question the proxy does not answer. Fifty-three and a hundred and forty-one, to the
+site, and then a hundred out.
+
+The second is that it did not fail by being **imprecise**. `plan` counted 51 sites the
+collector stopped refusing, and every one of those 51 is real -- the collector genuinely
+refuses 51 fewer. What it cannot see is that accepting them made 100 others unplaceable,
+because a longer window swallows the site of a neighbour that would have been placed. The
+two quantities move in opposite directions under exactly the change being measured, so no
+margin of error would have covered it: a bigger `plan` gain is evidence of a bigger placer
+loss, not of a better change.
+
 #### What that costs the record
 
 Two numbers here are `plan`-derived and are marked so rather than quietly kept:
@@ -7737,9 +7754,13 @@ placement.py      where detours land; icache_bench.c what they cost
   site of another. For a change that does not alter window lengths its answer and
   the binary's agree to the site. For one that does, they can point opposite ways --
   the reload rung gained 51 by `plan` and lost 49 in the built binary, because a
-  longer run collides with neighbours that would each have been placed. Cost a
-  change with `make detour` and `make detour-verify`; use `plan` to say which
-  bucket a refusal landed in. Finding 126.
+  longer run collides with neighbours that would each have been placed. **The two
+  quantities move in OPPOSITE directions under that change**, so a bigger `plan`
+  gain is evidence of a bigger placer loss rather than of a better change -- and
+  `plan` had agreed with the binary to the site on the two changes before it, which
+  is how it came to be trusted. Cost a change with `make detour` and
+  `make detour-verify`; use `plan` to say which bucket a refusal landed in.
+  Finding 126.
 - **Never compare a disassembly against a binary rebuilt after it.** That cost half
   an hour once. The same rule as `build-and-commit.md`'s about stale test binaries,
   and it applies to `objdump` output too. Delete the output before a run so a crash
