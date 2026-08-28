@@ -8375,6 +8375,77 @@ Six cases are permanent and three of them must refuse, which is what the sabotag
 confirm: removing the dereference check turns eight red, the push check two, the escape
 check two.
 
+### Finding 137 -- the 128-bit half, measured to its floor rather than abandoned
+
+Four increments took `no home space to borrow` from 2,153 to 1,332, and each returned
+less than the last -- 479, 414, 263, 80. **Diminishing returns are not a reason to stop;
+they are a reason to find out whether anything is left.** Three measurements say what is,
+and the answer for this seam is almost nothing.
+
+#### What still refuses, and it is mostly the program
+
+```
+1,332 sites declined `no home space to borrow`
+
+  624  callee: no call, so the region does not exist  |  shadow: still read from here
+  408  callee: still read from here                  |  shadow: still read from here
+  122  callee: still read from here                  |  shadow: refused whole
+   77  callee: no call, so the region does not exist  |  shadow: refused whole
+   66  callee: an rsp copy reaches it, unpositionally |  shadow: refused whole
+   35  callee: not in .pdata                          |  shadow: refused whole
+```
+
+**1,032 of them are refused because a reader is reachable**, which is the analysis
+working rather than failing. `readers_reachable` seeds every edge it cannot resolve as
+reaching a reader, so that verdict could still have been conservatism -- an indirect
+branch it declined to model rather than a real reference. Splitting it by whether any
+reference lies at a HIGHER address than the site, which is reachable by falling forward
+and cannot be an artefact:
+
+```
+  928  a reference at a higher address: a genuine forward read
+  104  references only behind it: a loop or an unresolved edge
+```
+
+**Nine in ten are the program genuinely using its own home space**, and no sharper
+analysis reaches them. The 104 are what a more precise CFG would be worth, and 300 more
+are structural -- a leaf with no callee region and a shadow it uses, a copy that reaches
+unpositionally, a function outside `.pdata`. What is left needs memory of the
+rewriter's own, which is static TLS at 740 sites and priced since Finding 69.
+
+#### `outside .pdata` is near its ceiling too
+
+325 sites are declined for sitting in code `.pdata` does not describe, and `outside.py`
+already recovers almost all of what can be recovered:
+
+```
+chunks outside .pdata                  89,747
+  of which contain a VEX site           3,006
+  VEX sites in them                    17,604
+
+  called, and ends in a transfer       2,979 chunks   17,237 sites   accepted
+  contains (bad) -- not code              20             315         refused
+  called, but runs off the end             4              35         refused
+  uncalled, ends in a transfer             3              17         refused
+```
+
+**17,237 of 17,604 are already taken.** The ceiling for relaxing it is 52 sites in the
+two small classes, and 315 in chunks containing bytes objdump cannot decode -- which are
+Finding 8's undecodable islands, the least safe thing in the binary to start calling
+code. Not worth a session.
+
+#### The frontier is where it was, and that is a decision
+
+`0x1428D1492` is still `vmovdqu %ymm0,0x28(%rsp)` in the rewritten binary. The
+`vzeroupper` six bytes after it did lower, to a `nop`, so the surrounding work landed --
+the site itself is refused because `zeroed_ymm` will not cross a `.pdata` chained-fragment
+start in `blocked`, which Finding 112 priced at 11 sites and declined.
+
+**None of today's 1,226 sites could have moved it**, because all of them are in the
+128-bit half and the frontier is a 256-bit store. That is the copyright holder's ranking
+working as intended -- sites removed, not the fault address -- and it is worth stating
+plainly rather than leaving a reader to wonder why six increments moved nothing visible.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8533,8 +8604,9 @@ What is left divides cleanly, and the two halves want different work:
     `256-bit: arithmetic rather than a copy` (1,818) are one problem stated twice, and
     that is the problem.
   * **2,599 are 128-bit** (and 180 are undecodable bytes rather than instructions --
-    see below), and after Findings 130, 131 and 134 to 136 their largest causes are a
-    shadow the
+    see below). **Finding 137 measures this half to its floor**: nine in ten of what
+    still refuses is the program genuinely using its own home space, and what remains
+    wants memory of the rewriter's own. Their largest causes are a shadow the
     function genuinely uses (which wants memory of our own -- static TLS is priced at 740
     sites), `outside .pdata` at 325, and `next instruction is a branch target` at 209.
 
