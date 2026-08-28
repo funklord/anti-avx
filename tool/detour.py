@@ -503,6 +503,11 @@ HOME_SPACE = 32
 # not fault, so comparing two binaries is the only way to test for it.
 RSP_BLANKET, RSP_FOLLOWED = "blanket", "followed"
 RSP_RULE = RSP_FOLLOWED
+# `--escape=` decides what a copy of `rsp` STORED TO MEMORY costs. `allow`
+# is Finding 127's rule; `refuse` is what preceded it and what Finding 132
+# measures the price of. See `copy_reaches_home`.
+ESCAPE_REFUSE, ESCAPE_ALLOW = "refuse", "allow"
+ESCAPE_RULE = ESCAPE_ALLOW
 # `--shadow=off` takes the caller's shadow away and leaves only the callee
 # home space, which is every borrow this tool wrote before Finding 130. It is
 # kept reachable for the same reason `--rsp=blanket` is: a borrow at the
@@ -1272,26 +1277,41 @@ def copy_reaches_home(rows, frame, region=None):
 				continue
 		if len(fields) == 2 and fields[0].startswith("%") \
 				and canonical(fields[0]) in taint and "(" in fields[1]:
-			# **The copy is stored to memory and that is no longer a
-			# refusal.** The pointer leaves this function's text, so nothing
-			# here can say where it is dereferenced -- but it cannot be
-			# dereferenced while a borrow is live, because nothing else
-			# runs: `emit_swallowed` brackets one lowering, `ymm_run` breaks
-			# on every control transfer, and `span_keeps_rsp` refuses a span
-			# that moves `rsp`. After the restore the region holds what it
-			# held before, so a later dereference sees what it would have
-			# seen.
+			# **The copy is stored to memory, and what it is worth
+			# depends on where it points.**
 			#
-			# That argument was in this docstring and declined in the same
-			# breath -- "second-order, resting on a property asserted in two
-			# docstrings rather than enforced by a check". It is enforced
-			# now: `verify` disassembles the stub section and fails on a
-			# single `call` instruction anywhere in it. Finding 127.
+			# Finding 127 allowed this outright, on the argument that an
+			# escaped pointer cannot be dereferenced WHILE the borrow is
+			# live, because nothing runs between the save and the restore.
+			# That much is true and is enforced rather than asserted. The
+			# sentence it rested on is not: "after the restore the region
+			# holds what it held before". It does not. The restore reads
+			# the region INTO the register, so the region keeps the
+			# borrowed value and the damage outlives the bracket the
+			# argument was about. Finding 132.
 			#
-			# The WRITE is still checked. Where the pointer is stored is a
-			# dereference like any other and the loop above refuses it if it
-			# lands in the region; what is allowed is only that the pointer
-			# goes somewhere this scan cannot follow.
+			# What is true, and is checked here rather than measured once:
+			# **the pointer that leaves does not point into the region.**
+			# Measured over a whole collect, 4,950 escapes and not one of
+			# them did -- the nearest were 31 pointing below it and 513
+			# within 64 bytes above -- so this costs nothing today and
+			# stops the case that would matter.
+			#
+			# **What it does not cover is a consumer that adds a
+			# displacement**, and that is named rather than hidden. The two
+			# ways a pointer INTO the region is formed are both refused
+			# already: a `lea` into it refuses the whole function, which is
+			# what covers the varargs idiom -- `va_list` points at exactly
+			# this memory -- and arithmetic walking a copy into it is
+			# refused by this walk. `--escape=refuse` declines the case
+			# entirely and costs 455 sites, measured on the binary.
+			#
+			# The WRITE is still checked either way. Where the pointer is
+			# stored is a dereference like any other and the loop above
+			# refuses it if it lands in the region.
+			if ESCAPE_RULE == ESCAPE_REFUSE \
+					or low <= taint[canonical(fields[0])] < high:
+				return True
 			continue
 		if fields and fields[-1].startswith("%") \
 				and mnemonic not in FLAGS_ONLY:
@@ -4857,19 +4877,27 @@ REACH_CASES = [
 	("immediate arithmetic walking a copy into the region",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("sub", "$0x28,%rax"),
 	  ("mov", "%rcx,(%rax)")], True),
+	("a copy stored to memory while pointing INTO the region",
+	 [("sub", "$0x28,%rsp"), ("mov", "%rsp,%rax"),
+	  ("mov", "%rax,0x100(%rsp)")], True),
+	("a copy stored to memory from above the region",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
+	  ("mov", "%rax,0x100(%rsp)")], False),
 	("arithmetic that cannot be followed",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("add", "%rdx,%rax"),
 	  ("mov", "%rcx,(%rax)")], True),
 	("an indexed access through the copy",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
 	  ("mov", "%rcx,(%rax,%rdx,1)")], True),
-	# **This case answered True until Finding 127 and now answers False.**
-	# The pointer escapes, so nothing here can say where it is
-	# dereferenced -- and it cannot be dereferenced while a borrow is live,
-	# because nothing else runs between the save and the restore. That
-	# argument was declined for as long as it rested on two docstrings;
-	# `verify` fails on a single `call` in the stub section now, so it
-	# rests on the artifact.
+	# **This case answered True until Finding 127, then False, and the
+	# reason has changed under it twice.** Finding 127 allowed it because
+	# nothing runs between a borrow's save and its restore, so an escaped
+	# pointer cannot be dereferenced while the borrow is live. True, and
+	# beside the point: the region keeps the borrowed value afterwards, so
+	# the damage outlives the bracket. What holds it now is narrower and
+	# checked -- the pointer that leaves does not point into the region,
+	# and the two ways one INTO it is formed are refused above. The case
+	# below is the same store from a pointer that does. Finding 132.
 	("the copy stored to memory, which no longer escapes the argument",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
 	  ("mov", "%rax,(%rdi)")], False),
@@ -5611,8 +5639,17 @@ def main(argv):
 	# evaluation switch rather than a tuning knob: the default refuses the
 	# site, as it always has, and the other two exist so that all three can
 	# be built and compared. See Finding 46.
-	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE
+	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
 	argv = list(argv)
+	for i, item in enumerate(argv):
+		if item.startswith("--escape="):
+			ESCAPE_RULE = item.split("=", 1)[1]
+			if ESCAPE_RULE not in (ESCAPE_REFUSE, ESCAPE_ALLOW):
+				print(f"detour.py: unknown escape rule {ESCAPE_RULE!r}",
+				      file=sys.stderr)
+				return 2
+			del argv[i]
+			break
 	for i, item in enumerate(argv):
 		if item.startswith("--region="):
 			REGION_RULE = item.split("=", 1)[1]

@@ -8014,6 +8014,74 @@ separate it from the real thing: a loop closing above the reference must refuse 
 closing below it must not. A rule that gave up on backward branches passes the first and
 fails the second while looking careful.
 
+### Finding 132 -- what Finding 127 rested on, and what actually holds it up
+
+Finding 131's insight has a third victim, and this one was shipped and load-bearing.
+
+`copy_reaches_home` allows a copy of `rsp` that is **stored to memory**, where the
+pointer leaves what any scan of this function can follow. Finding 127 opened that case,
+worth 449 sites at the time, on this argument:
+
+> The pointer leaves this function's text, so nothing here can say where it is
+> dereferenced -- but it cannot be dereferenced while a borrow is live, because nothing
+> else runs. **After the restore the region holds what it held before**, so a later
+> dereference sees what it would have seen.
+
+The first half is true and is enforced rather than asserted -- `emit_swallowed` and the
+run branch refuse a bracket containing any control transfer. **The sentence in bold is
+false.** A restore is `movups region, %xmm`, which reads the region into the register and
+writes nothing back; the region keeps the borrowed value for the rest of the program. The
+damage outlives the bracket, so an argument about what can run inside the bracket does not
+reach it. There is no repair either: putting the region's contents back needs somewhere to
+hold them, which is a register, which is the thing there was none of.
+
+**Refusing the case costs 455 sites, measured on the binary** -- 7,557 back up to 8,012,
+about half of what Findings 130 and 131 gained. So it was worth finding out whether
+anything better than "refuse" is available, rather than paying that on a hunch.
+
+#### What is true is narrower, and it is a check now
+
+Instrumenting a whole collect: **4,950 escape events, and not one of the pointers points
+into the region.**
+
+```
+  within 256 bytes above it                     2,390
+  more than 256 bytes above it                  2,016
+  within 64 bytes above it                        513
+  below the region                                 31
+  points INTO the region                            0
+  distance above the region's base: min -1320, median 224, max 3848
+```
+
+That is a measurement of one binary, so it is the check now instead: an escape is allowed
+only while the pointer does not point into the region, and refused when it does. It costs
+nothing today, and it stops the case that would matter without waiting for a binary where
+one occurs. This is Finding 127's own move -- *the argument was sound, so it was made
+checkable* -- applied to the narrower argument that survives.
+
+**What it does not cover is named rather than hidden: a consumer that adds a displacement
+to the escaped pointer.** The two ways a pointer INTO the region is formed are already
+refused, and between them they cover the idiom that would otherwise be alarming:
+
+  * a `lea` into the region refuses the whole function, which is what covers **varargs** --
+    `va_start` on Win64 points `va_list` at exactly this memory, the register spill area,
+    and reads through it;
+  * arithmetic walking a copy into the region is refused by the walk itself.
+
+What remains is a pointer stored to memory, reloaded, and dereferenced with an offset that
+happens to land in the region, in a function that keeps a local there and never once
+addresses it directly. `--escape=refuse` declines the whole case for whoever wants it, and
+the 455 sites are the price on the table.
+
+#### The shape, for the next person
+
+Three findings in a row turned on the same sentence being wrong: **a borrow does not
+restore the memory it borrowed.** Findings 129 and 130 wrote plans that assumed it; this
+one was resting on it in shipped code. The tell each time was an argument about a
+*window of time* -- "nothing runs between the save and the restore" -- answering a
+question about a *span of memory*. When a rule's justification talks about when something
+happens, check that the thing it protects is not permanent.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
