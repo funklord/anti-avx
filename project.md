@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **797,837 of 805,131 VEX
-sites -- 99.1%** -- through 202,069 detours, and every `make detour-verify` invariant
-holds on the result. 7,294 sites are left, and the rewritten binary loads 305 modules
+**Status:** the rewriter works. `tool/detour.py` rewrites **797,827 of 805,131 VEX
+sites -- 99.1%** -- through 202,064 detours, and every `make detour-verify` invariant
+holds on the result. 7,304 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
 ---
@@ -8282,6 +8282,52 @@ reachability pass rather than by two rules that could disagree. `copy_reaches_ho
 rows carrying their addresses to make that possible, and the two selftests that name no
 addresses lay theirs out four bytes apart in `_addressed`.
 
+### Finding 135 -- the walk followed the pointer's arithmetic and not its moves
+
+**A hole, found by reading the code to plan the next increment rather than by any
+check.** `copy_reaches_home` has tracked a copy of `rsp` since Finding 96, and it followed
+what was done TO the pointer -- immediate arithmetic, a `lea`, a narrow write that
+destroys it -- but never followed the pointer itself into another register.
+
+```
+	mov  %rsp,%rax
+	mov  %rax,%rbx        <- %rbx is untracked from here
+	mov  %rcx,-0x28(%rbx) <- a write into the region, and invisible
+```
+
+Measured on that shape and three others: **three of four reached the region and were
+allowed.** `add %rax,%rbx` is worse than the plain move, because it makes `%rbx` a stack
+pointer at an offset nothing can name, and it was allowed too.
+
+The rule now: a plain 64-bit `mov` carries the offset exactly and is followed; anything
+else that reads a tainted register and writes a **different** one is refused, which is the
+same answer the walk already gives to arithmetic it cannot follow. A narrow destination is
+neither -- a 32-bit write zeroes the upper half, so what lands there cannot address a
+stack at all, which is the existing kill rule read from the other side.
+
+#### It was wide, and in this binary it was nearly free
+
+```
+7,294 -> 7,304 sites          the cost, measured on the binary
+3,301 times the branch fires  3,217 following a move, 84 refusing
+                              (37 cmove, 12 add, 10 cmovbe, 10 movslq, 5 sub,
+                               4 cmovae, 2 imul, 2 cmovne, 2 vmovd)
+```
+
+**Ten sites.** That is the whole price, and the two numbers together are the finding: the
+walk was losing a pointer **3,217 times**, and in this binary almost none of those
+pointers went on to touch the region. Finding 96's original measurement -- that no copy in
+the binary reaches the callee home space -- survives, and it now survives for a better
+reason than that nobody was looking.
+
+**Counting the firings was not optional.** A fix costing ten sites is indistinguishable
+from a fix that reaches nothing, and the ten alone would have read as either. The count
+is what says which.
+
+Six cases are permanent, and two of them exist so that the fix is not merely "refuse
+anything that moves": a second-hand copy dereferenced clear of the region is still
+allowed, and so is a 32-bit move.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8439,8 +8485,9 @@ What is left divides cleanly, and the two halves want different work:
     the ABI. `ymm value has no known upper half` (1,140 outside a window) and
     `256-bit: arithmetic rather than a copy` (1,818) are one problem stated twice, and
     that is the problem.
-  * **2,669 are 128-bit** (and 180 are undecodable bytes rather than instructions --
-    see below), and after Findings 130, 131 and 134 their largest causes are a shadow the
+  * **2,679 are 128-bit** (and 180 are undecodable bytes rather than instructions --
+    see below), and after Findings 130, 131, 134 and 135 their largest causes are a shadow
+    the
     function genuinely uses (which wants memory of our own -- static TLS is priced at 740
     sites), `outside .pdata` at 325, and `next instruction is a branch target` at 209.
 

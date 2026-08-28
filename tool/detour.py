@@ -1332,6 +1332,40 @@ def copy_reaches_home(rows, frame, region=None, hazards=None):
 					or low <= taint[canonical(fields[0])] < high:
 				return True
 			continue
+		# **A tainted value moving into another register moves with it,
+		# and this walk did not follow it.** `mov %rsp,%rax` then
+		# `mov %rax,%rbx` left `%rbx` untracked, so a write through `%rbx`
+		# into the region was invisible and the function was lent -- and
+		# `add %rax,%rbx` was worse, since it makes `%rbx` a stack pointer
+		# at an offset nothing here can name. Both were allowed. The
+		# tracking only ever followed a pointer's ARITHMETIC, never its
+		# migration. Finding 135.
+		#
+		# A plain 64-bit `mov` carries the offset exactly and is followed.
+		# Anything else that reads a tainted register and writes a
+		# different one is refused, because the result is stack-derived and
+		# unlocated -- which is the same answer this already gives to
+		# arithmetic it cannot follow.
+		#
+		# A NARROW destination is neither: a 32-bit write zeroes the upper
+		# half, so what lands there cannot address a stack at all. That is
+		# the existing kill rule, read from the other side.
+		if len(fields) >= 2 and fields[-1].startswith("%") \
+				and mnemonic not in FLAGS_ONLY:
+			destination = fields[-1].lstrip("%")
+			wide = canonical(destination)
+			carried = [canonical(f) for f in fields[:-1]
+			           if f.startswith("%") and canonical(f) in taint]
+			if carried and wide not in carried:
+				if destination in WIDE32 \
+						or NUMBERED_NARROW.match(destination):
+					pass
+				elif len(fields) == 2 and len(carried) == 1 \
+						and mnemonic in ("mov", "movq"):
+					taint[wide] = taint[carried[0]]
+					continue
+				else:
+					return True
 		if fields and fields[-1].startswith("%") \
 				and mnemonic not in FLAGS_ONLY:
 			name = fields[-1].lstrip("%")
@@ -5068,6 +5102,28 @@ REACH_CASES = [
 	("immediate arithmetic walking a copy into the region",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("sub", "$0x28,%rax"),
 	  ("mov", "%rcx,(%rax)")], True),
+	# **The pointer's migration, which this walk followed for its
+	# arithmetic and not for its moves.** All five of these reached the
+	# region and were allowed until Finding 135, and the last two are here
+	# so that the fix is not merely "refuse anything that moves".
+	("through a register-to-register copy of the copy",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("mov", "%rax,%rbx"),
+	  ("mov", "%rcx,-0x28(%rbx)")], True),
+	("through a second-hand copy, the first killed after",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("mov", "%rax,%rbx"),
+	  ("xor", "%eax,%eax"), ("mov", "%rcx,-0x28(%rbx)")], True),
+	("a lea deriving from a second-hand copy",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("mov", "%rax,%rbx"),
+	  ("lea", "0x0(%rbx),%rdx"), ("mov", "%rcx,-0x28(%rdx)")], True),
+	("adding a tainted register into an untainted one",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("add", "%rax,%rbx"),
+	  ("mov", "%rcx,(%rbx)")], True),
+	("a second-hand copy dereferenced clear of the region",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("mov", "%rax,%rbx"),
+	  ("mov", "%rcx,-0x8(%rbx)")], False),
+	("a 32-bit move, which cannot carry a stack pointer at all",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("mov", "%eax,%ebx"),
+	  ("mov", "%rcx,-0x28(%rbx)")], False),
 	("a copy stored to memory while pointing INTO the region",
 	 [("sub", "$0x28,%rsp"), ("mov", "%rsp,%rax"),
 	  ("mov", "%rax,0x100(%rsp)")], True),
