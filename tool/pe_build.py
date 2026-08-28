@@ -58,6 +58,9 @@ HEADER_SIZE = 0x400
 # at all without somewhere legal to land, and the displacement arithmetic
 # does not care which section the target is in -- Starfield's own are into
 # `.data`, and its `.text` is not writable.
+# How many bytes the loader zeroes per thread after the raw template. The
+# real binary's directory asks for 0; raising it is the whole mechanism.
+TLS_ZERO_FILL = 32
 CODE = 0xE0000020		# CODE | EXECUTE | READ | WRITE
 CODE_READONLY = 0x60000020	# CODE | EXECUTE | READ
 DATA = 0x40000040		# INITIALIZED_DATA | READ
@@ -1521,6 +1524,90 @@ hundred:	.float 100.0
 """)
 
 
+# 40. Static TLS: does the loader allocate and zero the bytes we ask for?
+#
+# `project.md` has said since Finding 69 that raising the TLS directory's
+# `SizeOfZeroFill` gives the rewriter per-thread bytes of its own, and that
+# it is "proven under wine" -- and the tree held nothing that proved it. A
+# measurement recorded only in prose cannot be taken again, so here it is as
+# a program.
+#
+# Four things have to hold, and the exit code separates them: the loader
+# must allocate a block and write an index; the block must contain the raw
+# template this image ships; the 32 bytes past the template must be present
+# and ZEROED; and they must be writable and read back.
+#
+# The zero check is the one that matters. Without it a program that read the
+# template's own bytes back would pass, and the whole question is whether
+# the loader honoured `SizeOfZeroFill` rather than merely copying raw data.
+#
+# **Both ends of the 32 are probed, not just the first four bytes.** With
+# only the first probed, a `SizeOfZeroFill` of 8 passed as readily as one of
+# 32 -- the test would have confirmed that SOME bytes arrived and said
+# nothing about how many, which is the whole question. Reading and writing
+# at offset 44 as well makes the answer depend on the field's value.
+#
+# 66 only if every part holds. 11 to 17 name which failed, so a failure says
+# what the loader did rather than only that it did not work.
+PROGRAMS["tlsslot"] = (66, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	movq	%gs:0x58, %rax		/* ThreadLocalStoragePointer */
+	testq	%rax, %rax
+	movl	$11, %ecx
+	je	out			/* no TLS array at all */
+	movl	tls_index(%rip), %edx
+	movq	(%rax,%rdx,8), %rax	/* this module's block */
+	testq	%rax, %rax
+	movl	$12, %ecx
+	je	out			/* no block for this module */
+	movl	(%rax), %edx
+	movl	$13, %ecx
+	cmpl	$0x55667788, %edx
+	jne	out			/* the raw template was not copied */
+	movl	16(%rax), %edx
+	movl	$14, %ecx
+	testl	%edx, %edx
+	jne	out			/* the zero-fill area is not zeroed */
+	movl	44(%rax), %edx		/* the LAST four bytes of the 32 */
+	movl	$15, %ecx
+	testl	%edx, %edx
+	jne	out			/* the block is not as big as we asked */
+	movl	$0x5a5a5a5a, 16(%rax)
+	movl	$0xa5a5a5a5, 44(%rax)
+	movl	16(%rax), %edx
+	movl	$16, %ecx
+	cmpl	$0x5a5a5a5a, %edx
+	jne	out			/* the first slot did not hold */
+	movl	44(%rax), %edx
+	movl	$17, %ecx
+	cmpl	$0xa5a5a5a5, %edx
+	jne	out			/* the last slot did not hold */
+	movl	$66, %ecx
+out:
+	movl	%ecx, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 PROGRAMS["mxcsr"] = (55, """
 	.text
 	.globl _start
@@ -1727,7 +1814,8 @@ def align(value, to):
 	return (value + to - 1) // to * to
 
 
-def build(path, text, code_size, handler=None, frame=0, readonly=False):
+def build(path, text, code_size, handler=None, frame=0, readonly=False,
+          symbols=None):
 	"""Write a PE whose entry point is the start of `text`."""
 	# .xdata first, because .pdata points into it. A minimal UNWIND_INFO:
 	# version 1, no flags, no prolog, no unwind codes. Nothing here ever
@@ -1786,6 +1874,38 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False):
 		rva = align(rva + len(body), SECTION_ALIGNMENT)
 		offset += align(len(body), FILE_ALIGNMENT)
 
+	# **Static TLS, where a sample asks for it by naming the labels.** The
+	# structures live in `.text` like every other sample's data, because
+	# that is the only section whose offsets `assemble` reports back -- and
+	# the directory's fields are absolute VAs rather than RVAs, which is
+	# workable here only because these images have no ASLR and load at
+	# `IMAGE_BASE`.
+	#
+	# It is here to make a claim in `project.md` re-takeable. That document
+	# has said static TLS is "proven under wine" since Finding 69 and the
+	# tree held nothing that demonstrated it, which is a measurement
+	# recorded in prose with no way to take it again.
+	tls_directory = None
+	if symbols and "tls_directory" in symbols:
+		wanted = ("tls_raw", "tls_raw_end", "tls_index", "tls_callbacks",
+		          "tls_directory")
+		missing = [n for n in wanted if n not in symbols]
+		if missing:
+			raise SystemExit(f"pe_build: tls sample lacks {missing}")
+		base = IMAGE_BASE + sections[0][1]
+		at = symbols["tls_directory"]
+		text = bytearray(text)
+		struct.pack_into("<QQQQII", text, at,
+		                 base + symbols["tls_raw"],
+		                 base + symbols["tls_raw_end"],
+		                 base + symbols["tls_index"],
+		                 base + symbols["tls_callbacks"],
+		                 TLS_ZERO_FILL,
+		                 0x00100000)		# ALIGN_16BYTES
+		text = bytes(text)
+		sections[0] = sections[0][:3] + (text,) + sections[0][4:]
+		tls_directory = (sections[0][1] + at, 40)
+
 	image = bytearray(HEADER_SIZE)
 	image[0:2] = b"MZ"
 	struct.pack_into("<I", image, 0x3C, 0x40)
@@ -1820,6 +1940,9 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False):
 	# Data directory 3 is the exception table, which is .pdata.
 	struct.pack_into("<II", image, opt + 112 + 3 * 8,
 	                 sections[2][1], len(sections[2][3]))
+	# Data directory 9 is the TLS directory.
+	if tls_directory is not None:
+		struct.pack_into("<II", image, opt + 112 + 9 * 8, *tls_directory)
 
 	table = opt + 240
 	for i, (name, section_rva, section_offset, body, flags) in \
@@ -1856,6 +1979,12 @@ def main(argv):
 		print(f"pe_build.py: unknown mode {argv[0]!r}", file=sys.stderr)
 		return 2
 	name, output = argv[1], argv[2]
+	if len(argv) > 3:
+		# **How many bytes the TLS directory asks the loader to zero**, so
+		# that `check-tls` can run the A/B that makes `tlsslot` mean
+		# anything: a smaller number must not return 66.
+		global TLS_ZERO_FILL
+		TLS_ZERO_FILL = int(argv[3], 0)
 	if name not in PROGRAMS:
 		print(f"pe_build.py: no program {name!r}", file=sys.stderr)
 		return 2
@@ -1863,7 +1992,7 @@ def main(argv):
 	text, symbols = assemble(source)
 	code_size = symbols["func_end"]
 	sections = build(output, text, code_size, symbols.get("handler"),
-	                 FRAMES.get(name, 0), name in READONLY)
+	                 FRAMES.get(name, 0), name in READONLY, symbols)
 	print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
 	      f"function is {code_size} of them, expected exit code {expected}")
 	return 0

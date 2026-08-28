@@ -92,7 +92,8 @@ binary. `make clean` removes what it wrote, by name.
 ```sh
 make check        the gate: style, the lowering proof, and the C tests
 make check-pe     thirty-three PEs built here, rewritten, under wine
-make check-spill  the three ways a stub can get a scratch register
+make check-spill  the four ways a stub can get a scratch register
+make check-tls    whether the loader gives us per-thread bytes if asked
 make check-unwind whether an exception can be dispatched from inside a stub
 make hooks        install the commit-msg hook into .git/hooks
 make help         every target

@@ -8446,6 +8446,62 @@ start in `blocked`, which Finding 112 priced at 11 sites and declined.
 working as intended -- sites removed, not the fault address -- and it is worth stating
 plainly rather than leaving a reader to wonder why six increments moved nothing visible.
 
+### Finding 138 -- the TLS claim was prose, and is a check now
+
+`project.md` has said since Finding 69 that static TLS is feasible, that raising the TLS
+directory's `SizeOfZeroFill` gives the rewriter per-thread bytes of its own, and that it
+is **"proven under wine"**. The tree held nothing that proved it. A measurement recorded
+only in prose cannot be taken again, and the next session to build on it would have had
+to re-derive the whole thing before writing a line.
+
+`make check-tls` is that proof, and `pe_build.py` grows a TLS directory to carry it. The
+structures live in `.text` like every other sample's data, because that is the only
+section whose offsets `assemble` reports back, and the directory's fields are absolute
+VAs -- workable here only because these images have no ASLR and load at `IMAGE_BASE`.
+
+```
+StartAddressOfRawData 0x140001070      SizeOfZeroFill  32
+EndAddressOfRawData   0x140001080      Characteristics 0x100000
+AddressOfIndex        0x140001080
+AddressOfCallBacks    0x140001088
+```
+
+`tlsslot` reads `%gs:0x58`, indexes it by the index the loader wrote, and checks four
+things in order, returning a different number for each: the array exists, a block exists
+for this module, the raw template was copied, and the bytes past it are zeroed, writable
+and hold what was written.
+
+#### The sweep is what makes it a measurement rather than a demonstration
+
+```
+SizeOfZeroFill=0  returned 14     the area past the template is not zeroed
+SizeOfZeroFill=8  returned 15     the block is not as big as we asked
+SizeOfZeroFill=16 returned 15
+SizeOfZeroFill=32 returned 66
+```
+
+**The first version probed only the first four bytes of the area, and a `SizeOfZeroFill`
+of 8 passed exactly as readily as one of 32.** It would have confirmed that some bytes
+arrived and said nothing about how many, which is the entire question. Reading and writing
+at offset 44 as well -- the last four bytes of the 32 -- makes the answer depend on the
+field's value, and the sweep then reports three distinct failures before the pass.
+
+So the mechanism's file-format half is now established here rather than remembered: the
+loader honours the field, gives each thread exactly what is asked, and zeroes it.
+
+#### What is still not built, and what it needs
+
+Addressing a slot costs a general-purpose register and three instructions, which is
+Finding 69's objection and stands: `mov %gs:0x58,%rN`, an index, a load. What this does
+not settle is how many of the 1,332 sites still declined `no home space to borrow` have
+an `r8`-`r11` free across the bracket -- Finding 69 measured 740 of a differently-sized
+bucket, and that number wants re-taking against the current one.
+
+**Its failure mode is the only one in this area that is not silent corruption.** The bytes
+belong to nobody but the rewriter, so a slot used wrongly loses the rewriter's own value
+rather than a local of the program's -- which is why this is the mechanism to build next
+and not another refinement of the home space, whose floor Finding 137 measured.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

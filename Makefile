@@ -73,7 +73,8 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans check-spill check-unwind check-vex check-lanes \
+        census spans check-spill check-tls check-unwind check-vex \
+        check-lanes \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -373,6 +374,39 @@ placement: $(LISTING)
 
 # Reconcile what survives against what the rewriter declined, by comparing
 # address sets rather than totals.
+# Does the loader give us per-thread bytes if we ask for them? `project.md`
+# has said static TLS is "proven under wine" since Finding 69 with nothing
+# in the tree that proved it. This is that proof, and the sweep is what
+# makes it one: a smaller SizeOfZeroFill must NOT return 66.
+check-tls:
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-tls: wine is not installed"; exit 1; }
+	@mkdir -p $(PE_PREFIX)
+	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
+	@set -e; \
+	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	want=`$(PYTHON) tool/pe_build.py names | \
+	      awk '$$1 == "tlsslot" { print $$2 }'`; \
+	for fill in 0 8 16 32; do \
+		$(PYTHON) tool/pe_build.py sample tlsslot \
+			$(BUILD_DIR)/pe-tlsslot-$$fill.exe $$fill >/dev/null; \
+		$(WINE_ENV) timeout 120 wine \
+			$(BUILD_DIR)/pe-tlsslot-$$fill.exe >/dev/null 2>&1 \
+			&& got=0 || got=$$?; \
+		echo "check-tls: SizeOfZeroFill=$$fill returned $$got"; \
+		if [ "$$fill" = "32" ]; then \
+			if [ "$$got" != "$$want" ]; then \
+				echo "check-tls: the loader did not give us 32 zeroed"; \
+				echo "           per-thread bytes -- want $$want"; exit 1; \
+			fi; \
+		elif [ "$$got" = "$$want" ]; then \
+			echo "check-tls: SizeOfZeroFill=$$fill answered $$want too,"; \
+			echo "           so the test does not measure the field"; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "check-tls: the loader allocates and zeroes exactly what is asked"
+
 # What a closed 256-bit span could reach, which is not what Finding 133's
 # capacity figure suggests. A measurement, not a gate: it always exits 0.
 spans: $(LISTING) $(DETOURED)
