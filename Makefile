@@ -73,7 +73,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census check-spill check-unwind check-vex check-lanes \
+        census spans check-spill check-unwind check-vex check-lanes \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -373,6 +373,12 @@ placement: $(LISTING)
 
 # Reconcile what survives against what the rewriter declined, by comparing
 # address sets rather than totals.
+# What a closed 256-bit span could reach, which is not what Finding 133's
+# capacity figure suggests. A measurement, not a gate: it always exits 0.
+spans: $(LISTING) $(DETOURED)
+	objdump -d -j .text $(DETOURED) > $(BUILD_DIR)/after.asm
+	$(PYTHON) tool/detour.py spans $(TARGET) $(LISTING) $(BUILD_DIR)/after.asm
+
 census: $(LISTING) $(DETOURED)
 	objdump -d -j .text $(DETOURED) > $(BUILD_DIR)/after.asm
 	$(PYTHON) tool/detour.py census $(TARGET) $(LISTING) $(BUILD_DIR)/after.asm

@@ -8167,6 +8167,56 @@ sites need one upper half and have no slots at all** -- a function that will len
 which is the home-space problem of Findings 131 and 132 over again -- while **443 need
 eleven**, which no arrangement of 32-byte regions will ever hold.
 
+#### Corrected the same day: 1,674 was capacity, and capacity does not bind
+
+`make spans` is the instrument, `ymm_span` is the analysis behind it, and the number it
+returns is **212**, not 1,674.
+
+The two are not measuring the same thing and the earlier one was not wrong -- it was the
+wrong bound. **1,674 sites have room for the upper halves live at them.** Room is
+necessary and it is nowhere near sufficient, because an upper half exists only in a
+machine ymm register that no SSE instruction can reach: it can live in a slot only if
+every instruction that produces or consumes it was rewritten too. So the unit is a
+**closed span** -- one that begins at a definition this tool can materialise and ends
+with every value it tracks dead -- and closure is what binds:
+
+```
+surviving 256-bit sites             4,500
+covered by a closed span that fits    212
+
+    3,276  does not begin with a 256-bit load
+      101  ymm0 is still live after a branch target inside the span
+       92  ymm0 is still live after a control transfer
+       81  ymm1 is still live after a 256-bit form that is not lane-wise
+       57  ymm1 is still live after the value is touched by something narrower
+       53  nothing consumes the value
+```
+
+(The survey counts 4,500 by decoding every `c4`/`c5` as VEX where the by-mnemonic count
+is 4,451; the two admit different bytes and the 180 `(bad)` islands are where they can
+differ.)
+
+Of the spans that do close, the slot fit is a second filter and a milder one -- 81 of
+about 163 fit, and the common shortfall is wanting three slots with two available.
+
+**So the design Finding 133 named would buy about 212 sites**, against 479 for the
+caller's shadow and 414 for region liveness, at several times the complexity and in the
+part of the machinery that writes into the translated program's frame. That is not a
+trade worth making, and knowing it cost a measurement rather than a build.
+
+#### What would move it, in order of what it is worth
+
+  * **More lane-wise mnemonics.** "a 256-bit form that is not lane-wise" is the largest
+    closure refusal once the loads are set aside -- 81 + 45 + 45 and a tail. `LANE_WISE`
+    holds 35 and `lane_oracle.py` proves each of them under execution, so extending it is
+    bounded work with a proof attached rather than an argument.
+  * **Spans that need not close.** 92 sites lose their value at a control transfer and
+    101 at a branch target inside the span. Both would be answered by rewriting a whole
+    function's 256-bit work at once rather than a straight-line span, which is a much
+    larger design and the only one that reaches the 443 sites needing eleven slots.
+  * **Definitions other than a load** -- a zeroing idiom, a broadcast, a constant. 53
+    spans found nothing to consume the value, and 3,276 sites are not a load at all.
+
 #### What the measurement leaves open
 
 The lowering itself. Each 256-bit instruction becomes a pair of 128-bit ones, and

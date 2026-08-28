@@ -2671,6 +2671,163 @@ def assign_helpers(plain, positions, index, members, lendable=False):
 	return out, borrowed
 
 
+# How many 16-byte slots a home space holds. Two per region, and a site
+# whose function lends both has four. See Finding 133.
+SLOTS_PER_REGION = HOME_SPACE // SLOT
+
+
+def ymm_span(instructions, index, blocked, positions, limit=48, why=None):
+	"""A stretch of 256-bit work whose upper halves can live in slots.
+
+	`(members, last position, slots)` or None. This is analysis only -- it
+	emits nothing and nothing depends on it yet -- and it exists to price
+	the build Finding 133 scoped.
+
+	**Why a span and not an instruction.** An upper half exists only in the
+	machine's ymm register, which no SSE instruction can reach, so it can
+	be kept in a slot only if EVERY instruction that produces or consumes
+	it was rewritten too. The representation has to be consistent from the
+	definition to the death, which makes the unit a closed span rather than
+	a site.
+
+	`ymm_run` is this with two of the three cases: a load defines, a store
+	consumes, and anything else about the value ends the run. Arithmetic is
+	the third, and it is what `256-bit: arithmetic rather than a copy`
+	counts -- 1,974 sites, the largest 256-bit refusal there is.
+
+	**The span must close.** Every register it tracks has to be dead at the
+	end, because a value still live would have to be put back into a real
+	ymm register and nothing available can do that. A call ends the span and
+	costs nothing: Win64 makes every ymm upper half volatile across one, so
+	the value was dead there anyway.
+
+	`slots` is the PEAK number of upper halves live at once, not the number
+	of registers touched. A span that defines four values one after another
+	and kills each before the next needs one slot, not four.
+	"""
+	address, encoding, mnemonic, operands, _comment = instructions[index]
+	first = wide_move(encoding, mnemonic, operands)
+	if first is None or first[0] != "load":
+		note(why, "span: does not begin with a 256-bit load")
+		return None
+	# {register: [defined at member index, last used at member index]}
+	live = {first[1]: [0, 0]}
+	members = [("load", index, first[1])]
+	at = address + len(encoding)
+	stopped = "the span reached its limit"
+	for step in range(1, limit + 1):
+		position = index + step
+		if position >= len(instructions):
+			stopped = "the end of the listing"
+			break
+		next_address, bits, name, text, _c = instructions[position]
+		if next_address != at:
+			stopped = "a gap in the listing"
+			break
+		if next_address in blocked:
+			stopped = "a branch target inside the span"
+			break
+		if name.startswith(CONTROL_PREFIXES):
+			# A call ends it for free -- the upper halves were volatile
+			# across one anyway -- and so does any other transfer.
+			stopped = "a control transfer"
+			break
+		text = text or ""
+		vex = inplace.decode_vex(bits)
+		touched = [r for r in live
+		           if r in text or "%xmm" + r[len("%ymm"):] in text]
+		if vex is not None and vex["L"]:
+			what = wide_move(bits, name, text)
+			if what is not None and what[0] == "store" and what[1] in live:
+				live[what[1]][1] = len(members)
+				members.append(("store", position, what[1]))
+				at = next_address + len(bits)
+				continue
+			if what is not None and what[0] == "load":
+				live.setdefault(what[1], [len(members), len(members)])[1] = \
+					len(members)
+				members.append(("load", position, what[1]))
+				at = next_address + len(bits)
+				continue
+			pulled = extract_upper(bits, name, text, set(live))
+			if pulled is not None:
+				# **`extract_upper` returns the DESTINATION**, spelled as a
+				# ymm because that is what `ymm_run`'s `held_open` has to
+				# guard. What this span accounts for is the SOURCE, whose
+				# upper half the extract consumes; the destination is a
+				# fresh narrow value the original zeroed the top of, and it
+				# is tracked by nobody. Indexing `live` with the returned
+				# name was a `KeyError` on the first real listing.
+				source = canonical_ymm(inplace.split_operands(text)[1])
+				live[source][1] = len(members)
+				members.append(("extract", position, pulled))
+				at = next_address + len(bits)
+				continue
+			if name in LANE_WISE:
+				# **Every 256-bit SOURCE must already be tracked**, since
+				# its upper half has to come from somewhere this span
+				# wrote. A memory source needs no slot at all: its upper
+				# half is the sixteen bytes above it, addressed directly.
+				fields = inplace.split_operands(text)
+				if not fields:
+					stopped = "a lane-wise form with no operands"
+					break
+				wanted = [f for f in fields[:-1] if f.startswith("%ymm")]
+				if any(canonical_ymm(f) not in live for f in wanted):
+					stopped = "a lane-wise source this span never defined"
+					break
+				for field in wanted:
+					live[canonical_ymm(field)][1] = len(members)
+				destination = fields[-1]
+				if destination.startswith("%ymm"):
+					live.setdefault(canonical_ymm(destination),
+					                [len(members), len(members)])[1] = \
+						len(members)
+				members.append(("lane", position, canonical_ymm(destination)
+				                if destination.startswith("%ymm") else None))
+				at = next_address + len(bits)
+				continue
+			stopped = "a 256-bit form that is not lane-wise"
+			break
+		if touched:
+			stopped = "the value is touched by something narrower"
+			break
+		members.append(("plain", position, None))
+		at = next_address + len(bits)
+
+	# **The span closes or it is worth nothing.** A register still live at
+	# the end would have to be put back into a real ymm, and nothing here
+	# can do that.
+	end = index + len(members) - 1
+	for register in live:
+		if upper_half_read_later(instructions, end, register,
+		                         positions=positions):
+			note(why, "span: " + register[1:] + " is still live after "
+			     + stopped)
+			return None
+	if not any(kind in ("lane", "store", "extract")
+	           for kind, _p, _r in members):
+		note(why, "span: nothing consumes the value")
+		return None
+	# **The demand is the peak of the intervals, not the count of the
+	# registers.** Counting how many were ever tracked said two where a
+	# span defines a value, kills it, and defines another -- which needs
+	# one slot and reuses it. The selftest case for that is the reason this
+	# is computed from the intervals; the incremental count passed the
+	# other six.
+	peak = 0
+	for point in range(len(members)):
+		peak = max(peak, sum(1 for low, high in live.values()
+		                     if low <= point <= high))
+	return members, end, peak
+
+
+def canonical_ymm(field):
+	"""`%ymm7` from an operand, whatever else is around it."""
+	found = re.search(r"%ymm\d+", field)
+	return found.group(0) if found else field
+
+
 def lower_ymm_run(strategy, at, pool):
 	"""The run, with every 256-bit copy split and everything else moved."""
 	_helpers, entries = strategy[0], strategy[1]
@@ -4831,6 +4988,7 @@ def selftest():
 	failures += reach_selftest()
 	failures += shadow_selftest()
 	failures += reader_selftest()
+	failures += span_selftest()
 	failures += borrow_selftest()
 	failures += splat_selftest()
 	failures += constant_selftest()
@@ -5419,6 +5577,77 @@ REFERENCE_CASES = [
 ]
 
 
+# Instructions in the five-field shape `ymm_span` walks, laid out
+# contiguously so that no case fails for a gap. The encodings are real: a
+# VEX.256 load, store, `vaddps`, `vpermq` and a narrow `vmovaps`, since the
+# walk decodes `L` and the mnemonic and would be answering about nothing if
+# the bytes did not decode.
+SPAN_LOAD0 = bytes.fromhex("c5fc1006")		# vmovups (%rsi),%ymm0
+SPAN_LOAD1 = bytes.fromhex("c5fc104e20")	# vmovups 0x20(%rsi),%ymm1
+SPAN_STORE0 = bytes.fromhex("c5fc1107")		# vmovups %ymm0,(%rdi)
+SPAN_ADD = bytes.fromhex("c5f458c0")		# vaddps %ymm0,%ymm1,%ymm0
+SPAN_PERM = bytes.fromhex("c4e3fd00c001")	# vpermq $1,%ymm0,%ymm0
+SPAN_NARROW = bytes.fromhex("c5f828c8")		# vmovaps %xmm0,%xmm1
+SPAN_ADD2 = bytes.fromhex("c5f458d0")		# vaddps %ymm0,%ymm1,%ymm2
+
+
+def _span(rows):
+	"""Lay `(encoding, mnemonic, operands)` out end to end from 0x1000,
+	and end with a `ret`.
+
+	The `ret` is not decoration. `upper_half_read_later` answers "still
+	read" when it walks off the end of the listing, so a fixture without a
+	terminator refuses every span for a reason that is about the fixture
+	rather than about the code -- which is how the first run of this
+	selftest reported three failures that were its own.
+	"""
+	out, at = [], 0x1000
+	for encoding, mnemonic, operands in rows + [(b"\xc3", "ret", "")]:
+		out.append((at, encoding, mnemonic, operands, None))
+		at += len(encoding)
+	return out
+
+
+SPAN_CASES = [
+	("a load, an add and a store, which is the whole point",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_LOAD1, "vmovups", "0x20(%rsi),%ymm1"),
+	  (SPAN_ADD, "vaddps", "%ymm0,%ymm1,%ymm0"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")], 2),
+	("an add whose source this span never defined",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_ADD, "vaddps", "%ymm0,%ymm7,%ymm0"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")], None),
+	("a 256-bit form that does not split lane-wise",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_PERM, "vpermq", "$1,%ymm0,%ymm0"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")], None),
+	("the value touched by something narrower",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_NARROW, "vmovaps", "%xmm0,%xmm1"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")], None),
+	("a load nothing consumes",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0")], None),
+	# **The case the closure rule exists for**, and it was missing until a
+	# sabotage run removed the rule and nothing went red. Every other case
+	# closes by reaching the `ret`, so "the value must be dead at the end"
+	# was being asserted over spans where it was true anyway.
+	("a value still read after the span ends",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)"),
+	  (SPAN_ADD2, "vaddps", "%ymm0,%ymm1,%ymm2")], None),
+	("a memory source, which needs no slot of its own",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_ADD, "vaddps", "0x40(%rsi),%ymm0,%ymm0"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")], 1),
+	("two values whose lifetimes do not overlap need one slot",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)"),
+	  (SPAN_LOAD1, "vmovups", "0x20(%rsi),%ymm1"),
+	  (SPAN_STORE0, "vmovups", "%ymm1,(%rdi)")], 1),
+]
+
+
 def reach_selftest():
 	"""Prove `copy_reaches_home` still discriminates. Failures, or 0.
 
@@ -5480,6 +5709,32 @@ def reader_selftest():
 	return failures
 
 
+def span_selftest():
+	"""Prove `ymm_span` closes only where it can. Failures, or 0.
+
+	The number checked is the SLOT DEMAND, not merely whether a span was
+	found, because the demand is what Finding 133's whole argument turns
+	on -- a span that reported one slot where it needs two would be priced
+	as buildable and would corrupt a value the day it was built.
+	"""
+	failures = 0
+	for what, rows, expected in SPAN_CASES:
+		instructions = _span(rows)
+		positions = {a: i for i, (a, *_r) in enumerate(instructions)}
+		found = ymm_span(instructions, 0, set(), positions)
+		got = None if found is None else found[2]
+		if got != expected:
+			print(f"selftest: {what}: ymm_span wanted "
+			      f"{got if got is not None else 'nothing'} slot(s), want "
+			      f"{expected if expected is not None else 'a refusal'}",
+			      file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(SPAN_CASES)} ymm spans, closed and refused "
+		      f"with their slot demand")
+	return failures
+
+
 def shadow_selftest():
 	"""Prove the shadow is a second region and the depth walk is sound.
 
@@ -5536,6 +5791,102 @@ def shadow_selftest():
 		      f"{len(DEPTH_CASES)} rsp depths and "
 		      f"{len(REFERENCE_CASES)} shadow references, both directions")
 	return failures
+
+
+def span_survey(binary, listing, patched):
+	"""How much of the 256-bit residue a closed span could reach. Always 0.
+
+	A measurement rather than a gate, and it exists because Finding 133's
+	number was an upper bound on CAPACITY and this is the bound that binds:
+	a span is worth nothing unless every value it tracks dies inside it,
+	and most of them do not. Re-take it before building anything on the
+	scoping figure -- 1,674 sites have room for their upper halves, and 212
+	are reachable by a span that closes.
+	"""
+	groups = target_set.collect(binary)
+	blocked = set()
+	for values in groups.values():
+		blocked |= values
+	instructions = list(parse_with_comments(listing))
+	plain = [(a, e, m, o) for a, e, m, o, _c in instructions]
+	for address, _e, mnemonic, operands, comment in instructions:
+		if mnemonic.startswith(("j", "call", "loop")) and operands:
+			first = operands.split()[0]
+			if first.startswith("0x"):
+				try:
+					blocked.add(int(first, 16))
+				except ValueError:
+					pass
+		elif mnemonic == "lea" and isinstance(comment, int) \
+				and "(%rip)" in operands:
+			blocked.add(comment)
+	positions = scratch_finder.address_index(plain)
+	_p, _c, _s, _sk, _d, home = collect(binary, listing)
+	starts, ranges, _usable, _state = home
+
+	survivors = set()
+	for address, encoding, _m, _o in inplace.parse_listing(patched):
+		vex = inplace.decode_vex(encoding)
+		if vex is not None and vex["L"]:
+			survivors.add(address)
+
+	def slots(address):
+		"""How many 16-byte slots this site's function will lend."""
+		i = bisect.bisect_right(starts, address) - 1
+		if i < 0 or address >= ranges[i][1]:
+			return 0
+		total = 0
+		if home_space_free(home, address):
+			readers = home_readers(home, i)
+			if readers is not None and address not in readers:
+				total += SLOTS_PER_REGION
+		found = shadow_depths(home, i)
+		if found is not None:
+			seen, shadow_readers = found
+			if address not in shadow_readers \
+					and seen.get(address) is not None:
+				total += SLOTS_PER_REGION
+		return total
+
+	covered, refused, fit = set(), Counter(), Counter()
+	for index, (address, encoding, _m, _o, _c) in enumerate(instructions):
+		if address not in survivors:
+			continue
+		vex = inplace.decode_vex(encoding)
+		if vex is None or not vex["L"]:
+			continue
+		why = []
+		found = ymm_span(instructions, index, blocked, positions, why=why)
+		if found is None:
+			refused[why[0] if why else "?"] += 1
+			continue
+		members, _end, peak = found
+		room = slots(address)
+		fit[(peak, min(room, 2 * SLOTS_PER_REGION))] += 1
+		if peak <= room:
+			for _kind, member, _r in members:
+				if instructions[member][0] in survivors:
+					covered.add(instructions[member][0])
+
+	if not survivors:
+		# **A survey over nothing reports success as loudly as a real
+		# one.** The first run of this was handed the rewritten executable
+		# where a disassembly was wanted, found no instructions at all, and
+		# printed a tidy pair of zeroes above `exit 0`. `patched` is
+		# objdump's output, as `census` takes.
+		print("spans: no 256-bit site in that listing, so nothing was "
+		      "surveyed", file=sys.stderr)
+		return 2
+	print(f"surviving 256-bit sites          {len(survivors):>8,}")
+	print(f"covered by a closed span that fits {len(covered):>6,}")
+	print("\nwhy no span closed here:")
+	for reason, count in refused.most_common(8):
+		print(f"  {count:>7,}  {reason}")
+	print("\nclosed spans, slots wanted against slots available:")
+	for (peak, room), count in sorted(fit.items()):
+		print(f"  wants {peak}, has {room}: {count:>6,}"
+		      f"{'  fits' if peak <= room else ''}")
+	return 0
 
 
 def census(binary, listing, patched):
@@ -5693,6 +6044,9 @@ def main(argv):
 
 	if mode == "census":
 		return census(argv[1], argv[2], argv[3])
+
+	if mode == "spans":
+		return span_survey(argv[1], argv[2], argv[3])
 
 	if mode == "plan":
 		_patches, candidates, stats, skipped, declined, _home = \
