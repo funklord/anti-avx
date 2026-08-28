@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **797,827 of 805,131 VEX
-sites -- 99.1%** -- through 202,064 detours, and every `make detour-verify` invariant
-holds on the result. 7,304 sites are left, and the rewritten binary loads 305 modules
+**Status:** the rewriter works. `tool/detour.py` rewrites **797,907 of 805,131 VEX
+sites -- 99.1%** -- through 202,115 detours, and every `make detour-verify` invariant
+holds on the result. 7,224 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
 ---
@@ -8328,6 +8328,53 @@ Six cases are permanent, and two of them exist so that the fix is not merely "re
 anything that moves": a second-hand copy dereferenced clear of the region is still
 allowed, and so is a 32-bit move.
 
+### Finding 136 -- a pointer whose offset is lost is still a pointer
+
+**7,304 -> 7,224 sites**, and `no home space to borrow` from 1,391 to 1,332.
+
+`copy_reaches_home` refused the whole function whenever it lost a pointer's offset --
+arithmetic it could not follow, and, after Finding 135, a conditional move or anything
+else that carried a tracked register into a different one. That was the largest refusal
+left inside it. But losing the OFFSET is not losing the POINTER: what is known is still
+that the value is stack-derived, and what is unknown is only where it points.
+
+So a lost pointer becomes **unlocated** rather than fatal. Any dereference through it is
+refused, wherever it points -- which is the same answer as landing inside, since nothing
+can be said either way -- and anything that overwrites it ends the matter entirely.
+
+#### The measurement that said it was worth doing, and the one that was wrong
+
+The gain is exactly the pointers nothing dereferences before they die. Probing that
+during a real collect:
+
+```
+    1,906  dereferenced after the arithmetic
+      374  overwritten before any dereference
+       10  never dereferenced again
+```
+
+**The first version of that probe scanned the whole function** and reported 2,268 of
+2,290 dereferenced, which is a number it could hardly have failed to produce: `%rax` is
+dereferenced somewhere in almost any function, and the question was only ever about the
+suffix. Reading it as a verdict would have closed the case. The corrected probe scans
+forward from the arithmetic and stops at an overwrite, and it moved 384 events from
+"hopeless" to "free".
+
+The other 1,906 are not lost either: a dereference through an unlocated pointer is a
+hazard **at a place**, so Finding 134's reachability answers it exactly as it answers a
+located one.
+
+#### What still refuses, and why each has to
+
+An unlocated pointer **pushed** or **stored to memory** refuses the function outright.
+Both leave this text, and the escape check Finding 132 added compares the pointer's value
+against the region -- which needs a value. There is none, so there is nothing to check
+and refusing is the only answer.
+
+Six cases are permanent and three of them must refuse, which is what the sabotage runs
+confirm: removing the dereference check turns eight red, the push check two, the escape
+check two.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8485,9 +8532,9 @@ What is left divides cleanly, and the two halves want different work:
     the ABI. `ymm value has no known upper half` (1,140 outside a window) and
     `256-bit: arithmetic rather than a copy` (1,818) are one problem stated twice, and
     that is the problem.
-  * **2,679 are 128-bit** (and 180 are undecodable bytes rather than instructions --
-    see below), and after Findings 130, 131, 134 and 135 their largest causes are a shadow
-    the
+  * **2,599 are 128-bit** (and 180 are undecodable bytes rather than instructions --
+    see below), and after Findings 130, 131 and 134 to 136 their largest causes are a
+    shadow the
     function genuinely uses (which wants memory of our own -- static TLS is priced at 740
     sites), `outside .pdata` at 325, and `next instruction is a branch target` at 209.
 

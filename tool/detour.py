@@ -1251,12 +1251,20 @@ def copy_reaches_home(rows, frame, region=None, hazards=None):
 			return True
 		region = (-frame, -frame + HOME_SPACE)
 	low, high = region
-	taint, depth = {}, 0
+	# `taint` is a pointer whose offset from the entry `rsp` is known.
+	# **`unlocated` is one that is still stack-derived and no longer
+	# placed** -- arithmetic that could not be followed, a conditional
+	# move, anything that reads a tracked register and writes another by a
+	# route this cannot model. Losing the offset used to refuse the
+	# function; it refuses a DEREFERENCE now, wherever the pointer points,
+	# and nothing at all if the pointer is overwritten first. Finding 136.
+	taint, unlocated, depth = {}, set(), 0
 	for address, mnemonic, operands in rows:
 		operands = operands or ""
 		fields = inplace.split_operands(operands) if operands else []
 		if mnemonic in ("push", "pushq"):
-			if canonical(operands) in taint:
+			if canonical(operands) in taint \
+					or canonical(operands) in unlocated:
 				return True		# the copy leaves this text
 			depth = None if depth is None else depth - 8
 		elif mnemonic in ("pop", "popq"):
@@ -1268,7 +1276,13 @@ def copy_reaches_home(rows, frame, region=None, hazards=None):
 		# forms: taking the address of the region is refused exactly as a
 		# write to it is.
 		for match in MEMORY_BASE.finditer(operands):
-			if match.group(2) in taint:
+			if match.group(2) in unlocated:
+				# Nothing can be said about where this lands, which is the
+				# same answer as landing inside.
+				if hazards is None:
+					return True
+				hazards.append(address)
+			elif match.group(2) in taint:
 				text = match.group(1)
 				landing = taint[match.group(2)] + \
 					(int(text, 16) if text else 0)
@@ -1277,7 +1291,8 @@ def copy_reaches_home(rows, frame, region=None, hazards=None):
 						return True
 					hazards.append(address)
 		match = INDEXED_BASE.search(operands)
-		if match and match.group(1) in taint:
+		if match and (match.group(1) in taint
+		              or match.group(1) in unlocated):
 			if hazards is None:
 				return True
 			hazards.append(address)
@@ -1285,15 +1300,26 @@ def copy_reaches_home(rows, frame, region=None, hazards=None):
 			if depth is None:
 				return True
 			taint[RSP_COPY.match(operands).group(1)] = depth
+			unlocated.discard(RSP_COPY.match(operands).group(1))
 			continue
 		if mnemonic == "lea" and len(fields) == 2 \
 				and fields[1].startswith("%"):
 			match = MEMORY_BASE.fullmatch(fields[0])
+			if match and match.group(2) in unlocated:
+				taint.pop(canonical(fields[1]), None)
+				unlocated.add(canonical(fields[1]))
+				continue
 			if match and match.group(2) in taint:
 				text = match.group(1)
 				taint[canonical(fields[1])] = taint[match.group(2)] + \
 					(int(text, 16) if text else 0)
+				unlocated.discard(canonical(fields[1]))
 				continue
+		if len(fields) == 2 and fields[0].startswith("%") \
+				and canonical(fields[0]) in unlocated and "(" in fields[1]:
+			# An unlocated pointer leaving the text cannot be checked
+			# against the region, because there is nothing to check.
+			return True
 		if len(fields) == 2 and fields[0].startswith("%") \
 				and canonical(fields[0]) in taint and "(" in fields[1]:
 			# **The copy is stored to memory, and what it is worth
@@ -1355,32 +1381,49 @@ def copy_reaches_home(rows, frame, region=None, hazards=None):
 			destination = fields[-1].lstrip("%")
 			wide = canonical(destination)
 			carried = [canonical(f) for f in fields[:-1]
-			           if f.startswith("%") and canonical(f) in taint]
+			           if f.startswith("%")
+			           and (canonical(f) in taint or canonical(f) in unlocated)]
 			if carried and wide not in carried:
 				if destination in WIDE32 \
 						or NUMBERED_NARROW.match(destination):
 					pass
 				elif len(fields) == 2 and len(carried) == 1 \
+						and carried[0] in taint \
 						and mnemonic in ("mov", "movq"):
 					taint[wide] = taint[carried[0]]
+					unlocated.discard(wide)
 					continue
 				else:
-					return True
+					# Stack-derived and unplaced. Refusing here is what
+					# Finding 135 did; a dereference through it refuses
+					# now, and an overwrite ends it. Finding 136.
+					taint.pop(wide, None)
+					unlocated.add(wide)
+					continue
 		if fields and fields[-1].startswith("%") \
 				and mnemonic not in FLAGS_ONLY:
 			name = fields[-1].lstrip("%")
 			wide = canonical(name)
-			if wide not in taint:
+			overwritten = (mnemonic.startswith("mov")
+			               or mnemonic in ("pop", "popq")
+			               or mnemonic in OVERWRITES
+			               or name in WIDE32 or NUMBERED_NARROW.match(name))
+			if wide in unlocated:
+				# Whatever writes it either destroys the pointer or leaves
+				# it exactly as unplaceable, and only the first matters.
+				if overwritten:
+					unlocated.discard(wide)
+			elif wide not in taint:
 				taint.pop(wide, None)
-			elif mnemonic.startswith("mov") or mnemonic in ("pop", "popq") \
-					or mnemonic in OVERWRITES \
-					or name in WIDE32 or NUMBERED_NARROW.match(name):
+			elif overwritten:
 				del taint[wide]		# overwritten, or zero-extended away
 			else:
 				step = immediate_step(mnemonic, operands, fields[-1])
 				if step is None:
-					return True
-				taint[wide] += step
+					del taint[wide]
+					unlocated.add(wide)
+				else:
+					taint[wide] += step
 		if mnemonic in IMPLICIT_RAX:
 			taint.pop("rax", None)
 			taint.pop("rdx", None)
@@ -5133,6 +5176,30 @@ REACH_CASES = [
 	("arithmetic that cannot be followed",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("add", "%rdx,%rax"),
 	  ("mov", "%rcx,(%rax)")], True),
+	# **A pointer whose offset is lost is still a pointer**, and until
+	# Finding 136 losing the offset refused the function outright. It is
+	# tracked as unlocated instead: any dereference through it is a hazard
+	# wherever it points, and anything that overwrites it ends the matter.
+	# Measured over a collect, 374 of 2,290 such pointers are overwritten
+	# before they are dereferenced and 10 are never used again.
+	("arithmetic that cannot be followed, then the register overwritten",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("add", "%rdx,%rax"),
+	  ("mov", "%r8,%rax"), ("mov", "%rcx,(%rax)")], False),
+	("arithmetic that cannot be followed, and never used again",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("add", "%rdx,%rax"),
+	  ("mov", "%r8,%r9")], False),
+	("an unlocated pointer pushed, which leaves the text",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("add", "%rdx,%rax"),
+	  ("push", "%rax")], True),
+	("an unlocated pointer stored to memory",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("add", "%rdx,%rax"),
+	  ("mov", "%rax,0x100(%rsp)")], True),
+	("a cmov from a tainted register, never dereferenced",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("cmove", "%rax,%rbx"),
+	  ("mov", "%r8,%r9")], False),
+	("a cmov from a tainted register, then dereferenced",
+	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"), ("cmove", "%rax,%rbx"),
+	  ("mov", "%rcx,(%rbx)")], True),
 	("an indexed access through the copy",
 	 [("mov", "%rsp,%rax"), ("sub", "$0x28,%rsp"),
 	  ("mov", "%rcx,(%rax,%rdx,1)")], True),
