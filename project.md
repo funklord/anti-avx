@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **797,574 of 805,131 VEX
-sites -- 99.1%** -- through 201,887 detours, and every `make detour-verify` invariant
-holds on the result. 7,557 sites are left, and the rewritten binary loads 305 modules
+**Status:** the rewriter works. `tool/detour.py` rewrites **797,837 of 805,131 VEX
+sites -- 99.1%** -- through 202,069 detours, and every `make detour-verify` invariant
+holds on the result. 7,294 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
 ---
@@ -8231,6 +8231,57 @@ of that number is that the home-space analysis is now load-bearing for the 256-b
 as well as the 128-bit one. Every site Findings 131 and 132 add to what a function will
 lend is worth more than one site now.
 
+### Finding 134 -- the other whole-body answer, asked at a place instead
+
+**7,557 -> 7,294 sites.** 263 removed, 202,069 detours, `no home space to borrow` down
+from 1,620 to 1,391.
+
+Finding 131 made a direct reference to a home space a question about the site rather than
+about the function. It left the larger half of the same refusal untouched:
+`copy_reaches_home` walks a copy of `rsp` and returns a verdict about the whole function,
+and that verdict was the biggest single reason a function would lend nothing.
+
+Instrumenting a whole collect, the refusals inside it divide:
+
+```
+    1,708  a dereference lands in the region
+    1,158  arithmetic that cannot be followed
+      550  an indexed access through the copy
+```
+
+**Two of the six refusals are positional and four are not**, and the split is the whole
+of what makes this safe:
+
+  * a **dereference** through a tracked copy that lands in the region, and an **indexed
+    access** through one, each happen AT a place. If the site cannot reach that place,
+    the borrow does not disturb it -- the same argument, and the same
+    `readers_reachable`, that Finding 131 applied to a direct operand;
+  * a copy **pushed**, or **escaping into the region**, leaves this text entirely; one
+    taken at an **unknown depth** was never located; and **arithmetic that cannot be
+    followed** poisons every later dereference through that register rather than one.
+    None of those four is about a place, and all four stay verdicts about the function.
+
+So `copy_reaches_home` takes a `hazards` list now. Given one, the two positional refusals
+record an address and the walk carries on; without one it behaves exactly as before, which
+is what `--region=whole` still selects.
+
+#### The invariant that holds it, and it needed no classifying
+
+The risk in turning a refusal into a position is that a refusal goes missing. That is
+checkable without deciding which branch each case trips: **every case that refuses must
+either still refuse, or name at least one place; and no case that was allowed may start
+naming one.** Both halves run over all 18 of `REACH_CASES`.
+
+Sabotaged by dropping the recorded address, six of the eighteen go red.
+
+#### Two rows, one set
+
+A reader is a reader. `home_readers` unions the direct operands and the copy hazards into
+one list and hands it to `region_readers`, so the two kinds are answered by one
+reachability pass rather than by two rules that could disagree. `copy_reaches_home` takes
+rows carrying their addresses to make that possible, and the two selftests that name no
+addresses lay theirs out four bytes apart in `_addressed`.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8382,14 +8433,14 @@ one for several sessions.
 
 What is left divides cleanly, and the two halves want different work:
 
-  * **4,451 sites are 256-bit**, and **Finding 133 has scoped them**: the upper halves
+  * **4,445 sites are 256-bit**, and **Finding 133 has scoped them**: the upper halves
     want a home space rather than a register or a TLS slot, 1,674 of the sites have room
     for every upper half live at them, and the lifetimes of the two things coincide by
     the ABI. `ymm value has no known upper half` (1,140 outside a window) and
     `256-bit: arithmetic rather than a copy` (1,818) are one problem stated twice, and
     that is the problem.
-  * **2,926 are 128-bit** (and 180 are undecodable bytes rather than instructions --
-    see below), and after Findings 130 and 131 their largest causes are a shadow the
+  * **2,669 are 128-bit** (and 180 are undecodable bytes rather than instructions --
+    see below), and after Findings 130, 131 and 134 their largest causes are a shadow the
     function genuinely uses (which wants memory of our own -- static TLS is priced at 740
     sites), `outside .pdata` at 325, and `next instruction is a branch target` at 209.
 

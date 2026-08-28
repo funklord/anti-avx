@@ -1188,9 +1188,24 @@ def readers_reachable(plain, first, last, refs, inside_targets):
 	return reaching
 
 
-def copy_reaches_home(rows, frame, region=None):
+def copy_reaches_home(rows, frame, region=None, hazards=None):
 	"""True if a copy of `rsp` could reach a home space, or cannot be
 	followed. Refusing is the answer to every doubt.
+
+	`hazards` turns two of the refusals from a verdict about the function
+	into a list of ADDRESSES, which the caller can then ask reachability
+	about exactly as it does a direct operand -- see `region_readers` and
+	Finding 131. Left out, everything behaves as before.
+
+	**Only two of the six refusals are positional**, and the split is the
+	whole of what makes this safe. A dereference through a tracked copy
+	that lands in the region, and an indexed access through one, each
+	happen AT a place: if the site cannot reach that place, the borrow does
+	not disturb it. The other four are not about a place at all -- a copy
+	pushed or escaping into the region leaves this text entirely, a copy
+	taken at an unknown depth was never located, and arithmetic that cannot
+	be followed poisons every later dereference through that register
+	rather than one. Those stay verdicts about the function.
 
 	`region` is the entry-relative half-open range at risk, and it exists
 	because there are two of them. Left out, it is the callee home space
@@ -1237,7 +1252,7 @@ def copy_reaches_home(rows, frame, region=None):
 		region = (-frame, -frame + HOME_SPACE)
 	low, high = region
 	taint, depth = {}, 0
-	for mnemonic, operands in rows:
+	for address, mnemonic, operands in rows:
 		operands = operands or ""
 		fields = inplace.split_operands(operands) if operands else []
 		if mnemonic in ("push", "pushq"):
@@ -1258,10 +1273,14 @@ def copy_reaches_home(rows, frame, region=None):
 				landing = taint[match.group(2)] + \
 					(int(text, 16) if text else 0)
 				if low <= landing < high:
-					return True
+					if hazards is None:
+						return True
+					hazards.append(address)
 		match = INDEXED_BASE.search(operands)
 		if match and match.group(1) in taint:
-			return True
+			if hazards is None:
+				return True
+			hazards.append(address)
 		if RSP_COPY.match(operands):
 			if depth is None:
 				return True
@@ -1458,19 +1477,29 @@ def home_readers(home, i):
 	only a function actually asked about pays for it -- and so that a
 	direct reference no longer excuses the walk, now that a direct
 	reference is not a refusal by itself.
+
+	Two kinds of reader end up in the same set: an operand that names the
+	region, and a dereference through a copy of `rsp` that lands in it.
+	Both happen at an address, so both are answered by reachability rather
+	than by refusing the function. See `copy_reaches_home`'s `hazards`.
 	"""
 	_starts, ranges, _usable, state = home
 	if i in state["home_cache"]:
 		return state["home_cache"][i]
+	copied = []
 	if i in state["copies"]:
 		if RSP_RULE == RSP_BLANKET:
 			return state["home_cache"].setdefault(i, None)
-		rows = function_rows(state, ranges, i, with_address=False)
-		if copy_reaches_home(rows, prologue_frame(state["data"],
-		                                          state["unwind"],
-		                                          ranges[i][0])):
+		hazards = [] if REGION_RULE == REGION_LIVE else None
+		if copy_reaches_home(function_rows(state, ranges, i),
+		                     prologue_frame(state["data"], state["unwind"],
+		                                    ranges[i][0]),
+		                     hazards=hazards):
 			return state["home_cache"].setdefault(i, None)
-	refs = state["direct"].get(i, ())
+		# A dereference through a tracked copy is a reader at a place, like
+		# a direct operand, and is asked the same question. Finding 134.
+		copied = hazards or []
+	refs = list(state["direct"].get(i, ())) + copied
 	if refs and REGION_RULE == REGION_WHOLE:
 		return state["home_cache"].setdefault(i, None)
 	return state["home_cache"].setdefault(
@@ -1565,10 +1594,14 @@ def shadow_depths(home, i):
 	refs, pointed = region_references(rows, seen, CALLER_SHADOW)
 	if pointed:
 		return state["cache"].setdefault(i, None)
+	hazards = [] if REGION_RULE == REGION_LIVE else None
 	if any(RSP_COPY.match(operands) for _a, _m, operands in rows) \
-			and copy_reaches_home([(m, o) for _a, m, o in rows], None,
-			                      CALLER_SHADOW):
+			and copy_reaches_home(rows, None, CALLER_SHADOW,
+			                      hazards=hazards):
 		return state["cache"].setdefault(i, None)
+	# A hazard through a copy is a reader like a direct operand is, and is
+	# asked the same question. Finding 134.
+	refs = list(refs) + list(hazards or [])
 	if refs and REGION_RULE == REGION_WHOLE:
 		return state["cache"].setdefault(i, None)
 	return state["cache"].setdefault(
@@ -5511,6 +5544,16 @@ DEPTH_CASES = [
 # The reference is always at 0x14, the site always at 0x20, and what
 # changes is the control flow between and around them. `expected` is
 # whether the SITE can still reach the reference -- True means refuse.
+def _addressed(rows):
+	"""`REACH_CASES` and `SHADOW_CASES` name no addresses, because what
+	they test is the walk rather than where it is. `copy_reaches_home`
+	takes them now so that it can report a hazard's position, so they are
+	laid out four bytes apart here.
+	"""
+	return [(0x1000 + 4 * i, mnemonic, operands)
+	        for i, (mnemonic, operands) in enumerate(rows)]
+
+
 def _row(address, mnemonic, operands=""):
 	return (address, b"\x90", mnemonic, operands)
 
@@ -5661,15 +5704,34 @@ def reach_selftest():
 	"""
 	failures = 0
 	for what, rows, expected in REACH_CASES:
-		got = copy_reaches_home(rows, None if "unknown frame" in what
-		                        else 0x28)
+		got = copy_reaches_home(_addressed(rows),
+		                        None if "unknown frame" in what else 0x28)
 		if got != expected:
 			print(f"selftest: {what}: copy_reaches_home said {got}, "
 			      f"want {expected}", file=sys.stderr)
 			failures += 1
+	# **A refusal turned into a position must not go missing.** Asked for
+	# `hazards`, two of the six refusals report an address and carry on
+	# instead of returning True -- so every case that refuses must now
+	# either still refuse or name at least one place, and no case that was
+	# allowed may start naming one. That is the invariant, and it is
+	# checkable without classifying which refusal each case trips.
+	for what, rows, expected in REACH_CASES:
+		hazards = []
+		got = copy_reaches_home(_addressed(rows),
+		                        None if "unknown frame" in what else 0x28,
+		                        hazards=hazards)
+		if expected and not got and not hazards:
+			print(f"selftest: {what}: refused whole, and named no place "
+			      f"when asked for one", file=sys.stderr)
+			failures += 1
+		if not expected and (got or hazards):
+			print(f"selftest: {what}: was allowed, and now refuses or names "
+			      f"{[hex(a) for a in hazards]}", file=sys.stderr)
+			failures += 1
 	if not failures:
 		print(f"selftest: {len(REACH_CASES)} rsp-copy cases, caught in both "
-		      f"directions")
+		      f"directions and none lost when asked where")
 	return failures
 
 
@@ -5742,7 +5804,7 @@ def shadow_selftest():
 	"""
 	failures = 0
 	for what, rows, expected in SHADOW_CASES:
-		got = copy_reaches_home(rows, None, CALLER_SHADOW)
+		got = copy_reaches_home(_addressed(rows), None, CALLER_SHADOW)
 		if got != expected:
 			print(f"selftest: {what}: the shadow walk said {got}, "
 			      f"want {expected}", file=sys.stderr)
