@@ -8082,6 +8082,105 @@ one was resting on it in shipped code. The tell each time was an argument about 
 question about a *span of memory*. When a rule's justification talks about when something
 happens, check that the thing it protects is not permanent.
 
+### Finding 133 -- the 256-bit residue wants a home space, not a register and not TLS
+
+The largest item left has been "the register representation" for several sessions, filed
+as a different kind of work and deferred each time. It turns on one question -- **where
+does an upper half live** -- and that question is a measurement, not a preference.
+
+#### How many upper halves are live at once
+
+Win64 makes every ymm upper half volatile, so a lifetime never crosses a call and
+`upper_half_read_later` already returns "dead" at one. That bounds the question to the
+call-free region a site sits in. Taking an upper half as live from the first 256-bit
+instruction writing the register to the last one reading it, at the 4,318 surviving
+256-bit sites that fall inside a modelled region:
+
+```
+   1 live    1,426   33.0% cumulative
+   2 live      629   47.6%
+   3 live      255   53.5%
+   4 live      114   56.1%
+   5 live       91   58.2%
+  ...
+  11 live      443   85.0%
+  16 live      123  100.0%
+```
+
+**A third need one, half need two or fewer** -- and a long tail needs ten or more, with
+123 sites needing all sixteen. Any answer that only handles one or two leaves that tail,
+and any answer that must handle sixteen is doing register allocation on a machine with
+none to spare. The span model over-counts, since a register written twice has its span
+stretched between the two, which is the direction that does not flatter a small answer.
+
+#### Registers reach an eighth of it
+
+Of the spans mentioning exactly one ymm anywhere, 682 hold a surviving site. Asking the
+cheap conservative question -- how many xmm registers does the enclosing FUNCTION never
+mention, so that nothing needs saving and nothing reads them after:
+
+```
+      481  a volatile xmm the function never mentions
+      170  only a NONVOLATILE xmm is untouched
+       31  the function mentions all sixteen
+```
+
+So a helper register reaches something like 500 to 650 sites of 4,451. `free_across`
+would find more, since a register merely dead across the span will also do. It is not
+nothing and it is not the answer.
+
+#### TLS was rejected for this, correctly, and that is not the only memory
+
+Finding 69 priced per-thread memory and rejected it for the 256-bit half in one sentence:
+reaching a TLS slot costs a general-purpose register, at every site, in code that is
+register-starved by definition. That still holds.
+
+**A home space costs no register at all.** It is addressed `N(%rsp)`, and Findings 130 to
+132 made both of them -- the 32 bytes a function reserves for its callees and the 32 its
+caller reserved for it -- available and decided per site rather than per function.
+
+**And the lifetimes coincide exactly**, which is what makes this more than an
+availability coincidence. A ymm upper half is volatile across a call by the ABI. So is a
+home space: the callee home space IS the callee's shadow, by definition, and a call
+destroys what is in it. The span over which a home space can hold a value is precisely
+the span over which an upper half needs to live. Nothing has to be spilled at a call
+because nothing survives one on either side.
+
+Asked of every surviving 256-bit site:
+
+```
+    1,981   44.5%  neither region will lend
+    1,175   26.4%  the callee home space: two slots
+    1,138   25.6%  BOTH: four 16-byte slots
+      157    3.5%  the caller's shadow: two slots
+```
+
+#### Crossed, because two marginals multiplied are a derivation
+
+```
+    1,674   37.6%  the slots hold every live upper half
+```
+
+That is the prize, and it is larger than every increment this project has taken. What
+falls short falls short in two different ways, and they want different answers: **331
+sites need one upper half and have no slots at all** -- a function that will lend nothing,
+which is the home-space problem of Findings 131 and 132 over again -- while **443 need
+eleven**, which no arrangement of 32-byte regions will ever hold.
+
+#### What the measurement leaves open
+
+The lowering itself. Each 256-bit instruction becomes a pair of 128-bit ones, and
+`lane_oracle.py` already proves 35 mnemonics split lane-wise under execution -- that is
+the semantic foundation and it exists. What does not exist is the strategy that assigns
+slots across a span, spills nothing, and refuses cleanly when the span grows past its
+capacity. `assign_helpers`, `lifetimes` and `free_across` are the shape of it for
+registers; the same shape over slots is the work.
+
+Nor does it settle the 1,981 sites in functions that lend nothing, and the honest reading
+of that number is that the home-space analysis is now load-bearing for the 256-bit half
+as well as the 128-bit one. Every site Findings 131 and 132 add to what a function will
+lend is worth more than one site now.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8233,10 +8332,12 @@ one for several sessions.
 
 What is left divides cleanly, and the two halves want different work:
 
-  * **4,451 sites are 256-bit** and want the register representation, which
-    `project.md`'s ladder has always described as a different kind of work from anything
-    done so far. `ymm value has no known upper half` (1,140 outside a window) and
-    `256-bit: arithmetic rather than a copy` (1,818) are one problem stated twice.
+  * **4,451 sites are 256-bit**, and **Finding 133 has scoped them**: the upper halves
+    want a home space rather than a register or a TLS slot, 1,674 of the sites have room
+    for every upper half live at them, and the lifetimes of the two things coincide by
+    the ABI. `ymm value has no known upper half` (1,140 outside a window) and
+    `256-bit: arithmetic rather than a copy` (1,818) are one problem stated twice, and
+    that is the problem.
   * **2,926 are 128-bit** (and 180 are undecodable bytes rather than instructions --
     see below), and after Findings 130 and 131 their largest causes are a shadow the
     function genuinely uses (which wants memory of our own -- static TLS is priced at 740
