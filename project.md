@@ -8542,80 +8542,152 @@ code quickly.
    changes the flag is already there.
 2. **How much further should the Y1 register model go?** Finding 50 built its first
    piece -- the gapped copy, holding an upper half in a second register across a span --
-   and it works. 12,552 `vmovups` stores and 11,226 loads are
-   neither copies nor zero fills, and need a ymm represented as two xmm registers
-   across a basic block -- register allocation, the largest single remaining win, and
-   a different kind of work from anything done so far. Findings 39, 40 and 44 have
-   the measurements, and Finding 44 is the one that closes the alternatives: only
-   1,586 of the unresolved stores are blocked by control flow, the rest holding real
-   256-bit values that no scan can reason away, and Finding 40 also names what the model must repair: the in-place
-   lowerings have already destroyed the [255:128] zeroing that VEX.128 writes perform.
+   and it works. What is left needs a ymm represented as two halves across a basic
+   block. Findings 39, 40 and 44 have the original measurements, and Finding 40 names
+   what the model must repair: the in-place lowerings have already destroyed the
+   [255:128] zeroing that VEX.128 writes perform.
+
+   **Findings 133 and 137 have since answered most of the shape of it, and the answer
+   is not a register.** An upper half's lifetime never crosses a call, because Win64
+   makes it volatile -- and a home space is volatile across a call for the same reason,
+   so the two coincide exactly and a slot costs no register to address. A third of the
+   256-bit sites need one upper half live and half need two or fewer, but a tail needs
+   ten or more with 123 needing all sixteen, so registers alone reach an eighth.
+
+   **What is still the decision** is whether to build the general form. The
+   straight-line version is measured at 212 sites (`make spans`); reaching the 443 sites
+   that need eleven slots at once, or the 193 that lose their value at a control
+   transfer, needs a whole-function rewrite that nobody has started. Do not begin it on
+   the 1,674 capacity figure -- that is room, not reach.
 
 ### Where the residue actually is
 
-Measured after Finding 115. `make detour-plan` names every refusal; these are the buckets
-that matter, with the count outside any accepted window beside the total, because a site
-inside one has already been taken by whatever strategy claimed that window.
+**Re-measured 2026-08-29, after Findings 130 to 138.** `make detour-plan` names every
+refusal and `make census` reconciles them against the binary; these are the buckets that
+matter, with the count outside any accepted window beside the total, because a site inside
+one has already been taken by whatever strategy claimed that window.
 
 ```
-                                             total   outside
-ymm value has no known upper half           10,086     1,238
-no home space to borrow                      2,517     1,876
-256-bit: arithmetic rather than a copy       1,974     1,846
-256-bit: no store before 256-bit arithmetic    404       360
-outside .pdata                                 321       321
-no register free across the ymm run            213       213
-next instruction is a branch target            202       202
+                                                total   outside
+ymm value has no known upper half              10,015       966
+256-bit: arithmetic rather than a copy          1,974     1,818
+no home space to borrow                         1,332       992
+256-bit: no store before 256-bit arithmetic       359       282
+outside .pdata                                    325       325
+next instruction is a branch target               206       206
 the constant is read by something that
-  will not reload it                           182       182
-                                                       -----
-everything left, all buckets                           7,032
+  will not reload it                              182       182
+256-bit: no store before the value is touched     173       150
+256-bit: no store before a control transfer       161       160
+256-bit: no store before a branch target          139       138
+                                                          -----
+everything left, all buckets                              5,596
 ```
 
-**Three-fifths of what is left is one piece of work.** `arithmetic rather than a copy` and
-`ymm value has no known upper half` are both decision 2 above: the first is a 256-bit
-operation on a value, and the second is 10,023 `vmovups`, 50 `vmovdqu` and 13 `vmovupd`,
-every one of them with a memory operand. Together they are 3,084 of the 7,032, and the 182
-constants refused in Finding 109 are the same thing again -- 164 of those are blocked by
-256-bit arithmetic reading the hoisted value.
-
-**`no home space to borrow` is now 1,737 sites (1,313 outside any window)**, and the
-half of it Finding 129 called the leaves is answered: Finding 130 lends them the 32 bytes
-their own caller reserved, and the bucket fell from 2,153. What refuses the rest was
-measured against the 2,153 as it stood:
+The census reconciles exactly, which is the number to trust:
 
 ```
-  a copy of rsp reaches the shadow                981
-  addresses its own caller shadow                 579
-  (lendable, and now taken)                       417
-  a branch leaves at an unmodelled depth           77
-  a return does not balance the frame              45
-  not inside a known function                      32
-  frame register or no unwind codes                22
+VEX in the rewritten .text          7,224
+  declined by the collector          6,145
+  refused, stub not buildable          549
+  inside a committed window              0
+  skipped for overlap                  449
+  undecodable, never classified         81
+  unaccounted                            0
 ```
 
-**The first two are not a gap.** 1,560 of these functions genuinely use their shadow --
-spilling register parameters into it is exactly what the ABI reserves it for -- so no
-analysis will free them and the only mechanisms that reach them are ones that bring
-their own memory: static TLS (740 sites, priced, file-format half proven under wine) or
-a stack allocation described to the unwinder.
+**Counted by width rather than by refusal, which is a different set and the one that
+matters:**
 
-Finding 129's other two thirds are answered by **Finding 131**, which found the work
-they were ranked for was the wrong work -- the question is not taint but liveness -- and
-then built it. The bucket is 1,620 now.
+```
+  256-bit     4,445
+  128-bit     2,599
+  undecodable   180
+```
 
-**And 180 of the survivors are not instructions.** Of the c4/c5-prefixed lines in the
-rewritten `.text`, objdump calls 180 of them `(bad)` -- they sit inside Finding 8's 744
-undecodable islands, `decode_vex` reads their bytes as a prefix, and they are then counted
-as refused sites in a bucket that reads like work. `census` already files 81 of them under
-"undecodable, never classified"; the rest are spread through the named buckets. The residue
-is about two per cent smaller than its headline, and nothing needs doing about it except
-knowing.
+**The 180 are not instructions.** They sit inside Finding 8's 744 undecodable islands,
+`decode_vex` reads their bytes as a prefix, and they are then counted as refused sites in
+a bucket that reads like work. Nothing needs doing about them except knowing.
 
-### What is worth building next, and what the ladder cost to find out
+#### The 128-bit half is at its floor
 
-The scoping pass that produced this list ranked four rungs by what a walk *reaches*. All
-four are measured now, and the estimates did not survive:
+Findings 130, 131, 134, 135 and 136 took `no home space to borrow` from 2,153 to 1,332 in
+four increments of 479, 414, 263 and 80. **Finding 137 then measured what is left rather
+than calling it diminishing returns**: of the 1,032 refused because a reader is reachable,
+928 are a genuine forward read -- the program using its own home space, exactly what the
+ABI reserves it for -- and 104 are a loop or an edge the CFG declines to model. The other
+300 are structural.
+
+`outside .pdata` is near its ceiling too: `outside.py` already accepts 17,237 of the
+17,604 VEX sites in the chunks it can see, and relaxing it is worth 52 sites in two small
+classes plus 315 in chunks holding bytes objdump cannot decode.
+
+**So no further analysis reaches this half. What remains wants memory of the rewriter's
+own**, and that is static TLS -- whose file-format half is now `make check-tls` rather
+than a sentence (Finding 138).
+
+#### The 256-bit half is one problem stated several ways
+
+`ymm value has no known upper half` and `256-bit: arithmetic rather than a copy` are the
+same thing, and so are the four `no store before ...` buckets and the 182 constants. An
+upper half exists only in a machine ymm register no SSE instruction can reach.
+
+**Finding 133 scoped it and then corrected its own number the same day.** 1,674 sites have
+room for the upper halves live at them, in a home space, whose lifetime coincides with an
+upper half's by the ABI -- both die at a call. But room is capacity, and capacity is not
+the bound that binds. `make spans` asks the question that does:
+
+```
+surviving 256-bit sites             4,500
+covered by a closed span that fits    212
+```
+
+A span is worth nothing unless every value it tracks dies inside it, and closure is what
+fails -- 101 sites lose their value at a branch target inside the span, 92 at a control
+transfer, 171 at a 256-bit form that is not lane-wise, 57 to a narrower touch.
+
+### What is worth building next
+
+Ordered by what was measured, not by what looks large.
+
+  1. **Static TLS addressing.** The file-format half is proven and checked; what is not
+     built is the three instructions that reach a slot, and they cost a general-purpose
+     register. Finding 69 measured 740 sites against a bucket of 1,876; **that number
+     wants re-taking against today's 1,332** before anyone builds. Its failure mode is
+     the only one in this area that is not silent corruption -- the bytes belong to
+     nobody but the rewriter -- which is why it comes first.
+  2. **Extend `LANE_WISE`.** 171 of the span survey's closure failures are a 256-bit form
+     that does not split lane-wise. `lane_oracle.py` proves each of the 35 current
+     entries under execution, so adding to it is bounded work that carries its own proof.
+     Cheap, and it raises the 212 rather than replacing it.
+  3. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
+     value at a transfer, and the only one that reaches the 443 needing eleven slots at
+     once. A much larger design than the span, and the one the project has deferred five
+     times; do not start it on the 1,674 figure.
+
+**And do not re-mine these.** Each has a number saying why:
+
+  * the home-space seam (Finding 137: nine in ten of what refuses is the program);
+  * `outside .pdata` (Finding 137: 52 safe sites, 315 unsafe);
+  * `--spill=stack` (Finding 68: a chained fragment's allocation must equal its primary's,
+    so a stub that moves `rsp` cannot be described -- and a Windows host cannot change
+    that);
+  * `--spill=pool` (Finding 46: it cannot be made thread-safe);
+  * the local 256-bit span design as a build (Finding 133: 212 sites, against 479 and 414
+    for the two home-space increments, at several times the complexity).
+
+#### The frontier is where it was, and that is deliberate
+
+`0x1428D1492` is still `vmovdqu %ymm0,0x28(%rsp)`. The `vzeroupper` six bytes after it
+lowered to a `nop`, so the surrounding work landed; the site is refused because
+`zeroed_ymm` will not cross a `.pdata` chained-fragment start in `blocked`, which Finding
+112 priced at 11 sites and declined. **The copyright holder's ranking is sites removed,
+not the fault address** -- so a session that removes a thousand sites and moves nothing
+visible is working correctly, and should say so rather than leave a reader wondering.
+
+#### What the ladder cost to find out
+
+Four rungs were once ranked by what a walk *reaches*, and none of the estimates survived:
 
 ```
                                             estimated   measured
@@ -8625,82 +8697,39 @@ a 256-bit reload of a tracked register             86         -4   reverted
 carry a lane-safe ALU inside a run                320         +4   not built
 ```
 
-**Every estimate counted positions that qualify.** A site is gained only when the run it
-belongs to also reaches a store, gets a distinct helper for every lifetime, passes the
-upper-half guard -- and does not take the site from a strategy that already had it. That
-last one is what turned the reload from a gain into a loss: `ymm_run` is tried before
-`long_pair_stores`, so a longer run swallows loads the long pair was claiming and then
-fails for want of a second helper. See Finding 123.
+Three lessons, each paid for:
 
-So the next thing was not another rung, and it was not the order either. **A strategy
-that could not lower a site was declining it**, so the three behind it never saw it --
-one `continue`, worth 141 sites. Finding 125. What is still unmeasured is whether
-`ymm_run` should be tried before `long_pair_stores` at all; what is fixed is that failing
-no longer forecloses.
+  * **A site is gained only when everything downstream of it also holds.** The reload
+    turned from a gain into a loss because `ymm_run` runs before `long_pair_stores`, so a
+    longer run swallows loads the long pair was claiming and then fails for want of a
+    second helper. Finding 123.
+  * **`detour-plan` is the collector's view and the binary is the answer.** The reload
+     rung gained 51 by `plan` and cost 49 in the binary: a longer window collides with
+     neighbours that would each have been placed, which `plan` cannot model. Cost every
+     rung with `make detour`. Finding 126.
+  * **Count the survivors by mnemonic before ranking anything.** Every rung above is a
+    256-bit rung, because the residue was assumed to be the register representation. At
+    8,450 sites, 3,533 of the survivors were 128-bit and their largest single cause was a
+    scalar `vaddss` in a leaf with no 32 bytes to borrow. The refusal buckets count what
+    the collector declined, which is a different population, and it had stood in for the
+    real one for several sessions. Finding 130.
 
-**And the ladder's numbers are the collector's, not the binary's.** Finding 126 rebuilt
-the reload rung and found it costs 49 sites where `detour-plan` said it gained 51 -- a
-longer run collides with neighbours that would each have been placed, which `plan` cannot
-see. Cost the next one with `make detour`.
+#### The switches, and why each is kept
 
-**The ladder was also asking the wrong list.** Every rung above is a 256-bit rung,
-because the residue was assumed to be the register representation. It was not: at 8,450
-sites, 3,533 of the survivors were 128-bit, and their largest single cause was a scalar
-`vaddss` in a leaf that had no 32 bytes to borrow. Finding 130 took 479 of those. **Count
-the survivors by mnemonic before ranking anything** -- the refusal buckets count what the
-collector declined, which is a different set, and it had been standing in for the real
-one for several sessions.
+Every mechanism that could corrupt a local silently keeps its predecessor reachable, so
+that two binaries can be compared -- a borrow at the wrong displacement does not fault.
 
-What is left divides cleanly, and the two halves want different work:
+```
+--spill=none|stack|pool|home     where a borrowed register is saved (home)
+--rsp=blanket|followed           what a copy of rsp costs (followed)
+--shadow=off|on                  lend the caller's shadow as well (on)
+--region=whole|live              is a home-space reference a verdict on the
+                                 function, or a question about the site (live)
+--escape=refuse|allow            a copy of rsp stored to memory (allow)
+```
 
-  * **4,445 sites are 256-bit**, and **Finding 133 has scoped them**: the upper halves
-    want a home space rather than a register or a TLS slot, 1,674 of the sites have room
-    for every upper half live at them, and the lifetimes of the two things coincide by
-    the ABI. `ymm value has no known upper half` (1,140 outside a window) and
-    `256-bit: arithmetic rather than a copy` (1,818) are one problem stated twice, and
-    that is the problem.
-  * **2,599 are 128-bit** (and 180 are undecodable bytes rather than instructions --
-    see below). **Finding 137 measures this half to its floor**: nine in ten of what
-    still refuses is the program genuinely using its own home space, and what remains
-    wants memory of the rewriter's own. Their largest causes are a shadow the
-    function genuinely uses (which wants memory of our own -- static TLS is priced at 740
-    sites), `outside .pdata` at 325, and `next instruction is a branch target` at 209.
-
-The two built rungs have since been priced the same way, by disabling each in a copy and
-rebuilding: **the retry is worth 2 and the extract 50**, against 3 and 50 from `plan`.
-Neither was materially wrong, and they do not add to Finding 116's verified 53 because
-disabling one changes what the other reaches. Finding 128.
-
-**And the wall behind all of it is unchanged.** In the six functions holding 822 of the
-refused 256-bit sites, all sixteen xmm are named, twelve to sixteen ymm are live at the
-peak, `function_scope` lends nothing and four of the six cannot lend home space.
-`find_scratch` finds a register at 45.7% of the 3,186 against 89.3% for sites already
-taken in the same functions. **The next real question is where a spill can live**, and
-Finding 123's companion measured every road:
-
-  * `--spill=stack` is closed by the ABI's own sentence rather than by a corpus count --
-    a chained fragment's fixed allocation must equal its primary's, and four unwind
-    encodings all hand the handler a frame that tracks `rsp`. Finding 49's "re-run this
-    the day a Windows host exists" can be retired: a Windows host cannot change it.
-  * **Static TLS is feasible and priced.** Raising the TLS directory's `SizeOfZeroFill`
-    from 0 to 32 is a four-byte field edit; the loader then allocates and zeroes 32 bytes
-    per thread at block offset 12,896, which is 16-aligned. Proven under wine, including
-    the discriminating pair that shows the block really is that big and that writing it
-    leaves the image template untouched. Addressing costs one general-purpose register and
-    three instructions, and restricted to r8-r11 -- none of which any x86-64 instruction
-    implicitly reads -- `function_scope`'s own whole-function argument reaches **740 of
-    the 1,876** starved sites, or 226 for a two-register form. Its failure mode is the
-    only one here that is not silent corruption: the bytes belong to nobody but the
-    rewriter.
-  * The 1,154 `rsp`-copy refusals are three problems, not one: 702 store the copy to
-    memory, 317 index through it, 135 do arithmetic on it. The first 702 are the largest
-    single lever and need no analysis at all -- no borrow window can contain a call, so
-    nothing can dereference an escaped pointer while a borrow is live, which is Finding
-    98's argument at 702 sites rather than the 113 that made it not worth enforcing.
-  * The caller's shadow -- the 32 bytes `[entry_rsp+8, entry_rsp+40)` that this function's
-    own caller reserved -- reaches 245 sites, 150 of them outside any window, and all 150
-    are leaf functions. Reported and not built: it writes on parameters rather than
-    locals.
+`--region=whole` and `--shadow=off` are what `check-spill` uses to show that
+`regionlive`, `regionread` and `shadowspill` are testing what they claim.
 
 ### What each tool is for
 
@@ -8715,8 +8744,30 @@ targets.py        branch targets from .reloc, .pdata, .xdata, switch tables
 outside.py        the code .pdata does not describe, plus lea_targets
 scratch.py        liveness: find_scratch, and `check` proves its claims
 lowering_cases.py generates the executable test cases from the real rules
-pe_build.py       builds AVX PEs so the rewriter has a target it owns
+pe_build.py       builds AVX PEs so the rewriter has a target it owns,
+                  including one with a TLS directory
 placement.py      where detours land; icache_bench.c what they cost
+isa_guard.py      inside a function holding a cpuid or xgetbv, only a VEX
+                  instruction may differ; carries its own control
+vex_oracle.py     runs the original VEX under qemu against the lowering's
+                  bytes natively, which is how a host with no AVX checks
+lane_oracle.py    proves each LANE_WISE mnemonic really does split into two
+                  128-bit halves, under execution rather than by argument
+```
+
+And the targets, since several exist only to carry a measurement:
+
+```
+make check         the gate: style, the lowering proof, the C tests
+make check-pe      thirty-three PEs built here, rewritten, run under wine
+make check-spill   the four ways a stub gets a scratch, each with its A/B
+make check-tls     whether the loader gives us the per-thread bytes we ask
+make check-unwind  whether an exception dispatches from inside a stub
+make check-vex     the qemu oracle; make check-lanes the lane-wise one
+make detour        rewrite; make detour-verify the structural invariants
+make census        reconcile every survivor to a named cause
+make detour-plan   what the COLLECTOR refused, and why -- see the warning
+make spans         what a closed 256-bit span could reach (a measurement)
 ```
 
 ### Practical things that cost time to learn
@@ -9484,8 +9535,8 @@ crash at an unpredictable moment.
 | 2 | Rewrite a small self-built `/arch:AVX2` PE end-to-end | Toolchain works | **DONE** (Finding 32). `tool/pe_build.py` writes the PE, the rewriter rewrites it, and `make check-pe` runs both under wine: the original dies of an illegal instruction and the rewritten one returns 169. Assembled with `as` rather than MSVC, there being no mingw here. |
 | 2.5 | Strip Steam DRM with Steamless | `.bind` out of the way before rewriting | **DONE** — SteamStub 3.1 (x64), unpacked cleanly, OEP recovered |
 | 3 | Ddisasm round-trip of Starfield.exe with **no** modifications | Disassembly/reassembly is sound — was the biggest single risk, and is now worth a measured ~2,000 sites | **BLOCKED on memory, and off the critical path.** Needs ~90 GB; the machine has 47 (Finding 12). The PGO warning is a caution rather than a blocker (Finding 13). Milestone 4 was reached without it, and Finding 62 counts what it would still buy. |
-| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **796,681 of 805,131 VEX sites, 99.0%** (Findings 24 to 127), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
-| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. |
+| 4 | Classes A/B/C/Z only (~97% of sites) | Still crashes, but later — measurable progress | **DONE for A/B/C/Z** — in place (Finding 14), by detour (Finding 15), with widened windows once the indirect targets were enumerated (Finding 16). **797,907 of 805,131 VEX sites, 99.1%** (Findings 24 to 138), with no Ddisasm and no relocation of existing code. The higher figures this row carried before were inflated by the 256-bit truncation of Finding 37. |
+| 5 | Y1 peephole + Class F | Covers 94% of 256-bit usage | **Now a prerequisite rather than polish**, and part-built. Finding 37 showed 256-bit sites were being silently truncated and they are refused now. The adjacent copy pair (Findings 38, 41, 42 and 43, 5,881 sites) and the zero fill (Findings 40 and 44, 9,806 sites) are done and need no register model; the 12,552 stores and 11,226 loads that remain do. **Finding 133 scoped what that model would cost and Finding 133's own correction priced it: 212 sites for a straight-line span, because a span is worth nothing unless every value it tracks dies inside it.** |
 | 6 | Y2 shadow + Class H helpers | Completeness | **PART-BUILT, and the two halves are at different stages.** The Class H helpers are written and exhaustively tested -- `src/f16c.c`, `src/permil.c`, `src/permd.c`, `src/fmaddsub.c`, through `make check-f16c`, `check-f16c-oracle`, `check-permil`, `check-permd` and `check-fmaddsub`, all in `make check` -- but **the rewriter calls none of them and nothing links one into a PE**. The one Class H form `tool/detour.py` does lower is `vpermilps` with a control vector, and it is *inlined* as the `pshufb` sequence rather than called (`lower_permilps`, because a `call` inside a stub pushes a return address into code with no `.pdata`); `make check-pe`'s `permilps` fixture runs that lowering under wine. `vpermd`, `vperm2f128`, `vpermq`, `vpermpd`, `vcvtph2ps`/`vcvtps2ph` and `vfmsubadd*` all reach `lower: no direct SSE form and not a sequence` and are refused. In `tool/lower.py` the rules are thinner than the helpers: `vpermd` emits a bare `call permd` with no operand marshalling, and both F16C mnemonics are class `HELPER` with **no body at all**, so `make verify` never assembles them. **The Y2 shadow does not exist anywhere.** Two rules name it -- `Y2/extract` and `Y2/insert`, emitting the pseudo-operand `shadow(%reg)` -- and `verify` rewrites that to `(%rsp)` before assembling, so no shadow slot has ever been allocated, written or executed. `tool/detour.py` has no shadow area: its `shadow` is a helper *register* for Finding 50's gapped copy, and `lower_ymm_pair` states in terms that what it leaves behind **is** the Y2 case. Finding 7's 574 sites are untouched. |
 
 **Milestone 3 was the go/no-go, and the project routed around it.** That sentence stood
@@ -9584,6 +9635,16 @@ the project's largest risk.
   the definition, never 23.6%. **Milestone 0's three-operand lines are wrong and Finding
   6's replace them**; Finding 6's own bracketing figures are 5 and 110 low (178,311 and
   62,883 measured). Finding 120.
+- ~~**New: is static TLS actually available, or only believed to be?**~~ **Resolved
+  for the file format, and it is a check now.** `make check-tls` builds a PE whose TLS
+  directory asks for 32 zero-filled bytes per thread and reads them back through
+  `%gs:0x58`; a sweep of 0, 8, 16 and 32 returns three distinct failures before the
+  pass, so the test measures the field rather than merely observing that some bytes
+  arrived. Finding 138. **Still open: the addressing.** It costs a general-purpose
+  register at every site, and how many of the 1,332 sites still declined
+  `no home space to borrow` have an `r8`-`r11` free across the bracket has not been
+  measured against that bucket -- Finding 69's 740 was taken against a bucket of 1,876
+  and should not be carried forward.
 - Does anything depend on exact FP reproducibility? Class F breaks bit-exactness, and
   `vfmaddsub`/`vfmsubadd` (28 sites) break *correctness* if lowered as plain FMA.
 - ~~**Who writes the F16C software routine, and is it correct at the edges?**~~
@@ -9617,9 +9678,20 @@ translated binary should run at near-native speed.
 
 That was written when the risk looked concentrated in milestone 3 -- sound disassembly
 and reassembly of a large stripped PE -- and in verification. **Half of it has moved.**
-Milestone 3 was routed around rather than solved, and counting the residue puts what it
-would still be worth at about 2,000 of 18,757 sites; the rest is register pressure and the
-256-bit representation, which no rewriting mechanism removes.
+Milestone 3 was routed around rather than solved.
+
+**What is left is 7,224 sites of 805,131, and it is not evenly hard.** 2,599 are 128-bit
+and measured to their floor: nine in ten of what still refuses is the program genuinely
+using the memory the rewriter wanted to borrow, so no analysis reaches them and only the
+rewriter's own memory will -- static TLS, whose file format is proven and whose addressing
+is not built. 4,445 are 256-bit and are one problem: a value that exists only in a
+register no SSE instruction can reach. That problem has been scoped twice now, and the
+local answer is worth 212 sites while the general one is a whole-function rewrite nobody
+has started.
+
+**The honest reading is that the remaining work is smaller than it was and harder per
+site.** Every cheap mechanism is built; what is left needs either a new place to put
+bytes or a real representation change, and both are named, priced and unstarted.
 
 Verification is where the risk actually concentrated, and it earned that. Four defects
 here produced silently wrong output while passing every structural check -- the `src2`
