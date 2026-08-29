@@ -1523,7 +1523,17 @@ def main(argv: list[str]) -> int:
 		print(f"\n{len(problems)} convention violation(s) in {len(files)} file(s)",
 		      file=sys.stderr)
 		return 1
-	print(f"style-gate: {len(files)} files conform")
+	# "conform" asserted more than was checked, and this repository's own
+	# rules say to report what was actually verified. Measured 2026-08-27:
+	# the structural half compares each line's tab count against what the
+	# converter would emit, and the converter never ADDS indentation -- it
+	# only re-expresses excess tabs as alignment. So a line with too few
+	# tabs and no alignment spaces is invisible, and a file with no tabs
+	# at all passed while printing that it conformed. Over-indentation is
+	# caught; under-indentation is not. Saying so costs one line and
+	# stops a green run being quoted for a guarantee it never made.
+	print(f"style-gate: {len(files)} file(s) pass: whitespace, and "
+	      f"indentation except under-indentation, which is not checked")
 	return 0
 
 
