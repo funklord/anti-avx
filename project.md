@@ -10,6 +10,14 @@ sites -- 99.1%** -- through 202,115 detours, and every `make detour-verify` inva
 holds on the result. 7,224 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
+    Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
+
+Attribution for the rewriter and its tooling, and for nothing it emits: this
+project modifies somebody else's binary and holds no copyright in the result.
+`python3 tool/detour.py --version` prints the same line, and `README.md` carries
+it too. Licensing is a separate question and is deliberately not settled -- see
+the README.
+
 ---
 
 ## Motivation

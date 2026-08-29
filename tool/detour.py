@@ -51,7 +51,8 @@ import subprocess
 import sys
 from collections import Counter
 
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+HERE = __import__("pathlib").Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 import lower
 import isa_guard
 import outside
@@ -6167,9 +6168,35 @@ def census(binary, listing, patched):
 	return 0
 
 
+def version():
+	"""The project, its version and who holds the copyright.
+
+	**The first line is the parseable one and keeps its shape**, with the
+	attribution on a line of its own -- apt-emerge's shape, and its
+	caution: a version string with a stable format is an interface, so
+	appending to it changes that interface. Nothing consumes this one yet,
+	which is the moment to get it right rather than after.
+
+	**The attribution covers this rewriter and its tooling, and nothing
+	else.** anti-avx exists to modify somebody else's binary, and naming
+	the holder here says who wrote the tool; it says nothing whatever
+	about the artifact the tool emits, in which this project holds no
+	copyright and claims none.
+
+	The number comes from `VERSION`, which until now nothing read.
+	"""
+	release = HERE.parent / "VERSION"
+	number = release.read_text().strip() if release.is_file() else "unknown"
+	return (f"anti-avx {number}\n"
+	        f"Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>")
+
+
 def main(argv):
 	if not argv or argv[0] in ("-h", "--help"):
 		print(__doc__.strip())
+		return 0
+	if argv[0] in ("-V", "--version"):
+		print(version())
 		return 0
 	# `--spill=` selects where a borrowed register is saved, and it is an
 	# evaluation switch rather than a tuning knob: the default refuses the

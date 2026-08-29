@@ -109,6 +109,17 @@ the input and can execute the output, so "the original must crash and the
 rewritten one must work" is a real experiment rather than a wish. Every
 `check-pe` program asserts both halves.
 
+## Copyright
+
+    Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
+
+`python3 tool/detour.py --version` prints the same line.
+
+**It covers this rewriter and its tooling, and nothing else.** anti-avx exists
+to modify somebody else's binary; naming the holder here says who wrote the
+tool, and says nothing about the artifact the tool emits, in which this project
+holds no copyright and claims none.
+
 ## Licence
 
 **None chosen.** All rights reserved by the copyright holder.
