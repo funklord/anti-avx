@@ -8792,12 +8792,10 @@ Ordered by what was measured, not by what looks large.
 
 #### The frontier is where it was, and that is deliberate
 
-`0x1428D1492` is still `vmovdqu %ymm0,0x28(%rsp)`. The `vzeroupper` six bytes after it
-lowered to a `nop`, so the surrounding work landed; the site is refused because
-`zeroed_ymm` will not cross a `.pdata` chained-fragment start in `blocked`, which Finding
-112 priced at 11 sites and declined. **The copyright holder's ranking is sites removed,
-not the fault address** -- so a session that removes a thousand sites and moves nothing
-visible is working correctly, and should say so rather than leave a reader wondering.
+Measured and explained in Finding 137, and not repeated here: the site is a 256-bit store
+refused by a `.pdata` chained-fragment start in `blocked`, which Finding 112 priced at 11
+sites and declined. **The ranking is sites removed, not the fault address**, so a session
+that removes a thousand sites and moves nothing visible is working correctly.
 
 #### What the ladder cost to find out
 
