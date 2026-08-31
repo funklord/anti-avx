@@ -8510,6 +8510,81 @@ belong to nobody but the rewriter, so a slot used wrongly loses the rewriter's o
 rather than a local of the program's -- which is why this is the mechanism to build next
 and not another refinement of the home space, whose floor Finding 137 measured.
 
+### Finding 139 -- static TLS is worth 67 sites, not 740, and the fixture said so
+
+Written because it reverses this document's own recommendation. Finding 138 left static
+TLS as the top of the build-next list on Finding 69's price of 740 sites. **It is 67.**
+
+#### The addressing is the two-register form, and `check-tls`'s own program proves it
+
+Finding 69 said "one general-purpose register and three instructions" and priced 740
+against a `no home space to borrow` bucket of 1,876, with 226 for a two-register form. The
+working fixture written for Finding 138 is the two-register form, and it has to be:
+
+```
+	movq	%gs:0x58, %rax		/* ThreadLocalStoragePointer */
+	movl	tls_index(%rip), %edx	/* the index the loader wrote */
+	movq	(%rax,%rdx,8), %rax	/* this module's block */
+```
+
+The block is `*(*(gs:[0x58]) + index*8)` -- **two dereferences**, and the index is in
+memory rather than in the instruction, because the loader assigns it. Neither order
+saves a register: hold the array pointer and the index has nowhere to go; hold the index
+and the array pointer has nowhere to go. A segment-prefixed `%gs:0x58(,%r,8)` does not
+help, since `0x58` holds a pointer that must be followed before it is indexed.
+
+#### Re-priced against the bucket that exists
+
+`function_scope`'s whole-function argument applied to `r8`-`r11` -- if a function never
+names one, nothing in it reads that register, no callee is passed it and no caller expects
+it back, all four being volatile:
+
+```
+1,332 sites declined `no home space to borrow`
+    500  the range has a way out, so nothing is provably free
+    398  0 of r8-r11 never mentioned
+    335  1 of r8-r11 never mentioned
+     46  2
+     32  not inside a known function
+     12  3
+      9  4
+
+    402  have at least ONE   -- the form Finding 69 priced at 740
+     67  have at least TWO   -- the form the addressing actually needs
+```
+
+**Both halves of the old number moved.** The bucket shrank from 1,876 to 1,332 as
+Findings 130 to 136 took sites out of it, and the register requirement doubled. 740 was
+never wrong for what it measured; it measured a form that cannot be encoded and a
+population that no longer exists.
+
+#### 67 is a floor, and the way to raise it is already built
+
+The 500 refused for "a way out" are `function_scope`'s blunt rule, which disqualifies a
+range for any jump leaving it and loses real tail calls deliberately. **A borrow bracket
+contains no control transfer at all** -- that is enforced, not assumed -- so a register
+merely dead across the bracket would serve, and the machinery for asking that question per
+position rather than per function is what Findings 131 and 134 built for the home spaces.
+Nobody has pointed it at general-purpose registers.
+
+So the honest statement is: 67 by the cheap argument, unknown by the expensive one, and
+the expensive one is a day's work on machinery that already exists.
+
+#### The file-format half is confirmed against the binary, not remembered
+
+```
+TLS data directory    rva 0x4f07480, 40 bytes
+  raw data size         12,896 bytes
+  AddressOfIndex        0x145e123e0
+  AddressOfCallBacks    0x143a86ea0   (the game has callbacks; raising the
+                                       field does not disturb them)
+  SizeOfZeroFill        0
+  alignment             16 bytes
+  a new slot would sit at block offset 12,896
+```
+
+Every figure Finding 69 recorded holds. What changed is only what it costs to reach one.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8658,20 +8733,26 @@ transfer, 171 at a 256-bit form that is not lane-wise, 57 to a narrower touch.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **Static TLS addressing.** The file-format half is proven and checked; what is not
-     built is the three instructions that reach a slot, and they cost a general-purpose
-     register. Finding 69 measured 740 sites against a bucket of 1,876; **that number
-     wants re-taking against today's 1,332** before anyone builds. Its failure mode is
-     the only one in this area that is not silent corruption -- the bytes belong to
-     nobody but the rewriter -- which is why it comes first.
-  2. **Extend `LANE_WISE`.** 171 of the span survey's closure failures are a 256-bit form
-     that does not split lane-wise. `lane_oracle.py` proves each of the 35 current
-     entries under execution, so adding to it is bounded work that carries its own proof.
-     Cheap, and it raises the 212 rather than replacing it.
-  3. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
+  1. **Extend `LANE_WISE`.** 171 of the span survey's closure failures are a 256-bit form
+     that does not split lane-wise. `lane_oracle.py` proves each of the 35 current entries
+     under execution, so adding to it is bounded work that carries its own proof. Cheap,
+     and it raises the 212 rather than replacing it. **This is first by default rather
+     than by size** -- it is the only item left that is both small and safe.
+  2. **Per-position liveness for general-purpose registers.** Worth doing before static
+     TLS rather than after, because it decides what static TLS is worth: 67 of the 1,332
+     have two of `r8`-`r11` free by the whole-function argument, and 500 more are refused
+     only by that argument's bluntness. Findings 131 and 134 built exactly this machinery
+     for the home spaces and nobody has pointed it at GPRs.
+  3. **Static TLS addressing**, at **67 sites** by what is measured today -- see Finding
+     139, which corrects Finding 69's 740. The file-format half is proven and checked
+     (`make check-tls`); what is unbuilt is the addressing, and it needs TWO registers
+     rather than one. Its failure mode is still the only one in this area that is not
+     silent corruption, which is the reason to keep it on the list at all at that price.
+  4. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
      value at a transfer, and the only one that reaches the 443 needing eleven slots at
      once. A much larger design than the span, and the one the project has deferred five
-     times; do not start it on the 1,674 figure.
+     times; do not start it on the 1,674 figure. **It is also the only large item left**,
+     which is the real state of the project rather than a complaint about it.
 
 **And do not re-mine these.** Each has a number saying why:
 
@@ -8803,6 +8884,14 @@ make spans         what a closed 256-bit span could reach (a measurement)
   is how it came to be trusted. Cost a change with `make detour` and
   `make detour-verify`; use `plan` to say which bucket a refusal landed in.
   Finding 126.
+- **A green `make style` does not mean what its old wording said.** The gate's
+  structural half compares each line's tab count against what the converter would emit,
+  and the converter never ADDS indentation -- so a line with too few tabs and no
+  alignment spaces is invisible, and a file with no tabs at all used to pass while
+  printing that it conformed. Over-indentation is caught; under-indentation is not. The
+  pass line says so now, taken from the source tool in `5cb0cca`, and this entry exists
+  because "35 files conform" had been quoted as evidence here a dozen times for a
+  guarantee it never made.
 - **Never compare a disassembly against a binary rebuilt after it.** That cost half
   an hour once. The same rule as `build-and-commit.md`'s about stale test binaries,
   and it applies to `objdump` output too. Delete the output before a run so a crash
@@ -9648,11 +9737,12 @@ the project's largest risk.
   directory asks for 32 zero-filled bytes per thread and reads them back through
   `%gs:0x58`; a sweep of 0, 8, 16 and 32 returns three distinct failures before the
   pass, so the test measures the field rather than merely observing that some bytes
-  arrived. Finding 138. **Still open: the addressing.** It costs a general-purpose
-  register at every site, and how many of the 1,332 sites still declined
-  `no home space to borrow` have an `r8`-`r11` free across the bracket has not been
-  measured against that bucket -- Finding 69's 740 was taken against a bucket of 1,876
-  and should not be carried forward.
+  arrived. Finding 138. **Still open: the addressing, and it is worth 67 sites rather than
+  740.** Finding 139 re-took the price: the form is TWO registers rather than one,
+  because the block is `*(*(gs:[0x58]) + index*8)` and the index is in memory, and only
+  67 of the 1,332 have two of `r8`-`r11` free by the whole-function argument. 500 more
+  are refused only by that argument's bluntness, so 67 is a floor and the per-position
+  machinery that would raise it already exists.
 - Does anything depend on exact FP reproducibility? Class F breaks bit-exactness, and
   `vfmaddsub`/`vfmsubadd` (28 sites) break *correctness* if lowered as plain FMA.
 - ~~**Who writes the F16C software routine, and is it correct at the edges?**~~
