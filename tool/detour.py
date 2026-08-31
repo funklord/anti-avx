@@ -2098,25 +2098,44 @@ def splat_pair(site, following):
 
 
 # **Operations that are the same operation on each 128-bit lane**, so doing
-# one of them twice reproduces the 256-bit form exactly. Every entry is
-# element-wise by definition: a bitwise op combines corresponding bits, an
-# add or a multiply combines corresponding elements, and a min or a max
-# chooses between corresponding elements with the same rule in each. Nothing
-# horizontal is here (`vhaddps` combines neighbours), nothing cross-lane
-# (`vperm2f128`), and nothing whose result depends on the other half.
+# one of them twice reproduces the 256-bit form exactly. The requirement is
+# about LANES and not about elements: a bitwise op combines corresponding
+# bits, an add combines corresponding elements, `vpblendw` selects by an
+# immediate and `vphsubd` combines NEIGHBOURS -- and all four qualify,
+# because AVX defines even the horizontal forms per 128-bit lane. What
+# disqualifies a form is reaching across the lane boundary (`vperm2f128`,
+# `vpermq`, `vpermpd`) or otherwise depending on the other half.
+#
+# **This comment used to say "nothing horizontal is here" and give
+# `vhaddps` as the example**, while `vphsubd` sat in the set three lines
+# below it. Finding 122 caught that: the exclusion was safe by
+# conservatism and wrong by its stated reason, and a reason that does not
+# hold is worse than none, because the next person extends the set by
+# applying it.
 #
 # **Every one of these is executed, not reasoned.** `make check-lanes` runs
 # the 256-bit form under qemu against the two 128-bit halves natively and
-# requires them to agree bit for bit, and it fails if this set gains a
-# mnemonic the harness does not execute -- so the list and the evidence
-# cannot drift apart. Two of them occur in this binary, `vandps` and
-# `vmulps`; the rest are here because a list of two is a list nobody can
-# check, and they are now a list somebody has run.
+# requires them to agree bit for bit; it rebuilds each split wrong twice --
+# halves swapped, low half used for both -- and requires BOTH sabotages to
+# be rejected, so a verdict reached on inputs too symmetric to discriminate
+# is a failure rather than a pass; and it fails if this set gains a mnemonic
+# the harness does not execute, so the list and the evidence cannot drift
+# apart.
 #
 # `vpsadbw`, `vphsubd` and `vpblendw` were held out of it deliberately: they
 # are lane-wise by the manual and occur 5, 1 and 2 times, which is too rare
 # for `check-pe` to catch a misreading. The oracle settled them, so they are
 # in. Finding 122.
+#
+# **The last nine arrived when the set gained a second reader.** Finding 122
+# settled twelve further mnemonics as lane-wise under execution and took
+# none of them, for a reason that was right at the time: `splat_operation`
+# was the only thing reading this set, none of the twelve appears in a
+# splat triple here, and a set is a liability rather than an asset until
+# something reads it. `ymm_span` -- written six days later -- is that second
+# reader, and a 256-bit form it does not recognise closes the span it is
+# walking. `make spans` now ranks what closes them, and these are the
+# entries that ranked. Finding 140.
 #
 # A mnemonic missing from this set costs a site; one wrongly on it costs
 # correctness, which is `scratch.py`'s FULL_WRITE rule and the reason it is
@@ -2128,6 +2147,8 @@ LANE_WISE = frozenset("""
 	vpand vpandn vpor vpxor
 	vpaddb vpaddw vpaddd vpaddq vpsubb vpsubw vpsubd vpsubq
 	vpsadbw vphsubd vpblendw
+	vshufps vaddsubps vpmulld vpmuludq vpcmpeqb vpcmpeqw vpsubusw
+	vpshufb vpmaddwd
 """.split())
 
 
@@ -2419,6 +2440,54 @@ def wide_move(encoding, mnemonic, operands):
 	if fields[0].startswith("%ymm") and "(" in fields[1]:
 		return ("store", fields[0])
 	return None
+
+
+YMM_BROADCASTS = frozenset("""
+	vbroadcastss vbroadcastsd
+	vpbroadcastb vpbroadcastw vpbroadcastd vpbroadcastq
+""".split())
+
+
+def wide_copy(encoding, mnemonic, operands):
+	"""(%ymmS, %ymmD) if this is a 256-bit register-to-register move.
+
+	`wide_move` answers only where one operand is memory, because that is
+	all `ymm_run` ever needed: a run is a load, some work, a store. A copy
+	has neither operand in memory, so it fell through every branch of
+	`ymm_span` into the catch-all that reports "a 256-bit form that is not
+	lane-wise" -- an instruction with no lane structure at all, filed under
+	a label about lane structure. 24 of them here. Finding 140.
+	"""
+	vex = inplace.decode_vex(encoding)
+	if vex is None or not vex["L"] or mnemonic not in YMM_MOVES:
+		return None
+	fields = inplace.split_operands(operands)
+	if len(fields) != 2 or not all(f.startswith("%ymm") for f in fields):
+		return None
+	return (canonical_ymm(fields[0]), canonical_ymm(fields[1]))
+
+
+def wide_broadcast(encoding, mnemonic, operands):
+	"""%ymmD if this fills a 256-bit register from one, else None.
+
+	**A broadcast's two lanes are the same sixteen bytes**, which makes it
+	the one 256-bit definition whose upper half costs a span nothing to
+	know: it does not have to be carried from anywhere, it is the low half
+	repeated. So the source is deliberately NOT required to be tracked --
+	it is an xmm, and an xmm is a register SSE can already reach.
+
+	The register form only, which is AVX2. The memory-source form is the
+	Class D splat, lowered elsewhere, and it never reaches a span walk
+	because `lower_splat` has already claimed it.
+	"""
+	vex = inplace.decode_vex(encoding)
+	if vex is None or not vex["L"] or mnemonic not in YMM_BROADCASTS:
+		return None
+	fields = inplace.split_operands(operands)
+	if len(fields) != 2 or not fields[0].startswith("%xmm") \
+			or not fields[1].startswith("%ymm"):
+		return None
+	return canonical_ymm(fields[1])
 
 
 def note(why, reason):
@@ -2806,6 +2875,14 @@ def ymm_span(instructions, index, blocked, positions, limit=48, why=None):
 	the third, and it is what `256-bit: arithmetic rather than a copy`
 	counts -- 1,974 sites, the largest 256-bit refusal there is.
 
+	Two more definitions were added once `make spans` could say what
+	actually stopped a span rather than only that something had. A
+	register-to-register copy defines the destination from a source this
+	span must already hold; a broadcast defines one from nothing, because
+	its two lanes are the same sixteen bytes. Neither is arithmetic and
+	neither has lane structure, and both were being refused by the branch
+	that reports a form as not lane-wise. Finding 140.
+
 	**The span must close.** Every register it tracks has to be dead at the
 	end, because a value still live would have to be put back into a real
 	ymm register and nothing available can do that. A call ends the span and
@@ -2826,6 +2903,12 @@ def ymm_span(instructions, index, blocked, positions, limit=48, why=None):
 	members = [("load", index, first[1])]
 	at = address + len(encoding)
 	stopped = "the span reached its limit"
+	# **Which form stopped it, not merely that one did.** The refusal
+	# reason is what a span failed on; extending `LANE_WISE` needs to
+	# know WHICH 256-bit form, and a count of "not lane-wise" ranks
+	# nothing. Reported beside the reasons rather than folded into
+	# them, so the existing buckets stay comparable across runs.
+	stopper = None
 	for step in range(1, limit + 1):
 		position = index + step
 		if position >= len(instructions):
@@ -2858,6 +2941,42 @@ def ymm_span(instructions, index, blocked, positions, limit=48, why=None):
 				live.setdefault(what[1], [len(members), len(members)])[1] = \
 					len(members)
 				members.append(("load", position, what[1]))
+				at = next_address + len(bits)
+				continue
+			if what is not None and what[0] == "store":
+				# **A store of a value this span never defined**, whose
+				# upper half is therefore in a machine ymm nothing here can
+				# read. A correct refusal, and it gets its own reason
+				# because it used to land in the lane-wise catch-all: 125
+				# of the 319 stops were this one shape, and a bucket
+				# reading "not lane-wise" made them look like work that
+				# extending `LANE_WISE` would reach. Finding 140.
+				stopped = "a 256-bit store of a value this span never defined"
+				stopper = name + " reg,mem"
+				break
+			copied = wide_copy(bits, name, text)
+			if copied is not None:
+				source, destination = copied
+				# A copy is exactly as representable as its source: the
+				# destination's upper half IS the source's.
+				if source not in live:
+					stopped = "a 256-bit copy of a value this span " \
+						"never defined"
+					stopper = name + " reg,reg"
+					break
+				live[source][1] = len(members)
+				live.setdefault(destination,
+				                [len(members), len(members)])[1] = \
+					len(members)
+				members.append(("copy", position, destination))
+				at = next_address + len(bits)
+				continue
+			splatted = wide_broadcast(bits, name, text)
+			if splatted is not None:
+				live.setdefault(splatted,
+				                [len(members), len(members)])[1] = \
+					len(members)
+				members.append(("splat", position, splatted))
 				at = next_address + len(bits)
 				continue
 			pulled = extract_upper(bits, name, text, set(live))
@@ -2899,6 +3018,16 @@ def ymm_span(instructions, index, blocked, positions, limit=48, why=None):
 				at = next_address + len(bits)
 				continue
 			stopped = "a 256-bit form that is not lane-wise"
+			# **The mnemonic alone hides the shape**, and for a move the
+			# shape is the whole question: a register-to-register copy
+			# and a store of a value this span never defined arrive here
+			# spelled the same way and are not the same problem.
+			shape = [("mem" if "(" in f else
+			          "reg" if f.startswith("%") else "imm")
+			         for f in inplace.split_operands(text)]
+			stopper = name
+			if len(shape) == 2:
+				stopper = name + " " + ",".join(shape)
 			break
 		if touched:
 			stopped = "the value is touched by something narrower"
@@ -2915,6 +3044,8 @@ def ymm_span(instructions, index, blocked, positions, limit=48, why=None):
 		                         positions=positions):
 			note(why, "span: " + register[1:] + " is still live after "
 			     + stopped)
+			if stopper is not None:
+				note(why, "form: " + stopper)
 			return None
 	if not any(kind in ("lane", "store", "extract")
 	           for kind, _p, _r in members):
@@ -5756,6 +5887,10 @@ SPAN_ADD = bytes.fromhex("c5f458c0")		# vaddps %ymm0,%ymm1,%ymm0
 SPAN_PERM = bytes.fromhex("c4e3fd00c001")	# vpermq $1,%ymm0,%ymm0
 SPAN_NARROW = bytes.fromhex("c5f828c8")		# vmovaps %xmm0,%xmm1
 SPAN_ADD2 = bytes.fromhex("c5f458d0")		# vaddps %ymm0,%ymm1,%ymm2
+SPAN_COPY = bytes.fromhex("c5fc10c8")		# vmovups %ymm0,%ymm1
+SPAN_COPY2 = bytes.fromhex("c5fc10da")		# vmovups %ymm2,%ymm3
+SPAN_SPLAT = bytes.fromhex("c4e27d18cb")	# vbroadcastss %xmm3,%ymm1
+SPAN_STORE1 = bytes.fromhex("c5fc110f")		# vmovups %ymm1,(%rdi)
 
 
 def _span(rows):
@@ -5807,6 +5942,30 @@ SPAN_CASES = [
 	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
 	  (SPAN_ADD, "vaddps", "0x40(%rsi),%ymm0,%ymm0"),
 	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")], 1),
+	# **The three shapes Finding 140 added, each with the refusal it must
+	# still make.** A copy is representable only from a source the span
+	# holds, a broadcast from nothing at all, and a store of a value the
+	# span never defined is a correct refusal that had been wearing the
+	# lane-wise label.
+	("a copy of a tracked value, which the destination inherits",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_COPY, "vmovups", "%ymm0,%ymm1"),
+	  (SPAN_STORE1, "vmovups", "%ymm1,(%rdi)")], 2),
+	("a copy of a value this span never defined",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_COPY2, "vmovups", "%ymm2,%ymm3"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")],
+	 "a 256-bit copy of a value this span never defined"),
+	("a broadcast, whose two lanes are the same sixteen bytes",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_SPLAT, "vbroadcastss", "%xmm3,%ymm1"),
+	  (SPAN_STORE1, "vmovups", "%ymm1,(%rdi)"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")], 2),
+	("a store of a value this span never defined",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_STORE1, "vmovups", "%ymm1,(%rdi)"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")],
+	 "a 256-bit store of a value this span never defined"),
 	("two values whose lifetimes do not overlap need one slot",
 	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
 	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)"),
@@ -5902,13 +6061,31 @@ def span_selftest():
 	found, because the demand is what Finding 133's whole argument turns
 	on -- a span that reported one slot where it needs two would be priced
 	as buildable and would corrupt a value the day it was built.
+
+	**A string expectation checks the REASON instead**, and exists because
+	one of Finding 140's cases cannot fail without it. A store of a value
+	the span never defined was refused before that change and is refused
+	after it; all that moved is which bucket it is reported in. A case
+	asserting the refusal would therefore have passed against the code it
+	was written to exercise -- a test nobody could see fail, which is
+	Finding 111's rule and the reason this branch is here.
 	"""
 	failures = 0
 	for what, rows, expected in SPAN_CASES:
 		instructions = _span(rows)
 		positions = {a: i for i, (a, *_r) in enumerate(instructions)}
-		found = ymm_span(instructions, 0, set(), positions)
+		why = []
+		found = ymm_span(instructions, 0, set(), positions, why=why)
 		got = None if found is None else found[2]
+		if isinstance(expected, str):
+			if found is None and any(expected in reason for reason in why):
+				continue
+			print(f"selftest: {what}: ymm_span answered "
+			      f"{got if got is not None else 'a refusal'} saying "
+			      f"{why}, want a refusal naming {expected!r}",
+			      file=sys.stderr)
+			failures += 1
+			continue
 		if got != expected:
 			print(f"selftest: {what}: ymm_span wanted "
 			      f"{got if got is not None else 'nothing'} slot(s), want "
@@ -6035,6 +6212,7 @@ def span_survey(binary, listing, patched):
 		return total
 
 	covered, refused, fit = set(), Counter(), Counter()
+	forms = Counter()
 	for index, (address, encoding, _m, _o, _c) in enumerate(instructions):
 		if address not in survivors:
 			continue
@@ -6045,6 +6223,8 @@ def span_survey(binary, listing, patched):
 		found = ymm_span(instructions, index, blocked, positions, why=why)
 		if found is None:
 			refused[why[0] if why else "?"] += 1
+			if len(why) > 1 and why[1].startswith("form: "):
+				forms[why[1][len("form: "):]] += 1
 			continue
 		members, _end, peak = found
 		room = slots(address)
@@ -6065,9 +6245,22 @@ def span_survey(binary, listing, patched):
 		return 2
 	print(f"surviving 256-bit sites          {len(survivors):>8,}")
 	print(f"covered by a closed span that fits {len(covered):>6,}")
-	print("\nwhy no span closed here:")
+	print(f"\nwhy no span closed here, {sum(refused.values()):,} in "
+	      f"{len(refused)} reason(s), the 8 commonest:")
 	for reason, count in refused.most_common(8):
 		print(f"  {count:>7,}  {reason}")
+	if forms:
+		# **The total is printed because the rows are truncated.** The
+		# reason buckets above carry a register name, so "not lane-wise"
+		# was never one line but one per register, and reading the top of
+		# that list as the whole of it is how project.md came to quote 171
+		# for a population half again as large. A histogram that shows its
+		# head must say what the head is a head OF. Finding 140.
+		shown = forms.most_common(20)
+		print(f"\n256-bit forms that stopped a span, {sum(forms.values()):,} "
+		      f"in {len(forms)} form(s), the {len(shown)} commonest:")
+		for name, count in shown:
+			print(f"  {count:>7,}  {name}")
 	print("\nclosed spans, slots wanted against slots available:")
 	for (peak, room), count in sorted(fit.items()):
 		print(f"  wants {peak}, has {room}: {count:>6,}"

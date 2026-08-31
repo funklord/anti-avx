@@ -81,14 +81,35 @@ LANE_WISE = """
 EXCLUDED = [("vpsadbw", None), ("vphsubd", None), ("vpblendw", "$0x3c"),
             ("vpblendw", "$0xa5"), ("vpblendw", "$0x0f")]
 
-# Neither in the set nor excluded from it, and asked because the comment
-# above the set gives "nothing horizontal" as a reason. Horizontal is a
-# statement about elements; the set's own requirement is about lanes, and
-# these are the shapes where the two questions come apart.
+# Neither in the set nor excluded from it. Two reasons, and the second
+# arrived a fortnight after the first.
+#
+# The first twelve were asked because the comment above the set gives
+# "nothing horizontal" as a reason. Horizontal is a statement about
+# elements; the set's own requirement is about lanes, and these are the
+# shapes where the two questions come apart.
+#
+# The rest were asked because `ymm_span` reads `LANE_WISE` and did not
+# exist when the first twelve were settled. Finding 122 declined to take
+# them into the set because nothing but the splat triple read it, and a
+# set is a liability until something does; a span is a second reader, and
+# a 256-bit form it does not recognise closes it. Each of these stops one
+# in this binary -- `make spans` ranks them -- and every one has a
+# 128-bit SSE form spelled by dropping the v, which is what this harness
+# can ask about.
+#
+# `vshufps` is asked at two immediates for `vpblendw`'s reason: the
+# immediate is what selects the elements, so one value settles one
+# selection rather than the instruction. $0xe4 is left out deliberately --
+# it is the identity, and an identity cannot tell a correct split from a
+# sabotaged one.
 EXTRA = [("vhaddps", None), ("vhsubps", None), ("vphaddd", None),
          ("vpackssdw", None), ("vpackuswb", None), ("vpunpckldq", None),
          ("vpunpckhqdq", None), ("vpshufb", None), ("vpalignr", "$0x5"),
-         ("vpmaddwd", None), ("vpavgb", None), ("vpmulhw", None)]
+         ("vpmaddwd", None), ("vpavgb", None), ("vpmulhw", None),
+         ("vshufps", "$0x1b"), ("vshufps", "$0x4e"),
+         ("vaddsubps", None), ("vpmulld", None), ("vpmuludq", None),
+         ("vpcmpeqb", None), ("vpcmpeqw", None), ("vpsubusw", None)]
 
 # **A shape the naive split gets wrong, and the reason it is here.** The
 # count operand of a variable shift is one xmm however wide the data is, so

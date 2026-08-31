@@ -8610,6 +8610,145 @@ TLS data directory    rva 0x4f07480, 40 bytes
 
 Every figure Finding 69 recorded holds. What changed is only what it costs to reach one.
 
+### Finding 140 -- the span survey named its own biggest bucket wrong, and item 1 is worth nothing
+
+Written because it closes the top of this document's build-next list at zero. Item 1 was
+**extend `LANE_WISE`**, ranked "first by default rather than by size -- the only item left
+that is both small and safe", on the figure that 171 of the span survey's closure failures
+were a 256-bit form that does not split lane-wise. Both halves of that were wrong: the
+count and what it counted.
+
+#### The survey could say that a span stopped and not what stopped it
+
+`ymm_span` recorded a reason and `spans` printed the eight commonest, and those reasons
+carry the register name -- so `a 256-bit form that is not lane-wise` was never one bucket
+but one per register, and only the largest few ever appeared. The 171 is the sum of what
+fitted on the page. **Counted properly it is 325**, and the refusal list it came from is
+4,335 stops across 78 distinct reasons, of which the printed eight are 3,747.
+
+That was a reporting gap, and closing it was three lines: `ymm_span` records the mnemonic
+that stopped it and `spans` prints that histogram beside the reasons. What came back is
+not a longer version of the same answer.
+
+```
+      125  vmovups reg,mem     13  vfmadd213ps      3  vpermpd
+       45  vshufps              8  vcvtdq2ps        3  vfmadd213pd
+       40  vextractf128         7  vinsertf128      2  vpslld
+       30  vbroadcastss         6  vpcmpeqb       ...  325 in 27 forms
+       19  vmovups reg,reg      4  vpbroadcastd
+```
+
+**Both totals here are printed by the tool now**, and that is the durable half of the
+change. A histogram that shows its head must say what the head is a head OF, or the next
+reader sums the rows and quotes it -- which is how 171 got into this document and, two
+paragraphs into the first draft of this finding, how 319 nearly replaced it.
+
+**The largest entry is a move.** The branch that reports "not lane-wise" is the walk's
+catch-all -- everything 256-bit that no earlier branch claimed lands there -- and
+`wide_move` claims a move only when one operand is memory, because that is all `ymm_run`
+ever needed. So a register-to-register copy, a broadcast and a store of an untracked value
+all fell past it and were reported as a lane-structure problem, in instructions that have
+no lane structure at all.
+
+Split by operand shape, the bucket is three unrelated populations:
+
+```
+  125  vmovups reg,mem                a store of a value the span never defined
+   58  reg,reg moves and broadcasts   representable, and unbuilt
+   55  lane-wise arithmetic the set did not name
+   87  everything else -- FMA, conversions, extracts, the genuinely cross-lane
+```
+
+The 125 were never work. The upper half of a value the span never defined sits in a
+machine ymm nothing in the rewritten program can read, so refusing is correct and always
+was -- but under a label about lane structure they read as sites that extending a set of
+mnemonics would reach. **38% of the bucket that ranked item 1 first is a correct
+refusal.**
+
+#### All three increments were built, and all three bought nothing
+
+Each was measured on its own against `make detour` and the rebuilt binary, never against
+`detour-plan`, per Finding 126.
+
+```
+                                            surviving   covered   stops
+baseline, HEAD                                  4,494       218     325
++ 9 mnemonics in LANE_WISE                      4,494       218      --
++ copies, broadcasts, and the store reason       4,494       218     248
+```
+
+The mechanisms work and the evidence is that the histogram moves: `vshufps`, `vpcmpeqb`,
+`vpsubusw`, `vaddsubps` and `vpcmpeqw` leave it after the first change, the broadcasts
+leave it entirely after the second, and `vmovups reg,reg` falls from 19 to 16 -- the
+sixteen being copies of a source no span defined. **77 stops removed, 325 to 248, four
+whole forms gone, and not one additional site covered.**
+
+**77 and not 113, which is the arithmetic worth keeping.** Adding up what each change
+removes says 113; the measured net is 77, because a span that stops later is a span that
+walked further and can stop at something new. `vpmovmskb` and `vfmadd231ps` appear in the
+histogram only AFTER the first change, at 7 and 4 -- they were always there and nothing
+had ever reached them. The same shape as Finding 123's reload rung, arrived at from the
+other side: there a gain became a loss downstream, here a removal is partly refilled from
+further along the same walk.
+
+The slot-demand table is byte-identical across all three runs -- every one of its eleven
+rows -- which is the corroboration rather than a coincidence: a span that closed never met
+one of these forms at all, and a span that stopped at one now walks further and stops at
+the next. Finding 123 said a site is gained only when everything downstream of it also
+holds. Here that is the whole of the result rather than a caveat on it.
+
+**So the binary did not change either.** The rewriter's own tallies are the same to the
+site -- 547,716 in-place patches, 202,115 detours, 549 refused, every refusal bucket
+unmoved -- because `LANE_WISE`'s other reader, `splat_operation`, found no triple using a
+new mnemonic.
+
+#### What actually bounds the span, from the same survey
+
+```
+  3,273  does not begin with a 256-bit load
+    101  the value is still live after a branch target inside the span
+     92  ... after a control transfer
+     53  nothing consumes the value
+```
+
+and among spans that DO close, the slot table refuses 54 more on room rather than on
+shape -- 41 wanting one slot with none, 22 wanting three with two. **Recognising more
+forms is not what the 218 is short of**, and no further work on the walk's vocabulary
+reaches it. That is the finding: not that these three changes were too small, but that the
+quantity they move is not the quantity that binds.
+
+#### Kept anyway, and why
+
+None of it is reverted. The survey now names what stops a span, which is what made this
+measurable at all and what the next attempt on the 256-bit half will read first; the
+refusals are reported under honest names, so the 125 stop looking like work; and
+`LANE_WISE` gained nine mnemonics that are correct, executed and free. **What is retired
+is the claim on the list, not the code.**
+
+`make check-lanes` settles the nine the way it settles the other thirty-five -- the
+256-bit form under qemu against two 128-bit halves natively, bit for bit, with both
+sabotages of each split rejected. Finding 122 had already settled twelve more and
+deliberately taken none, because `splat_operation` was then the set's only reader and none
+of the twelve appears in a splat triple. That reasoning was right when written and expired
+when `ymm_span` was built six days later without anyone noticing the set had gained a
+second reader.
+
+**And the comment above the set had been wrong since Finding 122 said so.** It gave
+"nothing horizontal is here (`vhaddps` combines neighbours)" as the exclusion rule, three
+lines above `vphsubd`, which is horizontal and in the set -- AVX defines the horizontal
+forms per 128-bit lane, so the test is lanes and never was elements. Finding 122 recorded
+that the reason was wrong and did not go back and fix it. A reason that does not hold is
+worse than no reason, because the next person to extend the set applies it.
+
+#### The one shape whose test could not fail
+
+The store-of-an-untracked-value change moves a refusal from one bucket to another and
+changes no verdict, so a selftest case asserting the refusal passes against the code it
+was written to exercise. `SPAN_CASES` now takes a string expectation that checks the
+REASON, and the case is real. All four new cases were run against a copy of the tool with
+the change taken back out, and all four go red naming exactly what they lost -- Finding
+111's rule, which is why it is here.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8746,34 +8885,38 @@ upper half's by the ABI -- both die at a call. But room is capacity, and capacit
 the bound that binds. `make spans` asks the question that does:
 
 ```
-surviving 256-bit sites             4,500
-covered by a closed span that fits    212
+surviving 256-bit sites             4,494
+covered by a closed span that fits    218
 ```
 
 A span is worth nothing unless every value it tracks dies inside it, and closure is what
-fails -- 101 sites lose their value at a branch target inside the span, 92 at a control
-transfer, 171 at a 256-bit form that is not lane-wise, 57 to a narrower touch.
+fails -- 3,273 spans never begin at a 256-bit load at all, 101 lose their value at a
+branch target inside the span, 92 at a control transfer, 53 have nothing consume it, and
+57 lose it to a narrower touch.
+
+**Do not read the remaining refusals as a menu.** Finding 140 took the largest of them --
+the forms the walk did not recognise, 325 stops across 27 forms -- and removed 77 of them
+in three increments, for zero additional sites. What it measured on the way is the part
+worth keeping: 38% of that bucket was a store of a value the span never defined, which is
+a correct refusal wearing a label about lane structure, and removing the rest only moved
+each span's death to the next obstacle. The 54 spans that close and then fail on the slot
+table are a different question from any of this.
 
 ### What is worth building next
 
 Ordered by what was measured, not by what looks large.
 
-  1. **Extend `LANE_WISE`.** 171 of the span survey's closure failures are a 256-bit form
-     that does not split lane-wise. `lane_oracle.py` proves each of the 35 current entries
-     under execution, so adding to it is bounded work that carries its own proof. Cheap,
-     and it raises the 212 rather than replacing it. **This is first by default rather
-     than by size** -- it is the only item left that is both small and safe.
-  2. **Per-position liveness for general-purpose registers.** Worth doing before static
+  1. **Per-position liveness for general-purpose registers.** Worth doing before static
      TLS rather than after, because it decides what static TLS is worth: 67 of the 1,332
      have two of `r8`-`r11` free by the whole-function argument, and 500 more are refused
      only by that argument's bluntness. Findings 131 and 134 built exactly this machinery
      for the home spaces and nobody has pointed it at GPRs.
-  3. **Static TLS addressing**, at **67 sites** by what is measured today -- see Finding
+  2. **Static TLS addressing**, at **67 sites** by what is measured today -- see Finding
      139, which corrects Finding 69's 740. The file-format half is proven and checked
      (`make check-tls`); what is unbuilt is the addressing, and it needs TWO registers
      rather than one. Its failure mode is still the only one in this area that is not
      silent corruption, which is the reason to keep it on the list at all at that price.
-  4. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
+  3. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
      value at a transfer, and the only one that reaches the 443 needing eleven slots at
      once. A much larger design than the span, and the one the project has deferred five
      times; do not start it on the 1,674 figure. **It is also the only large item left**,
@@ -8788,7 +8931,13 @@ Ordered by what was measured, not by what looks large.
     that);
   * `--spill=pool` (Finding 46: it cannot be made thread-safe);
   * the local 256-bit span design as a build (Finding 133: 212 sites, against 479 and 414
-    for the two home-space increments, at several times the complexity).
+    for the two home-space increments, at several times the complexity);
+  * **the span walk's vocabulary** (Finding 140: three increments, 77 of its 325 stops
+    removed, four whole forms gone, zero sites gained). What the 218 is short of is not
+    which forms the walk recognises. 3,273 of its refusals never begin at a 256-bit load
+    at all, 193 lose the value at a transfer or a branch target, and 54 spans close and
+    then fail on slots rather than on shape -- so the next attempt here is item 3 or
+    nothing.
 
 #### The frontier is where it was, and that is deliberate
 
