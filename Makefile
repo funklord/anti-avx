@@ -480,10 +480,24 @@ $(BUILD_DIR)/sse-%.exe: $(BUILD_DIR)/pe-%.exe $(BUILD_DIR)/pe-%.asm \
 #
 # Termination: every wine invocation is wrapped in a timeout, and the trap
 # reaps the wineserver even when an assertion fails part way through.
+#
+# **A wine that will not start returns 1 for every binary here**, and 1 is
+# not any fixture's answer -- so the loop below blames the FIRST fixture and
+# reports a rewriting defect. That is what it did when this tree was checked
+# out under one account and run under another: wine refuses a prefix it does
+# not own, and the message named `aliasing`. The canary asks whether wine
+# runs at all before any of that, so the cause is stated once instead of
+# being attributed to whichever fixture happens to be first.
 check-pe: $(PE_FIXED) $(PE_SOURCES)
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-pe: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
+	@$(WINE_ENV) timeout 300 wine cmd /c exit 0 >/dev/null 2>&1 || \
+		{ echo "check-pe: wine will not start with WINEPREFIX=$(PE_PREFIX)."; \
+		  echo "          Every fixture would return 1 and be reported as a"; \
+		  echo "          rewriting defect. Run:"; \
+		  echo "          $(WINE_ENV) wine cmd /c exit 0"; \
+		  exit 1; }
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
 	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \

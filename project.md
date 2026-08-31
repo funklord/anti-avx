@@ -8931,6 +8931,16 @@ make spans         what a closed 256-bit span could reach (a measurement)
   will be flagged**. Write the functions out.
 - `wine` needs `WINEDLLOVERRIDES=winedbg.exe=d` or an expected crash hangs for the
   full timeout instead of returning immediately.
+- **A wine that will not start returns 1 for every fixture**, and 1 is not any
+  fixture's expected answer -- so `check-pe`'s loop blamed the first one and reported
+  `rewritten aliasing returned 1, want 169`, which reads as a rewriting defect. The
+  cause was that `build/wineprefix` belonged to the account that created it and the
+  session running the gate was a different one; wine refuses a prefix it does not own.
+  `check-pe` now asks `wine cmd /c exit 0` before the loop and says so. Override
+  `PE_PREFIX` to run against a prefix you own. Same shape as the style gate's
+  dubious-ownership fault taken in `b3fcb4f` two commits earlier, from the other
+  direction: **a tool met a permission it could not read and reported it as a fact
+  about the work.**
 - `.SECONDARY` **expands its prerequisites where it is read**, so a variable defined
   later expands to nothing and protects nothing.
 
