@@ -494,6 +494,23 @@ SPILL_NONE, SPILL_STACK, SPILL_POOL = "none", "stack", "pool"
 # It is the thread's own stack, so Finding 46's race does not apply. And
 # `(%rsp)` needs no register to address, so Finding 69 does not apply.
 SPILL_HOME = "home"
+# **Static TLS**, which is the home space's fallback rather than its rival:
+# `--spill=tls` takes the home space wherever it is lendable and reaches for
+# a per-thread slot only where it is not. The bytes belong to the rewriter,
+# so this is the one backing store here whose failure mode is not silent
+# corruption of somebody else's local -- a slot used wrongly loses the
+# rewriter's own value. It costs TWO general-purpose registers to address
+# (Finding 139) and is worth 753 sites by the liveness Finding 141 measured.
+SPILL_TLS = "tls"
+# **Every mode that lends the callee home space**, named once because it is
+# tested in four places and a mode missing from one of them is invisible.
+# `--spill=tls` is home FIRST and a per-thread slot only where the home
+# space said no, so everything the home space offers it offers too. Getting
+# this wrong cost 351 sites in the first build: `ymm_run`'s borrow and
+# `swallowed_borrow` both asked `SPILL == SPILL_HOME` exactly, so turning
+# TLS on took the home space away from a run and gave it back to nobody --
+# the mode gained its 753 and lost 287 net, which is how it was found.
+HOME_SPILLS = (SPILL_HOME, SPILL_TLS)
 SPILL = SPILL_HOME
 HOME_SPACE = 32
 # `--rsp=` decides what a copy of `rsp` costs. `blanket` refuses any function
@@ -582,6 +599,86 @@ def spill_register(registers):
 	"""
 	candidates = spill_candidates(registers)
 	return candidates[0] if candidates else None
+
+
+# **The thread's own TLS array, at `gs:[0x58]`.** The TEB holds
+# ThreadLocalStoragePointer there, and the loader gives every module with a
+# TLS directory an index into it. Reaching this module's block is therefore
+# two dereferences and needs TWO registers: hold the array pointer and the
+# index has nowhere to go, hold the index and the array pointer has nowhere
+# to go. A segment-prefixed `%gs:0x58(,%r,8)` does not help, because 0x58
+# holds a pointer that must be FOLLOWED before it is indexed. Finding 139.
+TEB_TLS_POINTER = 0x58
+
+# rax, rcx, rdx and r8-r11 by number, which is what an encoding wants.
+GPR_NUMBERS = {"rax": 0, "rcx": 1, "rdx": 2,
+               "r8": 8, "r9": 9, "r10": 10, "r11": 11}
+
+
+def encode_tls_base(block, index, index_va, at):
+	"""Put this module's TLS block in `block`, using `index` as scratch.
+
+	    movq %gs:0x58,%block
+	    mov  tls_index(%rip),%indexd
+	    movq (%block,%index,8),%block
+
+	`at` is where the sequence starts, because the middle instruction is
+	rip-relative and a displacement is measured from the END of it.
+
+	Both registers are clobbered and neither is put back. That is the whole
+	reason this needs `gpr_live_out` rather than a save: there is nowhere to
+	save a general-purpose register to that does not need a register to
+	address, which is the circularity Finding 69 met and Finding 141 broke
+	by finding registers that were already dead.
+	"""
+	out = bytearray()
+	out.append(0x65)						# %gs
+	out.append(0x48 | (0x04 if block >= 8 else 0))		# REX.W, REX.R
+	out += b"\x8b"
+	out.append(((block & 7) << 3) | 4)			# mod 00, rm 100 SIB
+	out.append(0x25)					# no base, no index
+	out += struct.pack("<I", TEB_TLS_POINTER)
+
+	middle = bytearray()
+	if index >= 8:
+		middle.append(0x44)					# REX.R
+	middle += b"\x8b"
+	middle.append(((index & 7) << 3) | 5)			# mod 00, rm 101 rip
+	# A 32-bit load zero-extends, so the index arrives in all 64 bits and
+	# the scale-8 index below is a whole register. `movl` is a byte shorter
+	# than `movq` and this sequence is emitted at every site that uses it.
+	following = at + len(out) + len(middle) + 4
+	middle += struct.pack("<i", index_va - following)
+	out += middle
+
+	out.append(0x48 | (0x04 if block >= 8 else 0)
+	           | (0x02 if index >= 8 else 0)
+	           | (0x01 if block >= 8 else 0))		# REX.W R X B
+	out += b"\x8b"
+	out.append(((block & 7) << 3) | 4)			# mod 00, rm 100 SIB
+	out.append(0xC0 | ((index & 7) << 3) | (block & 7))	# scale 8
+	return bytes(out)
+
+
+def encode_tls_spill(borrowed, save, block, offset):
+	"""Save or restore a borrowed xmm in the TLS slot at `offset(%block)`.
+
+	`movups` for `encode_spill`'s reason: nothing guarantees the block is
+	16-byte aligned beyond what the directory's own alignment asks for, and
+	an aligned move would fault on exactly the sites hardest to reproduce.
+
+	Always a disp32. The block runs to twelve kilobytes here and the slot
+	sits past the end of the module's own template, so a disp8 form would
+	be wrong for every real offset and right only in a fixture.
+	"""
+	out = bytearray()
+	rex = 0x40 | (0x04 if borrowed >= 8 else 0) | (0x01 if block >= 8 else 0)
+	if rex != 0x40:
+		out.append(rex)
+	out += b"\x0f\x11" if save else b"\x0f\x10"
+	out.append(0x80 | ((borrowed & 7) << 3) | (block & 7))	# mod 10, disp32
+	out += struct.pack("<i", offset)
+	return bytes(out)
 
 
 def encode_spill(borrowed, save, at, spill_base, slot, base):
@@ -1778,7 +1875,8 @@ def home_space_map(binary, plain, ranges, blocked):
 	# address order, so a function's rows are found by bisection.
 	state = {"plain": plain, "unwind": unwind_at, "prologue": prologue_end,
 	         "data": data, "cache": {}, "home_cache": {},
-	         "direct": direct, "copies": copies, "blocked": blocked}
+	         "direct": direct, "copies": copies, "blocked": blocked,
+	         "gpr_cache": {}}
 	return (starts, ranges,
 	        [calls[i] and i not in pointed and ranges[i][0] in fixed_frame
 	         for i in range(len(ranges))],
@@ -1986,6 +2084,70 @@ def borrow_offset(home, address):
 	return None if depth is None else CALLER_SHADOW[0] - depth
 
 
+def gpr_free_at(home, address):
+	"""The volatile GPRs dead across a borrow at `address`, as numbers.
+
+	`borrow_offset`'s counterpart for `--spill=tls`, and the same shape: a
+	question about a place, memoised per function because the walk wants
+	the whole function and only a few hundred are ever asked.
+
+	The site's own operands are excluded. A lowering reaching memory
+	through `(%rax,%rcx,4)` needs both registers while the stub runs, and
+	the liveness answer is about what happens AFTER the instruction.
+	"""
+	if home is None:
+		return frozenset()
+	_starts, ranges, _usable, state = home
+	starts = _starts
+	i = bisect.bisect_right(starts, address) - 1
+	if i < 0 or address >= ranges[i][1]:
+		return frozenset()
+	plain = state["plain"]
+	if i not in state["gpr_cache"]:
+		start, end = ranges[i]
+		first = bisect.bisect_left(plain, (start,))
+		last = bisect.bisect_left(plain, (end,), first)
+		blocked = state["blocked"]
+		inside = tuple(position for position in range(first, last)
+		               if plain[position][0] in blocked)
+		state["gpr_cache"][i] = (first, last,
+		                         gpr_live_out(plain, first, last, inside))
+	first, last, live = state["gpr_cache"][i]
+	at = bisect.bisect_left(plain, (address,), first, last)
+	if at >= last or plain[at][0] != address:
+		return frozenset()
+	free = frozenset(VOLATILE_GPRS) - live[at] \
+		- gprs_named(plain[at][3] or "")
+	return frozenset(GPR_NUMBERS[name] for name in free)
+
+
+def window_gpr_free(home, start, window):
+	"""`gpr_free_at` for every instruction a window covers.
+
+	A stub writes its addressing sequence once and the borrowed register
+	stays clobbered until the restore, so a register has to be dead at
+	EVERY instruction in the window and named by none of them -- the same
+	argument `window_borrow` makes about a displacement, for the same
+	reason. A widened window that took this from the site alone would
+	clobber a register the swallowed neighbour still wanted.
+	"""
+	if home is None:
+		return frozenset()
+	_starts, _ranges, _usable, state = home
+	plain = state["plain"]
+	free = None
+	at = bisect.bisect_left(plain, (start,))
+	while at < len(plain) and plain[at][0] < start + window:
+		here = gpr_free_at(home, plain[at][0]) \
+			- frozenset(GPR_NUMBERS[name]
+			            for name in gprs_named(plain[at][3] or ""))
+		free = here if free is None else (free & here)
+		if not free:
+			return frozenset()
+		at += 1
+	return free if free is not None else frozenset()
+
+
 def window_borrow(home, start, window):
 	"""`borrow_offset` for a whole window, or None if it is not one number.
 
@@ -2050,7 +2212,7 @@ def swallowed_borrow(plain, address, encoding, operands, mnemonic, home):
 	The site's own spill block and this one cannot overlap either: `preceding`
 	is emitted before it and `displaced` after.
 	"""
-	if SPILL != SPILL_HOME or borrow_offset(home, address) is None:
+	if SPILL not in HOME_SPILLS or borrow_offset(home, address) is None:
 		return None
 	fields = inplace.split_operands(operands)
 	registers = [o for o in fields if not o.startswith("$")]
@@ -4048,7 +4210,8 @@ def close_stub(body, displaced, stub_address, pool, spill_base, reasons,
 
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
                stub_address, scratch=None, pool=0, preceding=(),
-               strategy=None, spill_base=0, reasons=None, home=None):
+               strategy=None, spill_base=0, reasons=None, home=None,
+               tls=None):
 	"""The stub body for one window, placed at stub_address.
 
 	`start` is the window's first byte, which is the site's own address
@@ -4233,7 +4396,23 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# save has to come before the lowering and the restore after it, so
 		# neither can live inside lower_vex.
 		borrowed = strategy[1]
-		if base is None:
+		# **The home space first, and a per-thread slot only where there is
+		# none.** `tls` is `(index VA, slot offset)` when `--spill=tls` is
+		# on and the image has a TLS directory. The two registers must be
+		# dead across the WHOLE window for `window_borrow`'s reason: the
+		# addressing is written once and the clobber lasts until the
+		# restore, so a widened window that asked only about the site would
+		# destroy a register its swallowed neighbour still wanted.
+		tls_pair = None
+		if base is None and tls is not None:
+			available = sorted(window_gpr_free(home, start, window))
+			if len(available) >= 2:
+				# r11 and r10 first where they are free: neither is ever an
+				# argument or a return value, so taking them disturbs the
+				# fewest other things this tool might later want.
+				ordered = sorted(available, key=lambda n: -n)
+				tls_pair = (ordered[0], ordered[1])
+		if base is None and tls_pair is None:
 			if reasons is not None:
 				reasons["the site will not hold one borrow displacement"] += 1
 			return None, 0
@@ -4244,8 +4423,15 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			# to be zero: a backward-widened window emits its swallowed
 			# instructions first.
 			prologue = len(body)
-		saved = encode_spill(borrowed, True, stub_address + len(body),
-		                     spill_base, 0, base)
+		if tls_pair is not None:
+			index_va, slot_offset = tls
+			block, scratch_gpr = tls_pair
+			body += encode_tls_base(block, scratch_gpr, index_va,
+			                        stub_address + len(body))
+			saved = encode_tls_spill(borrowed, True, block, slot_offset)
+		else:
+			saved = encode_spill(borrowed, True, stub_address + len(body),
+			                     spill_base, 0, base)
 		if saved is None:
 			if reasons is not None:
 				reasons["the borrowed register could not be saved"] += 1
@@ -4258,8 +4444,17 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the site itself will not lower"] += 1
 			return None, 0
 		body += lowered
-		restored = encode_spill(borrowed, False, stub_address + len(body),
-		                        spill_base, 0, base)
+		if tls_pair is not None:
+			# The block pointer is still in `block`: nothing between the
+			# save and here may touch it, which is what `window_gpr_free`
+			# and the borrow bracket's no-control-transfer rule guarantee
+			# between them.
+			restored = encode_tls_spill(borrowed, False, tls_pair[0],
+			                            tls[1])
+		else:
+			restored = encode_spill(borrowed, False,
+			                        stub_address + len(body),
+			                        spill_base, 0, base)
 		if restored is None:
 			if reasons is not None:
 				reasons["the borrowed register could not be restored"] += 1
@@ -4490,7 +4685,17 @@ def collect(binary, listing):
 	long_shadow = {}
 	# Which functions can lend their callee home space, if asked to.
 	home = home_space_map(binary, plain, ranges, blocked) \
-		if SPILL == SPILL_HOME else None
+		if SPILL in HOME_SPILLS else None
+	# Where a per-thread slot would sit, if this image has a TLS directory
+	# at all. `None` makes `--spill=tls` behave exactly as `--spill=home`,
+	# which is the right answer for an image with no TLS: there is no index
+	# for the loader to write and nowhere to put the bytes.
+	tls_slot_offset = None
+	if SPILL == SPILL_TLS:
+		with open(binary, "rb") as image:
+			found = tls_slot(image.read())
+		if found is not None:
+			tls_slot_offset = found
 	# Where a 256-bit load can be taken at its word. Only the headers are
 	# read: the ranges come from the section table, and the bytes inside them
 	# are the CPU's business rather than this tool's.
@@ -4646,7 +4851,7 @@ def collect(binary, listing):
 					# and the span leaves `rsp` alone -- see `span_keeps_rsp`
 					# for why the second matters here and did not in
 					# Finding 93.
-					lendable = (SPILL == SPILL_HOME
+					lendable = (SPILL in HOME_SPILLS
 					            and borrow_offset(home, address) is not None
 					            and span_keeps_rsp(instructions, index, last))
 					assigned = assign_helpers(plain, positions, index,
@@ -4971,11 +5176,18 @@ def collect(binary, listing):
 				# whole of the question Finding 46 measures -- and the home
 				# space is the one that has to ask permission, because it
 				# belongs to the function rather than to the rewriter.
-				if SPILL == SPILL_HOME \
+				if SPILL in HOME_SPILLS \
 						and borrow_offset(home, address) is None:
-					skipped["no home space to borrow"] += 1
-					declined[address] = "no home space to borrow"
-					continue
+					# **The home space first, always.** It needs no
+					# register to address and no directory raised, so
+					# `--spill=tls` differs from `--spill=home` only where
+					# the home space said no. Two registers, because the
+					# addressing needs two and one is worth nothing to it.
+					if SPILL != SPILL_TLS or tls_slot_offset is None \
+							or len(gpr_free_at(home, address)) < 2:
+						skipped["no home space to borrow"] += 1
+						declined[address] = "no home space to borrow"
+						continue
 				borrowed = borrow_that_lowers(address, encoding, operands,
 				                              mnemonic, address, address)
 				if borrowed is not None:
@@ -5342,6 +5554,79 @@ def next_section_rva(data):
 	return (highest + alignment - 1) // alignment * alignment
 
 
+# Data directory 9 of a PE32+ optional header, which begins at 112.
+TLS_DIRECTORY = 9
+# IMAGE_TLS_DIRECTORY64: two VAs bounding the template, the VA of the index
+# the loader writes, the VA of the callback list, then the zero fill and the
+# characteristics.
+TLS_FIELDS = "<QQQQII"
+
+
+def tls_directory(data):
+	"""`(file offset of the directory, fields)` or None if there is no TLS.
+
+	The directory is addressed by RVA and lives in some section's raw data,
+	so finding it is the same walk `sections_of` does for everything else.
+	A binary with no TLS directory has no index for the loader to write and
+	nowhere to put a slot, and `--spill=tls` is simply unavailable there.
+	"""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	opt = pe + 24
+	count = struct.unpack_from("<I", data, opt + 108)[0]
+	if count <= TLS_DIRECTORY:
+		return None
+	rva, size = struct.unpack_from("<II", data,
+	                               opt + 112 + TLS_DIRECTORY * 8)
+	if not rva or size < struct.calcsize(TLS_FIELDS):
+		return None
+	for vaddr, vsize, raddr, _rsize in sections_of(data):
+		if vaddr <= rva < vaddr + vsize:
+			offset = raddr + (rva - vaddr)
+			return offset, struct.unpack_from(TLS_FIELDS, data, offset)
+	return None
+
+
+def tls_slot(data, want=SLOT):
+	"""Where a borrowed register may be saved, per thread.
+
+	Returns `(index VA, offset of the slot in the block, new zero fill)` or
+	None. The slot sits past the module's own template, at the alignment the
+	directory asks for, and `SizeOfZeroFill` is raised to cover it.
+
+	**This is the whole of the file-format half, and `make check-tls` is
+	what says the loader honours it** -- the directory asks for the bytes,
+	the loader allocates and zeroes them per thread, and Finding 138 swept
+	the field to prove the answer depends on its value rather than on the
+	template being copied. Nothing here is remembered from a manual.
+	"""
+	found = tls_directory(data)
+	if found is None:
+		return None
+	_offset, fields = found
+	start, end, index_va, _callbacks, zero_fill, characteristics = fields
+	if not index_va or end < start:
+		return None
+	# IMAGE_SCN_ALIGN_* lives in bits 20-23 and encodes 2^(n-1) bytes.
+	shift = (characteristics >> 20) & 0xF
+	alignment = 1 << (shift - 1) if shift else 1
+	template = end - start
+	slot = (template + alignment - 1) // alignment * alignment
+	return index_va, slot, max(zero_fill, slot - template + want)
+
+
+def set_tls_zero_fill(data, zero_fill):
+	"""Raise `SizeOfZeroFill` so the loader gives every thread the slot."""
+	found = tls_directory(data)
+	if found is None:
+		raise SystemExit("no TLS directory to raise")
+	offset, fields = found
+	if fields[4] >= zero_fill:
+		return bytes(data)
+	image = bytearray(data)
+	struct.pack_into("<I", image, offset + 32, zero_fill)
+	return bytes(image)
+
+
 def add_section(data, name, payload, flags):
 	"""Append a section to a PE image. Returns (new image, virtual address)."""
 	pe = struct.unpack_from("<I", data, 0x3C)[0]
@@ -5502,6 +5787,7 @@ def selftest():
 	failures += reader_selftest()
 	failures += span_selftest()
 	failures += gpr_selftest()
+	failures += tls_selftest()
 	failures += borrow_selftest()
 	failures += splat_selftest()
 	failures += constant_selftest()
@@ -6246,6 +6532,46 @@ GPR_CASES = [
 ]
 
 
+# **The assembler's own bytes**, taken from `as` on the sequence spelled out
+# in `encode_tls_base` and `encode_tls_spill` and pasted here. Every other
+# encoder in this file is exercised by something that RUNS it; these two are
+# emitted only where a site has two dead general-purpose registers, which no
+# fixture is guaranteed to contain, so the encoding is pinned directly.
+# `(what, bytes, call)` with the call spelled as arguments.
+TLS_ENCODINGS = [
+	("movq %gs:0x58,%rax / mov (%rip),%edx / movq (%rax,%rdx,8),%rax",
+	 "65488b0425580000008b155f332211488b04d0",
+	 ("base", 0, 2, 0x1122336e, 0)),
+	("the same with r10 and r11, which need every REX bit",
+	 "654c8b142558000000448b1d653322114f8b14da",
+	 ("base", 10, 11, 0x11223375, 0)),
+	("movups %xmm2,0x3260(%rax)", "0f119060320000",
+	 ("spill", 2, True, 0, 0x3260)),
+	("movups %xmm2,0x3260(%r10), which needs REX.B", "410f119260320000",
+	 ("spill", 2, True, 10, 0x3260)),
+	("movups %xmm9,0x3260(%r10), REX.R and REX.B", "450f118a60320000",
+	 ("spill", 9, True, 10, 0x3260)),
+	("and the restore, which differs by one opcode byte",
+	 "450f108a60320000", ("spill", 9, False, 10, 0x3260)),
+]
+
+
+def tls_selftest():
+	"""Prove the TLS encodings still say what `as` said. Failures, or 0."""
+	failures = 0
+	for what, want, call in TLS_ENCODINGS:
+		got = (encode_tls_base(*call[1:]) if call[0] == "base"
+		       else encode_tls_spill(*call[1:])).hex()
+		if got != want:
+			print(f"selftest: {what}: encoded {got}, want {want}",
+			      file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(TLS_ENCODINGS)} tls encodings match the "
+		      f"assembler byte for byte")
+	return failures
+
+
 def gpr_selftest():
 	"""Prove `gpr_live_out` frees a register only where it is dead. 0 or n.
 
@@ -6800,7 +7126,8 @@ def census(binary, listing, patched):
 	_patches, candidates, _stats, _skipped, declined, home = collect(
 		binary, listing)
 	placed, _blob, swallowed, overlapped, refused = place_stubs(
-		candidates, stub_base_of(open(binary, "rb").read()), home=home)
+		candidates, stub_base_of(open(binary, "rb").read()), home=home,
+		tls=tls_pair_of(tls_for(binary)))
 	rewritten = {address for address, _window, *_rest in placed}
 	covered = set()
 	for address, window, *_rest in placed:
@@ -6933,7 +7260,7 @@ def main(argv):
 		if item.startswith("--spill="):
 			SPILL = item.split("=", 1)[1]
 			if SPILL not in (SPILL_NONE, SPILL_STACK, SPILL_POOL,
-			                 SPILL_HOME):
+			                 SPILL_HOME, SPILL_TLS):
 				print(f"detour.py: unknown spill {SPILL!r}", file=sys.stderr)
 				return 2
 			del argv[i]
@@ -6992,6 +7319,25 @@ def main(argv):
 	return 2
 
 
+def tls_pair_of(found):
+	"""The `(index VA, slot offset)` a stub needs, from `tls_for`'s answer."""
+	return None if found is None else (found[0], found[1])
+
+
+def tls_for(binary):
+	"""`(index VA, slot offset, zero fill)` for `--spill=tls`, or None.
+
+	One place, because `census`, `apply` and `verify` all place stubs and a
+	disagreement between them is the defect `place_stubs` was written to
+	prevent: apply refusing a stub that verify expects leaves a window
+	uncommitted and a later site detoured inside it.
+	"""
+	if SPILL != SPILL_TLS:
+		return None
+	with open(binary, "rb") as image:
+		return tls_slot(image.read())
+
+
 def stub_base_of(data):
 	"""Where the stub section will start: past every section, page aligned."""
 	pe = struct.unpack_from("<I", data, 0x3C)[0]
@@ -7010,7 +7356,7 @@ def stub_base_of(data):
 
 
 def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
-                detail=None, home=None):
+                detail=None, home=None, tls=None):
 	"""Choose and build the stubs. (placed, blob, swallowed, overlap, refused)
 
 	**One selection rule, executed once and used by both apply and verify.**
@@ -7099,7 +7445,7 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			body, prologue = build_stub(
 				start, encoding, operands, mnemonic, window + grew,
 				list(displaced) + extra, stub_address, scratch, pool,
-				preceding, strategy, spill_base, home=home)
+				preceding, strategy, spill_base, home=home, tls=tls)
 			if body is None:
 				# The extended stub would not build. Fall back to the plain
 				# one rather than lose both -- taking a passenger along must
@@ -7120,7 +7466,7 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			body, prologue = build_stub(
 				start, encoding, operands, mnemonic, window, displaced,
 				stub_address, scratch, pool, preceding, strategy, spill_base,
-				per if per is not None else reasons, home)
+				per if per is not None else reasons, home, tls)
 			if per is not None:
 				if reasons is not None:
 					reasons.update(per)
@@ -7190,6 +7536,10 @@ def apply_all(binary, listing, output):
 	patches, candidates, _stats, _skipped, _declined, home = collect(
 		binary, listing)
 	data = bytearray(open(binary, "rb").read())
+	# Read from the ORIGINAL bytes, before anything is appended: the
+	# directory's own contents do not move, and reading it later would make
+	# the answer depend on how far the rewrite had got.
+	tls_here = tls_for(binary)
 	vaddr, raddr, _size = inplace.text_mapping(binary)
 
 	# The in-place work first: it does not move anything, so the addresses
@@ -7221,7 +7571,8 @@ def apply_all(binary, listing, output):
 	# Every failure path names itself now. Finding 88.
 	stub_reasons = Counter()
 	placed, blob, _swallowed, overlapped, refused = place_stubs(
-		candidates, stub_base, spill_base, stub_reasons, home=home)
+		candidates, stub_base, spill_base, stub_reasons, home=home,
+		tls=tls_pair_of(tls_here))
 
 	for site, window, stub_address, _length, _prologue in placed:
 		offset = raddr + (site - vaddr)
@@ -7267,6 +7618,17 @@ def apply_all(binary, listing, output):
 	pe = struct.unpack_from("<I", bytes(image), 0x3C)[0]
 	struct.pack_into("<II", image, pe + 24 + 112 + EXCEPTION_DIRECTORY * 8,
 	                 pdata_rva, len(pdata))
+
+	# **The slot has to be asked for or it is not there.** Raising
+	# `SizeOfZeroFill` is what makes the loader hand every thread the bytes
+	# past the module's template, and `make check-tls` is what proves it
+	# does -- Finding 138 swept the field and got a different answer for
+	# every value, so the pass depends on this write rather than on the
+	# template happening to be copied. Written last, after every section is
+	# added, because the directory is addressed by RVA and nothing here
+	# moves it.
+	if tls_here is not None:
+		image = bytearray(set_tls_zero_fill(bytes(image), tls_here[2]))
 
 	open(output, "wb").write(bytes(image))
 	print(f"apply: {len(patches):,} in-place patches, {len(placed):,} detours, "
@@ -7359,11 +7721,37 @@ def verify(original, patched, listing=None):
 			      f"{len(PERMIL_POOL)}-byte pool")
 
 	vaddr, raddr, size = inplace.text_mapping(original)
-	if a[raddr + size:] != b[raddr + size:len(a)]:
-		print("verify: FAILED -- sections after .text changed", file=sys.stderr)
-		problems += 1
-	else:
+	tail_a, tail_b = a[raddr + size:], b[raddr + size:len(a)]
+	if tail_a == tail_b:
 		print("verify: every section after .text is byte-identical")
+	else:
+		# **One field may differ, and exactly one.** `--spill=tls` raises
+		# `SizeOfZeroFill` so the loader hands every thread the sixteen
+		# bytes the stubs address. Everything else outside `.text` is the
+		# program's and is not ours to touch.
+		#
+		# Written as an identity rather than as a skip: put the rewritten
+		# field back into the original's bytes and the two must be equal
+		# again. A check that merely tolerated a difference somewhere in
+		# the TLS directory would tolerate a difference anywhere in it,
+		# and the directory holds four pointers this must never move.
+		raised = None
+		found = tls_directory(bytes(a))
+		if found is not None:
+			at = found[0] + 32 - (raddr + size)
+			if 0 <= at and at + 4 <= len(tail_a) and len(tail_a) == len(tail_b):
+				restored = bytearray(tail_a)
+				restored[at:at + 4] = tail_b[at:at + 4]
+				if bytes(restored) == bytes(tail_b):
+					raised = struct.unpack_from("<I", bytes(tail_b), at)[0]
+		if raised is None:
+			print("verify: FAILED -- sections after .text changed",
+			      file=sys.stderr)
+			problems += 1
+		else:
+			print(f"verify: every section after .text is byte-identical "
+			      f"except SizeOfZeroFill, raised to {raised} so the "
+			      f"loader allocates the per-thread slot")
 
 	# **The feature tests, which decide what the CPU is asked to run.** 179
 	# EVEX instructions in this image are unreachable only because a runtime
@@ -7401,7 +7789,8 @@ def verify(original, patched, listing=None):
 	                                                           listing)
 	# The same call apply makes, so the two cannot drift apart.
 	placed, _blob, swallowed, _overlapped, _refused = place_stubs(
-		candidates, stub_base_of(open(original, "rb").read()), home=home)
+		candidates, stub_base_of(open(original, "rb").read()), home=home,
+		tls=tls_pair_of(tls_for(original)))
 	groups = target_set.collect(original)
 	reachable = set()
 	for values in groups.values():

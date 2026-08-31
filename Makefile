@@ -347,13 +347,20 @@ patch-verify: $(PATCHED)
 detour-plan: $(LISTING)
 	$(PYTHON) tool/detour.py plan $(TARGET) $<
 
+# `SPILL_FLAGS` is how a run picks a backing store other than the default,
+# e.g. `make detour SPILL_FLAGS=--spill=tls`. It has to reach `verify` and
+# `census` too: those place stubs themselves, and a mode disagreement
+# between them and `apply` is the defect `place_stubs` exists to prevent.
+SPILL_FLAGS ?=
+
 $(DETOURED): $(TARGET) $(LISTING) tool/detour.py tool/patch.py | $(BUILD_DIR)
-	$(PYTHON) tool/detour.py apply $(TARGET) $(LISTING) $@
+	$(PYTHON) tool/detour.py $(SPILL_FLAGS) apply $(TARGET) $(LISTING) $@
 
 detour: $(DETOURED)
 
 detour-verify: $(DETOURED) $(LISTING)
-	$(PYTHON) tool/detour.py verify $(TARGET) $(DETOURED) $(LISTING)
+	$(PYTHON) tool/detour.py $(SPILL_FLAGS) verify $(TARGET) $(DETOURED) \
+	          $(LISTING)
 
 # -- measuring the cost ------------------------------------------------------
 
@@ -424,7 +431,8 @@ spans: $(LISTING) $(DETOURED)
 
 census: $(LISTING) $(DETOURED)
 	objdump -d -j .text $(DETOURED) > $(BUILD_DIR)/after.asm
-	$(PYTHON) tool/detour.py census $(TARGET) $(LISTING) $(BUILD_DIR)/after.asm
+	$(PYTHON) tool/detour.py $(SPILL_FLAGS) census $(TARGET) $(LISTING) \
+	          $(BUILD_DIR)/after.asm
 
 # Which of the sites .pdata refuses to vouch for are real leaf functions.
 outside: $(LISTING)
@@ -546,7 +554,8 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
              $(BUILD_DIR)/pe-homespill.exe $(BUILD_DIR)/pe-homespill.asm \
              $(BUILD_DIR)/pe-shadowspill.exe $(BUILD_DIR)/pe-shadowspill.asm \
              $(BUILD_DIR)/pe-regionlive.exe $(BUILD_DIR)/pe-regionlive.asm \
-             $(BUILD_DIR)/pe-regionread.exe $(BUILD_DIR)/pe-regionread.asm
+             $(BUILD_DIR)/pe-regionread.exe $(BUILD_DIR)/pe-regionread.asm \
+             $(BUILD_DIR)/pe-tlsspill.exe $(BUILD_DIR)/pe-tlsspill.asm
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-spill: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
@@ -643,7 +652,30 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 			fi; \
 		done; \
 	done; \
-	echo "check-spill: a region dead from the site is lent and a live one is not"
+	echo "check-spill: a region dead from the site is lent and a live one is not"; \
+	want=`$(PYTHON) tool/pe_build.py names | \
+	      awk '$$1 == "tlsspill" { print $$2 }'`; \
+	for mode in home tls; do \
+		$(PYTHON) tool/detour.py --spill=$$mode apply \
+			$(BUILD_DIR)/pe-tlsspill.exe $(BUILD_DIR)/pe-tlsspill.asm \
+			$(BUILD_DIR)/sse-tlsspill-$$mode.exe >/dev/null; \
+		$(WINE_ENV) timeout 120 wine \
+			$(BUILD_DIR)/sse-tlsspill-$$mode.exe \
+			>/dev/null 2>&1 && got=0 || got=$$?; \
+		echo "check-spill: tlsspill --spill=$$mode returned $$got, want $$want"; \
+		if [ "$$mode" = "home" ]; then \
+			if [ "$$got" = "$$want" ]; then \
+				echo "check-spill: --spill=home answered $$want, so the"; \
+				echo "             site had a home space or a shadow after"; \
+				echo "             all and static TLS proves nothing here"; \
+				exit 1; \
+			fi; \
+		elif [ "$$got" != "$$want" ]; then \
+			echo "check-spill: the per-thread slot did not round-trip"; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "check-spill: and a site with neither lends itself sixteen bytes of TLS"
 
 # Can an exception be dispatched from inside a stub? Two programs that fault
 # on purpose, both registering a handler through .pdata -- which is how a PE

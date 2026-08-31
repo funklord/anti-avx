@@ -8872,6 +8872,124 @@ that must not.
 the rewriter, exactly as `ymm_span` was when Finding 133 scoped it. What it settles is the
 price of the item, not the item.
 
+### Finding 142 -- static TLS is built, and it is worth 671 sites
+
+**7,224 -> 6,553 surviving VEX sites**, measured against the binary with `make detour` and
+`make detour-verify` in both modes at the same revision, per Finding 126. 99.1% to 99.2%.
+`--spill=tls` is built, off by default, and gated by a fixture that runs under wine.
+
+The mechanism is the one Finding 69 described and declined, Finding 138 proved the file
+format of, Finding 139 re-priced at 67 sites, and Finding 141 re-priced again at 753 by
+asking liveness per position instead of per function. Nothing about it is new; what was
+missing was the registers, and they were there all along.
+
+#### What a stub emits
+
+```
+	mov	%gs:0x58,%r11		the thread's TLS array
+	mov	tls_index(%rip),%r10d	the slot the loader gave this module
+	mov	(%r11,%r10,8),%r11	this module's block
+	movups	%xmm2,0x3260(%r11)	the borrowed register, saved
+	...the lowering...
+	movups	0x3260(%r11),%xmm2
+```
+
+**Neither general-purpose register is saved, and that is the whole mechanism.** There is
+nowhere to save one to that does not need a register to address, which is the circularity
+Finding 69 met; the way out is not to save them but to take ones already dead. `r11` and
+`r10` are preferred where free because neither is ever an argument or a return value.
+
+`--spill=tls` is the home space's **fallback and not its rival**: it lends the home space
+wherever the home space is lendable and reaches for a per-thread slot only where
+`borrow_offset` says no. So it is a strict superset of `--spill=home`, which is what makes
+the two comparable at all.
+
+#### The file-format half, recomputed rather than remembered
+
+`tls_slot` reads the directory out of the image, and every figure Finding 139 recorded
+comes back from the binary rather than from this document:
+
+```
+	template          12,896 bytes    (End - Start)
+	AddressOfIndex    0x145e123e0
+	alignment         16 bytes        (characteristics bits 20-23)
+	slot at           12,896
+	SizeOfZeroFill    0 -> 16
+```
+
+`apply` raises `SizeOfZeroFill` last, after every section is added, because the directory
+is addressed by RVA and nothing else moves it. **`verify` now allows exactly that field
+and nothing else outside `.text`**: it puts the rewritten four bytes back into the
+original's and demands byte-identity again. Written as an identity rather than as a skip,
+because a check that tolerated a difference somewhere in the TLS directory would tolerate
+one anywhere in it, and the directory holds four pointers this must never move.
+
+#### The fixture, and the A/B that makes it mean something
+
+`tlsspill` is `regionread` with a TLS directory: a leaf, so it reserves no callee home
+space of its own, whose caller's shadow holds a local read AFTER the site, so the shadow
+cannot be lent either. Both stores refuse it, which is the residue `no home space to
+borrow` counts.
+
+```
+check-spill: tlsspill --spill=home returned 29, want 121
+check-spill: tlsspill --spill=tls  returned 121, want 121
+```
+
+29 is the illegal-instruction death of a surviving VEX site. 121 comes back only if BOTH
+halves held: `%xmm2` was restored from a per-thread slot, and the local in the shadow was
+still there to be added. **The `home` arm is an assertion and not a control run**: if it
+ever returns 121 the site was never the hard case and the `tls` arm proves nothing, and
+the gate says exactly that.
+
+The two encoders are pinned against `as` byte for byte in `tls_selftest`, because every
+other encoder here is exercised by something that runs it and these two are emitted only
+where a site has two dead general-purpose registers -- which no fixture is guaranteed to
+contain.
+
+#### The 753 was exact, and the first build still lost sites
+
+`make gprs` said 753 sites have two volatile GPRs dead across the bracket. `detour-plan`
+with `--spill=tls` took `no home space to borrow` from 1,332 to 579: **753 exactly.** The
+liveness measurement and the collector agree to the site, which is the corroboration
+Finding 141 could not give itself.
+
+**The first build was nevertheless worse than `--spill=home` by 969 sites**, and the cause
+was not the mechanism:
+
+```
+                                        home    tls, first build
+  no home space to borrow              1,332      579   -753
+  no register free across the ymm run     49      400   +351
+  not inside any accepted window       5,596    5,883   +287
+```
+
+`ymm_run`'s borrow and `swallowed_borrow` both asked `SPILL == SPILL_HOME` **exactly**, so
+turning TLS on took the home space away from every run and gave it back to nobody. A mode
+added to one test and missed in two others. They go through a named `HOME_SPILLS` now, so
+a fifth backing store cannot miss one of the four places.
+
+**`detour-plan` is what found it, and this is the case it is for.** It runs the collector
+without the placer, so a refusal moving in the wrong bucket is visible with nothing else
+changed -- and the search was about to go to `place_stubs`, which was innocent. Finding
+126 says to COST a change with the binary; it does not say to DIAGNOSE one with it.
+
+#### Two ways the measurement lied before it told the truth
+
+Both are recorded because each cost a wrong conclusion, and neither was subtle.
+
+**A truncated list read as a whole one.** The first comparison was `tail -30` of one run
+against a full record of another, and the refusal profile looked scrambled -- buckets
+apparently vanishing that were merely above the cut. It produced a confident diagnosis of
+a defect that was not there, on top of a real one that was.
+
+**`make` will not rebuild what is newer than its prerequisites.** The second A/B ran
+`make detour SPILL_FLAGS=--spill=tls` against a binary the `home` half had just built,
+printed `Nothing to be done for 'detour'`, and then verified a TLS collection against a
+home binary -- reporting 214 lost boundaries, every one of them a site the TLS mode would
+have detoured and the home binary had not. **A flag that changes the OUTPUT but not the
+prerequisites is invisible to make.** Remove the target before switching modes.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9029,16 +9147,7 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **Static TLS addressing**, at **753 sites** -- Finding 141, which re-prices Finding
-     139's 67 now that the liveness question is asked per position rather than per
-     function. The file-format half is proven and checked (`make check-tls`); the register
-     half is measured (`make gprs`), and 753 of the 1,332 starved sites have the TWO the
-     addressing needs. What is unbuilt is the addressing itself. **Its failure mode is
-     still the only one in this area that is not silent corruption** -- the bytes belong
-     to the rewriter, so a slot used wrongly loses the rewriter's own value rather than a
-     local of the program's -- and it is now the largest measured item on this list as
-     well as the safest.
-  2. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
+  1. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
      value at a transfer, and the only one that reaches the 443 needing eleven slots at
      once. A much larger design than the span, and the one the project has deferred five
      times; do not start it on the 1,674 figure. **It is also the only large item left**,
@@ -9103,7 +9212,7 @@ Every mechanism that could corrupt a local silently keeps its predecessor reacha
 that two binaries can be compared -- a borrow at the wrong displacement does not fault.
 
 ```
---spill=none|stack|pool|home     where a borrowed register is saved (home)
+--spill=none|stack|pool|home|tls  where a borrowed register is saved (home)
 --rsp=blanket|followed           what a copy of rsp costs (followed)
 --shadow=off|on                  lend the caller's shadow as well (on)
 --region=whole|live              is a home-space reference a verdict on the
@@ -9194,6 +9303,11 @@ make gprs          how many volatile GPRs are dead at each starved site,
   pass line says so now, taken from the source tool in `5cb0cca`, and this entry exists
   because "35 files conform" had been quoted as evidence here a dozen times for a
   guarantee it never made.
+- **`make` cannot see a flag that changes the output but not the prerequisites.**
+  `make detour SPILL_FLAGS=--spill=tls` after a `--spill=home` build prints
+  `Nothing to be done for 'detour'` and leaves the home binary in place; verifying
+  that with `--spill=tls` then reports lost boundaries for every site the other mode
+  would have detoured. Delete the target before switching modes. Finding 142.
 - **Never compare a disassembly against a binary rebuilt after it.** That cost half
   an hour once. The same rule as `build-and-commit.md`'s about stale test binaries,
   and it applies to `objdump` output too. Delete the output before a run so a crash

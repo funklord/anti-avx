@@ -1132,7 +1132,7 @@ hundred:	.float 100.0
 # unwind codes claim a frame of zero has its `jmp` refused at -40 and the
 # borrow it exists to test never happens.
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
-          "regionread": 40}
+          "regionread": 40, "tlsspill": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -1591,6 +1591,80 @@ out:
 	addq	$40, %rsp
 	ret
 func_end:
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# 41. Static TLS as a backing store: the site no other store can reach.
+#
+# `regionread` above is this program without the TLS directory, and it is
+# refused: a leaf reserves no callee home space of its own, and its caller's
+# shadow holds a local that is read AFTER the site, so `borrow_offset`
+# answers None and the VEX survives. That is the residue `no home space to
+# borrow` counts, and it is the largest named cause anywhere in it.
+#
+# What this borrows instead is sixteen bytes the LOADER gives every thread,
+# past the end of this module's own TLS template, because the directory asks
+# for them with `SizeOfZeroFill`. Reaching them costs two general-purpose
+# registers and three instructions -- `gs:[0x58]` is a pointer that must be
+# followed before it is indexed, and the index is in memory because the
+# loader assigns it (Finding 139).
+#
+# **The two registers are not saved, and that is the whole mechanism.**
+# There is nowhere to save a general-purpose register to that does not need
+# a register to address, which is the circularity Finding 69 met. Finding
+# 141 broke it by measuring that the registers are already dead: here
+# `r10` and `r11` are named nowhere in the program, so the borrow destroys
+# nothing.
+#
+# The A/B is the point and it is run both ways. `--spill=home` returns 29,
+# the illegal-instruction death of a surviving VEX site, because no home
+# space and no shadow can be lent. `--spill=tls` returns 121 -- and only if
+# BOTH halves held: %xmm2 came back holding 100.0 from a per-thread slot,
+# and the local in the shadow was still there to be added, because nothing
+# touched it.
+PROGRAMS["tlsspill"] = (121, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp		/* a frame, and no call: this is a leaf */
+	vzeroupper
+	movl	$11, 48(%rsp)		/* a local, kept in the caller's shadow */
+	vmovss	three(%rip), %xmm0
+	vmovss	ten(%rip), %xmm1
+	vmovss	hundred(%rip), %xmm2	/* the register the borrow will take */
+	vmovss	one(%rip), %xmm3
+	vmovss	one(%rip), %xmm4
+	vmovss	one(%rip), %xmm5
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased; every volatile xmm is live */
+	vaddss	%xmm2, %xmm0, %xmm0	/* 7 + 100, only if xmm2 came back */
+	vaddss	%xmm3, %xmm0, %xmm0
+	vaddss	%xmm4, %xmm0, %xmm0
+	vaddss	%xmm5, %xmm0, %xmm0
+	vcvttss2si %xmm0, %eax
+	addl	48(%rsp), %eax		/* read AFTER the site: the shadow is
+					   live, so it cannot be lent */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+one:	.float 1.0
+hundred:	.float 100.0
 	.p2align 4
 tls_raw:
 	.long	0x55667788, 0x11223344
