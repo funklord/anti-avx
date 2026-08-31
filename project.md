@@ -8553,10 +8553,17 @@ it back, all four being volatile:
      67  have at least TWO   -- the form the addressing actually needs
 ```
 
-**Both halves of the old number moved.** The bucket shrank from 1,876 to 1,332 as
-Findings 130 to 136 took sites out of it, and the register requirement doubled. 740 was
-never wrong for what it measured; it measured a form that cannot be encoded and a
-population that no longer exists.
+**Both halves of the old number moved, and they moved for opposite reasons.** The
+denominator aged honestly: the bucket shrank from 1,876 to 1,332 because Findings 130 to
+136 took sites out of it, so that half was right when written and was overtaken by the
+project working. **The numerator was wrong from the start.** One register never could
+encode `*(*(gs:[0x58]) + index*8)`, at any moment in this project's life; that half was
+not overtaken by anything.
+
+The first draft of this paragraph said "740 was never wrong for what it measured", which
+is true of one half and false of the other, and the distinction is the useful part.
+**Re-checking a count while trusting its base is how a figure comes to look measured
+without being so** -- and here the base was the half that had never been checked at all.
 
 #### 67 is a floor, and the way to raise it is already built
 
