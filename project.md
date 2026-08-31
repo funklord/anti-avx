@@ -8565,6 +8565,24 @@ is true of one half and false of the other, and the distinction is the useful pa
 **Re-checking a count while trusting its base is how a figure comes to look measured
 without being so** -- and here the base was the half that had never been checked at all.
 
+#### The answer was in this tree for two days, in a program that ran
+
+**The fixture had been demonstrating the two-register form since Finding 138 and nobody
+read it as evidence about the mechanism.** It was written to answer one question -- does
+the loader honour `SizeOfZeroFill` -- and it necessarily answered a second, because to
+ask the first it had to reach a slot. The second answer was the more valuable of the two
+and went unread for two days while the price it refutes sat at the top of the build-next
+list.
+
+Nothing about that was subtle. `make check-tls` prints its result, the program is
+seventeen instructions, and the two registers are on adjacent lines. What was missing was
+the question: a fixture gets read for its verdict, and the code that produces the verdict
+is treated as scaffolding rather than as a measurement of whatever it had to do to get
+there.
+
+**What a test does in passing is data this project already owns**, and it is the cheapest
+data here, because somebody has already made it run.
+
 #### 67 is a floor, and the way to raise it is already built
 
 The 500 refused for "a way out" are `function_scope`'s blunt rule, which disqualifies a
@@ -8891,6 +8909,12 @@ make spans         what a closed 256-bit span could reach (a measurement)
   is how it came to be trusted. Cost a change with `make detour` and
   `make detour-verify`; use `plan` to say which bucket a refusal landed in.
   Finding 126.
+- **Read a fixture as a measurement, not only as a verdict.** A test has to do real
+  work to ask its question, and what it does on the way is evidence about the mechanism
+  it exercises. `check-tls`'s program answered "does the loader honour `SizeOfZeroFill`"
+  and, unavoidably, "what does reaching a slot cost" -- and the second answer sat unread
+  for two days while a price it refutes led the build-next list. Finding 139. The habit
+  is cheap: when a fixture passes, ask what it had to establish in order to pass.
 - **A green `make style` does not mean what its old wording said.** The gate's
   structural half compares each line's tab count against what the converter would emit,
   and the converter never ADDS indentation -- so a line with too few tabs and no
