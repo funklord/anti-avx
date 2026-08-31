@@ -286,13 +286,48 @@ def load_config(root: Path) -> Config:
 # ------------------------------------------------------------ discovery
 
 def in_git_repo(root: Path) -> bool:
+	"""True if git will answer for this tree; False if it is not a repo.
+
+	There is a third case, and folding it into the second is the fault
+	discover() already guards against one function below, arriving by the
+	earlier door. A tree that IS a repository but whose git refuses to
+	speak exits non-zero here exactly as a plain directory does -- the
+	dubious-ownership guard, on a checkout owned by another user, is the
+	way to meet this without anything being broken. Read as "not a
+	repository" it falls through to the filesystem walk, and that walk is
+	right only for a tree with no `.git` to skip: `.git` itself and every
+	ignored build artifact enter the population, the excludes written
+	against git's list do not cover them, and the collapse floor is then
+	measured against a number with nothing to do with the tree.
+
+	Measured in this repository, 2026-08-31: raw population 1084 instead
+	of 18, three quarters of it `.git`, and `make style-source` failed
+	with "found 15 files, expected at least 444 -- check include/exclude
+	in .style-gate.toml". The excludes were fine. A gate that names the
+	wrong suspect costs more than one that says nothing, because the hour
+	goes into the file it accused.
+
+	So a `.git` present and git unwilling stops the run, the same way an
+	`ls-files` that exits non-zero does, and for the same reason: the tool
+	cannot say anything true about a file set it was unable to read. A
+	tree with no `.git` still walks, which is the case the fallback was
+	built for and the only one it is right for.
+	"""
 	try:
 		out = subprocess.run(["git", "-C", str(root), "rev-parse",
 		                      "--is-inside-work-tree"],
 		                     capture_output=True, text=True, check=False)
-		return out.returncode == 0 and out.stdout.strip() == "true"
-	except OSError:
-		return False
+		if out.returncode == 0:
+			return out.stdout.strip() == "true"
+		detail = out.stderr.strip().splitlines() or [
+			f"git rev-parse exited {out.returncode} and said nothing."]
+	except OSError as exc:
+		detail = [f"git could not be run: {exc}"]
+	if (root / ".git").exists():
+		reject(f"{root} has a .git, and git will not read it.", *detail,
+		       "the fallback from here is a filesystem walk, which is "
+		       "right only for a tree that is not a repository.")
+	return False
 
 
 def discover(root: Path, cfg: Config) -> tuple[list[Path], int]:
