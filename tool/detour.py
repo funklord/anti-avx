@@ -511,7 +511,18 @@ SPILL_TLS = "tls"
 # TLS on took the home space away from a run and gave it back to nobody --
 # the mode gained its 753 and lost 287 net, which is how it was found.
 HOME_SPILLS = (SPILL_HOME, SPILL_TLS)
-SPILL = SPILL_HOME
+# **`tls` is the default**, and what it changes from `home` is one thing: a
+# site whose function will lend no home space gets sixteen bytes of its own
+# thread instead of keeping its VEX. Worth 671 sites in the binary (Finding
+# 142), and safe to make the default for a reason none of the other stores
+# can give -- the bytes belong to the rewriter, so a slot addressed wrongly
+# loses the rewriter's own saved register rather than a local of the
+# program's. Every other backing store here fails by corrupting somebody
+# else's value in silence.
+#
+# `--spill=home` stays reachable and is the A/B: `check-spill` runs
+# `tlsspill` both ways and requires 29 from one and 121 from the other.
+SPILL = SPILL_TLS
 HOME_SPACE = 32
 # `--rsp=` decides what a copy of `rsp` costs. `blanket` refuses any function
 # that makes one, which is what Findings 72 and 73 shipped; `followed` works

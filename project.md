@@ -9212,7 +9212,7 @@ Every mechanism that could corrupt a local silently keeps its predecessor reacha
 that two binaries can be compared -- a borrow at the wrong displacement does not fault.
 
 ```
---spill=none|stack|pool|home|tls  where a borrowed register is saved (home)
+--spill=none|stack|pool|home|tls  where a borrowed register is saved (tls)
 --rsp=blanket|followed           what a copy of rsp costs (followed)
 --shadow=off|on                  lend the caller's shadow as well (on)
 --region=whole|live              is a home-space reference a verdict on the
