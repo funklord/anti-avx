@@ -73,7 +73,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans check-spill check-tls check-unwind check-vex \
+        census spans gprs check-spill check-tls check-unwind check-vex \
         check-lanes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -406,6 +406,15 @@ check-tls:
 		fi; \
 	done; \
 	echo "check-tls: the loader allocates and zeroes exactly what is asked"
+
+# How many volatile general-purpose registers are dead across the borrow
+# bracket at each site that could find no home space. This is what static
+# TLS costs, and it needs TWO at once. A measurement, not a gate.
+#
+# It needs no rewritten binary: the question is about the ORIGINAL text,
+# and `collect` is what says which sites were starved.
+gprs: $(LISTING)
+	$(PYTHON) tool/detour.py gprs $(TARGET) $(LISTING)
 
 # What a closed 256-bit span could reach, which is not what Finding 133's
 # capacity figure suggests. A measurement, not a gate: it always exits 0.

@@ -8749,6 +8749,129 @@ REASON, and the case is real. All four new cases were run against a copy of the 
 the change taken back out, and all four go red naming exactly what they lost -- Finding
 111's rule, which is why it is here.
 
+### Finding 141 -- the registers were dead all along, and static TLS is worth 753
+
+**67 -> 753 sites.** Finding 139 priced static TLS by asking `function_scope`'s question
+about general-purpose registers -- does this function ever NAME `r8` -- and said in the
+same paragraph that the argument is blunt and that the machinery to do better already
+existed. It does, and this is it pointed at GPRs.
+
+```
+sites declined `no home space to borrow`     1,332
+  not inside a known function                    0
+
+volatile GPRs dead across the bracket      per position   whole function
+  none                                              394              905
+  one                                               185              370
+  two                                               152               13
+  three                                             140               15
+  four                                              241                5
+  five or more                                      220               24
+
+  at least ONE                                      938              402
+  at least TWO                                      753               57
+```
+
+`make gprs` is the measurement. The right-hand column is the same question asked of the
+whole function, in `gpr_function_scope`, kept precisely so the two can be printed side by
+side rather than compared across sessions.
+
+**Two registers at once is the number that matters**, because the addressing needs two
+(Finding 139) and one is worth nothing to it. It goes from 57 to 753.
+
+#### Why a call kills nothing, which is the decision worth arguing about
+
+The ABI makes all seven volatile, so the obvious rule is that a call clobbers every one
+and kills its liveness. **This binary refutes that twice over, and the second way would
+have corrupted a frame.**
+
+`__chkstk` at `0x14365d930` opens by saving `r10` and `r11` to the stack and closes by
+restoring them: it preserves the two registers the ABI most clearly permits it to destroy.
+And its callers rely on that class of behaviour, because the frame-allocation sequence
+MSVC emits is
+
+```
+	mov  $0x99e0,%eax
+	call 0x14365d930
+	sub  %rax,%rsp
+```
+
+where `rax` is live ACROSS the call. A rule that killed the volatiles would have called
+`rax` dead at the `mov` and let a borrow take the frame size, and nothing downstream would
+have looked wrong.
+
+**What the ABI permits a callee to do is not what this program relies on it not doing**,
+and only the second is safe to assume. So a call READS the four argument registers --
+nothing here knows a callee's arity -- and writes nothing. `r10` and `r11` are dead across
+a call anyway, not because it clobbers them but because it never reads them.
+
+#### What the per-position question actually buys
+
+`function_scope`'s rule disqualifies a range for any jump leaving it, which loses every
+real tail call, and it disqualifies it for a mention anywhere, which loses a register the
+program writes before reading. Both are the same conservatism: a verdict about a function
+standing in for a question about a place. A borrow bracket holds one instruction and
+contains no control transfer at all, so the question that fits it is whether the register
+is dead AT THE SITE.
+
+The kill is what most of the gain rests on, and it is one rule: `mov`, `movabs` or `lea`
+whose last operand is a bare 32- or 64-bit register writes that register and does not read
+it. Deliberately three mnemonics -- `add %rax,%r11` writes `r11` and reads it too, and the
+cost of getting that wrong is a borrow over a live value.
+
+#### One site, checked by hand, because 57 to 753 is not a number to take on trust
+
+`make gprs` prints eight sites and the function they sit in, so this is repeatable.
+`0x1402ad714`, a `vandnps` inside a vectorised loop in `0x1402ad560-0x1402b04c1` -- a
+function containing 20 calls and 239 mentions of `r8`-`r11`, none of them reachable from
+the site:
+
+```
+	1402ad714:	vandnps %xmm1,%xmm3,%xmm1	<- the site
+	1402ad718:	vorps	%xmm1,%xmm2,%xmm2
+	1402ad71c:	vmovups %xmm2,(%rax)		<- reads rax
+	1402ad720:	mov	%rcx,%rax
+	1402ad726:	cmp	%rbx,%rax
+	1402ad729:	jb	0x1402ad6e3		<- back to the loop head
+	1402ad72d:	jmp	0x1402b02b5		<- to the epilogue
+	...
+	1402b02b5:	lea	0xa0(%rsp),%r11		<- WRITES r11 before reading it
+	1402b02bd:	mov	0x30(%r11),%rbx
+	1402b02ed:	mov	%r11,%rsp
+	1402b02f9:	ret
+```
+
+The loop head is `cmp %r14,%rdi`, and `r14` is non-volatile and not tracked. So `r8`, `r9`
+and `r10` are never mentioned on any path out of the site, and `r11` is written before it
+is read -- four dead, which is what the survey says.
+
+**The register it does NOT claim is the better evidence.** `rax` is withheld here, and two
+instructions after the site `vmovups %xmm2,(%rax)` reads it as a memory base. The same
+survey claims `rax` at `0x1402ad682` and `0x1402adb59` in the same function. So the answer
+varies with the position rather than with the function, which is the whole claim.
+
+#### What is proven and what is not
+
+Nineteen selftest cases, half of them asserting a register is DEAD -- an analysis that
+answered "live" everywhere would be sound, would free nothing, and would pass every case
+that only checks for corruption. Seven sabotages, each taking out one rule: killing the
+volatiles at a call, dropping the argument-register read, treating a departure from the
+range as safe, making a `ret` read everything, letting a narrow write kill, replacing
+reachability with address order, and dropping the read of a write's source. Each turns at
+least one case red.
+
+**One of those cases was worthless when written and the sabotage is what said so.** The
+backward-branch case put the read one instruction after the site, where plain address
+order finds it too, so it passed against the sabotage that replaces reachability with "the
+next instruction" -- the fixpoint was resting on nothing. The replacement is the pair
+Finding 131 named: the read at a LOWER address than the site, reachable only over the
+loop's back edge, with a loop closing above it that must carry it and one closing below it
+that must not.
+
+**Nothing is built on this yet.** `gpr_live_out` is read by the survey and by nothing in
+the rewriter, exactly as `ymm_span` was when Finding 133 scoped it. What it settles is the
+price of the item, not the item.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -8906,17 +9029,16 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **Per-position liveness for general-purpose registers.** Worth doing before static
-     TLS rather than after, because it decides what static TLS is worth: 67 of the 1,332
-     have two of `r8`-`r11` free by the whole-function argument, and 500 more are refused
-     only by that argument's bluntness. Findings 131 and 134 built exactly this machinery
-     for the home spaces and nobody has pointed it at GPRs.
-  2. **Static TLS addressing**, at **67 sites** by what is measured today -- see Finding
-     139, which corrects Finding 69's 740. The file-format half is proven and checked
-     (`make check-tls`); what is unbuilt is the addressing, and it needs TWO registers
-     rather than one. Its failure mode is still the only one in this area that is not
-     silent corruption, which is the reason to keep it on the list at all at that price.
-  3. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
+  1. **Static TLS addressing**, at **753 sites** -- Finding 141, which re-prices Finding
+     139's 67 now that the liveness question is asked per position rather than per
+     function. The file-format half is proven and checked (`make check-tls`); the register
+     half is measured (`make gprs`), and 753 of the 1,332 starved sites have the TWO the
+     addressing needs. What is unbuilt is the addressing itself. **Its failure mode is
+     still the only one in this area that is not silent corruption** -- the bytes belong
+     to the rewriter, so a slot used wrongly loses the rewriter's own value rather than a
+     local of the program's -- and it is now the largest measured item on this list as
+     well as the safest.
+  2. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
      value at a transfer, and the only one that reaches the 443 needing eleven slots at
      once. A much larger design than the span, and the one the project has deferred five
      times; do not start it on the 1,674 figure. **It is also the only large item left**,
@@ -9029,6 +9151,8 @@ make detour        rewrite; make detour-verify the structural invariants
 make census        reconcile every survivor to a named cause
 make detour-plan   what the COLLECTOR refused, and why -- see the warning
 make spans         what a closed 256-bit span could reach (a measurement)
+make gprs          how many volatile GPRs are dead at each starved site,
+                   which is what static TLS costs (a measurement)
 ```
 
 ### Practical things that cost time to learn

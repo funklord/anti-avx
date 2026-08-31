@@ -1091,6 +1091,324 @@ REGION_WHOLE, REGION_LIVE = "whole", "live"
 REGION_RULE = REGION_LIVE
 
 
+# The volatile general-purpose registers of the Win64 ABI. A stub may borrow
+# only a volatile register, for Finding 123's reason: a non-volatile one owes
+# its caller the value back, and the stub section has no unwind codes to say
+# where it was put.
+VOLATILE_GPRS = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")
+
+# The four that carry integer arguments, in order. Nothing here knows a
+# callee's arity, so a call reads all four.
+ARGUMENT_GPRS = frozenset(("rcx", "rdx", "r8", "r9"))
+
+# What a `ret` hands back. `rdx` is here for the 128-bit return, which is
+# rare and costs only `rdx`, a register this analysis was never going to
+# free anyway.
+RETURN_GPRS = frozenset(("rax", "rdx"))
+
+# Every spelling of every one of them, because a read of `%r8b` is a read of
+# `%r8` and a scan keyed on the 64-bit name alone would not see it. The
+# high-byte forms alias bits 15:8 of the first three.
+GPR_SPELLINGS = {}
+for _wide, _parts in (
+		("rax", ("rax", "eax", "ax", "al", "ah")),
+		("rcx", ("rcx", "ecx", "cx", "cl", "ch")),
+		("rdx", ("rdx", "edx", "dx", "dl", "dh")),
+		("r8", ("r8", "r8d", "r8w", "r8b")),
+		("r9", ("r9", "r9d", "r9w", "r9b")),
+		("r10", ("r10", "r10d", "r10w", "r10b")),
+		("r11", ("r11", "r11d", "r11w", "r11b"))):
+	for _part in _parts:
+		GPR_SPELLINGS[_part] = _wide
+
+# The spellings whose write reaches all 64 bits: a 32-bit write zero-extends,
+# an 8- or 16-bit one leaves the rest of the register alone and is therefore
+# not a kill. Written out rather than derived -- the first version took the
+# names beginning with "r", which is every 64-bit name and also `r10b` and
+# `r10w`, so an 8-bit write killed the whole register. The selftest case for
+# the narrow write is what caught it.
+GPR_FULL_WRITE = frozenset((
+	"rax", "rcx", "rdx", "r8", "r9", "r10", "r11",
+	"eax", "ecx", "edx", "r8d", "r9d", "r10d", "r11d"))
+
+# Mnemonics whose last operand is written and not also read. Deliberately
+# three: `add %rax,%r11` writes r11 and reads it too, and the cost of
+# getting that wrong is a borrow over a live value.
+GPR_WRITERS = frozenset(("mov", "movabs", "lea"))
+
+_GPR_TOKEN = re.compile(r"%(\w+)")
+
+
+def gprs_named(operands):
+	"""The volatile GPRs any spelling in `operands` names."""
+	if not operands:
+		return frozenset()
+	found = set()
+	for token in _GPR_TOKEN.findall(operands):
+		wide = GPR_SPELLINGS.get(token)
+		if wide is not None:
+			found.add(wide)
+	return frozenset(found)
+
+
+def gpr_effect(mnemonic, operands):
+	"""`(read, written)` volatile GPRs for one instruction.
+
+	**Every mention is a read and almost nothing is a write.** That is the
+	direction that costs sites rather than the one that corrupts a program:
+	a register wrongly called live loses a borrow, one wrongly called dead
+	destroys a value while it is still wanted, and nothing downstream would
+	look wrong.
+
+	**A call reads the four argument registers and writes NOTHING**, which
+	is the decision in this function worth arguing about. The ABI makes all
+	seven volatile, so the obvious rule is that a call clobbers every one of
+	them and kills its liveness -- and this binary refutes that twice over.
+	Its `__chkstk` at 0x14365d930 saves `r10` and `r11` to the stack on
+	entry and restores them before returning, so it preserves the two
+	registers the ABI most clearly lets it destroy; and its callers rely on
+	that kind of thing, because the frame-allocation sequence is
+
+	    mov  $0x99e0,%eax
+	    call 0x14365d930
+	    sub  %rax,%rsp
+
+	where `rax` is live ACROSS the call. A rule that killed the volatiles at
+	a call would have called `rax` dead at the `mov` and let a borrow take
+	the frame size. **What the ABI permits a callee to do is not what this
+	program relies on it not doing**, and only the second is safe to assume.
+	"""
+	named = gprs_named(operands)
+	if mnemonic.startswith("call"):
+		return (named | ARGUMENT_GPRS, frozenset())
+	if mnemonic.startswith("ret"):
+		return (RETURN_GPRS, frozenset())
+	if mnemonic in GPR_WRITERS:
+		fields = inplace.split_operands(operands or "")
+		destination = fields[-1] if fields else ""
+		if len(fields) == 2 and destination.startswith("%") \
+				and "(" not in destination:
+			written = GPR_SPELLINGS.get(destination[1:])
+			if written is not None \
+					and destination[1:] in GPR_FULL_WRITE:
+				# The source still reads whatever it names, including this
+				# register: `mov (%r11),%r11` writes r11 and reads it.
+				return (gprs_named(fields[0]), frozenset((written,)))
+	return (named, frozenset())
+
+
+def gpr_function_scope(plain, ranges):
+	"""Per function, the volatile GPRs it provably never touches.
+
+	`scratch.function_scope`'s argument, applied to general-purpose
+	registers instead of to xmm: if a range never NAMES `r10`, nothing in
+	it reads `r10`; no callee can expect it, because it is not an argument
+	register; and no caller can expect it, because it is volatile. So it is
+	free at every point in the range.
+
+	The escape rule is the same blunt one, and is why this exists here only
+	as a baseline. Any jump whose target is outside the range, any indirect
+	jump, and any range not ending in a control transfer disqualifies the
+	whole range -- because a `.pdata` entry is not always a whole function,
+	and the other half of a split one is entered with registers live. Real
+	tail calls are lost with it.
+
+	Finding 139 priced static TLS at 67 sites with this argument and said
+	in the same sentence that 500 more were refused only by its bluntness.
+	`gpr_live_out` asks the question at a place instead, and `gpr_survey`
+	prints the two side by side.
+	"""
+	starts = [start for start, _end in ranges]
+	mentioned = [set() for _ in ranges]
+	escapes = [False] * len(ranges)
+	last_mnemonic = [None] * len(ranges)
+	for address, _encoding, mnemonic, operands in plain:
+		i = bisect.bisect_right(starts, address) - 1
+		if i < 0 or address >= ranges[i][1]:
+			continue
+		mentioned[i].update(gprs_named(operands or ""))
+		if mnemonic.startswith("call"):
+			mentioned[i].update(ARGUMENT_GPRS)
+		last_mnemonic[i] = mnemonic
+		if not mnemonic.startswith(("j", "loop")):
+			continue
+		target = None
+		field = (operands or "").split()[0] if operands else ""
+		if field.startswith("0x"):
+			try:
+				target = int(field, 16)
+			except ValueError:
+				target = None
+		if target is None or not ranges[i][0] <= target < ranges[i][1]:
+			escapes[i] = True
+	for i, mnemonic in enumerate(last_mnemonic):
+		if mnemonic is None or not (mnemonic.startswith(("ret", "jmp", "ud"))
+		                            or mnemonic == "int3"):
+			escapes[i] = True
+	free = [frozenset() if escapes[i]
+	        else frozenset(r for r in VOLATILE_GPRS if r not in mentioned[i])
+	        for i in range(len(ranges))]
+	return starts, free
+
+
+def gpr_live_out(plain, first, last, inside_targets):
+	"""`{position: frozenset}` -- the volatile GPRs live AFTER each position.
+
+	Backward liveness over one function range, the general-purpose answer to
+	the question Findings 131 and 134 answered for a home space: not "does
+	this function touch the register" but "can anything that reads it still
+	run". `function_scope` asks the whole-function form and refuses a range
+	for any way out of it, which loses every real tail call deliberately;
+	a borrow bracket holds one instruction and contains no control transfer
+	at all, so what it needs is a register dead AT A PLACE.
+
+	**Where control leaves in a way this cannot follow, everything is
+	live.** A jump out of the range is a tail call and reads the argument
+	registers; an indirect branch may be one; a fall-through off the end
+	arrives somewhere this never looked. Each of those is seeded with all
+	seven rather than with the four a tail call would really read, because
+	the reason they are here is that the destination is unknown -- and a
+	set chosen from a guess about an unknown destination is a guess.
+
+	A `ret` is not one of those. It is modelled exactly: the caller reads
+	the return value and nothing else, so `r10` and `r11` are dead at
+	every one.
+	"""
+	successors, unresolved, leaving = control_successors(
+		plain, first, last, inside_targets)
+	everything = frozenset(VOLATILE_GPRS)
+	effects = {}
+	for position in range(first, last):
+		_a, _e, mnemonic, operands = plain[position]
+		effects[position] = gpr_effect(mnemonic, operands or "")
+
+	# Seeded once: what is live on the way OUT of a position, before any
+	# successor has been accounted for.
+	base = {}
+	for position in range(first, last):
+		out = set()
+		if position in unresolved or position in leaving:
+			out |= everything
+		base[position] = out
+
+	live_in, live_out = {}, {}
+	for position in range(first, last):
+		live_out[position] = frozenset(base[position])
+		read, written = effects[position]
+		live_in[position] = read | (live_out[position] - written)
+
+	# **Predecessors are built rather than searched for.** The first draft
+	# rescanned every position of the range to find who pointed at the one
+	# it had just changed, which is quadratic in the function's length --
+	# and the ranges here run to thousands of instructions.
+	predecessors = {}
+	for position, edges in successors.items():
+		for edge in edges:
+			if first <= edge < last:
+				predecessors.setdefault(edge, []).append(position)
+
+	work = list(range(first, last))
+	in_work = set(work)
+	while work:
+		position = work.pop()
+		in_work.discard(position)
+		out = set(base[position])
+		for edge in successors.get(position, ()):
+			if first <= edge < last:
+				out |= live_in[edge]
+		if out == live_out[position]:
+			continue
+		live_out[position] = frozenset(out)
+		read, written = effects[position]
+		fresh = read | (live_out[position] - written)
+		if fresh == live_in[position]:
+			continue
+		live_in[position] = fresh
+		for earlier in predecessors.get(position, ()):
+			if earlier not in in_work:
+				work.append(earlier)
+				in_work.add(earlier)
+	return live_out
+
+
+def control_successors(plain, first, last, inside_targets):
+	"""`(successors, unresolved, leaving)` over the positions `[first, last)`.
+
+	The control-flow graph of one function range, shared by every analysis
+	that walks one. The EDGES are the same question whoever asks -- where
+	can control go from here -- so they are built once; what differs
+	between callers is what an edge MEANS, and that is left to them.
+
+	  * `unresolved` is the positions whose control this cannot model at
+	    all: a fall-through off the end of the range, and a branch into
+	    the middle of an instruction. Every caller has to treat one as
+	    reaching whatever it is afraid of.
+	  * `leaving` is the positions from which control can go OUTSIDE the
+	    range while the program carries on -- a jump to another `.pdata`
+	    entry, or an indirect one. `readers_reachable` may ignore it,
+	    because a home space belongs to a frame that a departure abandons.
+	    `gpr_live_out` may not: a jump out of a range is a tail call, and
+	    a tail call reads the argument registers.
+
+	A `ret` is neither. It is an exit this models exactly, and what is
+	live across one is the caller's business rather than an unknown.
+	"""
+	successors, unresolved, leaving = {}, set(), set()
+	for position in range(first, last):
+		_address, _encoding, mnemonic, operands = plain[position]
+		operands = operands or ""
+		if mnemonic.startswith("ret"):
+			successors[position] = ()
+			continue
+		following = position + 1
+		if mnemonic.startswith(("j", "loop")):
+			target, first_field = None, operands.split()[0] if operands else ""
+			if first_field.startswith("0x"):
+				try:
+					target = int(first_field, 16)
+				except ValueError:
+					target = None
+			if target is None:
+				# Indirect. It can only land where something can be
+				# branched to, and this function's share of that set is
+				# `inside_targets` -- but it can also be a call through a
+				# pointer that never comes back here.
+				successors[position] = inside_targets
+				leaving.add(position)
+				continue
+			inside = plain[first][0] <= target < plain[last - 1][0] + 1 \
+				if last > first else False
+			edges = []
+			if inside:
+				at = bisect.bisect_left(plain, (target,), first, last)
+				if at < last and plain[at][0] == target:
+					edges.append(at)
+				else:
+					# A branch into the middle of an instruction is not
+					# something this can model. Refuse to model the rest.
+					unresolved.add(position)
+			else:
+				leaving.add(position)
+			# A conditional falls through as well; an unconditional does
+			# not, and one leaving the range takes its edge with it.
+			if not mnemonic.startswith("jmp"):
+				if following < last:
+					edges.append(following)
+				else:
+					unresolved.add(position)
+			successors[position] = tuple(edges)
+			continue
+		# Everything else falls through, `call` included: it comes back.
+		if following < last:
+			successors[position] = (following,)
+		else:
+			# Off the end of the range with no terminator. Where control
+			# goes is the range's business and the range may be wrong.
+			unresolved.add(position)
+			successors[position] = ()
+	return successors, unresolved, leaving
+
+
 def readers_reachable(plain, first, last, refs, inside_targets):
 	"""Positions in `[first, last)` from which some position in `refs` can
 	still be reached. `refs` must not be empty.
@@ -1122,56 +1440,8 @@ def readers_reachable(plain, first, last, refs, inside_targets):
 	modelled, so the position is seeded as though it did. That is the
 	direction that costs sites rather than the one that corrupts a frame.
 	"""
-	successors, unresolved = {}, set()
-	for position in range(first, last):
-		address, _encoding, mnemonic, operands = plain[position]
-		operands = operands or ""
-		if mnemonic.startswith("ret"):
-			successors[position] = ()
-			continue
-		following = position + 1
-		if mnemonic.startswith(("j", "loop")):
-			target, first_field = None, operands.split()[0] if operands else ""
-			if first_field.startswith("0x"):
-				try:
-					target = int(first_field, 16)
-				except ValueError:
-					target = None
-			if target is None:
-				# Indirect. It can only land where something can be
-				# branched to, and this function's share of that set is
-				# `inside_targets`.
-				successors[position] = inside_targets
-				continue
-			inside = plain[first][0] <= target < plain[last - 1][0] + 1 \
-				if last > first else False
-			edges = []
-			if inside:
-				at = bisect.bisect_left(plain, (target,), first, last)
-				if at < last and plain[at][0] == target:
-					edges.append(at)
-				else:
-					# A branch into the middle of an instruction is not
-					# something this can model. Refuse to model the rest.
-					unresolved.add(position)
-			# A conditional falls through as well; an unconditional does
-			# not, and one leaving the range takes its edge with it.
-			if not mnemonic.startswith("jmp"):
-				if following < last:
-					edges.append(following)
-				else:
-					unresolved.add(position)
-			successors[position] = tuple(edges)
-			continue
-		# Everything else falls through, `call` included: it comes back,
-		# and a callee cannot read this frame's home space.
-		if following < last:
-			successors[position] = (following,)
-		else:
-			# Off the end of the range with no terminator. Where control
-			# goes is the range's business and the range may be wrong.
-			unresolved.add(position)
-			successors[position] = ()
+	successors, unresolved, _leaving = control_successors(
+		plain, first, last, inside_targets)
 
 	predecessors = {}
 	for position, edges in successors.items():
@@ -5231,6 +5501,7 @@ def selftest():
 	failures += shadow_selftest()
 	failures += reader_selftest()
 	failures += span_selftest()
+	failures += gpr_selftest()
 	failures += borrow_selftest()
 	failures += splat_selftest()
 	failures += constant_selftest()
@@ -5893,6 +6164,114 @@ SPAN_SPLAT = bytes.fromhex("c4e27d18cb")	# vbroadcastss %xmm3,%ymm1
 SPAN_STORE1 = bytes.fromhex("c5fc110f")		# vmovups %ymm1,(%rdi)
 
 
+def _flow(rows):
+	"""Lay `(mnemonic, operands)` out four bytes apart from 0x1000.
+
+	Four bytes because `gpr_live_out` reads a branch target as an address
+	and has to find an instruction there; one byte apart would make every
+	target land mid-instruction and every case answer the unresolved
+	question instead of the one it asks.
+	"""
+	return [(0x1000 + 4 * i, b"\x90\x90\x90\x90", mnemonic, operands)
+	        for i, (mnemonic, operands) in enumerate(rows)]
+
+
+# `(what, rows, position, register, expected)` -- is `register` live after
+# `rows[position]`? Every case is here in both directions where the shape
+# admits one, because a liveness answer that is always "live" is sound,
+# useless, and passes any test that only checks for corruption.
+GPR_CASES = [
+	("a later read makes it live",
+	 [("mov", "$0x1,%r10"), ("nop", ""), ("add", "%r10,%rax"),
+	  ("ret", "")], 1, "r10", True),
+	("nothing reads it again",
+	 [("mov", "$0x1,%r10"), ("nop", ""), ("add", "%rcx,%rax"),
+	  ("ret", "")], 1, "r10", False),
+	# The kill. Without it every later mention reads back to the start of
+	# the function and the analysis frees almost nothing.
+	("a full write kills what was there",
+	 [("nop", ""), ("mov", "$0x2,%r10"), ("add", "%r10,%rax"),
+	  ("ret", "")], 0, "r10", False),
+	("a 32-bit write kills, because it zero-extends",
+	 [("nop", ""), ("mov", "$0x2,%r10d"), ("add", "%r10,%rax"),
+	  ("ret", "")], 0, "r10", False),
+	("an 8-bit write does NOT kill, it leaves the rest",
+	 [("nop", ""), ("mov", "$0x2,%r10b"), ("add", "%r10,%rax"),
+	  ("ret", "")], 0, "r10", True),
+	("a write whose source names it reads it too",
+	 [("nop", ""), ("mov", "(%r10),%r10"), ("ret", "")], 0, "r10", True),
+	("a memory destination is not a write of its base",
+	 [("nop", ""), ("mov", "%rax,(%r10)"), ("ret", "")], 0, "r10", True),
+	# The call. Reads the argument registers, kills nothing -- see
+	# `gpr_effect`, where the binary's own __chkstk is the argument.
+	("a call reads the argument registers",
+	 [("nop", ""), ("call", "0x2000"), ("ret", "")], 0, "r8", True),
+	("a call does not read r10",
+	 [("nop", ""), ("call", "0x2000"), ("ret", "")], 0, "r10", False),
+	("a call does not kill, so a value survives it",
+	 [("mov", "$0x1,%rax"), ("call", "0x2000"), ("sub", "%rax,%rsp"),
+	  ("ret", "")], 0, "rax", True),
+	# A ret is modelled exactly rather than treated as an unknown exit.
+	("a ret reads the return value",
+	 [("nop", ""), ("ret", "")], 0, "rax", True),
+	("a ret does not read the scratch registers",
+	 [("nop", ""), ("ret", "")], 0, "r11", False),
+	# Leaving the range is a tail call, and its callee reads what it likes.
+	("a jump out of the range is a tail call, so everything is live",
+	 [("nop", ""), ("jmp", "0x9000")], 0, "r10", True),
+	("falling off the end of the range is not modelled",
+	 [("nop", ""), ("nop", "")], 0, "r10", True),
+	# **The pair address order gets wrong**, and the reason this is a
+	# fixpoint over edges rather than a scan. The read is at a LOWER
+	# address than the site in both, so nothing looking forward from the
+	# site can see it; only the loop's back edge reaches it. The first
+	# version of this case put the read one instruction after the site,
+	# where address order finds it too -- so it passed against a sabotage
+	# that replaced reachability with "the next instruction", and the
+	# whole rule was resting on nothing.
+	("a loop closing above the read carries it back",
+	 [("add", "%r10,%rax"), ("nop", ""), ("jne", "0x1000"),
+	  ("ret", "")], 1, "r10", True),
+	("a loop closing below the read does not",
+	 [("add", "%r10,%rax"), ("nop", ""), ("nop", ""), ("jne", "0x1008"),
+	  ("ret", "")], 1, "r10", False),
+	("a forward branch does not carry it backwards",
+	 [("add", "%r10,%rax"), ("nop", ""), ("jne", "0x100c"),
+	  ("ret", "")], 1, "r10", False),
+	("live on one path of two is live",
+	 [("jne", "0x100c"), ("nop", ""), ("ret", ""),
+	  ("add", "%r10,%rax"), ("ret", "")], 0, "r10", True),
+	("a narrow spelling is the same register",
+	 [("nop", ""), ("add", "%r10b,%al"), ("ret", "")], 0, "r10", True),
+]
+
+
+def gpr_selftest():
+	"""Prove `gpr_live_out` frees a register only where it is dead. 0 or n.
+
+	**The direction that matters is the False answers.** A liveness pass
+	that answered "live" everywhere would be sound, would free nothing, and
+	would pass every case here that asserts a register is live -- so half
+	of these assert the opposite, and the sabotage runs take out one rule
+	at a time to show which case is holding which.
+	"""
+	failures = 0
+	for what, rows, position, register, expected in GPR_CASES:
+		plain = _flow(rows)
+		live = gpr_live_out(plain, 0, len(plain), ())
+		got = register in live[position]
+		if got != expected:
+			print(f"selftest: {what}: {register} after "
+			      f"{plain[position][2]} {plain[position][3]} is "
+			      f"{'live' if got else 'dead'}, want "
+			      f"{'live' if expected else 'dead'}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(GPR_CASES)} gpr liveness shapes, live and "
+		      f"dead in both directions")
+	return failures
+
+
 def _span(rows):
 	"""Lay `(encoding, mnemonic, operands)` out end to end from 0x1000,
 	and end with a `ret`.
@@ -6154,6 +6533,123 @@ def shadow_selftest():
 		      f"{len(DEPTH_CASES)} rsp depths and "
 		      f"{len(REFERENCE_CASES)} shadow references, both directions")
 	return failures
+
+
+def gpr_survey(binary, listing):
+	"""How many volatile GPRs are dead at each starved site. Always 0.
+
+	A measurement rather than a gate, and it exists to price static TLS
+	before anyone builds it. Finding 139 put that at 67 sites by
+	`function_scope`'s whole-function argument -- a function that never
+	NAMES a register cannot read it -- and said in the same breath that the
+	argument is blunt: it disqualifies a range for any jump leaving it, so
+	500 of the 1,332 starved sites are refused for having a tail call
+	somewhere rather than for wanting the register. A borrow bracket holds
+	one instruction and contains no control transfer at all, so the
+	question that fits it is whether the register is dead AT THE SITE.
+
+	Reported by count, because the addressing needs TWO registers at once
+	(Finding 139) and one is worth nothing to it.
+	"""
+	groups = target_set.collect(binary)
+	blocked = set()
+	for values in groups.values():
+		blocked |= values
+	instructions = list(parse_with_comments(listing))
+	plain = [(a, e, m, o) for a, e, m, o, _c in instructions]
+	for address, _e, mnemonic, operands, comment in instructions:
+		if mnemonic.startswith(("j", "call", "loop")) and operands:
+			field = operands.split()[0]
+			if field.startswith("0x"):
+				try:
+					blocked.add(int(field, 16))
+				except ValueError:
+					pass
+		elif mnemonic == "lea" and isinstance(comment, int) \
+				and "(%rip)" in operands:
+			blocked.add(comment)
+	_p, _c, _s, _sk, declined, home = collect(binary, listing)
+	starts, ranges, _usable, _state = home
+	scope_starts, scope_free = gpr_function_scope(plain, ranges)
+
+	wanted = sorted(address for address, reason in declined.items()
+	                if reason == "no home space to borrow")
+	if not wanted:
+		print("gprs: no site was declined `no home space to borrow`, so "
+		      "there is nothing to price", file=sys.stderr)
+		return 2
+
+	cache = {}
+
+	def live_after(i, address):
+		"""The volatile GPRs live after `address` in function `i`."""
+		if i not in cache:
+			start, end = ranges[i]
+			first = bisect.bisect_left(plain, (start,))
+			last = bisect.bisect_left(plain, (end,), first)
+			inside = tuple(position for position in range(first, last)
+			               if plain[position][0] in blocked)
+			cache[i] = (first, last,
+			            gpr_live_out(plain, first, last, inside))
+		first, last, live = cache[i]
+		at = bisect.bisect_left(plain, (address,), first, last)
+		if at >= last or plain[at][0] != address:
+			return None
+		return live[at]
+
+	counts, per_register, whole = Counter(), Counter(), Counter()
+	unplaced, sample = 0, []
+	for address in wanted:
+		i = bisect.bisect_right(starts, address) - 1
+		if i < 0 or address >= ranges[i][1]:
+			unplaced += 1
+			continue
+		live = live_after(i, address)
+		if live is None:
+			unplaced += 1
+			continue
+		# The site's own operands are live: a 256-bit load reaching through
+		# `(%rax,%rcx,4)` needs both while the stub runs.
+		free = (frozenset(VOLATILE_GPRS) - live
+		        - gprs_named(plain[bisect.bisect_left(
+			        plain, (address,))][3] or ""))
+		counts[len(free)] += 1
+		for name in free:
+			per_register[name] += 1
+		# **A number this large has to be checkable by hand.** The
+		# whole-function argument reached 57 sites and this reaches 753,
+		# and a reader who cannot pick one out and read the disassembly
+		# around it has only the tool's word for the difference.
+		if len(free) >= 2 and len(sample) < 8:
+			sample.append((address, ranges[i], sorted(free)))
+		# What the whole-function argument says about the same site, for
+		# the comparison this survey exists to make.
+		j = bisect.bisect_right(scope_starts, address) - 1
+		whole[len(scope_free[j]) if 0 <= j < len(scope_free)
+		      and address < ranges[j][1] else 0] += 1
+
+	total = sum(counts.values())
+	print(f"sites declined `no home space to borrow` {len(wanted):>10,}")
+	print(f"  not inside a known function            {unplaced:>10,}")
+	print(f"  priced here                            {total:>10,}")
+	print("\nvolatile GPRs dead across the bracket:")
+	for many in sorted(counts):
+		print(f"  {many}: {counts[many]:>7,}")
+	at_least = lambda n: sum(c for k, c in counts.items() if k >= n)
+	print(f"\n  at least ONE  {at_least(1):>7,}")
+	print(f"  at least TWO  {at_least(2):>7,}   <- what the addressing needs")
+	print("\nby register, dead across the bracket:")
+	for name in VOLATILE_GPRS:
+		print(f"  {name:<4} {per_register[name]:>7,}")
+	print("\nwhat the whole-function argument says at the same sites:")
+	for many in sorted(whole):
+		print(f"  {many}: {whole[many]:>7,}")
+	if sample:
+		print("\nsites to check by hand, with the function they sit in:")
+		for address, (start, end), free in sample:
+			print(f"  0x{address:x}  in 0x{start:x}-0x{end:x}  "
+			      f"{' '.join(free)}")
+	return 0
 
 
 def span_survey(binary, listing, patched):
@@ -6449,6 +6945,9 @@ def main(argv):
 
 	if mode == "census":
 		return census(argv[1], argv[2], argv[3])
+
+	if mode == "gprs":
+		return gpr_survey(argv[1], argv[2])
 
 	if mode == "spans":
 		return span_survey(argv[1], argv[2], argv[3])
