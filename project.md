@@ -8990,6 +8990,61 @@ home binary -- reporting 214 lost boundaries, every one of them a site the TLS m
 have detoured and the home binary had not. **A flag that changes the OUTPUT but not the
 prerequisites is invisible to make.** Remove the target before switching modes.
 
+### Finding 143 -- the span was short of slots, and slots stopped being scarce
+
+**218 -> 342 sites.** `make spans` priced a closed 256-bit span against the home space and
+the caller's shadow, which is what existed when it was written. Those are 32 bytes each
+and cannot grow. A per-thread block grows by editing one field in a directory, so eleven
+slots there cost exactly what one costs -- and the survey had no way to say so, because
+`--spill=tls` was built the day after it.
+
+```
+covered by a span the home space fits      218
+  and by one only a block fits             124
+  both                                     342
+```
+
+Of the 76 closed spans the home space cannot fit:
+
+```
+  40  a block would fit it
+  25  0 register(s) dead across the span
+  11  1 register(s) dead across the span
+```
+
+40 of 76, covering 124 surviving sites. The other 36 fail for want of two dead
+general-purpose registers across the WHOLE span, which is a floor rather than a modelling
+gap -- the registers must survive every instruction the span covers, not merely its first,
+because a slot addressed through a register the span itself clobbers is worse than no slot.
+
+**This is the third time a measurement has moved this item before anybody built it.**
+Finding 133 scoped the 256-bit residue at 1,674 sites of capacity and corrected itself the
+same day to 212 of reach; Finding 140 removed 77 of the 325 stops for zero sites; and this
+adds 124 without touching the walk at all, by changing what the answer is priced against.
+The span analysis has not changed since Finding 133 built it. What changed is that the
+project acquired memory of its own.
+
+#### What it does not touch, which is still the large item
+
+```
+  3,273  span: does not begin with a 256-bit load
+    101  ... still live after a branch target inside the span
+     92  ... after a control transfer
+```
+
+**A span must begin at a 256-bit load and a whole-function representation would not**, so
+the 3,273 is untouched by any of this and remains the only reason to build the larger
+design. What has changed is the case for building it FIRST. Finding 133 parked 443 sites
+as needing eleven slots at once, and that figure is part of why the whole-function rewrite
+looked mandatory; it is not a constraint any more.
+
+**Nothing is emitted yet.** `ymm_span` remains analysis, as it has been since Finding 133,
+and this finding prices it rather than building it. The order that follows from the
+numbers is the span first -- 342 sites, an analysis that already exists, and the first
+thing here that would EMIT 256-bit code rather than measure it -- and the whole-function
+design afterwards, against a smaller residue that is better understood for having had the
+cheap half taken out of it.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9144,7 +9199,8 @@ the bound that binds. `make spans` asks the question that does:
 
 ```
 surviving 256-bit sites             4,494
-covered by a closed span that fits    218
+covered by a closed span that fits    218   the home space and the shadow
+                                      342   with a per-thread block as well
 ```
 
 A span is worth nothing unless every value it tracks dies inside it, and closure is what
@@ -9164,11 +9220,19 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **Whole-function 256-bit rewriting.** The only route to the 193 sites that lose their
-     value at a transfer, and the only one that reaches the 443 needing eleven slots at
-     once. A much larger design than the span, and the one the project has deferred five
-     times; do not start it on the 1,674 figure. **It is also the only large item left**,
-     which is the real state of the project rather than a complaint about it.
+  1. **Emit the 256-bit span**, at **342 sites** -- Finding 143, which re-prices Finding
+     133's 212 against a per-thread block instead of against 32 bytes of home space. The
+     analysis has existed since Finding 133 and has never emitted anything; what is
+     unbuilt is the lowering. It is the smaller of the two remaining items by a wide
+     margin, and it would be the first thing here to EMIT 256-bit code rather than
+     measure it.
+  2. **Whole-function 256-bit rewriting.** The only route to the 3,273 spans that never
+     begin at a 256-bit load, and to the 193 sites that lose their value at a transfer. A
+     much larger design than the span, and the one the project has deferred five times;
+     do not start it on the 1,674 figure, and note that the 443 sites Finding 133 parked
+     as needing eleven slots at once are no longer bounded by slots at all (Finding 143).
+     **It is the only large item left**, which is the real state of the project rather
+     than a complaint about it.
 
 **And do not re-mine these.** Each has a number saying why:
 

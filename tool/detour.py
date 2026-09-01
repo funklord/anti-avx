@@ -7044,7 +7044,19 @@ def span_survey(binary, listing, patched):
 				total += SLOTS_PER_REGION
 		return total
 
+	# **A per-thread block is as big as it is asked to be.** `slots` above
+	# answers for the home space and the caller's shadow, which are 32 bytes
+	# each and cannot grow; `SizeOfZeroFill` is a number in a directory, so
+	# eleven slots there cost exactly what one costs. What a TLS-backed span
+	# pays instead is two general-purpose registers dead across the whole of
+	# it -- the same price `--spill=tls` pays per site, asked over a span.
+	#
+	# Reported as its own column rather than folded in, because the two are
+	# different claims: the home space is free and limited, the block is
+	# unlimited and costs registers. Finding 143.
+	tls_here = tls_for(binary)
 	covered, refused, fit = set(), Counter(), Counter()
+	tls_covered, tls_reason = set(), Counter()
 	forms = Counter()
 	for index, (address, encoding, _m, _o, _c) in enumerate(instructions):
 		if address not in survivors:
@@ -7066,6 +7078,22 @@ def span_survey(binary, listing, patched):
 			for _kind, member, _r in members:
 				if instructions[member][0] in survivors:
 					covered.add(instructions[member][0])
+		# The same span, priced against a per-thread block instead. The
+		# registers have to be dead across every instruction the span
+		# covers, not merely at its first -- a slot addressed through a
+		# register the span itself clobbers is worse than no slot.
+		if tls_here is not None and peak > room:
+			last_member = instructions[members[-1][1]]
+			length = last_member[0] + len(last_member[1]) - address
+			free = window_gpr_free(home, address, length)
+			if len(free) >= 2:
+				tls_reason["a block would fit it"] += 1
+				for _kind, member, _r in members:
+					if instructions[member][0] in survivors:
+						tls_covered.add(instructions[member][0])
+			else:
+				tls_reason[f"{len(free)} register(s) dead across the span"] \
+					+= 1
 
 	if not survivors:
 		# **A survey over nothing reports success as loudly as a real
@@ -7098,6 +7126,16 @@ def span_survey(binary, listing, patched):
 	for (peak, room), count in sorted(fit.items()):
 		print(f"  wants {peak}, has {room}: {count:>6,}"
 		      f"{'  fits' if peak <= room else ''}")
+	if tls_here is not None:
+		print("\nspans that do NOT fit the home space, priced against a "
+		      "per-thread block:")
+		for reason, count in tls_reason.most_common():
+			print(f"  {count:>7,}  {reason}")
+		print(f"\ncovered by a span the home space fits   {len(covered):>6,}")
+		print(f"  and by one only a block fits          "
+		      f"{len(tls_covered - covered):>6,}")
+		print(f"  both                                  "
+		      f"{len(covered | tls_covered):>6,}")
 	return 0
 
 
