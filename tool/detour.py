@@ -3641,6 +3641,65 @@ def region_reachable(instructions, index, blocked):
 	return None
 
 
+def region_end(instructions, index, blocked, limit=192):
+	"""Where this site's call-free region ends, exclusive.
+
+	The mirror of `region_start`: a call ends a region because the ABI
+	kills every upper half there, and a branch target ends one because
+	control can leave and arrive by a route this walk did not take.
+	"""
+	at = index
+	while at < len(instructions) and at - index < limit:
+		address, encoding, mnemonic, _o = instructions[at][:4]
+		if at > index and address in blocked:
+			return at
+		if mnemonic.startswith(CONTROL_PREFIXES):
+			return at + 1		# the transfer itself is the last member
+		following = at + 1
+		if following < len(instructions) \
+				and instructions[following][0] != address + len(encoding):
+			return following
+		at = following
+	return at
+
+
+def region_demand(instructions, first, last):
+	"""`(peak, registers)` -- how many upper halves are live at once.
+
+	The peak of the intervals and not the count of the registers, which is
+	`ymm_span`'s distinction and the reason it is computed the same way: a
+	region that defines a value, kills it, and defines another needs one
+	slot and reuses it. Counting registers said two where one was wanted.
+
+	A register's interval runs from its first 256-bit write to its last
+	read of any width, because a narrower read still consumes the value
+	the slot is standing in for.
+	"""
+	live = {}
+	for position in range(first, last):
+		_a, encoding, _m, operands = instructions[position][:4]
+		operands = operands or ""
+		vex = inplace.decode_vex(encoding)
+		fields = inplace.split_operands(operands)
+		for field in fields:
+			if not field.startswith("%ymm"):
+				continue
+			name = canonical_ymm(field)
+			if name in live:
+				live[name][1] = position
+		if vex is None or not vex["L"] or not fields:
+			continue
+		destination = fields[-1]
+		if destination.startswith("%ymm"):
+			name = canonical_ymm(destination)
+			live.setdefault(name, [position, position])[1] = position
+	peak = 0
+	for point in range(first, last):
+		peak = max(peak, sum(1 for begin, end in live.values()
+		                     if begin <= point <= end))
+	return peak, frozenset(live)
+
+
 def span_operand_shape(vex, tail, operands, tracked):
 	"""`("load"|"store"|"lane", register)` if this member is one this can
 	emit, else None.
@@ -7497,7 +7556,13 @@ def span_survey(binary, listing, patched):
 	# different claims: the home space is free and limited, the block is
 	# unlimited and costs registers. Finding 143.
 	tls_here = tls_for(binary)
+	# The whole-function free-register argument, which is what a region's
+	# helper is chosen from -- the same blunt rule `span_helper` uses, and
+	# the same one Finding 141 sharpened for general-purpose registers and
+	# nobody has yet pointed at xmm.
+	scope = scratch_finder.function_scope(plain, ranges)
 	region_covered, region_refused = set(), Counter()
+	region_cache, region_slots, region_cost = {}, Counter(), Counter()
 	covered, refused, fit = set(), Counter(), Counter()
 	tls_covered, tls_reason = set(), Counter()
 	forms = Counter()
@@ -7518,6 +7583,36 @@ def span_survey(binary, listing, patched):
 		refusal = region_reachable(instructions, index, blocked)
 		if refusal is None:
 			region_covered.add(address)
+			# **What the region would COST**, which is the bound Finding
+			# 147 said to take before designing anything on the 3,355.
+			# Memoised on the region's first instruction, because a region
+			# holds many sites and the demand is the region's.
+			begin = region_start(instructions, index, blocked)
+			if begin not in region_cache:
+				finish = region_end(instructions, begin, blocked)
+				extent = instructions[finish - 1][0] \
+					+ len(instructions[finish - 1][1]) \
+					- instructions[begin][0]
+				peak, used = region_demand(instructions, begin, finish)
+				at = instructions[begin][0]
+				helpers = set(scratch_finder.scope_free(scope, at))
+				for position in range(begin, finish):
+					helpers -= set(scratch_finder.xmm_numbers(
+						instructions[position][3] or ""))
+				region_cache[begin] = (
+					peak, len(helpers),
+					window_borrow(home, at, extent) is not None,
+					len(window_gpr_free(home, at, extent)))
+			peak, helpers, frame, gprs = region_cache[begin]
+			region_slots[min(peak, 9)] += 1
+			if not helpers:
+				region_cost["no xmm free across the region"] += 1
+			elif not frame and gprs < 2:
+				region_cost["no frame region and fewer than two GPRs"] += 1
+			elif peak > TLS_SLOTS and not frame:
+				region_cost[f"wants more than {TLS_SLOTS} slots"] += 1
+			else:
+				region_cost["slots and registers both available"] += 1
 		else:
 			region_refused[refusal] += 1
 		why = []
@@ -7587,6 +7682,13 @@ def span_survey(binary, listing, patched):
 	      f"{len(region_covered):>6,}")
 	for reason, count in region_refused.most_common(6):
 		print(f"  {count:>7,}  {reason}")
+	print("\n  upper halves live at once in the region, by site:")
+	for many in sorted(region_slots):
+		print(f"    {many}{'+' if many == 9 else ' '}: "
+		      f"{region_slots[many]:>6,}")
+	print("\n  and what the region can afford:")
+	for reason, count in region_cost.most_common():
+		print(f"    {count:>7,}  {reason}")
 	if tls_here is not None:
 		print("\nspans that do NOT fit the home space, priced against a "
 		      "per-thread block:")

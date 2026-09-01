@@ -9270,6 +9270,61 @@ that it is worth 3,355 sites.** Anyone continuing it should take the slot and re
 bounds first, exactly as `make spans` took them for the span -- and should expect the
 number to fall, because every previous measurement on this item has.
 
+### Finding 148 -- the region is worth 512, and what binds it is one xmm register
+
+Finding 147 measured what a call-free region REACHES -- 3,355 of 4,494 surviving 256-bit
+sites -- and said in the same breath that the figure was a bound on reach and not a number
+of sites, because Finding 133 made exactly that error on exactly this item. These are the
+bounds it said to take.
+
+```
+3,355  reachable by the representation
+2,782    no xmm free across the region
+   61    no frame region and fewer than two GPRs
+  512  slots and registers both available
+```
+
+**512**, against the span's 342. The region design is worth about 170 sites more than what
+is already built, not 3,013.
+
+#### What binds it is not slots
+
+Slot demand is real and heavy -- 676 of the sites sit in a region wanting nine or more
+upper halves live at once, and the distribution has a second hump at six:
+
+```
+  1: 1,001    4:  71    7:  70
+  2:   685    5: 117    8:  28
+  3:   291    6: 370    9+: 676
+```
+
+But slots stopped being scarce when the per-thread block arrived (Finding 143), and
+`SizeOfZeroFill` is a number. **83% of the loss is one xmm register**, which the slot
+traffic all goes through.
+
+And that register is chosen by `function_scope`'s whole-function argument: free everywhere
+in the function, because the function names it nowhere. Over a span of a few instructions
+that is a mild rule. **Over a region that can run to 192 instructions it is nearly always
+empty**, and that is the bound -- not the program's register pressure, but the bluntness of
+the question asked about it.
+
+**Finding 141 built the per-position machinery for general-purpose registers and nobody has
+pointed it at xmm.** That is the same sentence Finding 139 wrote about GPRs before Finding
+141 answered it and took static TLS from 67 sites to 753. One instance is not evidence that
+it repeats, but it is the obvious next measurement and it is a day's work on machinery that
+already exists.
+
+#### The instrument's own flaw, stated because the counts are read off it
+
+The three buckets are exclusive and ordered: a site with no free xmm is counted there even
+if it would also have failed on slots. **The 512 is sound** -- it is the case that passes
+every check -- but the other 2,843 are attributed to whichever test ran first and must not
+be read as three independent causes. In particular the slot check never fires in this run,
+so `TLS_SLOTS` at four is not measured against the 676 sites wanting nine.
+
+Fixing the attribution is cheap and was not done here, because the number that decides
+whether to build the design is the 512, and that one does not depend on the ordering.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9455,12 +9510,15 @@ Ordered by what was measured, not by what looks large.
      -- see Finding 147. A call-free region is the largest unit over which an upper half
      can be represented, because the ABI kills every one of them at a call; and at a
      region's edges the span's two hard constraints both dissolve. 3,355 of the 4,494
-     surviving 256-bit sites have every ymm they read defined inside their own region.
-     **That is a bound on reach and not a number of sites** -- slots, one xmm, two GPRs
-     for a block pointer, the emittable shapes and placement are all uncounted, and
-     Finding 133 made exactly this mistake on exactly this item. Take those bounds before
-     designing anything. **It is the only large item left**, which is the real state of
-     the project rather than a complaint about it.
+     surviving 256-bit sites have every ymm they read defined inside their own region,
+     and **512 of those can also afford the slots and registers** (Finding 148) --
+     against 342 for the span that is already built. So the design is worth about 170
+     sites as costed today, and the thing to do BEFORE building it is **per-position xmm
+     liveness**: 2,782 of the 3,355 are refused for want of one xmm free across the
+     region, chosen by `function_scope`'s whole-function rule, and Finding 141 built
+     exactly that machinery for general-purpose registers. Shapes and placement remain
+     uncounted on top. **It is the only large item left**, which is the real state of the
+     project rather than a complaint about it.
 
 **And do not re-mine these.** Each has a number saying why:
 
