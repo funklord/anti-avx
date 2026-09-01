@@ -9542,6 +9542,60 @@ today and the shape needs two, so the population that can use it is smaller than
 histogram's 2,357 -- **that is unmeasured**, and it is the same mistake as reading 1,237
 emittable as a site count. `make spans` will say, once the collector offers the shape.
 
+### Finding 153 -- the span is a copy mechanism, and the shape it wanted is not in it
+
+The register-second-source shape is built, proven bit for bit by `make check-span`, wired
+into the collector -- and it lowers **zero** sites. 6,505 survivors before and after, and
+the apply tallies identical to the digit: 202,555 detours, 39,434 overlapped, 586 refused.
+
+The reason is not the helper, the slots or the ordering. Every 256-bit site in the listing
+was walked and every span that CLOSES was classified:
+
+```
+closed spans found            9,587
+  containing the new shape        0
+
+shapes appearing in a closed span:
+    9,587  load
+    9,562  store
+       46  an immediate form
+       15  lane mem,D,D
+        1  a register-to-register move
+```
+
+**Every closed span is a load and a store.** Fifteen contain the memory-source arithmetic
+the shape work started from, and none contains a register second source.
+
+#### Closure is what excludes arithmetic, and closure is the span's premise
+
+A span is worth nothing unless every value it tracks is dead at the end, and arithmetic is
+precisely what keeps a value alive past it -- the result gets read later, or a source was
+never defined inside. So the spans that close are the ones doing nothing but moving
+sixteen bytes twice. **`ymm_span` is a copy mechanism wearing an arithmetic design**, and
+its 342 sites are copies `ymm_run` did not already take.
+
+This also explains a number that should have looked odd earlier: Finding 150 counted
+thousands of arithmetic shapes, and it counted them over REGIONS. A region discharges
+closure by the ABI rather than by analysis, which is exactly the constraint that keeps
+arithmetic out of a span. The two populations were never comparable and the histogram was
+read as though the shapes were reachable from where the lowering lives.
+
+#### So the order in Finding 151 was wrong
+
+It said build the shape first because it raises the span that already ships and the
+region's ceiling too. **The first half is false**: the shape cannot raise the span, because
+no closing span contains it. Only the second half stands.
+
+The shape is kept -- it is correct, it is executed by the oracle, and it is what the region
+will need on the day the region is built. But it is dead code until then, and the honest
+order is the region first and the shapes it needs afterwards, one at a time, each measured
+against the binary.
+
+**What was measured cheaply here and should have been measured before building**: which
+shapes occur inside the structure the lowering actually serves. Twenty minutes of probe
+against a day of building, and the probe is `span_shape_name` over `ymm_span`, both of
+which already existed.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9717,13 +9771,7 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **The register-second-source shape**, at 1,367 and 990 sites for its two forms and
-     the biggest single population in Finding 150's histogram. `slot_tail` is written for
-     it and has never been called: the second source's slot has to be a memory OPERAND of
-     the operation rather than something moved in and out. It raises the span that is
-     already built and shipping, and it raises the region's ceiling too. Do this before
-     the region, which Finding 151 costs at 101 sites over the span.
-  2. **Region-based 256-bit rewriting**, which is what "whole-function" should have said
+  1. **Region-based 256-bit rewriting**, which is what "whole-function" should have said
      -- see Finding 147. A call-free region is the largest unit over which an upper half
      can be represented, because the ABI kills every one of them at a call; and at a
      region's edges the span's two hard constraints both dissolve. 3,355 of the 4,494

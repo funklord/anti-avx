@@ -3697,8 +3697,17 @@ def span_shape_name(encoding, operands):
 			return "lane mem,D,D"
 		return "mem,S,D with a destination of its own"
 	if len(fields) == 3 and len(wide) == 3:
-		if fields[1] == fields[2] or fields[0] == fields[2]:
-			return "a register second source, D reused"
+		# **Split by WHICH source is the destination**, because only one of
+		# them is what the lowering emits. `op %ymmS,%ymmD,%ymmD` has src1
+		# as the destination and is the SSE two-operand form with the
+		# prefix dropped; `op %ymmD,%ymmS,%ymmD` has src2 as the
+		# destination, which is the aliasing case `lower_vex` needs a
+		# scratch for and this does not build. Lumping them together would
+		# make `SPAN_EMITTABLE` claim a shape that is not emitted.
+		if fields[1] == fields[2]:
+			return "a register second source, src1 is D"
+		if fields[0] == fields[2]:
+			return "a register second source, src2 is D"
 		return "a register second source, D of its own"
 	if len(fields) == 4:
 		return "four operands -- an insert, a blend or an FMA"
@@ -3708,7 +3717,8 @@ def span_shape_name(encoding, operands):
 # The shapes `lower_ymm_span` can emit today. Named here rather than
 # inferred, so that the survey and the lowering cannot drift apart about
 # what is built.
-SPAN_EMITTABLE = frozenset(("load", "store", "lane mem,D,D"))
+SPAN_EMITTABLE = frozenset(("load", "store", "lane mem,D,D",
+                            "a register second source, src1 is D"))
 
 
 def region_start(instructions, index, blocked, limit=192):
@@ -4139,7 +4149,12 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 
 
 def span_helper(scope, address, entries):
-	"""One xmm free across the whole span, or None.
+	"""The xmm registers free across the whole span, fewest first.
+
+	Two are wanted where the span carries a register-second-source
+	operation, because a slot cannot be that operation's memory operand --
+	SSE wants it 16-byte aligned and nothing aligns a slot (Finding 152).
+	One is enough for every other shape.
 
 	**The whole-function argument and nothing cleverer**, deliberately.
 	`find_scratch` answers for a POINT and a span needs a register dead at
@@ -4156,11 +4171,10 @@ def span_helper(scope, address, entries):
 	"""
 	free = set(scratch_finder.scope_free(scope, address))
 	if not free:
-		return None
-	for _kind, _address, _encoding, _mnemonic, operands, _slot, _moved \
-			in entries:
-		free -= set(scratch_finder.xmm_numbers(operands or ""))
-	return min(free) if free else None
+		return ()
+	for entry in entries:
+		free -= set(scratch_finder.xmm_numbers(entry[4] or ""))
+	return tuple(sorted(free))
 
 
 def span_candidate(instructions, plain, positions, index, blocked, home,
@@ -4220,14 +4234,16 @@ def span_candidate(instructions, plain, positions, index, blocked, home,
 	if len(slots) > max(SLOTS_PER_REGION, TLS_SLOTS if block else 0):
 		return None
 	entries = span_entries(members, instructions, slots, scope, plain)
-	helper = span_helper(scope, address, entries)
-	if helper is None:
+	free = span_helper(scope, address, entries)
+	if not free:
 		return None
-	if lower_ymm_span(entries, base, helper, address, address,
-	                  block) is None:
+	helper = free[0]
+	second_helper = free[1] if len(free) > 1 else None
+	if lower_ymm_span(entries, base, helper, address, address, block,
+	                  second_helper) is None:
 		return None
 	return (address, encoding, operands, mnemonic, window, [], None, [],
-	        ("span", (entries, helper, block, base)))
+	        ("span", (entries, helper, block, base, second_helper)))
 
 
 def value_survives_loop(instructions, index, register, blocked, sources,
@@ -5164,7 +5180,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# number over all of it -- `window_borrow`'s argument, and the
 		# reason a span holding a `push` is refused rather than restored
 		# from somewhere the save never wrote.
-		entries, helper, span_block, span_base = strategy[1]
+		entries, helper, span_block, span_base, second_helper = \
+			strategy[1]
 		if span_block is not None:
 			# **The block carries its own base**, worked out when the span
 			# was collected, and `base` -- the frame displacement
@@ -5173,7 +5190,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			# lend no frame, which is the whole point of offering it.
 			lowered = lower_ymm_span(entries, span_base, helper,
 			                         stub_address + len(body), pool,
-			                         span_block)
+			                         span_block, second_helper)
 			if lowered is None:
 				if reasons is not None:
 					reasons["the span operand cannot be moved"] += 1
@@ -5194,7 +5211,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 					        "displacement"] += 1
 				return None, 0
 			lowered = lower_ymm_span(entries, base, helper,
-			                         stub_address + len(body), pool)
+			                         stub_address + len(body), pool,
+			                         None, second_helper)
 			if lowered is None:
 				if reasons is not None:
 					reasons["the span operand cannot be moved"] += 1
