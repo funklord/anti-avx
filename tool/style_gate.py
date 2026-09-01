@@ -1699,7 +1699,26 @@ _DOC_SUFFIX = (".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".py", ".rs", ".situ",
 
 
 def doc_paths(text: str) -> list[tuple[int, str]]:
-	"""Backticked paths in table rows: the document's declared inventory."""
+	"""Backticked paths in table rows: the document's declared inventory.
+
+	Table rows only, and deliberately: a path in a table is a CLAIM about
+	the tree, while a path in prose is as often an example, a glob, a
+	layout being described, or a file that does not exist yet. Measured
+	across seventeen documents 2026-09-01: 128 backticked paths sit in
+	table rows and 1625 sit in prose, of which only 617 name a file that
+	is there. Widening this to prose would mean judging about a thousand
+	tokens that are not meant to be files, which is the flood the caller's
+	own "describing a layout rather than pointing at a file" guard exists
+	to avoid.
+
+	So a document with no inventory table has a path half that inspects
+	NOTHING, and that is a documentation style rather than a fault. Four
+	of the seventeen are in that state -- and none of them could have been
+	known to be, because until the count was printed beside the verdict a
+	gate checking 233 headings and 0 paths said exactly what a gate
+	checking both would say. Found by fuzzypickles on the first run after
+	the count landed, in their own tree, which is the case for printing a
+	population rather than a verdict."""
 	found = []
 	for number, line in enumerate(text.splitlines(), start=1):
 		if not line.lstrip().startswith("|"):
