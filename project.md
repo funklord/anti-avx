@@ -9714,6 +9714,62 @@ target exists rather than a dependency that runs it. Claimed without looking at 
 Each is a limit of the harness rather than of the lowering, and each is why 295 is smaller
 than the 669 shapes the census counts.
 
+### Finding 156 -- the region is built, and it lowers arithmetic the span never could
+
+**6,505 -> 6,405 surviving VEX sites.** 100 sites, and they are the first this project
+lowers by carrying a value across a stretch of code without asking it to die there.
+
+```
+                    before      with region
+survivors            6,505            6,405    -100
+detours            202,555          202,562      +7
+overlap             39,434           39,465     +31
+stub bytes       3,324,009        3,759,667   +436k
+```
+
+Detours rose by seven while survivors fell by a hundred, which is the mechanism rather
+than an oddity: a region covers many instructions in one window. The stub section grew
+436 KB, which is what re-emitting each region's members costs.
+
+#### What it is, and why the span could not be it
+
+`region_members` walks a call-free region and asks one question per instruction --
+**is every ymm this reads defined by a 256-bit write since the region began?** Both of the
+span's hard constraints are gone, and neither was relaxed: they are discharged by the
+region's edges. At the start every upper half is dead because the ABI kills them at a call;
+at the end the same is true again, so closure needs no analysis.
+
+Closure is exactly what kept arithmetic out of a span. Finding 153 measured it: every span
+that closes is a load and a store, because arithmetic is what keeps a value alive past the
+end. **A region does not ask, so arithmetic is what it is for** -- and the
+register-second-source shape built in Finding 152, which reached zero sites through the
+span, is reachable here.
+
+`lower_ymm_span` emits it unchanged. Every member kind a region needs is one it already
+had, which is why this is a hundred lines rather than a second lowering.
+
+#### Three bounds written into it, and only one is about correctness
+
+  * **The window stops before the terminating transfer.** `region_end` includes the call,
+    because the liveness question needs it -- a call reads the argument registers. A window
+    may not: a stub is entered by a jump, so a call inside one has a return address to get
+    right and unwind data to describe. Ending before it costs nothing, the upper halves
+    being dead at the call either way.
+  * **Offered once per region, at its first instruction.** Asking at every member would
+    build the same window repeatedly and let the placer commit whichever it saw first.
+  * **A cap of 24 instructions, which is a PLACEMENT bound and not a correctness one.** A
+    region may run to 192, and a window that long swallows everything inside it and
+    collides with every candidate it covers. That is Finding 126's lesson at a scale
+    nobody has measured, so: small first, widen with the binary as the judge.
+
+#### 100 against a costing of 443
+
+Finding 151 costed the region at 443 buildable sites. This takes 100, and the gap is the
+24-instruction cap and the four-slot ceiling rather than anything the costing got wrong --
+both are dials, and neither has been turned. **Widening them is the next measurement**, and
+it is the first time on this item that the next step is a number to raise rather than a
+question to answer.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

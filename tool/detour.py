@@ -4177,6 +4177,120 @@ def span_helper(scope, address, entries):
 	return tuple(sorted(free))
 
 
+def region_members(instructions, first, last):
+	"""`(members, slots)` for a whole call-free region, or None.
+
+	The span's walk without its two hard constraints. A span must begin at
+	a 256-bit load and must CLOSE -- every value dead at the end -- and
+	both are discharged here by the region's edges rather than by
+	analysis: at a region's start every upper half is dead because the ABI
+	kills them at a call, and at its end the same is true again.
+
+	What is left is the one question Finding 147 named: **is every ymm this
+	instruction reads defined by a 256-bit write since the region began?**
+	A value that arrives from outside has its upper half in a machine ymm
+	nothing here can reach, and one instruction like that spoils the whole
+	region -- a representation is not something a program can have half of.
+
+	Members carry the same three fields `ymm_span` produces, because
+	`span_entries` and `lower_ymm_span` already read that shape and every
+	member kind a region needs is one they emit.
+	"""
+	members, slots, defined = [], {}, set()
+	for position in range(first, last):
+		_a, encoding, _m, operands, _c = instructions[position]
+		vex = inplace.decode_vex(encoding)
+		if vex is None or not vex["L"]:
+			members.append(("plain", position, None))
+			continue
+		shape = span_operand_shape(vex, encoding[vex["length"]:], operands,
+		                           None)
+		if shape is None:
+			return None			# a shape the lowering cannot emit
+		what, register = shape[0], shape[1]
+		if what == "load":
+			if register not in slots:
+				slots[register] = len(slots)
+			defined.add(register)
+		else:
+			# Everything else READS the register it names, so the region
+			# must already have defined it.
+			if register not in defined:
+				return None
+			if what == "lanereg" and shape[2] not in defined:
+				return None
+		members.append((what, position, register))
+	return (members, slots) if slots else None
+
+
+def region_candidate(instructions, plain, positions, index, blocked, home,
+                     ranges, scope, tls, limit=24):
+	"""A candidate lowering a whole call-free region, or None.
+
+	Offered where the span declined, and it reaches what the span cannot:
+	Finding 153 measured that every span which CLOSES is a load and a
+	store, because arithmetic is exactly what keeps a value alive past the
+	end. A region does not ask for closure, so arithmetic is what it is
+	for.
+
+	**The window stops before the terminating transfer.** `region_end`
+	includes the call, because the liveness question needs it -- a call
+	reads the argument registers. A window may not: a stub is entered by a
+	jump and a call inside one has a return address to get right and unwind
+	data to describe it. Ending before it costs nothing, since the upper
+	halves are dead at the call either way, which is the whole reason the
+	region ends there.
+
+	`limit` is a cap on the window in instructions, and it is a placement
+	bound rather than a correctness one. A region may run to 192, and a
+	window that long swallows everything inside it and collides with every
+	candidate it covers -- which is Finding 126's lesson at a scale nobody
+	has measured. Small first, then widen with the binary as the judge.
+	"""
+	first = region_start(instructions, index, blocked)
+	if first is None or first != index:
+		# Offered once per region, at its first instruction. Asking at
+		# every member would build the same window many times and let the
+		# placer commit whichever it saw first.
+		return None
+	last = region_end(instructions, first, blocked)
+	if last - first > limit:
+		return None
+	closing = instructions[last - 1][2]
+	if closing.startswith(CONTROL_PREFIXES):
+		last -= 1
+	if last - first < 2:
+		return None
+	found = region_members(instructions, first, last)
+	if found is None:
+		return None
+	members, slots = found
+	address = instructions[first][0]
+	tail_entry = instructions[last - 1]
+	window = tail_entry[0] + len(tail_entry[1]) - address
+	if window < 5 or not inplace.covered_by(ranges, address, window):
+		return None
+	base, block = window_borrow(home, address, window), None
+	if base is None or len(slots) > SLOTS_PER_REGION:
+		if tls is None or len(slots) > TLS_SLOTS:
+			return None
+		free = sorted(window_gpr_free(home, address, window), reverse=True)
+		if len(free) < 2:
+			return None
+		base, block = tls[1], (free[0], free[1], tls[0])
+	entries = span_entries(members, instructions, slots, scope, plain)
+	helpers = span_helper(scope, address, entries)
+	if not helpers:
+		return None
+	second = helpers[1] if len(helpers) > 1 else None
+	if lower_ymm_span(entries, base, helpers[0], address, address, block,
+	                  second) is None:
+		return None
+	return (address, instructions[first][1], instructions[first][3],
+	        instructions[first][2], window, [], None, [],
+	        ("span", (entries, helpers[0], block, base, second)))
+
+
 def span_candidate(instructions, plain, positions, index, blocked, home,
                    ranges, scope, tls=None):
 	"""A candidate that lowers a whole 256-bit span, or None.
@@ -5698,6 +5812,18 @@ def collect(binary, listing):
 			                         tls_slot_offset)
 			if spanned is not None:
 				candidates.append(spanned)
+				continue
+			# **And the region, where the span declined.** A span carries
+			# a load through to a store and needs the value dead at the
+			# end; a region needs neither, because the ABI kills every
+			# upper half at its edges. Finding 153 measured what that
+			# costs the span -- every closing span is a copy, and the
+			# arithmetic the design was for never appears in one.
+			regional = region_candidate(instructions, plain, positions,
+			                            index, blocked, home, ranges,
+			                            scope, tls_slot_offset)
+			if regional is not None:
+				candidates.append(regional)
 				continue
 
 		if carried is None:
