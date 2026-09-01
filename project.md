@@ -9689,7 +9689,14 @@ themselves -- and it cannot be widened into forgiveness, because "one executor r
 they agreed" is a fact about a pair of programs rather than a category.
 
 All five `vdpps` shapes agree under qemu, including the three the first rule could not
-settle. `check-shapes` is in the aggregate `check` now.
+settle.
+
+**`check-shapes` is its own target and not part of `check`**, alongside `check-vex`,
+`check-lanes` and `check-span`. Those need qemu and take minutes, and `check` is the fast
+gate a commit waits on. The commit that landed this said it had joined `check` and it had
+not -- the edit added it to `.PHONY` and nowhere else, which is a declaration that the
+target exists rather than a dependency that runs it. Claimed without looking at what
+`check:` actually lists.
 
 #### What the harness cannot ask, stated so the 295 is not read as coverage
 
@@ -10079,14 +10086,20 @@ make check-shapes  and whether each computes the same answer, with the
 - `wine` needs `WINEDLLOVERRIDES=winedbg.exe=d` or an expected crash hangs for the
   full timeout instead of returning immediately.
 - **A wine that will not start returns 1 for every fixture**, and 1 is not any
-  fixture's expected answer -- so `check-pe`'s loop blamed the first one and reported
-  `rewritten aliasing returned 1, want 169`, which reads as a rewriting defect. The
-  cause was that `build/wineprefix` belonged to the account that created it and the
-  session running the gate was a different one; wine refuses a prefix it does not own.
-  `check-pe` now asks `wine cmd /c exit 0` before the loop and says so. Override
-  `PE_PREFIX` to run against a prefix you own. Same shape as the style gate's
-  dubious-ownership fault taken in `b3fcb4f` two commits earlier, from the other
-  direction: **a tool met a permission it could not read and reported it as a fact
+  fixture's expected answer -- so a target blames whatever it was testing.
+  `check-pe` reported `rewritten aliasing returned 1, want 169`, which reads as a
+  rewriting defect; `check-tls` reported that the loader had not zeroed the bytes it
+  was asked for; `check-unwind` reported that a handler could not be reached from
+  inside a stub. All three were wine refusing a prefix it does not own, because
+  `build/wineprefix` belongs to the account that created it. Override `PE_PREFIX` to
+  run against one you own.
+  **All four wine targets share one `WINE_CANARY` now**, which asks `wine cmd /c exit 0`
+  before anything else. `check-pe` grew that check first and kept it to itself, and the
+  other three went on misreporting for a day until the whole gate set was run at once --
+  **a fix that lands in one of four places is a quarter of a fix**, and the three that
+  did not get it were invisible because nobody ran them together.
+  Same shape as the style gate's dubious-ownership fault taken in `b3fcb4f`, from the
+  other direction: **a tool met a permission it could not read and reported it as a fact
   about the work.**
 - `.SECONDARY` **expands its prerequisites where it is read**, so a variable defined
   later expands to nothing and protects nothing.

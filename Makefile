@@ -395,6 +395,7 @@ check-tls:
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-tls: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
+	$(WINE_CANARY)
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
 	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
@@ -440,6 +441,9 @@ shapes: $(LISTING)
 # sides agrees -- which proves the lowering right and leaves qemu and this
 # CPU differing about the instruction itself. Eight comparisons are that,
 # all `vrcpps`, `vrsqrtps` and `vdpps`.
+#
+# Not a prerequisite of `check`, for `check-vex`'s reason: it needs qemu
+# and takes minutes, and `check` is the gate a commit waits on.
 check-shapes: $(LISTING)
 	$(PYTHON) tool/shape_oracle.py $(LISTING) $(BUILD_DIR)
 
@@ -472,6 +476,21 @@ PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
 # Wine wants an absolute prefix, and it is kept under BUILD_DIR so that it is
 # this build's to remove rather than something in the user's home.
 PE_PREFIX  = $(abspath $(BUILD_DIR))/wineprefix
+# **Every target that runs wine asks whether wine runs first.** A wine that
+# will not start returns 1 for every binary, and 1 is not any fixture's
+# expected answer -- so a target without this reports a startup failure as
+# a verdict on the work. check-pe grew the canary first and kept it to
+# itself, and the other three went on misreporting: running the whole gate
+# set found check-tls claiming the loader had not zeroed the bytes and
+# check-unwind claiming a handler was unreachable, both of them wine
+# refusing a prefix owned by another account. A fix that lands in one of
+# four places is a quarter of a fix.
+WINE_CANARY = @$(WINE_ENV) timeout 300 wine cmd /c exit 0 >/dev/null 2>&1 || \
+	{ echo "$@: wine will not start with WINEPREFIX=$(PE_PREFIX)."; \
+	  echo "      Every fixture would return 1 and be reported as a"; \
+	  echo "      failure of the thing under test. Run:"; \
+	  echo "      $(WINE_ENV) wine cmd /c exit 0"; \
+	  exit 1; }
 # winedbg is disabled deliberately. The originals are MEANT to die of an
 # illegal instruction, and with the debugger enabled that crash starts
 # winedbg and waits -- two minutes of timeout for a result already known.
@@ -530,12 +549,7 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-pe: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
-	@$(WINE_ENV) timeout 300 wine cmd /c exit 0 >/dev/null 2>&1 || \
-		{ echo "check-pe: wine will not start with WINEPREFIX=$(PE_PREFIX)."; \
-		  echo "          Every fixture would return 1 and be reported as a"; \
-		  echo "          rewriting defect. Run:"; \
-		  echo "          $(WINE_ENV) wine cmd /c exit 0"; \
-		  exit 1; }
+	$(WINE_CANARY)
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
 	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
@@ -580,6 +594,7 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-spill: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
+	$(WINE_CANARY)
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
 	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
@@ -717,6 +732,7 @@ check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe \
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-unwind: wine is not installed"; exit 1; }
 	@mkdir -p $(PE_PREFIX)
+	$(WINE_CANARY)
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
 	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
