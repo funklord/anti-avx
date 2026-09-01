@@ -3706,9 +3706,9 @@ def span_shape_name(encoding, operands):
 		# make `SPAN_EMITTABLE` claim a shape that is not emitted.
 		if fields[1] == fields[2]:
 			return "a register second source, src1 is D"
-		if fields[0] == fields[2]:
-			return "a register second source, src2 is D"
-		return "a register second source, D of its own"
+		if fields[0] != fields[2] and fields[1] != fields[2]:
+			return "a register second source, D of its own"
+		return "a register second source, src2 is D"
 	if len(fields) == 4:
 		return "four operands -- an insert, a blend or an FMA"
 	return "some other shape"
@@ -3718,7 +3718,8 @@ def span_shape_name(encoding, operands):
 # inferred, so that the survey and the lowering cannot drift apart about
 # what is built.
 SPAN_EMITTABLE = frozenset(("load", "store", "lane mem,D,D",
-                            "a register second source, src1 is D"))
+                            "a register second source, src1 is D",
+                            "a register second source, D of its own"))
 
 
 def region_start(instructions, index, blocked, limit=192):
@@ -3910,6 +3911,15 @@ def span_operand_shape(vex, tail, operands, tracked):
 		# it there. That is `slot_tail`'s reason for existing. Finding 152.
 		return ("lanereg", canonical_ymm(fields[2]),
 		        canonical_ymm(fields[0]))
+	if len(fields) == 3 and len(wide) == 3 and fields[0] != fields[2]:
+		# `op %ymmS2,%ymmS1,%ymmD` with a destination of its own, which is
+		# the largest shape Finding 150 counted and the one the region
+		# reaches that no span could. SSE has no three-operand form, so
+		# both halves become a move and an operation -- which is exactly
+		# what `lower_vex` does for a Class C site, one width down.
+		# Finding 158.
+		return ("lanereg3", canonical_ymm(fields[2]),
+		        canonical_ymm(fields[0]), canonical_ymm(fields[1]))
 	return None
 
 
@@ -3964,15 +3974,20 @@ def span_entries(members, instructions, slots, scope, plain):
 		# A register-second-source operation needs TWO slots: its
 		# destination's, and the one it reads from. The second is resolved
 		# here because `build_stub` has no operand text to look it up with.
-		second = None
+		second = third = None
 		vex = inplace.decode_vex(encoding)
 		if vex is not None and vex["L"]:
 			shape = span_operand_shape(vex, encoding[vex["length"]:],
 			                           operands, None)
-			if shape is not None and shape[0] == "lanereg":
+			if shape is not None and shape[0] in ("lanereg", "lanereg3"):
 				second = slots.get(shape[2])
+			# `lanereg3` reads TWO slots and writes a third, so the first
+			# source's is resolved here too. `build_stub` has no operand
+			# text to look either of them up with.
+			if shape is not None and shape[0] == "lanereg3":
+				third = slots.get(shape[3])
 		out.append((kind, address, encoding, mnemonic, operands,
-		            slots.get(register), moved, second))
+		            slots.get(register), moved, second, third))
 	return out
 
 
@@ -4032,8 +4047,8 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		# member would cost three instructions each and a pointer clobbered
 		# mid-span would address somebody else's thread data.
 		body += encode_tls_base(block[0], block[1], block[2], at)
-	for kind, address, encoding, mnemonic, operands, slot, moved, second \
-			in entries:
+	for kind, address, encoding, mnemonic, operands, slot, moved, second, \
+			third in entries:
 		if kind == "plain":
 			fixed = moved_instruction(moved[:5], at + len(body), pool)
 			if fixed is None:
@@ -4082,6 +4097,45 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if piece is None:
 				return None
 			body += piece
+			continue
+		if what == "lanereg3":
+			# **A destination of its own, so both halves are a move and an
+			# operation.** SSE has no three-operand form: `op S2,S1,D`
+			# becomes `movaps S1,D; op S2,D`, which is what `lower_vex`
+			# emits for a Class C site one width down. The upper half is
+			# the same shape between slots -- the two sources' slots into
+			# the two helpers, the operation between them, and the result
+			# into the destination's slot, which is a THIRD slot and the
+			# reason this shape needs the region's slot count rather than
+			# a span's two.
+			if second_helper is None or second is None or third is None:
+				return None
+			destination, source2, source1 = shape[1], shape[2], shape[3]
+			low_dst = scratch_finder.xmm_numbers(destination)[0]
+			low_s2 = scratch_finder.xmm_numbers(source2)[0]
+			low_s1 = scratch_finder.xmm_numbers(source1)[0]
+			body += encode_movaps(low_dst, low_s1)
+			operation = inplace.sse_encoding(
+				dict(vex, L=0, R=low_dst >> 3, X=0, B=low_s2 >> 3),
+				tail[:1] + bytes([0xC0 | ((low_dst & 7) << 3)
+				                  | (low_s2 & 7)]))
+			if operation is None:
+				return None
+			body += operation
+			# The upper half, between slots.
+			body += span_slot_move(helper, False, base, third, block,
+			                       at + len(body))
+			body += span_slot_move(second_helper, False, base, second,
+			                       block, at + len(body))
+			operation = inplace.sse_encoding(
+				dict(vex, L=0, R=helper >> 3, X=0, B=second_helper >> 3),
+				tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
+				                  | (second_helper & 7)]))
+			if operation is None:
+				return None
+			body += operation
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
 			continue
 		if what == "lanereg":
 			# **TWO helpers, because a slot cannot be an operand.** The
@@ -4216,6 +4270,16 @@ def region_members(instructions, first, last):
 			return None			# a shape the lowering cannot emit
 		what, register = shape[0], shape[1]
 		if what == "load":
+			if register not in slots:
+				slots[register] = len(slots)
+			defined.add(register)
+		elif what == "lanereg3":
+			# **Reads two and writes a third.** The destination is not a
+			# source, so it need not be defined already -- this DEFINES
+			# it -- but both sources must be, and the destination needs a
+			# slot of its own.
+			if shape[2] not in defined or shape[3] not in defined:
+				return None
 			if register not in slots:
 				slots[register] = len(slots)
 			defined.add(register)

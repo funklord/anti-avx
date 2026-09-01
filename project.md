@@ -9820,6 +9820,59 @@ unreachable through the span, and which the region can now reach.
 reads as progress and cost two rebuilds; the probe that explained it is forty lines and ran
 in three minutes, and it could have been written first.
 
+### Finding 158 -- the three-register shape, and the bound is a chain rather than a place
+
+`op %ymmS2,%ymmS1,%ymmD` with a destination of its own is the largest shape Finding 150
+counted, at 1,367, and the region can reach what no span could. It is built and proved --
+`make check-span` runs it against the original under qemu, bit for bit -- and it lowers
+**zero** sites. Every figure in the binary is identical to the build before it, down to the
+stub section's byte count.
+
+SSE has no three-operand form, so both halves are a move and an operation: `movaps S1,D;
+op S2,D` for the low half, and the same between slots for the upper -- two read into the
+two helpers, the result into a THIRD slot. A version that wrote the result into a source's
+slot would corrupt whatever read that source next, which is why the oracle's case uses
+three distinct registers rather than reusing one.
+
+#### Why it takes nothing, measured properly this time
+
+Twice in a row a conclusion on this item was wrong. Finding 156 said the gap was two dials;
+neither was binding. Finding 157 said the bound was `region_members`; it accepts 82% of
+what it sees. **The bound is a chain, and no single link is it:**
+
+```
+4,445  256-bit sites
+2,858    a region starts at them        offered to region_candidate
+2,357      every member representable   region_members
+1,343        and past the cheap filters .pdata, slots, a helper
+  ~100          lowered in the binary
+```
+
+The two visible constraints are **981 regions with no xmm helper free** -- the
+whole-function bluntness Finding 149 measured, which per-position liveness relieves only
+partly -- and a factor of thirteen between 1,343 and 100 which is NOT measured: it is
+`window_borrow` and `window_gpr_free` asking for a frame region or two dead GPRs across the
+whole region, and placement overlap on top.
+
+**So the shape was never the bound**, and building it first was choosing from a histogram
+that ranks what regions CONTAIN rather than what refuses them. Finding 150 said its buckets
+"rank what to build and partition nothing"; that was the right warning and it was not heard.
+
+#### The probe measured its own missing input, which is the fifth time today
+
+Its first run reported 2,348 regions with no helper and zero passing. `function_ranges`
+came back empty because the probe asked for it the wrong way, so `scope` was None,
+`scope_free` returned nothing, and every region failed the helper test. The output was an
+artefact end to end.
+
+It printed `ranges: UNAVAILABLE` on its first line and the numbers were still nearly
+believed. The fix is an `assert` rather than a note: **a probe with no input must fail
+loudly rather than report zeros**, which is `evidence.md`'s rule about a gate over an empty
+file list, met here for the fifth time in one session -- a fixed scratch measuring the
+example's registers, a fixed exit set flooding the liveness, a fixed wine prefix blaming
+the rewriter, a fixed frame size failing a correct emission, and now a missing range list.
+Every one was a constant that was right for the case it was written against.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

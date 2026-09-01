@@ -75,6 +75,20 @@ CASES = [
 	 [("load", 0, "%ymm0"), ("load", 1, "%ymm1"), ("lane", 2, "%ymm0"),
 	  ("store", 3, "%ymm0")],
 	 {"%ymm0": 0, "%ymm1": 1}),
+	# **Three distinct registers**, the shape Finding 150 counted at 1,367
+	# and the largest the region reaches that no span could. SSE has no
+	# three-operand form, so both halves are a move and an operation, and
+	# THREE slots are in play: two read, one written. A span that wrote the
+	# result into a source's slot would return the wrong value from the
+	# next instruction that read it.
+	("a register second source with a destination of its own",
+	 [("c5fc1006", "vmovups", "(%rsi),%ymm0"),
+	  ("c5fc104e20", "vmovups", "0x20(%rsi),%ymm1"),
+	  ("c5fc58d1", "vaddps", "%ymm1,%ymm0,%ymm2"),
+	  ("c5fc1117", "vmovups", "%ymm2,(%rdi)")],
+	 [("load", 0, "%ymm0"), ("load", 1, "%ymm1"), ("lane", 2, "%ymm2"),
+	  ("store", 3, "%ymm2")],
+	 {"%ymm0": 0, "%ymm1": 1, "%ymm2": 2}),
 	# A multiply rather than an add, so the answer depends on the opcode
 	# surviving the split rather than on the operands alone.
 	("a multiply, whose result differs from an add's",
@@ -86,7 +100,7 @@ CASES = [
 ]
 
 # How many bytes each case writes, and how much input it reads.
-OUT_BYTES = {0: 32, 1: 64, 2: 32, 3: 32}
+OUT_BYTES = {0: 32, 1: 64, 2: 32, 3: 32, 4: 32}
 IN_BYTES = 256
 
 
@@ -113,11 +127,17 @@ def source(name, body):
 	The 32-byte frame is the slot's, and it is the harness standing in for
 	the callee home space a real stub borrows.
 	"""
+	# **128 bytes, not 32.** The frame holds the span's slots, and the
+	# three-register shape uses three -- the third at 0x20, which a
+	# 32-byte frame does not contain. It wrote past the allocation and the
+	# case came back DIFFER with the emission visibly correct, which is
+	# the harness measuring itself. `TLS_SLOTS` slots of sixteen bytes is
+	# the most any span here asks for, and 128 is comfortably that.
 	lines = [".text", f".globl {name}", f".type {name}, @function",
-	         f"{name}:", "\tsubq\t$32, %rsp"]
+	         f"{name}:", "\tsubq\t$128, %rsp"]
 	for i in range(0, len(body), 8):
 		lines.append("\t.byte " + ", ".join(str(b) for b in body[i:i + 8]))
-	lines += ["\taddq\t$32, %rsp", "\tret", ""]
+	lines += ["\taddq\t$128, %rsp", "\tret", ""]
 	return "\n".join(lines) + "\n"
 
 
