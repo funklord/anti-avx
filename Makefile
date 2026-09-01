@@ -73,7 +73,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs check-spill check-tls check-unwind check-vex \
+        census spans gprs shapes check-spill check-tls check-unwind check-vex \
         check-lanes check-span \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -428,6 +428,12 @@ check-tls:
 # and `collect` is what says which sites were starved.
 gprs: $(LISTING)
 	$(PYTHON) tool/detour.py gprs $(TARGET) $(LISTING)
+
+# Every VEX shape the binary contains, and whether the plain lowering path
+# takes it. A measurement, not a gate: the point is the shapes nobody wrote
+# a case for, which no hand-written list can report on itself.
+shapes: $(LISTING)
+	$(PYTHON) tool/shape_census.py $(TARGET) $(LISTING)
 
 # What a closed 256-bit span could reach, which is not what Finding 133's
 # capacity figure suggests. A measurement, not a gate: it always exits 0.

@@ -9596,6 +9596,63 @@ shapes occur inside the structure the lowering actually serves. Twenty minutes o
 against a day of building, and the probe is `span_shape_name` over `ymm_span`, both of
 which already existed.
 
+### Finding 154 -- the shapes enumerated from the binary rather than written down
+
+Every case list in this tree is hand written. `lowering_cases.build` enumerates the shapes
+somebody thought of, `lane_oracle` names its mnemonics, `span_oracle` spells out four
+spans. Each is a good list, and **none of them is derived from the program under test**, so
+a shape the binary contains and nobody wrote down is checked by nothing.
+
+That is not hypothetical. Two defects this week were exactly it: a span's low half read
+from inside the stub section because every case in `span_oracle` used an ordinary
+displacement and none a RIP-relative one; and the alignment fault, because no case put a
+slot in an operand.
+
+`make shapes` derives the list instead.
+
+```
+VEX instructions           805,050
+distinct shapes                669
+  shapes that lower            468   (748,292 instructions)
+  shapes that do not           201   ( 56,758 instructions)
+```
+
+A shape is the mnemonic, the width, memory-or-register per operand, **which operands are
+the same register**, and whether there is an immediate. Register NUMBERS are thrown away:
+keeping them makes sixteen shapes out of one and drowns the result, while keeping the
+aliasing is essential, because `%xmm2,%xmm1,%xmm2` and `%xmm2,%xmm1,%xmm0` are different
+questions and the first needs a scratch. That aliasing is where two of this project's
+silent-corruption bugs lived.
+
+#### What it says, and it is one sentence
+
+**No shape in this binary makes the lowering raise.** 669 of them, and not one hits a case
+nobody considered. That is a claim only enumeration can make, and it is the reason to have
+this rather than a longer hand-written list.
+
+#### What "does not lower" does NOT mean
+
+It asks `lower_vex`, the plain path: one instruction in, SSE bytes out. Everything done
+with a STRATEGY is invisible to it -- the pair and the run split 256-bit moves, a sequence
+juggles `vblendv`'s mask, the span carries a stretch. `vblendvps 128 r0,r1,r2,r0` is 1,234
+instructions and is reported refused; it is Class D and the rewriter handles it.
+
+So 56,758 is an upper bound on what is unhandled and not a residue. `make census` is what
+reconciles against the binary, and this reconciles against nothing -- it reports coverage
+of a path, and the shapes nobody wrote a case for.
+
+#### The instrument measured its own example before it measured the shape
+
+The first run passed `scratch=5` for every shape, so any shape whose example instruction
+happened to use `xmm5` was reported as having no lowering -- and those were the Class C
+aliasing shapes, the ones this census exists to watch. `vmaxss 128 r0,r1,r0` at 806
+instructions, `vxorps` at 477, `vaddps` at 314, all of them handled and all reported
+refused. Picking a scratch the instruction does not name moved eight shapes and 304
+instructions.
+
+**A fixed scratch measures the example's register numbers**, which is the exact thing the
+shape abstraction exists to discard. The census was reporting on its own sample.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9882,6 +9939,9 @@ lane_oracle.py    proves each LANE_WISE mnemonic really does split into two
 span_oracle.py    runs a lowered 256-bit span natively against the original
                   under qemu, which is how a SEQUENCE is proved rather than
                   an instruction
+shape_census.py   every VEX shape the binary contains, derived from it
+                  rather than written down, and whether the plain path
+                  lowers each
 ```
 
 And the targets, since several exist only to carry a measurement:
@@ -9901,6 +9961,8 @@ make detour-plan   what the COLLECTOR refused, and why -- see the warning
 make spans         what a closed 256-bit span could reach (a measurement)
 make gprs          how many volatile GPRs are dead at each starved site,
                    which is what static TLS costs (a measurement)
+make shapes        every VEX shape in the binary and whether it lowers,
+                   which is the list no hand-written case set can check
 ```
 
 ### Practical things that cost time to learn
