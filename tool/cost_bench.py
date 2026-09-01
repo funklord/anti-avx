@@ -27,12 +27,24 @@ rewriter actually creates.
 
 Usage:  cost_bench.py [build directory]
 
-**Read the third column, not the first.** Case 0 is an empty body, so its
-time is the loop's own, and the run-to-run wander is around +-0.3 ns -- one
-case has measured below an empty body, which is impossible and is the honest
-bound on what this can resolve. Everything that merely rearranges the same
-work across registers and memory sits inside that wander. What shows up is
-arithmetic a pair cannot express. See Finding 168.
+**Resolution, and how it is known rather than asserted.** The first version
+called each body once per iteration, so every measurement carried a `call`,
+a frame, a `ret` and a loop -- six or seven cycles wrapped around a
+three-uop sequence the core overlapped with them. Everything read 2.1 ns,
+one case read below an empty body, and nothing could be ranked (Finding
+168). The body is now repeated UNROLL times inside one call, which drops
+the floor to about 0.05 ns, and the passes run outside the cases rather
+than inside, so a drifting clock moves every case together instead of one
+against another.
+
+**The rig checks itself against the ISA.** Eight `addps` in a dependency
+chain must take three times eight independent ones, on any clock, because
+Westmere gives the instruction three cycles of latency and one per cycle of
+throughput. That ratio is printed and enforced: miss it and the tool says
+the table is not a measurement and exits 3. It is the only error here that
+the table cannot show on its own, since every strategy inflating together
+looks exactly like every strategy being slow -- which is what a shared
+machine does. See Finding 169.
 """
 
 import subprocess
@@ -45,7 +57,34 @@ import detour
 import patch as inplace
 
 WORK = Path("build") / "costbench"
-ROUNDS = 4_000_000
+ROUNDS = 100_000
+# **The body is repeated inside the function, not called again.** One
+# `call`, one frame, one `ret`, one counter and one branch cost six or
+# seven cycles on this Westmere, and a lowering is three to five uops the
+# core overlaps with them entirely -- which is why every strategy first
+# measured at 2.1 ns and one measured below an empty body. Repeating the
+# sequence UNROLL times inside one call divides that overhead by UNROLL
+# and leaves the sequence itself as the thing being timed.
+#
+# What this measures is therefore the sequence **back to back with
+# itself**, dependencies and all: a `plain` carries a chain through xmm2
+# and a `spill` reloads the slot it just wrote. That is the hot-loop case,
+# which is the one the rewriter's output has to survive.
+UNROLL = 64
+# The minimum over more passes, because on a contended machine the
+# measurement wanted is the quietest slice that occurred and more passes
+# is more chances at one. Each pass is now a fraction of a second.
+PASSES = 15
+
+# Calibration, and the only sequences here not emitted by a lowering.
+# `addps` on Westmere is 3 cycles of latency and one per cycle of
+# throughput, so eight in a dependency chain must take three times eight
+# independent ones. That ratio is fixed by the ISA and does not depend on
+# the clock, so it checks the harness against something outside itself:
+# a rig that cannot see 3.0 here cannot resolve one cycle anywhere.
+CALIB_CYCLES = 8
+CALIB_INDEP = bytes.fromhex("0f58c1" "0f58d3" "0f58e5" "0f58f7") * 2
+CALIB_DEP = bytes.fromhex("0f58c1") * 8
 
 # A Class C site whose src2 IS the destination, which is what `plain`
 # lowers and what a borrow is needed for when no register is dead.
@@ -145,6 +184,10 @@ def cases():
 	# distinguished from doing nothing -- which is a statement about the
 	# harness's resolution, not about the strategy being free.
 	out.append(("(control) an empty body: the loop's own cost", 1, b""))
+	out.append(("(calibration) 8 independent addps, 1 cycle each", 1,
+	            CALIB_INDEP))
+	out.append(("(calibration) 8 chained addps, 3 cycles each", 1,
+	            CALIB_DEP))
 	out.append(("plain: an aliased site, a dead register to hand", 1,
 	            plain_body()))
 	out.append(("spill: the same site, the register BORROWED (stack)", 1,
@@ -174,11 +217,15 @@ def cases():
 
 
 MAIN = r"""
+#define _GNU_SOURCE
 #include <stdio.h>
+#include <sched.h>
 #include <time.h>
-#define ROUNDS %d
-#define PASSES 9
-%s
+#define ROUNDS @@ROUNDS@@
+#define UNROLL @@UNROLL@@
+#define PASSES @@PASSES@@
+#define NCASES @@NCASES@@
+@@DECLS@@
 /* **Normal floats, not a byte pattern.** The first version filled this
    with i*7+3 and the case carrying an `addps` timed at 87 ns against 5 ns
    for a sequence two instructions shorter -- a microcode assist on
@@ -187,31 +234,79 @@ MAIN = r"""
    near 1.0 are what the rewritten program's own data looks like and what
    the comparison is about. */
 static float buf[128] __attribute__((aligned(64)));
-/* **The minimum of several passes, not one pass.** A single timing of a
-   three-nanosecond body is dominated by whatever else the machine is
-   doing: three consecutive runs gave the pair 3.12, 5.18 and 3.08 ns and
-   the region 3.49, 2.28 and 4.64, which is noise larger than the
-   difference being measured and reverses the ranking between runs.
-   Nothing makes code faster, so the minimum is the measurement and
-   everything above it is interference. */
-static double run(void (*f)(void *out, const void *in)) {
+@@TABLE@@
+/* **Thread CPU time, not wall time.** This machine is shared, and a run
+   taken at load 106 on twelve cores measured a one-cycle dependent add at
+   2.653 ns -- an 8.5x inflation, which is the oversubscription and not the
+   code. CLOCK_THREAD_CPUTIME_ID counts only the time this thread was
+   actually on a CPU, which removes preemption and recovers about 3x of
+   that. It cannot remove an SMT sibling competing for the same ports, so
+   a busy machine still reads slow; that is what the calibration is for. */
+static double once(void (*f)(void *out, const void *in)) {
 	struct timespec a, b;
-	double best = 1e30;
-	f(buf + 64, buf);			/* warm */
-	for (int pass = 0; pass < PASSES; pass++) {
-		clock_gettime(CLOCK_MONOTONIC, &a);
-		for (long i = 0; i < ROUNDS; i++) f(buf + 64, buf);
-		clock_gettime(CLOCK_MONOTONIC, &b);
-		double ns = (b.tv_sec - a.tv_sec) * 1e9
-			+ (b.tv_nsec - a.tv_nsec);
-		if (ns < best) best = ns;
-	}
-	return best;
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &a);
+	for (long i = 0; i < ROUNDS; i++) f(buf + 64, buf);
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &b);
+	return (b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec);
 }
 int main(void) {
-	for (int i = 0; i < 128; i++) buf[i] = 1.0f + (float)(i %% 17) * 0.25f;
-%s
-	return 0;
+	/* Pinned, because a migration between two cases is indistinguishable
+	   from one of them being slower. */
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	CPU_SET(0, &set);
+	sched_setaffinity(0, sizeof set, &set);
+	for (int i = 0; i < 128; i++) buf[i] = 1.0f + (float)(i % 17) * 0.25f;
+	int bad = 0;
+	double best[NCASES];
+	for (int c = 0; c < NCASES; c++) {
+		best[c] = 1e30;
+		FNS[c](buf + 64, buf);		/* warm */
+	}
+	/* **Passes outside, cases inside.** The first version ran all nine
+	   passes of one case before starting the next, so a clock that drifted
+	   between them moved one case against another and nothing shared the
+	   drift -- which is how an aliased lowering measured 0.26 ns FASTER
+	   than an empty body. Interleaved, every case meets the same machine.
+	   Nothing makes code faster, so the minimum is the measurement and
+	   everything above it is interference. */
+	for (int pass = 0; pass < PASSES; pass++)
+		for (int c = 0; c < NCASES; c++) {
+			double ns = once(FNS[c]);
+			if (ns < best[c]) best[c] = ns;
+		}
+	double each[NCASES];
+	for (int c = 0; c < NCASES; c++)
+		each[c] = best[c] / (double)ROUNDS / (double)UNROLL;
+	double floor_ns = each[0];
+	double indep = each[@@INDEP@@] - floor_ns;
+	double dep = each[@@DEP@@] - floor_ns;
+	double per_cycle = indep / @@CALIB@@;	/* ns in one cycle */
+	double ratio = indep > 0 ? dep / indep : 0.0;
+	printf("calibration: %.3f ns per cycle (%.2f GHz apparent); "
+	       "chained/independent addps = %.2f, the ISA says 3.00\n",
+	       per_cycle, 1.0 / per_cycle, ratio);
+	printf("floor (an empty body, per repeat): %.3f ns\n\n", floor_ns);
+	/* **The calibration is a gate, not a decoration.** Two sequences whose
+	   ratio the ISA fixes at 3.00 are the one thing here that can be wrong
+	   in a way the table cannot show: every strategy inflating together
+	   looks exactly like every strategy being slow. If the rig cannot
+	   reproduce a ratio it does not get to rank anything, and saying so is
+	   the whole reason the two cases are in the list. */
+	if (ratio < 2.70 || ratio > 3.30) {
+		printf("cost_bench: the calibration missed 3.00, so what follows "
+		       "is not a measurement -- most likely this machine is\n"
+		       "            busy enough that execution resources are "
+		       "shared. Re-run it quiet; do not rank from these.\n\n");
+		bad = 1;
+	}
+	for (int c = 0; c < NCASES; c++) {
+		double over = each[c] - floor_ns;
+		printf("%-48s %6.2f ns  %6.2f/site  %6.2f cyc\n",
+		       NAMES[c], each[c], over / SITES[c],
+		       per_cycle > 0 ? over / per_cycle : 0.0);
+	}
+	return bad ? 3 : 0;
 }
 """
 
@@ -221,33 +316,39 @@ def build(rows):
 	lines = [".text"]
 	for i, (_name, _sites, body) in enumerate(rows):
 		lines += [f".globl body_{i}", f".type body_{i}, @function",
-		          f"body_{i}:", "\tsubq\t$128, %rsp"]
-		for at in range(0, len(body), 8):
-			lines.append("\t.byte " + ", ".join(str(b)
-			                                    for b in body[at:at + 8]))
+		          "\t.p2align 6", f"body_{i}:", "\tsubq\t$128, %rsp"]
+		# **Every case starts from the same register file, holding the
+		# same normal floats.** Without this a lowering read whatever the
+		# previous case left in xmm1 and xmm2 -- possibly a denormal, and
+		# the denormal assist is the fault that once turned one extra
+		# instruction into 87 ns. Once per call, outside the repeat.
+		for r in range(8):
+			lines.append(f"\tmovaps\t{r * 16}(%rsi), %xmm{r}")
+		for _ in range(UNROLL):
+			for at in range(0, len(body), 8):
+				lines.append("\t.byte " + ", ".join(
+					str(b) for b in body[at:at + 8]))
 		lines += ["\taddq\t$128, %rsp", "\tret", ""]
 	(WORK / "bodies.s").write_text("\n".join(lines) + "\n")
 	decls = "\n".join(f"extern void body_{i}(void *out, const void *in);"
 	                  for i in range(len(rows)))
-	# **One run, two columns.** The first version called `run` once per
-	# column, so the total and the per-site figure came from different
-	# measurements and did not divide -- 3.24 ns printed beside 1.79
-	# ns/site for two sites. A number that cannot be checked against the
-	# one beside it invites being believed separately.
-	# **The floor is subtracted, not left to the reader.** Case 0 is the
-	# empty body, so its time is the loop's own -- counter, branch, call
-	# and return. Every raw figure here sits within about 1 ns of it, and
-	# the first reading of this table took 2.11 ns for a measurement of a
-	# strategy when it was very nearly a measurement of the loop. The
-	# third column is the part that is actually the lowering's.
-	calls = "\n".join(
-		f'\t{{ double t = run(body_{i}) / ROUNDS;'
-		f' if ({i} == 0) floor = t;'
-		f' printf("%-46s %8.2f ns  %6.2f ns/site  %+6.2f over floor\\n",'
-		f' "{name}", t, t / {sites}, t - floor); }}'
-		for i, (name, sites, _b) in enumerate(rows))
-	calls = "\tdouble floor = 0.0;\n" + calls
-	(WORK / "bench.c").write_text(MAIN % (ROUNDS, decls, calls))
+	names = ",\n\t".join('"%s"' % name for name, _s, _b in rows)
+	table = ("static void (*const FNS[])(void *, const void *) = {\n\t"
+	         + ", ".join(f"body_{i}" for i in range(len(rows)))
+	         + "\n};\n"
+	         + "static const char *const NAMES[] = {\n\t" + names + "\n};\n"
+	         + "static const double SITES[] = {\n\t"
+	         + ", ".join(str(float(sites)) for _n, sites, _b in rows)
+	         + "\n};\n")
+	source = MAIN
+	for token, value in (("@@ROUNDS@@", ROUNDS), ("@@UNROLL@@", UNROLL),
+	                     ("@@PASSES@@", PASSES), ("@@NCASES@@", len(rows)),
+	                     ("@@DECLS@@", decls), ("@@TABLE@@", table),
+	                     ("@@INDEP@@", 1), ("@@DEP@@", 2),
+	                     ("@@CALIB@@", float(CALIB_CYCLES))):
+		source = source.replace(token, str(value))
+	assert "@@" not in source, "a template token was left unfilled"
+	(WORK / "bench.c").write_text(source)
 	binary = WORK / "bench"
 	subprocess.run(["gcc", "-O2", "-o", str(binary), str(WORK / "bench.c"),
 	                str(WORK / "bodies.s")], check=True, timeout=300)
@@ -264,13 +365,22 @@ def main():
 		      "emitters changed rather than that there is nothing to time",
 		      file=sys.stderr)
 		return 2
-	print(f"== {len(rows)} lowerings, {ROUNDS:,} rounds each, buffer in L1 ==")
+	load = Path("/proc/loadavg").read_text().split()[0]
+	print(f"== {len(rows)} bodies, {ROUNDS:,} x {UNROLL} repeats each, "
+	      f"buffer in L1, load average {load} ==")
 	for name, sites, body in rows:
 		print(f"   {name:<46} {len(body):>4} bytes, {sites} site(s)")
 	print()
 	done = subprocess.run([str(build(rows))], capture_output=True, text=True,
 	                      timeout=600)
 	print(done.stdout, end="")
+	if done.returncode == 3:
+		# The benchmark ran and its self-check failed. That is a report
+		# about the machine, not a crash, and it has already said so on
+		# stdout -- but it must not exit 0, or a caller that checks the
+		# status learns the opposite of what the text says.
+		print(f"cost_bench: load average now {load}", file=sys.stderr)
+		return 3
 	if done.returncode != 0:
 		print(f"cost_bench: the benchmark exited {done.returncode}",
 		      file=sys.stderr)

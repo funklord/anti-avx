@@ -10363,6 +10363,11 @@ process, a residual against a measurement, and a shared count against a per-caus
 
 ### Finding 168 -- the time model for the rest of the strategies, and the floor under all of them
 
+**Superseded by Finding 169, and wrong in its conclusion.** The floor this records was
+mostly the harness timing its own `call` and `ret`, not a limit on what the strategies cost.
+Kept because the reasoning from a broken instrument is the point: the table was read
+correctly and the instrument was never checked against anything outside itself.
+
 The byte model ranks the strategies over a 4x spread: `splat` 7.2 bytes per site, `pair`
 12.4, `plain` 13.2, `zero` 16.0, `spill` 24.4, `conststore` 30.8. `cost_bench` timed three
 of them; this took the rest, emitting each body from its real lowering -- `lower_vex` for
@@ -10419,6 +10424,97 @@ The earlier reading of the same harness -- 7.56 ns for the region's copy-with-an
 against 2.71 ns for the identical body a minute later -- was the same wander, seen before
 there was a control to compare it against and briefly believed. A minimum of nine passes
 bounds sampling noise and does nothing about a floor that moves between cases.
+
+
+### Finding 169 -- the harness could not separate the strategies because it was timing itself
+
+Finding 168 reported every strategy at 2.1 ns, one of them below an empty body, and called
+the +-0.3 ns wander the honest bound on the rig. The bound was real and the diagnosis was
+incomplete: **almost all of that 2.1 ns was the harness**, and two structural faults put it
+there.
+
+**The body was called once per iteration.** Every measurement carried a `call`, a
+`subq`/`addq` frame, a `ret`, a loop counter and a branch -- six or seven cycles on this
+Westmere -- wrapped around a sequence of three to five uops that the out-of-order core
+overlapped with them completely. The strategies were not indistinguishable; they were
+invisible behind a constant. Repeating the sequence 64 times inside one call amortises that
+overhead by 64 and **drops the floor from 2.11 ns to 0.054 ns, a factor of 39.**
+
+**And each case was measured to completion before the next began.** `run()` did all nine
+passes of one case, then all nine of the next, so a clock that drifted between them moved
+one case against another with nothing sharing the drift. That is precisely how an aliased
+`plain` came out 0.26 ns faster than an empty body. The pass loop now runs outside the case
+loop, so every case meets the same machine.
+
+Two smaller things went with them. Each body is aligned to 64 bytes, so code alignment stops
+being a per-case lottery; and each body's prologue loads xmm0-7 from the buffer, so a
+lowering no longer reads whatever the previous case happened to leave in xmm1 -- which could
+be a denormal, and the denormal assist is the fault that once turned one extra instruction
+into 87 ns.
+
+**What the rig now resolves, and how that is known rather than claimed.** The table gained
+two cases that are not lowerings at all: eight `addps` in a dependency chain, and eight
+independent ones. Westmere gives `addps` three cycles of latency and one per cycle of
+throughput, so the first must take three times the second **on any clock**, which checks the
+harness against something outside itself. Before the fix the rig reported an apparent 0.86
+GHz on a 3.19 GHz part and a ratio of 2.45. After it, a run at load 90 reported **3.14 GHz
+apparent and a ratio of 2.81** -- the instrument now recovers the machine's real clock to
+within 2%.
+
+That calibration is enforced, not printed. Outside 2.70-3.30 the tool says the table is not
+a measurement and **exits 3**. It is the one error the table cannot show on its own: every
+strategy inflating together looks exactly like every strategy being slow, which is what a
+shared machine does to a benchmark. A rig that cannot reproduce a ratio fixed by the ISA has
+not earned the right to rank anything.
+
+**The remaining limit is not the harness, and it is worth writing down because it is not
+going away.** This machine carries a load average of 90-120 on twelve cores -- other work in
+other trees, eight to ten times oversubscribed. A dependent chain of one-cycle integer adds,
+which must take exactly one cycle each, measured 2.653 ns under wall time: an 8.5x inflation
+that is the contention and nothing else. Switching the harness to `CLOCK_THREAD_CPUTIME_ID`,
+which counts only time the thread was actually on a CPU, recovers about 3x of that; it cannot
+recover the rest, because an SMT sibling competing for the same issue ports is time the
+thread genuinely spent running. The gate passes at load 90 and fails from about 100 upward,
+which is the tool correctly describing the machine it is on.
+
+**A run at load 73.8 passed the gate**, at a ratio of 2.91 with the chained calibration
+reading 23.25 cycles against the ISA's 24 -- inside 3%. That is the measurement:
+
+```
+                                              ns    ns/site   cycles
+(control) an empty body                     0.04      0.00      0.00
+(calibration) 8 independent addps           2.45      2.41      8.00
+(calibration) 8 chained addps               7.03      6.99     23.25   (ISA: 24)
+zero: 256-bit store of an emptied register  0.62      0.57      1.91
+pair: 256-bit copy, register helper         0.70      0.33      2.20
+plain: aliased site, a dead register        1.01      0.96      3.20
+run: load, add, store, split in place       1.25      0.40      4.02
+region: the same copy, through a slot       1.33      0.64      4.27
+spill: same site, the register BORROWED     1.52      1.48      4.91
+region: a copy with an add                  2.51      0.82      8.20
+```
+
+**Finding 168's conclusion is withdrawn.** It said the byte model has no consequence in time
+and that nothing separates the strategies. Both were artefacts of the rig. The strategies
+span 1.91 to 8.20 cycles, a 4.3x range, and the byte model broadly tracks it.
+
+Three results fall out, and the first is the one this benchmark was built for:
+
+- **A region costs 1.94x a pair for the identical copy** -- 4.27 cycles against 2.20. The
+  docstring's premise was that a `movups` to a memory slot and a `movaps` between registers
+  are the same length and not the same cost, and that this is the one comparison bytes
+  understate. It is: bytes rate them 22 against 14, a factor of 1.57, where the machine says
+  1.94. The byte model understates the region, which argues for the pair keeping its place
+  ahead of the region in `collect`'s chain rather than the other way about.
+- **The borrow costs 1.71 cycles**, `spill` at 4.91 against the same site's `plain` at 3.20.
+  Real, and smaller than 24.4 bytes against 13.2 implies. The store forwards; what is left is
+  two extra uops, not a round trip to memory.
+- **`plain` is the byte model's worst case.** By bytes it sits second cheapest of the five
+  timed; by cycles it is second dearest. Three dependent SSE operations in a chain are
+  short to encode and slow to retire, which is the whole reason bytes are not cycles.
+
+Per site, which is the number that decides anything: pair 1.10, run 1.34, zero 1.91, region
+2.13, region-with-add 2.73, plain 3.20, spill 4.91 cycles.
 
 
 ## Picking this up again
