@@ -11414,18 +11414,32 @@ That was written when the risk looked concentrated in milestone 3 -- sound disas
 and reassembly of a large stripped PE -- and in verification. **Half of it has moved.**
 Milestone 3 was routed around rather than solved.
 
-**What is left is 7,224 sites of 805,131, and it is not evenly hard.** 2,599 are 128-bit
-and measured to their floor: nine in ten of what still refuses is the program genuinely
-using the memory the rewriter wanted to borrow, so no analysis reaches them and only the
-rewriter's own memory will -- static TLS, whose file format is proven and whose addressing
-is not built. 4,445 are 256-bit and are one problem: a value that exists only in a
-register no SSE instruction can reach. That problem has been scoped twice now, and the
-local answer is worth 212 sites while the general one is a whole-function rewrite nobody
-has started.
+**What is left is 6,405 sites of 805,131, and it is not evenly hard.** Roughly 1,900 are
+128-bit and were measured to their floor by Finding 137: nine in ten of what refuses is
+the program genuinely using the memory the rewriter wanted to borrow, so no analysis
+reaches them and only the rewriter's own memory would. **That memory now exists.** Static
+TLS is built and is the default backing store (Finding 142), worth 671 sites, and what is
+left under it is 579 sites with no home space AND fewer than two dead general-purpose
+registers -- a floor of a different kind rather than an analysis gap.
 
-**The honest reading is that the remaining work is smaller than it was and harder per
-site.** Every cheap mechanism is built; what is left needs either a new place to put
-bytes or a real representation change, and both are named, priced and unstarted.
+About 4,400 are 256-bit and are one problem: a value that exists only in a register no SSE
+instruction can reach. **The representation for it is built too.** The span emits (Finding
+144) and the call-free region emits arithmetic no span could (Finding 156), together worth
+about 150 sites, and Findings 158 to 161 measured every link of why it is not more: 2,858
+regions offered, 2,357 whose members are all representable, 1,343 past the filters, and
+about 100 lowered -- because earlier strategies take the sites and reordering costs more
+than it gains (Finding 161: 1,145 windows for seven sites).
+
+180 of the 6,405 are not instructions at all. They sit inside Finding 8's undecodable
+islands and `decode_vex` reads their bytes as a prefix.
+
+**The honest reading has changed shape.** When this was written every remaining mechanism
+was unbuilt and the work was "build them". They are built -- static TLS, the span, the
+region, per-position liveness for both register files -- and the residue did not fall the
+way the site counts predicted. What is left is not a mechanism but an ALLOCATION problem:
+which strategy should lower which site, measured in cost rather than count. Finding 162
+priced every strategy in bytes per site and Finding 163 in nanoseconds, and those two
+tables are the first instruments here that can answer it.
 
 Verification is where the risk actually concentrated, and it earned that. Four defects
 here produced silently wrong output while passing every structural check -- the `src2`
@@ -11450,6 +11464,13 @@ five times running -- Findings 106 to 110 -- and twice it named something the ce
 filed under the wrong cause. The frontier is at `0x1428D1492` now, 305 modules in, and it
 names a 256-bit store of a register a `vpxor` emptied six instructions above it, refused
 because a `.pdata` function start lies in between.
+
+**That frontier has not been re-measured since**, and it is the number this document most
+wants and least has. Every site count here comes from `make detour` and `make census`,
+which say what the file contains; only running the binary says what it EXECUTES, and the
+two are different questions. 6,405 sites survive in the file and nobody knows how many lie
+on a reached path. Re-taking the frontier is one wine run and it has not been done in a
+hundred findings.
 
 Reproduce the measurements with:
 
