@@ -9050,36 +9050,37 @@ code quickly.
 
 ### Where the residue actually is
 
-**Re-measured 2026-08-29, after Findings 130 to 138.** `make detour-plan` names every
-refusal and `make census` reconciles them against the binary; these are the buckets that
-matter, with the count outside any accepted window beside the total, because a site inside
-one has already been taken by whatever strategy claimed that window.
+**Re-measured 2026-09-01, on the default build, which is `--spill=tls` since Finding
+142.** `make detour-plan` names every refusal and `make census` reconciles them against
+the binary; these are the buckets that matter, with the count outside any accepted window
+beside the total, because a site inside one has already been taken by whatever strategy
+claimed that window.
 
 ```
                                                 total   outside
 ymm value has no known upper half              10,015       966
 256-bit: arithmetic rather than a copy          1,974     1,818
-no home space to borrow                         1,332       992
+no home space to borrow                           579       461
 256-bit: no store before 256-bit arithmetic       359       282
 outside .pdata                                    325       325
-next instruction is a branch target               206       206
+next instruction is a branch target               209       209
 the constant is read by something that
   will not reload it                              182       182
 256-bit: no store before the value is touched     173       150
 256-bit: no store before a control transfer       161       160
 256-bit: no store before a branch target          139       138
                                                           -----
-everything left, all buckets                              5,596
+everything left, all buckets                              5,095
 ```
 
 The census reconciles exactly, which is the number to trust:
 
 ```
-VEX in the rewritten .text          7,224
-  declined by the collector          6,145
-  refused, stub not buildable          549
+VEX in the rewritten .text          6,553
+  declined by the collector          5,424
+  refused, stub not buildable          595
   inside a committed window              0
-  skipped for overlap                  449
+  skipped for overlap                  453
   undecodable, never classified         81
   unaccounted                            0
 ```
@@ -9088,16 +9089,24 @@ VEX in the rewritten .text          7,224
 matters:**
 
 ```
-  256-bit     4,445
-  128-bit     2,599
-  undecodable   180
+                 now    under --spill=home
+  256-bit      4,445                 4,445
+  128-bit      1,928                 2,599
+  undecodable    180                   180
 ```
+
+**Every one of Finding 142's 671 sites is 128-bit, and the 256-bit half did not move at
+all.** 2,599 - 1,928 = 671 exactly. That is what static TLS was aimed at and it is worth
+recording as a check on the mechanism rather than only as an outcome: a per-thread slot
+lends a register to a site that could find no home space, and `no home space to borrow` is
+a 128-bit refusal. A gain that had shown up in the 256-bit column would have meant
+something else was happening.
 
 **The 180 are not instructions.** They sit inside Finding 8's 744 undecodable islands,
 `decode_vex` reads their bytes as a prefix, and they are then counted as refused sites in
 a bucket that reads like work. Nothing needs doing about them except knowing.
 
-#### The 128-bit half is at its floor
+#### The 128-bit half was at its floor, and the floor was the backing store
 
 Findings 130, 131, 134, 135 and 136 took `no home space to borrow` from 2,153 to 1,332 in
 four increments of 479, 414, 263 and 80. **Finding 137 then measured what is left rather
@@ -9106,13 +9115,21 @@ than calling it diminishing returns**: of the 1,032 refused because a reader is 
 ABI reserves it for -- and 104 are a loop or an edge the CFG declines to model. The other
 300 are structural.
 
+That measurement stands and was never the thing to attack. Its conclusion was that **no
+further ANALYSIS reaches this half, and what remains wants memory of the rewriter's own**
+-- and Finding 142 built it. `no home space to borrow` is 579 now, and every one of the
+671 sites is 128-bit. The 928 genuine forward reads are still genuine forward reads; they
+simply no longer decide the site, because the site is not asking the program for its
+memory any more.
+
+**What is left of this half is 579 sites with no home space AND fewer than two dead
+general-purpose registers**, which is a real floor rather than an analysis gap: Finding
+141's per-position liveness is already the sharp form of that question, and 394 of the
+1,332 had no volatile register free at all.
+
 `outside .pdata` is near its ceiling too: `outside.py` already accepts 17,237 of the
 17,604 VEX sites in the chunks it can see, and relaxing it is worth 52 sites in two small
 classes plus 315 in chunks holding bytes objdump cannot decode.
-
-**So no further analysis reaches this half. What remains wants memory of the rewriter's
-own**, and that is static TLS -- whose file-format half is now `make check-tls` rather
-than a sentence (Finding 138).
 
 #### The 256-bit half is one problem stated several ways
 
