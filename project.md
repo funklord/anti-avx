@@ -10077,7 +10077,7 @@ other lowering at all.
 **`zerorun` at 9.4 and `splat` at 7.2 are the cheapest**, both for the same reason: one
 window serving many stores of a value that is already known.
 
-#### What it is not
+#### What bytes cannot say
 
 Bytes are a proxy for time and an imperfect one. A `movups` to a memory slot and a `movaps`
 between registers are the same length and not the same cost -- **which is exactly the
