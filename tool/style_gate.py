@@ -129,14 +129,23 @@ DEFAULTS: Config = {
 	# Makefiles. They still get the text checks.
 	#
 	# Files whose indentation is ours to govern.
-	# `.rs` is deliberately absent. This tool has no Rust parser, so the line
-	# rule cannot tell a string literal from code and reports the usage text
-	# inside one as space-indented -- 97 such findings in netcfgd, none real.
-	# Rust is not unchecked: `rustfmt` with `hard_tabs = true` enforces the
-	# same rule and does have a parser. Check what you can read; defer the
-	# rest to something that can, rather than guessing loudly.
+	# `.rs` is here, but without the column heuristic -- see
+	# NO_COLUMN_HEURISTIC below. It was absent because this tool has no Rust
+	# parser, so the line rule cannot tell a string literal from code and
+	# reported a `--help` text inside one as space-indented: 118 findings in
+	# netcfgd, none real, 106 of them in a single literal.
+	#
+	# That reasoning was right about the heuristic and wrong to drop the
+	# whole file. The note it replaced said Rust was covered anyway because
+	# `rustfmt` with `hard_tabs = true` has a parser and enforces the same
+	# rule -- true in netcfgd, which configures it; false in situ, whose
+	# single `runtime/rust/situ_rt.rs` has no rustfmt.toml and no `cargo
+	# fmt` anywhere in its build. A claim about how another tree is covered
+	# had been generalised from the tree that measured it.
+	#
+	# So Rust gets the checks that need no parser and not the one that does.
 	"indent_suffixes": [".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".py",
-	                    ".situ", ".ebnf", ".lua"],
+	                    ".situ", ".ebnf", ".lua", ".rs"],
 	"indent_names": [],
 
 	# Files that get the text checks (trailing space, final newline, and
@@ -561,6 +570,30 @@ def is_comment_continuation(line: str) -> bool:
 C_SUFFIXES = frozenset({".c", ".h", ".cpp", ".hpp", ".cc", ".hh"})
 
 
+# Suffixes whose files are gated WITHOUT the column heuristic -- the
+# "space-indented line; use tabs" rule, the only line check that needs to
+# know where a string literal begins.
+#
+# The gate had this backwards, and Rust was the first language to show it.
+# Python has its literal rows skipped; C and C++ stand the heuristic down
+# because a depth-aware fixer knows better. A language with NEITHER got the
+# strictest reading with the least knowledge, so the only way to avoid
+# reporting a here-doc of usage text was to leave the language out of the
+# gate altogether. Standing the heuristic down instead keeps space-before-
+# tab, trailing whitespace, carriage returns, the final newline and ASCII,
+# all of which are exact at every width and need no parser.
+#
+# This is `code-style.md`'s existing trade for the ASCII rule, where a
+# language with no lexer here gets the whole-file byte check rather than
+# nothing -- not a new precedent.
+NO_COLUMN_HEURISTIC = frozenset({".rs"})
+
+
+def wants_column_heuristic(path: Path) -> bool:
+	"""False where a leading space cannot be read as indentation with confidence."""
+	return not has_fixer(path) and path.suffix not in NO_COLUMN_HEURISTIC
+
+
 def has_fixer(path: Path) -> bool:
 	"""True where a depth-aware converter exists, making the line rule redundant."""
 	return is_python(path) or path.suffix in C_SUFFIXES
@@ -832,7 +865,26 @@ def check_text(text: str, where: Path, indent: bool = True,
 	"""
 	problems: list[Problem] = []
 	previous = ""
-	for number, line in enumerate(text.splitlines(), start=1):
+	# split("\n") rather than splitlines(), which CONSUMES the "\r" of a
+	# "\r\n" as part of the line ending -- so the carriage-return check
+	# below could never fire, in any tree, for any language, from the day it
+	# was written. It reads as a live check and is not one: a CRLF file
+	# passes clean. Found 2026-09-01 by sabotaging each Rust check in turn
+	# while adding that language, which is the only reason it surfaced --
+	# nothing in this workspace has a CRLF file to have caught it honestly.
+	#
+	# splitlines() also breaks on form feed and the Unicode separators,
+	# which would number lines differently from every other tool; split()
+	# agrees with git, diff and the compiler.
+	for number, line in enumerate(text.split("\n"), start=1):
+		# The carriage return is reported and then removed, so the trailing-
+		# whitespace rule below does not report the same character again
+		# under a name that hides what it is.
+		if line.endswith("\r"):
+			problems.append(Problem(where, number, len(line),
+			                        "carriage return"))
+			line = line[:-1]
+
 		# A backslash-continued line's leading whitespace is alignment under
 		# whatever it continues, not indentation -- a Makefile variable list
 		# aligned under its first entry sits at depth 0 and correctly carries
@@ -929,7 +981,7 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 	# have no fixer, where something is better than nothing.
 	skip = python_literal_lines(text) if is_python(path) else frozenset()
 	problems.extend(check_text(text, rel, wants_indent(path, cfg), skip,
-	                           heuristic=not has_fixer(path)))
+	                           heuristic=wants_column_heuristic(path)))
 
 	# Where a fixer exists, "tabs-then-spaces" is the weaker of two possible
 	# questions. The C fixer also knows what LEVEL each line belongs at, so a
@@ -1805,8 +1857,18 @@ def main(argv: list[str]) -> int:
 	# level it declined to write, and the comparison reads that. The
 	# caveat goes with the gap rather than outliving it, which is the only
 	# reason to touch this line at all.
+	# Naming the files that are only PARTLY checked, because a pass line
+	# that does not is the thing this one was rewritten to stop being. The
+	# column rule needs to know where a string literal starts; for a
+	# language this tool cannot lex it is stood down, and those files get
+	# every check that is exact without a parser and not that one.
+	partial = sum(1 for f in files
+	              if wants_indent(f, cfg) and not wants_column_heuristic(f)
+	              and not has_fixer(f))
+	note = (f" ({partial} without the column rule, which needs a parser "
+	        f"this tool does not have)" if partial else "")
 	print(f"style-gate: {len(files)} file(s) pass: whitespace and "
-	      f"indentation")
+	      f"indentation{note}")
 	return 0
 
 
