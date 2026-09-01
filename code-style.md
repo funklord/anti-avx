@@ -169,11 +169,11 @@ Settled exceptions:
   `CMakeLists.txt`, `AndroidManifest.xml`, `Dockerfile`, `Cargo.toml`.
 - **Root files with an established convention** -- `README.md`, `LICENSE`,
   `CHANGELOG.md`, `AUTHORS`, `VERSION`. The last is this workspace's own
-  rather than the wider world's, and is settled by use: thirteen of the
-  fourteen private projects track one, and a build reads it for the
-  package version and for whatever the program prints, so the number
-  lives in exactly one place. `claude-guidelines` is the one without it,
-  and it packages nothing.
+  rather than the wider world's, and is settled by use: a project that
+  packages or ships a version tracks one, and a build reads it for the
+  package version and for whatever the program prints, so the number lives
+  in exactly one place. `claude-guidelines` is the exception, because it
+  packages nothing.
 - **Package-system spellings** -- kebab-case where Cargo or Debian require
   it.
 
