@@ -86,10 +86,14 @@ def explain(binary, listing, address):
 	last = detour.region_end(instructions, first, blocked)
 	print(f"  region        0x{instructions[first][0]:x} .. "
 	      f"0x{instructions[last - 1][0]:x}, {last - first} instruction(s)")
-	if first != index:
-		print(f"  region head   NO -- the region starts at "
-		      f"0x{instructions[first][0]:x}, and a region is offered only "
-		      f"at its first instruction")
+	# Through `region_anchor` rather than a rule of its own: this printed
+	# "offered only at its first instruction" for one commit after the
+	# collector had stopped believing it.
+	anchor = detour.region_anchor(instructions, first, last)
+	if anchor != index:
+		where = f"0x{instructions[anchor][0]:x}" if anchor is not None \
+			else "nowhere -- the region holds no 256-bit site"
+		print(f"  region offered at {where}, not here")
 	found = detour.region_members(instructions, first, last)
 	if found is None:
 		print("  region members REFUSED -- a shape it cannot emit, or a "

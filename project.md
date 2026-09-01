@@ -10190,6 +10190,128 @@ nobody looked at: regions whose head is not a VEX instruction. **The single most
 consequential address in this project is one of them**, and two commands found it where a
 day of building did not.
 
+### Finding 165 -- the anchor fixed, measured on a build where the region was OFF
+
+**Every number below is wrong and Finding 166 has the right ones.** It is kept because the
+way it was wrong is the point: the measurement was taken on a binary built with the region
+disabled by a regression this session had shipped an hour earlier and not noticed, so it
+measured nothing about the anchor. The conclusion "worth nothing" was drawn from a build
+that could not have shown a gain whatever the anchor did.
+
+The original text follows.
+
+### Finding 165a -- the anchor fixed, worth nothing, and the tool had already said so
+
+Finding 164 found that the region containing the frontier site begins at a non-VEX
+instruction, and that `region_candidate` -- called only from `collect`'s 256-bit branch --
+could therefore never be offered it. Unreachable by construction rather than outranked.
+
+Fixed: a region is offered at its first 256-bit SITE now, not its first instruction. The
+binary does not change.
+
+```
+                       before    after
+span windows               21       21
+span sites                135      135
+pair                    7,255    7,255
+stub bytes          3,757,025  3,757,025
+```
+
+Byte for byte identical. Regions whose head is not a VEX instruction are either rare or
+refused for another reason, and the tool had already said which.
+
+#### `make why` printed both reasons and only one was read
+
+Its output on the frontier site was two lines, not one:
+
+```
+  region head   NO -- the region starts at 0x1428d1479
+  region members REFUSED -- a shape it cannot emit, or a value
+                            defined outside the region
+```
+
+**The second line was on the same screen as the first.** The head was fixed and treated as
+the explanation, when the region's members were refused independently and still are. The
+information was not missing; the line that matched what was about to be built got read and
+the other did not.
+
+That is the fifth wrong prediction on this item -- the dials, `region_members`, the shape,
+placement, and now the anchor -- and it is the first one where the correct answer was
+already printed. The others needed a probe. This one needed reading.
+
+#### One thing the fix did earn
+
+`region_anchor` is a function now and both `region_candidate` and `why.py` call it.
+`why.py` had its own copy of the rule and went on printing "offered only at its first
+instruction" for a commit after the collector had stopped believing it. **Two places
+holding one rule** is what `SPAN_EMITTABLE` exists to prevent between the survey and the
+lowering, and it appeared again between the explainer and the collector within an hour of
+the explainer existing.
+
+#### And a limit of the cache, measured by using it
+
+`probe.py` keys on `detour.py`'s mtime, so every edit to the rewriter invalidates
+everything and costs the full 524 seconds. **It is a probing tool, not a building one.** A
+session asking questions of a stable tree gets fifteenfold; a session editing the collector
+gets nothing and pays a rebuild each time. Today was both, which is its worst case. The key
+is still right -- the other direction serves stale answers -- but the win is narrower than
+"twelve minutes saved per question" suggested.
+
+### Finding 166 -- the switch that turned the region off, and the 135 sites it hid
+
+**6,405 -> 6,270.** The best count this project has had, and getting there meant undoing a
+regression it had shipped.
+
+```
+                            survivors   detours   span windows   span sites
+region disabled (the bug)       6,505   202,555            21          135
+before the bug                  6,405   202,562            21          135
+restored, with the anchor       6,270   202,629           185          688
+```
+
+#### The regression
+
+Finding 161 moved the region to the head of `collect`'s chain, measured the trade, and put
+it back. **It did not put it back.** Moving it deleted the late call site and made the new
+one conditional on `REGION_FIRST`, so setting the flag to False did not restore the old
+order -- it disabled the region entirely. 100 sites, shipped under a commit message saying
+the opposite.
+
+Nothing caught it because nothing was run. The `REGION_FIRST = True` build was verified;
+the revert was a one-line flag flip and was committed without re-measuring, on the
+judgement that a flag flip is too small to need a build. Every gate that would have caught
+it is a build that was skipped.
+
+**A switch must select between two behaviours that both exist.** `--spill=home` and
+`--spill=tls` do; `--rsp=blanket` and `--rsp=followed` do; `REGION_FIRST` selected between
+one behaviour and none. It selects between two positions now, and both call sites are in
+the file.
+
+#### What the bug hid
+
+Finding 165 measured the anchor fix at zero on a binary with the region switched off. With
+it on, the anchor is worth **135 sites** -- `span` goes from 21 windows to 185 and from 135
+sites to 688. Offering a region at its first 256-bit SITE rather than its first
+INSTRUCTION reaches regions whose head is an ordinary `mov`, which is most of them, and
+`make why` on the frontier address is what pointed at the rule in the first place.
+
+So the tool was right, the fix was right, and the measurement was taken against a broken
+build. **The instrument was sound and the specimen was not** -- which is a failure this
+document has recorded in every other direction and not yet in this one.
+
+#### What the reach costs
+
+```
+kind    windows   sites    stub B   B/site
+pair      7,252  14,504   180,279     12.4
+span        185     688    12,759     18.5
+```
+
+18.5 against the region's previous 16.9, and against a pair's 12.4. **The new regions are
+dearer per site than the old ones**, which is what reaching further looks like: the easy
+regions were already taken and these carry more members for the same slot traffic. They
+lower sites nothing else can, which is the only reason to pay it.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

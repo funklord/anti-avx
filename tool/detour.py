@@ -4311,6 +4311,34 @@ def region_members(instructions, first, last):
 	return (members, slots) if slots else None
 
 
+def region_anchor(instructions, first, last):
+	"""The position a region is offered at, or None if it has no site.
+
+	**Once per region, at its first 256-bit SITE.** Once per region because
+	asking at every member would build the same window many times and let
+	the placer commit whichever it saw first. At the first site rather than
+	the first INSTRUCTION because `region_candidate` is only ever called
+	from `collect`'s 256-bit branch -- so a region whose head is an
+	ordinary `mov` was never visited at all, unreachable by construction
+	rather than outranked, which is a different failure from Finding 160's.
+
+	`make why` found it on the frontier address: the region containing
+	`0x1428d1492` begins at `mov %rdi,0x8(%r11)`, and no VEX site in it
+	could ever have been the head.
+
+	A function rather than a rule written twice, because `why.py` reports
+	this and had its own copy for one commit -- long enough to print the
+	old answer after the collector had the new one. Two places holding one
+	rule is what `SPAN_EMITTABLE` exists to prevent between the survey and
+	the lowering, met again between the explainer and the collector.
+	"""
+	for position in range(first, last):
+		vex = inplace.decode_vex(instructions[position][1])
+		if vex is not None and vex["L"]:
+			return position
+	return None
+
+
 def region_candidate(instructions, plain, positions, index, blocked, home,
                      ranges, scope, tls, limit=24):
 	"""A candidate lowering a whole call-free region, or None.
@@ -4339,13 +4367,12 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 	is not the bound and never was. Finding 157.
 	"""
 	first = region_start(instructions, index, blocked)
-	if first is None or first != index:
-		# Offered once per region, at its first instruction. Asking at
-		# every member would build the same window many times and let the
-		# placer commit whichever it saw first.
+	if first is None:
 		return None
 	last = region_end(instructions, first, blocked)
 	if last - first > limit:
+		return None
+	if region_anchor(instructions, first, last) != index:
 		return None
 	closing = instructions[last - 1][2]
 	if closing.startswith(CONTROL_PREFIXES):
@@ -5924,6 +5951,22 @@ def collect(binary, listing):
 			                         tls_slot_offset)
 			if spanned is not None:
 				candidates.append(spanned)
+				continue
+
+		# **The region in its late position**, which `REGION_FIRST = False`
+		# selects. The switch chooses BETWEEN TWO PLACES and not between
+		# on and off: the first version of it deleted this call and made
+		# the early one conditional, so turning the switch back off did
+		# not restore the old order, it disabled the region -- 100 sites,
+		# shipped in a commit whose message said "put it back", and found
+		# only when a later verify came back 6,505 against a 6,405
+		# baseline. Finding 166.
+		if vex["L"] and not REGION_FIRST:
+			regional = region_candidate(instructions, plain, positions,
+			                            index, blocked, home, ranges,
+			                            scope, tls_slot_offset)
+			if regional is not None:
+				candidates.append(regional)
 				continue
 
 		if carried is None:
