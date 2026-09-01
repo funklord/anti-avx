@@ -9440,6 +9440,62 @@ reload rung gained 51 by plan and lost 49 in the binary. **Every measurement tak
 item has moved the number down**, four times now, and the honest reading is that the design
 is worth a few hundred sites rather than a few thousand.
 
+### Finding 151 -- the region is worth 101 sites more than what is built, and that settles the order
+
+The intersection Finding 150 left unmeasured, which is the first figure on this item that
+is a site count rather than a population.
+
+```
+  the span, built and shipping                 342
+  a region, every bound taken                  443
+```
+
+**101 sites**, for a design substantially larger than the span, and before placement --
+which is not a rounding error here: the ladder's reload rung gained 51 sites by
+`detour-plan` and lost 49 in the binary (Finding 126).
+
+#### The sequence, because the shape of it is the finding
+
+Every measurement on this item has been a different population, and each was smaller than
+the one before it once the right question was asked:
+
+```
+  Finding 133   1,674   room for the upper halves      capacity
+                  212   reachable by a closed span     reach, same day
+  Finding 143     342   with a per-thread block        built
+  Finding 147   3,355   represented by a region        not a site count, said so
+  Finding 149     689   slots and a helper as well
+  Finding 150   1,237   fully emittable                a different population
+  Finding 151     443   emittable AND affordable       the intersection
+```
+
+**1,237 and 689 are not comparable and neither is an answer.** They are two different
+subsets of the same 3,355, and taking either for the result would have overstated the
+design by two or three hundred sites. That is the same error Finding 133 made with 1,674,
+made twice more in the same week, and caught each time only by asking what the number was
+a count OF.
+
+#### So build the shape, not the region
+
+The region is worth 101 sites over the span. The shape histogram says why:
+
+```
+  1,367  a register second source, D of its own
+    990  a register second source, D reused
+```
+
+**That shape is the biggest single population on the list, and the span is already built.**
+`slot_tail` was written for it and has never been called: the second source's slot has to
+be a memory OPERAND of the operation rather than something moved in and out. Building it
+into `lower_ymm_span` is small, measurable against the binary immediately, benefits the
+342 sites that already ship -- and raises the region's 443 as well, because the
+intersection is bounded by emittability.
+
+**The order that follows from the numbers is the shape first and the region afterwards, if
+at all.** A design worth 101 sites is not obviously worth building at the size this one is;
+a design worth 101 sites plus whatever the shape adds might be. Nobody can tell yet, and
+that is the honest state.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9615,25 +9671,27 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **Emit the 256-bit span**, at **342 sites** -- Finding 143, which re-prices Finding
-     133's 212 against a per-thread block instead of against 32 bytes of home space. The
-     analysis has existed since Finding 133 and has never emitted anything; what is
-     unbuilt is the lowering. It is the smaller of the two remaining items by a wide
-     margin, and it would be the first thing here to EMIT 256-bit code rather than
-     measure it.
+  1. **The register-second-source shape**, at 1,367 and 990 sites for its two forms and
+     the biggest single population in Finding 150's histogram. `slot_tail` is written for
+     it and has never been called: the second source's slot has to be a memory OPERAND of
+     the operation rather than something moved in and out. It raises the span that is
+     already built and shipping, and it raises the region's ceiling too. Do this before
+     the region, which Finding 151 costs at 101 sites over the span.
   2. **Region-based 256-bit rewriting**, which is what "whole-function" should have said
      -- see Finding 147. A call-free region is the largest unit over which an upper half
      can be represented, because the ABI kills every one of them at a call; and at a
      region's edges the span's two hard constraints both dissolve. 3,355 of the 4,494
      surviving 256-bit sites have every ymm they read defined inside their own region,
-     and **689 of those can also afford the slots and registers** (Findings 148 and 149)
-     -- against 342 for the span that is already built, so the design is worth about 347
-     sites as costed today. The helper comes from the UNION of the whole-function rule
-     and per-position liveness, which are sound for different reasons and neither of
-     which contains the other; per-position alone is worse than the blunt rule, which is
-     Finding 149 and not what was expected. Still uncounted: the emittable shapes, of
-     which `span_operand_shape` handles three, and placement. **It is the only large item
-     left**, which is the real state of the project rather than a complaint about it.
+     689 of those can also afford the slots and a helper (Findings 148 and 149), and
+     **443 of those are also emittable, which is the buildable number** -- 101 sites more
+     than the span already ships (Finding 151). The helper comes from the UNION of the
+     whole-function rule and per-position liveness, which are sound for different reasons
+     and neither of which contains the other; per-position alone is worse than the blunt
+     rule, which is Finding 149 and not what was expected. **101 sites is a small return
+     on a design this size**, and placement is still on top of it -- so build item 1
+     first and re-take this number, because the shape raises the 443 as well. It remains
+     the only large item left, which is the real state of the project rather than a
+     complaint about it.
 
 **And do not re-mine these.** Each has a number saying why:
 

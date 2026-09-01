@@ -7809,6 +7809,7 @@ def span_survey(binary, listing, patched):
 	region_covered, region_refused = set(), Counter()
 	region_cache, region_slots, region_cost = {}, Counter(), Counter()
 	region_whole = region_emittable = 0
+	region_buildable = set()
 	region_shapes = Counter()
 
 	def inside_here(instructions, begin, finish, blocked):
@@ -7900,7 +7901,8 @@ def span_survey(binary, listing, patched):
 				region_whole += 1
 			for name in shapes - SPAN_EMITTABLE:
 				region_shapes[name] += 1
-			if not (shapes - SPAN_EMITTABLE):
+			emittable = not (shapes - SPAN_EMITTABLE)
+			if emittable:
 				region_emittable += 1
 			region_slots[min(peak, 9)] += 1
 			if not helpers:
@@ -7911,6 +7913,12 @@ def span_survey(binary, listing, patched):
 				region_cost[f"wants more than {TLS_SLOTS} slots"] += 1
 			else:
 				region_cost["slots and registers both available"] += 1
+				# **The intersection, which is the buildable number.**
+				# Emittable and affordable are different populations over
+				# the same 3,355, and every earlier figure on this item
+				# was one population read as though it were the answer.
+				if emittable:
+					region_buildable.add(address)
 		else:
 			region_refused[refusal] += 1
 		why = []
@@ -7995,6 +8003,8 @@ def span_survey(binary, listing, patched):
 	print("  what the rest would need built, by site:")
 	for name, count in region_shapes.most_common(10):
 		print(f"    {count:>7,}  {name}")
+	print(f"\n  BUILDABLE: emittable AND affordable        "
+	      f"{len(region_buildable):>6,}")
 	if tls_here is not None:
 		print("\nspans that do NOT fit the home space, priced against a "
 		      "per-thread block:")
