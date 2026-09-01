@@ -1205,9 +1205,27 @@ def convert_c(text: str, width: int,
 						virtual += 1
 						head_paren = None
 				elif counting and c == "{":
-					# The brace takes the level the braceless body would have
-					# had, rather than adding a second one on top of it.
-					if virtual:
+					# The brace takes the level the braceless body would
+					# have had, rather than adding a second one on top of
+					# it -- but only a body that is still waiting INSIDE
+					# this block. The enclosing frame's fourth field is the
+					# count that was already open when the block was
+					# entered, and those belong to a statement this whole
+					# block is only a part of. Taking one of those is how a
+					# lambda ate an enclosing loop's level:
+					#
+					#     for (int y = 0; y < n; ++y)
+					#             for (int x = 0; x < n; ++x) {
+					#                     auto g = [&] {
+					#                             h();
+					#                     };
+					#
+					# the inner `for`'s brace has already taken the outer
+					# one's body, and what is left pending is the outer
+					# `for`'s, which this block is inside of. The lambda's
+					# brace opens an expression, not that body.
+					body_floor = stack[-1][3] if stack else 0
+					if virtual > body_floor:
 						virtual -= 1
 					await_body = False
 					# Remember the paren depth this block opened at. A C++
