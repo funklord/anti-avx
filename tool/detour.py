@@ -3591,7 +3591,28 @@ def slot_tail(register, base, slot):
 		+ struct.pack("<i", offset)
 
 
-def lower_ymm_span(members, instructions, base, helper, slots, at, pool):
+def span_entries(members, instructions, slots, scope, plain):
+	"""The span's members resolved to bytes, as `build_stub` needs them.
+
+	`lower_ymm_span` is handed this rather than the listing, for
+	`lower_ymm_run`'s reason: a stub is built long after the collector
+	walked, and a strategy that carried positions would have to carry the
+	listing with them.
+	"""
+	out = []
+	for kind, position, register in members:
+		address, encoding, mnemonic, operands, comment = instructions[position]
+		moved = None
+		if kind == "plain":
+			moved = (address, encoding, comment, operands, mnemonic,
+			         swallowed_scratch(plain, position, address, encoding,
+			                           operands, mnemonic, scope))
+		out.append((kind, address, encoding, mnemonic, operands,
+		            slots.get(register), moved))
+	return out
+
+
+def lower_ymm_span(entries, base, helper, at, pool):
 	"""The span, with every upper half kept in a 16-byte slot. Bytes or None.
 
 	**The first thing here that emits 256-bit work rather than measuring
@@ -3609,11 +3630,9 @@ def lower_ymm_span(members, instructions, base, helper, slots, at, pool):
 	operations whose second source is memory -- see `span_operand_shape`.
 	"""
 	body = bytearray()
-	for kind, position, register in members:
-		address, encoding, mnemonic, operands, _c = instructions[position]
+	for kind, address, encoding, mnemonic, operands, slot, moved in entries:
 		if kind == "plain":
-			fixed = moved_instruction((address, encoding, None, operands,
-			                           mnemonic), at + len(body), pool)
+			fixed = moved_instruction(moved[:5], at + len(body), pool)
 			if fixed is None:
 				return None
 			body += fixed
@@ -3622,11 +3641,10 @@ def lower_ymm_span(members, instructions, base, helper, slots, at, pool):
 		if vex is None or not vex["L"]:
 			return None
 		tail = encoding[vex["length"]:]
-		shape = span_operand_shape(vex, tail, operands, slots)
-		if shape is None or shape[1] not in slots:
+		shape = span_operand_shape(vex, tail, operands, None)
+		if shape is None or slot is None:
 			return None
-		what, wide = shape
-		slot = slots[wide]
+		what = shape[0]
 		if what == "load":
 			low = narrow_piece(vex, tail, 0, address, len(encoding),
 			                   at + len(body))
@@ -3672,6 +3690,82 @@ def lower_ymm_span(members, instructions, base, helper, slots, at, pool):
 		body += piece
 		body += encode_spill(helper, True, at + len(body), 0, slot, base)
 	return bytes(body)
+
+
+def span_helper(scope, address, entries):
+	"""One xmm free across the whole span, or None.
+
+	**The whole-function argument and nothing cleverer**, deliberately.
+	`find_scratch` answers for a POINT and a span needs a register dead at
+	every instruction in it; `assign_helpers` answers per position, which is
+	what a run wants because a run can change helper mid-flight and a span
+	cannot -- the slot traffic all goes through one register. So this asks
+	`function_scope`, which says a register the function never names is free
+	everywhere in it, and then removes anything the span's own operands
+	mention.
+
+	That is blunt and it is the first increment's bound rather than the
+	mechanism's. Finding 141 built the per-position machinery for
+	general-purpose registers and nobody has pointed it at xmm.
+	"""
+	free = set(scratch_finder.scope_free(scope, address))
+	if not free:
+		return None
+	for _kind, _address, _encoding, _mnemonic, operands, _slot, _moved \
+			in entries:
+		free -= set(scratch_finder.xmm_numbers(operands or ""))
+	return min(free) if free else None
+
+
+def span_candidate(instructions, plain, positions, index, blocked, home,
+                   ranges, scope):
+	"""A candidate that lowers a whole 256-bit span, or None.
+
+	The span is the analysis Finding 133 built and Findings 140 and 143
+	priced; this is what turns one into a window the placer can commit.
+	Every condition below is a way the representation fails rather than a
+	tidiness rule:
+
+	  * it must CLOSE -- every upper half dead at the end -- which
+	    `ymm_span` decides;
+	  * the function must lend enough slots at one displacement, which is
+	    `window_borrow`'s question and not `borrow_offset`'s, because the
+	    save and the restore are written once for the whole window;
+	  * one xmm must be free across all of it, since the slot traffic goes
+	    through a single register;
+	  * and every member must be a shape `lower_ymm_span` can emit, which
+	    is asked by building the bytes rather than by classifying.
+	"""
+	address, encoding, mnemonic, operands, _c = instructions[index]
+	found = ymm_span(instructions, index, blocked, positions)
+	if found is None:
+		return None
+	members, last, peak = found
+	tail_entry = instructions[members[-1][1]]
+	window = tail_entry[0] + len(tail_entry[1]) - address
+	if window < 5 or not inplace.covered_by(ranges, address, window):
+		return None
+	base = window_borrow(home, address, window)
+	if base is None or peak > SLOTS_PER_REGION:
+		# The first increment takes the callee home space only: 32 bytes,
+		# two slots, at one displacement for the whole window. The shadow
+		# and a per-thread block are what Finding 143 priced and neither is
+		# wired here.
+		return None
+	slots = {}
+	for _kind, _position, register in members:
+		if register is not None and register not in slots:
+			slots[register] = len(slots)
+	if len(slots) > SLOTS_PER_REGION:
+		return None
+	entries = span_entries(members, instructions, slots, scope, plain)
+	helper = span_helper(scope, address, entries)
+	if helper is None:
+		return None
+	if lower_ymm_span(entries, base, helper, address, address) is None:
+		return None
+	return (address, encoding, operands, mnemonic, window, [], None, [],
+	        ("span", (entries, helper)))
 
 
 def value_survives_loop(instructions, index, register, blocked, sources,
@@ -4602,6 +4696,23 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		if SPILL == SPILL_STACK:
 			body += STACK_CLOSE
 		lowered = b""
+	elif kind == "span":
+		# **The upper halves live in the callee home space for the length
+		# of the window**, which is why the displacement has to be one
+		# number over all of it -- `window_borrow`'s argument, and the
+		# reason a span holding a `push` is refused rather than restored
+		# from somewhere the save never wrote.
+		entries, helper = strategy[1]
+		if base is None:
+			if reasons is not None:
+				reasons["the span will not hold one slot displacement"] += 1
+			return None, 0
+		lowered = lower_ymm_span(entries, base, helper,
+		                         stub_address + len(body), pool)
+		if lowered is None:
+			if reasons is not None:
+				reasons["the span operand cannot be moved"] += 1
+			return None, 0
 	elif kind == "zero":
 		vex = inplace.decode_vex(encoding)
 		lowered = lower_ymm_zero_store(vex, encoding[vex["length"]:], site,
@@ -5061,6 +5172,29 @@ def collect(binary, listing):
 				carried = held_back(
 					pair_reason,
 					refusal or "no register free across the ymm run")
+		# **The span, where the run did not take the site.** A run carries
+		# copies and whatever lies between them; a span carries arithmetic
+		# too, by keeping each upper half in a 16-byte slot rather than in a
+		# helper register. Both anchor at a 256-bit load, so the span is
+		# offered second -- Finding 125's rule, that a strategy which cannot
+		# lower a site must not consume it, and its corollary that one which
+		# CAN must not be reached only through one that did. Reaching here
+		# at all means the run did not take it: every path that takes a site
+		# continues.
+		#
+		# **Outside the run's own arm, deliberately.** The first wiring sat
+		# inside `if found is not None`, so a load whose next instruction is
+		# arithmetic -- which is exactly what stops a run, and exactly what
+		# a span exists for -- never reached it. It took zero sites and
+		# every gate stayed green, because a strategy nobody offers is
+		# indistinguishable from one that refuses.
+		if vex["L"]:
+			spanned = span_candidate(instructions, plain, positions, index,
+			                         blocked, home, ranges, scope)
+			if spanned is not None:
+				candidates.append(spanned)
+				continue
+
 		if carried is None:
 			carried = pair_reason
 
@@ -7684,6 +7818,12 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			entries = strategy[1][1]
 			for entry in entries[1:]:
 				swallowed.add(entry[4])
+		if strategy is not None and strategy[0] == "span":
+			# The window's first byte keeps its boundary because the jump is
+			# written there; every member after the first loses its own.
+			# Each entry's second field is its address.
+			for entry in strategy[1][0][1:]:
+				swallowed.add(entry[1])
 		if strategy is not None and strategy[0] == "splatop":
 			# The insert keeps the window's first byte; the operation and
 			# the store both lose theirs. Each half of the strategy is

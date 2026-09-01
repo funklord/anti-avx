@@ -89,8 +89,8 @@ def rows_of(case):
 
 def emit(case, helper=5):
 	"""The span's bytes, or None if it refuses."""
-	return detour.lower_ymm_span(case[2], rows_of(case), 0, helper,
-	                             case[3], 0x2000, 0)
+	entries = detour.span_entries(case[2], rows_of(case), case[3], None, [])
+	return detour.lower_ymm_span(entries, 0, helper, 0x2000, 0)
 
 
 def source(name, body):

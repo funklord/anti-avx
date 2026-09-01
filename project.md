@@ -9114,6 +9114,53 @@ is lowered by it and the binary is unchanged. What exists is the lowering and th
 that it computes the right answer; what is unbuilt is choosing sites and placing them,
 which is where the 342 of Finding 143 would come from.
 
+### Finding 145 -- the span is wired in, and a strategy nobody offers looks exactly like one that refuses
+
+**6,553 -> 6,535 surviving VEX sites.** 18 removed, and the span is the first strategy here
+to lower 256-bit arithmetic rather than copies. `span_candidate` turns a closed span into a
+window and `build_stub` emits it through `lower_ymm_span`.
+
+Note the shape of the numbers: detours went DOWN by 22 while survivors went down by 18. A
+span covers several instructions in one window, so one detour replaces several -- the
+count of detours is not the count of work done, and never was.
+
+#### The first wiring took zero sites and every gate passed
+
+It was placed inside the run's own arm -- `if found is not None`, where `found` is a run.
+A span exists precisely for a load whose next instruction is arithmetic, and **arithmetic
+is what stops a run**, so the one case it was built for could never reach it. The build
+was clean: `detour-verify` green, `check-span` green, the lowering proven bit-for-bit
+against the original under qemu, and the site count identical to the digit.
+
+**A strategy nobody offers is indistinguishable from one that refuses**, and nothing in the
+gate set can tell them apart. Every check here answers "is what you emitted correct"; none
+answers "was it ever asked for". The only signal was the site count not moving, which is
+why costing a change against the binary is the rule (Finding 126) and why "it verified" is
+not evidence that a feature exists.
+
+It is offered after the whole run attempt now. Reaching that point already means the run
+did not take the site, because every path that takes one continues.
+
+#### 18 and not 342, which is the first increment's bound rather than the mechanism's
+
+Finding 143 priced a span at 342 sites. This takes 18, and every gap is a condition written
+into `span_candidate` on purpose:
+
+  * **the callee home space only** -- 32 bytes, two slots, at one displacement for the
+    whole window. The caller's shadow and the per-thread block are what Finding 143's 342
+    counts and neither is wired;
+  * **peak of two slots**, for the same reason;
+  * **one arithmetic shape**, `op mem,%ymmD,%ymmD`, which is what SSE expresses by dropping
+    the prefix. An operation whose second source is another tracked ymm needs that source's
+    slot as a memory OPERAND, and `slot_tail` is written for it and still uncalled;
+  * **a blunt helper**, from `function_scope`'s whole-function argument -- a register the
+    function never names is free everywhere in it. `find_scratch` answers for a point and a
+    span needs one register dead at every instruction; Finding 141 built the per-position
+    machinery for general-purpose registers and nobody has pointed it at xmm.
+
+Each is a separate increment with its own measurement, and none of them is a design
+question. **The mechanism is proved; what is unbuilt is its reach.**
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
