@@ -10135,6 +10135,61 @@ extra instructions, and a ranking that flipped. That is the same habit this sess
 needed repeatedly and it is not a gate -- it is reading the number and asking whether it
 can be true.
 
+### Finding 164 -- the cache, the explainer, and what they said about the frontier
+
+Two tools, built because this session spent more time re-deriving the same data than
+measuring anything with it.
+
+**`make probe` caches what every measurement starts with.** Parsing the 927 MB listing and
+building the home-space map is 524 seconds; warm it is 35. That twelve minutes was paid
+about fifteen times today for data unchanged since the binary was unpacked.
+
+The design is the key, not the cache. It covers the binary and the listing by size and
+mtime, the size and mtime of all five tool files that could change the answer, and the flag
+values -- so editing `detour.py` or switching `--spill` MISSES rather than being served a
+stale answer. Deliberately over-conservative: an unrelated comment change costs one
+rebuild, and the other direction costs a wrong measurement, which is the mistake this
+session made six times in other forms. `--verify` builds everything twice and requires
+agreement; it does, which is the only reason the cache is trusted.
+
+**`make why ADDR=0x...` answers what a fault hands you.** The frontier method -- run, die,
+the address names a site, the site names a strategy -- has been the project's most
+productive and its least tooled, and getting from an address to an answer meant writing a
+probe. Six were written today and two measured their own missing input.
+
+#### What it said about the frontier, immediately
+
+```
+0x1428d1492: vmovdqu %ymm0,0x28(%rsp)
+  width         256-bit
+  shape         store
+  inside .pdata yes
+  branch target no
+  xmm free by the whole-function rule  none
+  plain lowering refuses it
+  region        0x1428d1479 .. 0x1428d149f, 10 instruction(s)
+  region head   NO -- the region starts at 0x1428d1479
+  region members REFUSED
+```
+
+And then, in one more command:
+
+```
+0x1428d1479: mov %rdi,0x8(%r11)
+  not VEX, so the rewriter has no business with it
+```
+
+**The region containing the frontier site begins at a non-VEX instruction**, and
+`region_candidate` is only ever called from `collect`'s 256-bit branch. So that region can
+never be offered at all -- not outranked by an earlier strategy, which is Finding 160's
+problem, but unreachable by construction. Every VEX member inside it fails the
+`first != index` test and the head is never visited.
+
+The 2,858 sites that earlier probe counted as "a region starts at them" have a complement
+nobody looked at: regions whose head is not a VEX instruction. **The single most
+consequential address in this project is one of them**, and two commands found it where a
+day of building did not.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -10429,6 +10484,11 @@ vex_oracle.py     runs the original VEX under qemu against the lowering's
                   bytes natively, which is how a host with no AVX checks
 lane_oracle.py    proves each LANE_WISE mnemonic really does split into two
                   128-bit halves, under execution rather than by argument
+probe.py          cached access to the listing, the ranges, the scope and
+                  the home map -- 524 seconds cold, 35 warm, keyed so an
+                  edit misses rather than serving a stale answer
+why.py            everything known about one address, which is what a
+                  fault hands you
 cost_bench.py     times what each lowering emits, because bytes are not
                   cycles; the minimum of nine passes, since nothing makes
                   code faster
@@ -10460,6 +10520,8 @@ make detour-plan   what the COLLECTOR refused, and why -- see the warning
 make spans         what a closed 256-bit span could reach (a measurement)
 make gprs          how many volatile GPRs are dead at each starved site,
                    which is what static TLS costs (a measurement)
+make probe         warm the cache every measurement reads through
+make why ADDR=0x.. what is known about one address, and what refuses it
 make cost-bench    what a lowering costs in TIME, which is the question
                    `make detour`'s byte table cannot answer
 make shapes        every VEX shape in the binary and whether it lowers,

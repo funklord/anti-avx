@@ -73,7 +73,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs shapes cost-bench check-spill check-tls check-unwind check-vex \
+        census spans gprs shapes cost-bench probe why check-spill check-tls check-unwind check-vex \
         check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -429,6 +429,20 @@ check-tls:
 # and `collect` is what says which sites were starved.
 gprs: $(LISTING)
 	$(PYTHON) tool/detour.py gprs $(TARGET) $(LISTING)
+
+# Warm the cache every measurement here reads through. Parsing the listing
+# and building the home-space map is about twelve minutes and the answer
+# has not changed since the binary was unpacked; `probe.py` keys the cache
+# on the binary, the listing, every tool that could change the answer, and
+# the flag values, so an edit misses rather than serving a stale answer.
+probe: $(LISTING)
+	$(PYTHON) tool/probe.py $(TARGET) $(LISTING)
+
+# Everything known about one address, which is what a fault hands you.
+# `make why ADDR=0x1428d1492`
+why: $(LISTING)
+	@test -n "$(ADDR)" || { echo "why: pass ADDR=0x..."; exit 1; }
+	$(PYTHON) tool/why.py $(TARGET) $(LISTING) $(ADDR)
 
 # What each lowering costs in TIME, which bytes cannot say: a movups to a
 # memory slot and a movaps between registers are the same length and not
