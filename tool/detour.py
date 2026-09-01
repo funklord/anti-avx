@@ -3982,6 +3982,13 @@ def span_entries(members, instructions, slots, scope, plain):
 # wants one slot and a span wants its peak, and the two never overlap in
 # time -- a stub runs to completion before another is entered on the same
 # thread -- so they share the area rather than each needing their own.
+# **Four, and raising it was measured to buy nothing.** Finding 148's slot
+# histogram says regions wanting five to eight upper halves at once are 585
+# sites, so eight looked like the obvious turn of the dial. It changed the
+# binary not at all -- the regions this offers are three to twelve
+# instructions long and rarely hold five distinct values. Kept at four
+# because a bigger `SizeOfZeroFill` for no sites is a cost with no return.
+# Finding 157.
 TLS_SLOTS = 4
 
 
@@ -4245,7 +4252,10 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 	bound rather than a correctness one. A region may run to 192, and a
 	window that long swallows everything inside it and collides with every
 	candidate it covers -- which is Finding 126's lesson at a scale nobody
-	has measured. Small first, then widen with the binary as the judge.
+	has measured. Small first, then widen with the binary as the judge --
+	and widening it to 64 was measured and moved nothing, because the
+	regions this offers run to twelve instructions and not to 192. The cap
+	is not the bound and never was. Finding 157.
 	"""
 	first = region_start(instructions, index, blocked)
 	if first is None or first != index:

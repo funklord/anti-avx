@@ -9770,6 +9770,56 @@ both are dials, and neither has been turned. **Widening them is the next measure
 it is the first time on this item that the next step is a number to raise rather than a
 question to answer.
 
+### Finding 157 -- both dials turned, nothing moved, and the closing claim was wrong
+
+Finding 156 ended by saying the region's 100 sites against a costing of 443 was the two
+dials set conservatively, that both were numbers to raise, and that **"the next step is a
+number to raise rather than a question to answer."** Both were raised -- the window cap
+from 24 instructions to 64, `TLS_SLOTS` from four to eight -- and the binary did not change
+by one site.
+
+```
+dials at 24 / 4      6,405 survivors, 202,562 detours, 586 refused
+dials at 64 / 8      6,405 survivors, 202,562 detours, 586 refused
+```
+
+Identical to the digit, and `detour-verify` clean on both.
+
+#### Why neither was binding, measured rather than guessed
+
+```
+256-bit sites                      4,445
+  whose region STARTS at them      2,858   <- offered to region_candidate
+
+region length, for those:
+    3: 200    6: 278    9: 334   12: 154
+    4: 169    7: 208   10: 152
+    5: 179    8: 254   11: 143
+```
+
+**The regions this offers are three to twelve instructions long**, so a cap of 24 was never
+reached and 64 cannot help. A region that short rarely holds five distinct ymm values
+either, so the four-slot ceiling was not binding and eight buys nothing. Both are back
+where they were: a larger `SizeOfZeroFill` and a wider collision surface for no sites is a
+cost with no return.
+
+#### The bound is the one thing that is not a dial
+
+2,858 regions are offered and 100 are taken. What refuses the rest is `region_members`, and
+it is not a setting: **every 256-bit member must be a shape the lowering emits, and every
+ymm any of them reads must be defined inside the region.** One instruction failing either
+spoils the whole region, because a representation is not something a program can have half
+of.
+
+So the next step is a question after all, and it is the one Finding 150 already ranked: the
+shapes. `span_operand_shape` accepts four, and the histogram of what the rest would need is
+led by the register second source -- which Finding 152 built and Finding 153 found
+unreachable through the span, and which the region can now reach.
+
+**The wrong prediction is worth as much as the measurement here.** "A number to raise"
+reads as progress and cost two rebuilds; the probe that explained it is forty lines and ran
+in three minutes, and it could have been written first.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
