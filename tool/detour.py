@@ -3546,6 +3546,134 @@ def lower_ymm_run(strategy, at, pool):
 	return bytes(body)
 
 
+def span_operand_shape(vex, tail, operands, tracked):
+	"""`("load"|"store"|"lane", register)` if this member is one this can
+	emit, else None.
+
+	**The first increment deliberately handles one arithmetic shape**: an
+	operation whose only ymm operand is its own destination, with the other
+	source in memory. That is `op mem,%ymmD,%ymmD`, and it is the shape SSE
+	can express by dropping the prefix -- two operands, destination read and
+	written. Anything with a second ymm SOURCE needs that source's slot as
+	a memory operand of the operation itself, which is a different encoding
+	problem and is not built here.
+
+	A span containing a shape this refuses is not lowered at all rather
+	than lowered in part: a span is a representation, and half of one is a
+	program that reads an upper half nobody wrote.
+	"""
+	fields = inplace.split_operands(operands or "")
+	wide = [f for f in fields if f.startswith("%ymm")]
+	if len(fields) == 2 and len(wide) == 1:
+		if "(" in fields[0] and wide[0] == fields[1]:
+			return ("load", canonical_ymm(fields[1]))
+		if "(" in fields[1] and wide[0] == fields[0]:
+			return ("store", canonical_ymm(fields[0]))
+		return None
+	if len(fields) == 3 and len(wide) == 2 and "(" in fields[0] \
+			and fields[1] == fields[2]:
+		# `op mem,%ymmD,%ymmD` -- src1 IS the destination, so the SSE form
+		# is the prefix dropped and nothing rearranged.
+		return ("lane", canonical_ymm(fields[2]))
+	return None
+
+
+def slot_tail(register, base, slot):
+	"""modrm and SIB for `slot(%rsp)` with modrm.reg = `register`.
+
+	The same address `encode_spill` writes, built as a TAIL so that
+	`sse_encoding` can put any opcode in front of it -- which is what makes
+	an upper half an operand of the operation rather than only something
+	moved in and out.
+	"""
+	offset = base + slot * SLOT
+	return bytes([0x80 | ((register & 7) << 3) | 4, 0x24]) \
+		+ struct.pack("<i", offset)
+
+
+def lower_ymm_span(members, instructions, base, helper, slots, at, pool):
+	"""The span, with every upper half kept in a 16-byte slot. Bytes or None.
+
+	**The first thing here that emits 256-bit work rather than measuring
+	it.** `ymm_span` has been analysis since Finding 133 and priced three
+	times since; this is the lowering it was pricing.
+
+	The shape is one rule applied per member: the low half is the original
+	instruction with `VEX.L` cleared, acting on the real xmm the program
+	already uses, and the upper half is the same operation performed
+	between a slot and `helper`. A load fills both, a store empties both,
+	and an operation reads the slot into `helper`, applies itself, and puts
+	it back.
+
+	`helper` is one register and not two, which is what confines this to
+	operations whose second source is memory -- see `span_operand_shape`.
+	"""
+	body = bytearray()
+	for kind, position, register in members:
+		address, encoding, mnemonic, operands, _c = instructions[position]
+		if kind == "plain":
+			fixed = moved_instruction((address, encoding, None, operands,
+			                           mnemonic), at + len(body), pool)
+			if fixed is None:
+				return None
+			body += fixed
+			continue
+		vex = inplace.decode_vex(encoding)
+		if vex is None or not vex["L"]:
+			return None
+		tail = encoding[vex["length"]:]
+		shape = span_operand_shape(vex, tail, operands, slots)
+		if shape is None or shape[1] not in slots:
+			return None
+		what, wide = shape
+		slot = slots[wide]
+		if what == "load":
+			low = narrow_piece(vex, tail, 0, address, len(encoding),
+			                   at + len(body))
+			if low is None:
+				return None
+			body += low
+			high_vex, high_tail = retarget(vex, tail, helper)
+			piece = narrow_piece(high_vex, high_tail, SLOT, address,
+			                     len(encoding), at + len(body))
+			if piece is None:
+				return None
+			body += piece
+			body += encode_spill(helper, True, at + len(body), 0, slot, base)
+			continue
+		if what == "store":
+			low = narrow_piece(vex, tail, 0, address, len(encoding),
+			                   at + len(body))
+			if low is None:
+				return None
+			body += low
+			body += encode_spill(helper, False, at + len(body), 0, slot,
+			                     base)
+			high_vex, high_tail = retarget(vex, tail, helper)
+			piece = narrow_piece(high_vex, high_tail, SLOT, address,
+			                     len(encoding), at + len(body))
+			if piece is None:
+				return None
+			body += piece
+			continue
+		# A lane-wise operation whose other source is memory. The low half
+		# is the instruction with L cleared; the upper half is the same
+		# opcode between the slot and the helper.
+		low = inplace.sse_encoding(dict(vex, L=0), tail)
+		if low is None:
+			return None
+		body += low
+		body += encode_spill(helper, False, at + len(body), 0, slot, base)
+		high_vex, high_tail = retarget(vex, tail, helper)
+		piece = narrow_piece(high_vex, high_tail, SLOT, address,
+		                     len(encoding), at + len(body))
+		if piece is None:
+			return None
+		body += piece
+		body += encode_spill(helper, True, at + len(body), 0, slot, base)
+	return bytes(body)
+
+
 def value_survives_loop(instructions, index, register, blocked, sources,
                         limit=32):
 	"""True if the loop this store heads cannot disturb the register.

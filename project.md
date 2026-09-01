@@ -9045,6 +9045,75 @@ thing here that would EMIT 256-bit code rather than measure it -- and the whole-
 design afterwards, against a smaller residue that is better understood for having had the
 cheap half taken out of it.
 
+### Finding 144 -- the span emits, and it computes what the original computed
+
+`ymm_span` has been analysis since Finding 133 and has been priced three times without
+emitting a byte. `lower_ymm_span` is the lowering it was pricing, and `make check-span`
+runs it.
+
+```
+	movups	(%rsi),%xmm0		the low half, in the register the program uses
+	movups	0x10(%rsi),%xmm5	the upper half, into the helper
+	movups	%xmm5,(%rsp)		and into its slot
+	addps	0x40(%rsi),%xmm0	the low half's share of the work
+	movups	(%rsp),%xmm5
+	addps	0x50(%rsi),%xmm5	the upper half's, at +16 on the operand
+	movups	%xmm5,(%rsp)
+	movups	%xmm0,(%rdi)
+	movups	(%rsp),%xmm5
+	movups	%xmm5,0x10(%rdi)
+```
+
+One rule per member: **the low half is the original instruction with `VEX.L` cleared,
+acting on the xmm the program already uses; the upper half is the same operation between
+a slot and one helper register.** A load fills both, a store empties both, and an
+operation reads the slot into the helper, applies itself, and puts it back. `narrow_piece`
+does the +16 on every memory operand, rip-relative ones included, and `encode_spill`
+addresses the slot -- both already existed for the run and the borrow.
+
+#### Proved by running it, because shape checks cannot see arithmetic
+
+The project's own lesson is that every structural check here is about shape, and the two
+bugs that produced silently wrong arithmetic had the right shape. So the span is settled
+the way `vex_oracle` settles a lowering, with one difference that earns it a tool of its
+own: **a span is a representation, and what has to hold is not that one instruction
+lowered correctly but that the upper half survives from its definition to its death.**
+Only running the sequence end to end asks that.
+
+```
+   native exit -4 (SIGILL -- host cannot execute the input)
+   a load, a memory-source add and a store                agree
+   two values in two slots, each stored                   agree
+   a multiply, whose result differs from an add's         agree
+   collapsing two slots into one: rejected
+```
+
+The 256-bit original runs under qemu, which decodes VEX on a host that has none; the span
+runs natively, because the span is pure SSE and that is the point of the project. Both
+write 32 bytes and the two must agree bit for bit.
+
+**Three controls.** The capability control requires the 256-bit side to die of SIGILL
+here, so an agreement cannot come from both sides running the same thing. The two-slot
+case exists because a span that gave both values the same sixteen bytes would return one
+of them twice -- Finding 118's defect in the home space, which assembled and verified and
+corrupted a register. And the sabotage collapses those two slots into one deliberately and
+requires the answer to change: inputs that cannot tell two slots from one would make every
+agreement above unearned.
+
+#### What it does not lower yet
+
+An operation whose second source is another tracked ymm. That needs the source's slot as a
+memory OPERAND of the operation rather than as something moved in and out, which is a
+different encoding problem -- `slot_tail` is written for it and nothing calls it yet.
+`span_operand_shape` names the shapes it accepts and refuses the rest, and **a span
+containing one shape it cannot emit is refused whole**: half a representation is a program
+that reads an upper half nobody wrote.
+
+**Nothing in the rewriter calls this yet.** The collector has no span strategy, so no site
+is lowered by it and the binary is unchanged. What exists is the lowering and the proof
+that it computes the right answer; what is unbuilt is choosing sites and placing them,
+which is where the 342 of Finding 143 would come from.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9326,6 +9395,9 @@ vex_oracle.py     runs the original VEX under qemu against the lowering's
                   bytes natively, which is how a host with no AVX checks
 lane_oracle.py    proves each LANE_WISE mnemonic really does split into two
                   128-bit halves, under execution rather than by argument
+span_oracle.py    runs a lowered 256-bit span natively against the original
+                  under qemu, which is how a SEQUENCE is proved rather than
+                  an instruction
 ```
 
 And the targets, since several exist only to carry a measurement:
@@ -9337,6 +9409,8 @@ make check-spill   the four ways a stub gets a scratch, each with its A/B
 make check-tls     whether the loader gives us the per-thread bytes we ask
 make check-unwind  whether an exception dispatches from inside a stub
 make check-vex     the qemu oracle; make check-lanes the lane-wise one
+make check-span    whether a lowered 256-bit span computes what the
+                   original did, end to end
 make detour        rewrite; make detour-verify the structural invariants
 make census        reconcile every survivor to a named cause
 make detour-plan   what the COLLECTOR refused, and why -- see the warning

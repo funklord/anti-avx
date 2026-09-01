@@ -74,7 +74,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
         census spans gprs check-spill check-tls check-unwind check-vex \
-        check-lanes \
+        check-lanes check-span \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -144,6 +144,12 @@ check-vex: | $(BUILD_DIR)
 # table, all under a timeout inside the harness.
 check-lanes: | $(BUILD_DIR)
 	$(PYTHON) tool/lane_oracle.py $(BUILD_DIR)
+
+# Does a lowered 256-bit SPAN compute what the 256-bit original computes?
+# The original runs under qemu because this host has no AVX; the span runs
+# natively, because the span is pure SSE and that is the whole point.
+check-span: | $(BUILD_DIR)
+	$(PYTHON) tool/span_oracle.py $(BUILD_DIR)
 
 # -- the software F16C conversions -------------------------------------------
 
