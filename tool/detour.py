@@ -4404,9 +4404,18 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 	if lower_ymm_span(entries, base, helpers[0], address, address, block,
 	                  second) is None:
 		return None
+	# **Labelled `region`, not `span`.** They share a lowering and nothing
+	# else: a span walks from a load and must close, a region is bounded by
+	# the ABI and carries arithmetic. Sharing the label made every tally
+	# add them together, and that is how a build with the region switched
+	# off read as "the anchor changed nothing" -- `span 21 windows` was 21
+	# spans and zero regions, and looked exactly like 21 of a mixture.
+	#
+	# A count that cannot go to zero for one cause alone cannot serve as
+	# the positive control for a null result about that cause. Finding 167.
 	return (address, instructions[first][1], instructions[first][3],
 	        instructions[first][2], window, [], None, [],
-	        ("span", (entries, helpers[0], block, base, second)))
+	        ("region", (entries, helpers[0], block, base, second)))
 
 
 def span_candidate(instructions, plain, positions, index, blocked, home,
@@ -5406,7 +5415,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		if SPILL == SPILL_STACK:
 			body += STACK_CLOSE
 		lowered = b""
-	elif kind == "span":
+	elif kind in ("span", "region"):
 		# **The upper halves live in the callee home space for the length
 		# of the window**, which is why the displacement has to be one
 		# number over all of it -- `window_borrow`'s argument, and the
@@ -8922,7 +8931,7 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			entries = strategy[1][1]
 			for entry in entries[1:]:
 				swallowed.add(entry[4])
-		if strategy is not None and strategy[0] == "span":
+		if strategy is not None and strategy[0] in ("span", "region"):
 			# The window's first byte keeps its boundary because the jump is
 			# written there; every member after the first loses its own.
 			# Each entry's second field is its address.

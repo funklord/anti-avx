@@ -10312,6 +10312,55 @@ dearer per site than the old ones**, which is what reaching further looks like: 
 regions were already taken and these carry more members for the same slot traffic. They
 lower sites nothing else can, which is the only reason to pay it.
 
+### Finding 167 -- a null result needs a positive control, and a shared label denies it one
+
+Finding 166 recorded the anchor fix being measured at zero on a build where the region was
+switched off, and called it "the instrument was sound and the specimen was not". That is
+the right observation and the wrong stopping point, because it reads as bad luck. It was
+structural.
+
+**The count could not have distinguished the two cases.** Region candidates were labelled
+`"span"`, so the placer tally, the cost table and every other measurement added them
+together. The build with the region disabled reported
+
+```
+span   21 windows   135 sites
+```
+
+and so did the build before it, and so would a build with 21 regions and no spans. Reading
+that as "the anchor changed nothing" was reasonable; **no reading of it could have been
+otherwise**, because the number cannot go to zero for one cause alone.
+
+They are labelled apart now. A span walks from a 256-bit load and must close; a region is
+bounded by the ABI and carries arithmetic; they share a lowering and nothing else, and
+sharing a label was a convenience that cost 135 sites and a wrong write-up.
+
+#### The rule, stated so it survives this instance
+
+**A zero needs a positive control as much as a search for an absence does** -- something
+the instrument would demonstrably have caught, on the same specimen. `evidence.md` has this
+for a passing check over an empty file list, and `lane_oracle` and `span_oracle` both carry
+one for exactly this reason: `--sabotage` rebuilds the answer wrong on purpose and requires
+the harness to notice. A measurement of a CHANGE has the same need and had no such habit
+here.
+
+Concretely, when a change measures at zero the next question is not why it is small but
+**whether the mechanism ran at all**, and that must be answerable from a number the change
+cannot fake. It was not, and now it is.
+
+#### And the failure underneath both of tonight's
+
+Neither the flag revert nor the `nohup` completion was a skipped check. **Each was a
+cheaper thing accepted in place of one**: a prediction standing in for a build, a shell's
+exit standing in for a result. Both felt like the same information for less work and both
+were wrong in a direction nothing would have reported.
+
+That is worth separating from laziness, because the remedy is different. Laziness is fixed
+by discipline; a substitution is fixed by knowing which cheap signals are proxies for which
+expensive ones, and refusing the trade at the points where the proxy can differ silently.
+This session found four such points: a flag flip against a build, a shell exit against a
+process, a residual against a measurement, and a shared count against a per-cause one.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
