@@ -73,7 +73,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs shapes check-spill check-tls check-unwind check-vex \
+        census spans gprs shapes cost-bench check-spill check-tls check-unwind check-vex \
         check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -429,6 +429,12 @@ check-tls:
 # and `collect` is what says which sites were starved.
 gprs: $(LISTING)
 	$(PYTHON) tool/detour.py gprs $(TARGET) $(LISTING)
+
+# What each lowering costs in TIME, which bytes cannot say: a movups to a
+# memory slot and a movaps between registers are the same length and not
+# the same cost. A measurement, not a gate.
+cost-bench: | $(BUILD_DIR)
+	$(PYTHON) tool/cost_bench.py $(BUILD_DIR)
 
 # Every VEX shape the binary contains, and whether the plain lowering path
 # takes it. A measurement, not a gate: the point is the shapes nobody wrote

@@ -10088,6 +10088,53 @@ and nothing here does.
 The in-place patches are not in the table and are the bulk of the work: 547,716 of them,
 each one instruction replaced by another of the same length, costing nothing.
 
+### Finding 163 -- the lowerings timed, and the region is 1.4x a pair for the same copy
+
+Finding 162 priced every strategy in bytes and named the one thing bytes cannot say: a
+`movups` to a memory slot and a `movaps` between registers are the same length and not the
+same cost, which is exactly the region-against-pair question. `make cost-bench` times what
+the lowering functions actually emit.
+
+```
+                                        run 1   run 2   run 3
+pair: 256-bit copy, register helper      2.21    2.29    2.18   ns
+region: same copy, through a slot        3.12    3.44    3.12
+region: copy + add, which a pair cannot  3.81    3.21    4.04
+```
+
+**A pair is about 1.4x faster than a region for the same copy** -- 2.2 ns against 3.1. The
+byte model made the gap 36% and time makes it roughly 42%, so bytes UNDERSTATED it, as
+Finding 162 said they would. Finding 161's revert was right on both measures and is now
+right for a reason that was measured rather than argued.
+
+**The third row is the region's actual case.** 1.07 to 1.35 ns per site, cheaper per site
+than either copy, because one window carries three sites' work. The region is not a worse
+pair; it is the only thing that lowers a load, an arithmetic instruction and a store
+together, and when it does that it is the cheapest per site in the table.
+
+So the ordering the project has is right: pair first, region after. Not because the region
+is bad but because a pair is better at the one thing they both do.
+
+#### Two instruments corrected before the numbers were believed
+
+**The buffer was byte-filled and the arithmetic case timed 87 ns**, sixteen times the
+copy's, for one extra instruction pair. Those bytes are denormal floats and this Westmere
+takes a microcode assist on every one, so the benchmark was measuring the FPU's exception
+path. Normal values near 1.0 -- which is what a rewritten program's data looks like -- put
+it at 4 ns.
+
+**A single timing could not tell the strategies apart.** Three consecutive runs gave the
+pair 3.12, 5.18 and 3.08 ns and the region 3.49, 2.28 and 4.64, which reverses the ranking
+between runs: noise larger than the effect. Nothing makes code faster, so the measurement
+is the MINIMUM of nine passes and everything above it is another process on the machine.
+The numbers above are stable to a few percent across runs because of that and for no other
+reason.
+
+**Both were caught by a number being implausible rather than by a check.** 87 ns for two
+extra instructions, and a ranking that flipped. That is the same habit this session has
+needed repeatedly and it is not a gate -- it is reading the number and asking whether it
+can be true.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -10263,13 +10310,12 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **A cost model in TIME rather than bytes.** Finding 162 built the byte version and
-     `make detour` prints it: `pair` 12.4 B/site, `span` 16.9, `spill` 24.4. It settles
-     ordering questions between strategies of similar shape and cannot settle the one that
-     matters most -- a `movups` to a memory slot and a `movaps` between registers are the
-     same length and not the same cost, which is the whole difference between a region and
-     a pair. `icache_bench.c` exists and measures detour placement; nothing measures a
-     lowering.
+  1. **The region where a pair cannot go.** Finding 163 timed the lowerings: a pair is
+     1.4x faster than a region for the same copy, and a region carrying a load, an
+     arithmetic instruction and a store is the CHEAPEST thing in the table per site. So
+     the ordering is settled -- pair first -- and the open work is making the region take
+     the sites no pair can, which Finding 160 measured at 920 eligible regions against 70
+     candidates and Finding 161 showed cannot be had by reordering alone.
   2. **The collector and the lowering disagree about 386 regions.** `region_members`
      accepts what `lower_ymm_span` then refuses -- an operand `narrow_piece` cannot move,
      or a second helper the region has not got. `SPAN_EMITTABLE` keeps the survey and the
@@ -10383,6 +10429,9 @@ vex_oracle.py     runs the original VEX under qemu against the lowering's
                   bytes natively, which is how a host with no AVX checks
 lane_oracle.py    proves each LANE_WISE mnemonic really does split into two
                   128-bit halves, under execution rather than by argument
+cost_bench.py     times what each lowering emits, because bytes are not
+                  cycles; the minimum of nine passes, since nothing makes
+                  code faster
 span_oracle.py    runs a lowered 256-bit span natively against the original
                   under qemu, which is how a SEQUENCE is proved rather than
                   an instruction
@@ -10411,6 +10460,8 @@ make detour-plan   what the COLLECTOR refused, and why -- see the warning
 make spans         what a closed 256-bit span could reach (a measurement)
 make gprs          how many volatile GPRs are dead at each starved site,
                    which is what static TLS costs (a measurement)
+make cost-bench    what a lowering costs in TIME, which is the question
+                   `make detour`'s byte table cannot answer
 make shapes        every VEX shape in the binary and whether it lowers,
                    which is the list no hand-written case set can check
 make check-shapes  and whether each computes the same answer, with the
