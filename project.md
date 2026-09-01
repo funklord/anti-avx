@@ -9161,6 +9161,59 @@ into `span_candidate` on purpose:
 Each is a separate increment with its own measurement, and none of them is a design
 question. **The mechanism is proved; what is unbuilt is its reach.**
 
+### Finding 146 -- the span reaches the block, and the fixture caught what nothing else could
+
+The span's slots may live in a per-thread block now, not only in the callee home space.
+`span_slot_move` is the whole of the difference -- `(%rsp)` plus a displacement for a frame
+region, a displacement from a general-purpose register for a block -- and the block pointer
+is computed once at the top of the span, which is what `window_gpr_free` had to establish
+before the span was offered. A pointer clobbered mid-span would address another thread's
+data.
+
+The frame comes first wherever it serves, for `--spill=tls`'s reason: a displacement from
+`rsp` needs no register and no directory raised. The block is offered where no frame region
+will lend, or where the span wants more slots than one region holds. `TLS_SLOTS` is four,
+and it is one number for the image because `SizeOfZeroFill` is one number -- the borrow
+spill and a span share the area, since a stub runs to completion before another is entered
+on the same thread.
+
+#### The defect, which every structural check passed
+
+The low half of a lane-wise operation went through `sse_encoding` and the load and the
+store went through `narrow_piece`. Those produce the same bytes for an ordinary
+displacement and differ on a RIP-relative one, **which has to absorb the move into the stub
+as well** -- Finding 43's correction, which `narrow_piece` does and `sse_encoding` cannot,
+because it does not know where the instruction landed.
+
+So the low half of every span whose operation had a rip-relative source read from inside
+the stub section:
+
+```
+	addps	0x41(%rip),%xmm0	# 0x1400040a2  <- the stub, not the data
+	addps	-0x3000(%rip),%xmm4	# 0x140001070  <- correct, addend+16
+```
+
+The upper half was right and the lower was wrong, in the same instruction pair.
+
+**Nothing that existed could see it.** `detour-verify` was clean: the shape is perfect, a
+rip displacement is a rip displacement. `span_oracle` passed, and could not have failed --
+every case in it uses `(%rsi)` and `0x40(%rsi)`, ordinary displacements, so the correction
+it needed was never exercised. And `make detour` reported 30 more sites lowered, which read
+as progress.
+
+`spanblock` is what caught it, and it returned **5** where it wanted 99. It is a leaf whose
+caller's shadow is read after the span, so both frame regions refuse and the block is the
+only backing store left; and it reads its answer from the LAST element of the result, which
+is in the upper half. The fixture was built before the commit precisely because the
+combination it covers -- a span whose slots live in a block -- was new emission that no
+existing check exercised, and it earned that on its first run.
+
+**The lesson is the one this project keeps paying for and it has a new instance.** Every
+structural check here is about shape; a rip-relative displacement pointing at the wrong
+address has exactly the right shape. What catches arithmetic is running it, and what
+decides whether running it MEANS anything is whether the case exercises the path -- the
+oracle ran three spans and proved nothing at all about this one.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

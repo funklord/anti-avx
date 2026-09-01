@@ -1132,7 +1132,7 @@ hundred:	.float 100.0
 # unwind codes claim a frame of zero has its `jmp` refused at -40 and the
 # borrow it exists to test never happens.
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
-          "regionread": 40, "tlsspill": 40}
+          "regionread": 40, "tlsspill": 40, "spanblock": 72}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -1665,6 +1665,63 @@ three:	.float 3.0
 ten:	.float 10.0
 one:	.float 1.0
 hundred:	.float 100.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# 42. A 256-bit SPAN whose slots live in a per-thread block.
+#
+# `span_oracle` proves the span lowering computes the right answer with its
+# slots at `(%rsp)`, and `tlsspill` proves `gs:[0x58]` addressing reaches a
+# per-thread slot. Neither proves the two together, and the combination is
+# what the collector emits wherever a function will lend no frame region --
+# so this is the case that would otherwise be built and never run.
+#
+# A leaf, so there is no callee home space; and its caller's shadow holds a
+# local read AFTER the span, so the shadow cannot be lent either. Both frame
+# regions refuse, exactly as in `tlsspill`, which leaves the block.
+#
+# The answer is read from the LAST element of the result, which is in the
+# UPPER half. A span that lost the upper half -- to a slot addressed wrongly,
+# a block pointer clobbered mid-span, or an operand not moved by +16 --
+# returns something else or faults. The low half's own arithmetic is checked
+# by nothing here on purpose: `span_oracle` compares all 32 bytes, and what
+# this fixture is for is the half that travels through memory.
+#
+# 8.0 + 80.0 = 88.0, plus the 11 kept in the shadow, is 99.
+PROGRAMS["spanblock"] = (99, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp		/* a leaf: no callee home space */
+	vzeroupper
+	movl	$11, 80(%rsp)		/* a local, in the caller's shadow */
+	vmovups	values(%rip), %ymm0	/* the span's load */
+	vaddps	addend(%rip), %ymm0, %ymm0	/* memory-source arithmetic */
+	vmovups	%ymm0, 8(%rsp)		/* the span's store */
+	cvttss2si 36(%rsp), %eax	/* element 7, from the upper half */
+	addl	80(%rsp), %eax		/* read AFTER the span: shadow is live */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+values:
+	.float	1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0
+addend:
+	.float	10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0
 	.p2align 4
 tls_raw:
 	.long	0x55667788, 0x11223344

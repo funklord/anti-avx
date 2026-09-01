@@ -3612,7 +3612,30 @@ def span_entries(members, instructions, slots, scope, plain):
 	return out
 
 
-def lower_ymm_span(entries, base, helper, at, pool):
+# **How many slots a per-thread span may use.** One number for the whole
+# image, because `SizeOfZeroFill` is one number: the block has to be big
+# enough for the largest thing that will ever address it. A borrow spill
+# wants one slot and a span wants its peak, and the two never overlap in
+# time -- a stub runs to completion before another is entered on the same
+# thread -- so they share the area rather than each needing their own.
+TLS_SLOTS = 4
+
+
+def span_slot_move(helper, save, base, slot, block, at):
+	"""Move `helper` to or from slot `slot`, wherever the slots live.
+
+	The two backing stores address a slot differently and nothing else
+	about the span changes: `(%rsp)` plus a displacement for the home space
+	and the caller's shadow, and a displacement from a general-purpose
+	register for a per-thread block. Keeping that in one function is what
+	stops the difference leaking into every member's emission.
+	"""
+	if block is None:
+		return encode_spill(helper, save, at, 0, slot, base)
+	return encode_tls_spill(helper, save, block[0], base + slot * SLOT)
+
+
+def lower_ymm_span(entries, base, helper, at, pool, block=None):
 	"""The span, with every upper half kept in a 16-byte slot. Bytes or None.
 
 	**The first thing here that emits 256-bit work rather than measuring
@@ -3630,6 +3653,13 @@ def lower_ymm_span(entries, base, helper, at, pool):
 	operations whose second source is memory -- see `span_operand_shape`.
 	"""
 	body = bytearray()
+	if block is not None:
+		# **Once, at the top.** The block pointer stays in its register for
+		# the length of the span, which is what `window_gpr_free` had to
+		# establish before the span was offered -- a pointer recomputed per
+		# member would cost three instructions each and a pointer clobbered
+		# mid-span would address somebody else's thread data.
+		body += encode_tls_base(block[0], block[1], block[2], at)
 	for kind, address, encoding, mnemonic, operands, slot, moved in entries:
 		if kind == "plain":
 			fixed = moved_instruction(moved[:5], at + len(body), pool)
@@ -3657,7 +3687,8 @@ def lower_ymm_span(entries, base, helper, at, pool):
 			if piece is None:
 				return None
 			body += piece
-			body += encode_spill(helper, True, at + len(body), 0, slot, base)
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
 			continue
 		if what == "store":
 			low = narrow_piece(vex, tail, 0, address, len(encoding),
@@ -3665,8 +3696,8 @@ def lower_ymm_span(entries, base, helper, at, pool):
 			if low is None:
 				return None
 			body += low
-			body += encode_spill(helper, False, at + len(body), 0, slot,
-			                     base)
+			body += span_slot_move(helper, False, base, slot, block,
+			                       at + len(body))
 			high_vex, high_tail = retarget(vex, tail, helper)
 			piece = narrow_piece(high_vex, high_tail, SLOT, address,
 			                     len(encoding), at + len(body))
@@ -3677,18 +3708,31 @@ def lower_ymm_span(entries, base, helper, at, pool):
 		# A lane-wise operation whose other source is memory. The low half
 		# is the instruction with L cleared; the upper half is the same
 		# opcode between the slot and the helper.
-		low = inplace.sse_encoding(dict(vex, L=0), tail)
+		#
+		# **Through `narrow_piece` and not `sse_encoding`, at delta 0.**
+		# The two produce the same bytes for an ordinary displacement and
+		# differ on a RIP-relative one, which has to absorb the move into
+		# the stub as well -- and `sse_encoding` does not, because it does
+		# not know where the instruction landed. The load and the store
+		# went through `narrow_piece` from the first line written; this
+		# did not, so the low half of every rip-relative operation read
+		# from inside the stub section. `check-pe` returned 5 for the
+		# fixture built to catch exactly this.
+		low = narrow_piece(vex, tail, 0, address, len(encoding),
+		                   at + len(body))
 		if low is None:
 			return None
 		body += low
-		body += encode_spill(helper, False, at + len(body), 0, slot, base)
+		body += span_slot_move(helper, False, base, slot, block,
+		                       at + len(body))
 		high_vex, high_tail = retarget(vex, tail, helper)
 		piece = narrow_piece(high_vex, high_tail, SLOT, address,
 		                     len(encoding), at + len(body))
 		if piece is None:
 			return None
 		body += piece
-		body += encode_spill(helper, True, at + len(body), 0, slot, base)
+		body += span_slot_move(helper, True, base, slot, block,
+		                       at + len(body))
 	return bytes(body)
 
 
@@ -3718,7 +3762,7 @@ def span_helper(scope, address, entries):
 
 
 def span_candidate(instructions, plain, positions, index, blocked, home,
-                   ranges, scope):
+                   ranges, scope, tls=None):
 	"""A candidate that lowers a whole 256-bit span, or None.
 
 	The span is the analysis Finding 133 built and Findings 140 and 143
@@ -3745,27 +3789,43 @@ def span_candidate(instructions, plain, positions, index, blocked, home,
 	window = tail_entry[0] + len(tail_entry[1]) - address
 	if window < 5 or not inplace.covered_by(ranges, address, window):
 		return None
-	base = window_borrow(home, address, window)
-	if base is None or peak > SLOTS_PER_REGION:
-		# The first increment takes the callee home space only: 32 bytes,
-		# two slots, at one displacement for the whole window. The shadow
-		# and a per-thread block are what Finding 143 priced and neither is
-		# wired here.
-		return None
 	slots = {}
 	for _kind, _position, register in members:
 		if register is not None and register not in slots:
 			slots[register] = len(slots)
-	if len(slots) > SLOTS_PER_REGION:
+	# **The frame first, the block second**, for `--spill=tls`'s reason: a
+	# displacement from `rsp` needs no register and no directory raised, so
+	# it is strictly cheaper wherever it serves. `window_borrow` answers for
+	# the callee home space AND the caller's shadow -- whichever this
+	# function will lend -- but for one of them, not both: the two are 32
+	# bytes each at different displacements, and a span writes its slot
+	# addressing once.
+	base, block = window_borrow(home, address, window), None
+	if base is None or peak > SLOTS_PER_REGION:
+		# Neither frame region will serve, or the span wants more slots
+		# than one of them holds. A per-thread block has neither limit: it
+		# is as large as `SizeOfZeroFill` asks, and TLS_SLOTS is what this
+		# image asks for. What it costs is two general-purpose registers
+		# dead across the WHOLE span, which is `window_gpr_free`'s
+		# question -- one to hold the block and one to index it, and
+		# neither restored, exactly as Finding 142's borrow does.
+		if tls is None or peak > TLS_SLOTS:
+			return None
+		free = sorted(window_gpr_free(home, address, window), reverse=True)
+		if len(free) < 2:
+			return None
+		base, block = tls[1], (free[0], free[1], tls[0])
+	if len(slots) > max(SLOTS_PER_REGION, TLS_SLOTS if block else 0):
 		return None
 	entries = span_entries(members, instructions, slots, scope, plain)
 	helper = span_helper(scope, address, entries)
 	if helper is None:
 		return None
-	if lower_ymm_span(entries, base, helper, address, address) is None:
+	if lower_ymm_span(entries, base, helper, address, address,
+	                  block) is None:
 		return None
 	return (address, encoding, operands, mnemonic, window, [], None, [],
-	        ("span", (entries, helper)))
+	        ("span", (entries, helper, block, base)))
 
 
 def value_survives_loop(instructions, index, register, blocked, sources,
@@ -4702,17 +4762,41 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# number over all of it -- `window_borrow`'s argument, and the
 		# reason a span holding a `push` is refused rather than restored
 		# from somewhere the save never wrote.
-		entries, helper = strategy[1]
-		if base is None:
-			if reasons is not None:
-				reasons["the span will not hold one slot displacement"] += 1
-			return None, 0
-		lowered = lower_ymm_span(entries, base, helper,
-		                         stub_address + len(body), pool)
-		if lowered is None:
-			if reasons is not None:
-				reasons["the span operand cannot be moved"] += 1
-			return None, 0
+		entries, helper, span_block, span_base = strategy[1]
+		if span_block is not None:
+			# **The block carries its own base**, worked out when the span
+			# was collected, and `base` -- the frame displacement
+			# `window_borrow` computes here -- does not apply to it. A span
+			# backed by a block is refused nothing by a function that will
+			# lend no frame, which is the whole point of offering it.
+			lowered = lower_ymm_span(entries, span_base, helper,
+			                         stub_address + len(body), pool,
+			                         span_block)
+			if lowered is None:
+				if reasons is not None:
+					reasons["the span operand cannot be moved"] += 1
+				return None, 0
+			body += lowered
+			lowered = b""
+		else:
+			# **The frame path is an `else` and not a fall-through.** The
+			# first version left the block branch falling into this call,
+			# which overwrote the bytes it had just emitted and then passed
+			# `base` -- None for a block-backed span, because no frame
+			# region was found -- straight into `encode_spill`. It crashed
+			# on the first site rather than corrupting one, which is the
+			# only reason it cost a build and not a binary.
+			if base is None:
+				if reasons is not None:
+					reasons["the span will not hold one slot "
+					        "displacement"] += 1
+				return None, 0
+			lowered = lower_ymm_span(entries, base, helper,
+			                         stub_address + len(body), pool)
+			if lowered is None:
+				if reasons is not None:
+					reasons["the span operand cannot be moved"] += 1
+				return None, 0
 	elif kind == "zero":
 		vex = inplace.decode_vex(encoding)
 		lowered = lower_ymm_zero_store(vex, encoding[vex["length"]:], site,
@@ -4943,7 +5027,7 @@ def collect(binary, listing):
 	tls_slot_offset = None
 	if SPILL == SPILL_TLS:
 		with open(binary, "rb") as image:
-			found = tls_slot(image.read())
+			found = tls_slot(image.read(), TLS_SLOTS * SLOT)
 		if found is not None:
 			tls_slot_offset = found
 	# Where a 256-bit load can be taken at its word. Only the headers are
@@ -5190,7 +5274,8 @@ def collect(binary, listing):
 		# indistinguishable from one that refuses.
 		if vex["L"]:
 			spanned = span_candidate(instructions, plain, positions, index,
-			                         blocked, home, ranges, scope)
+			                         blocked, home, ranges, scope,
+			                         tls_slot_offset)
 			if spanned is not None:
 				candidates.append(spanned)
 				continue
@@ -7646,7 +7731,11 @@ def tls_for(binary):
 	if SPILL != SPILL_TLS:
 		return None
 	with open(binary, "rb") as image:
-		return tls_slot(image.read())
+		# `TLS_SLOTS` slots, not one. The borrow spill wants a single slot
+		# and a span wants its peak, and both address the same area --
+		# `SizeOfZeroFill` is one number for the image, so it is sized for
+		# the largest thing that will ever reach into it.
+		return tls_slot(image.read(), TLS_SLOTS * SLOT)
 
 
 def stub_base_of(data):
