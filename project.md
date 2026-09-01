@@ -9986,6 +9986,51 @@ Five conclusions in a row, each replaced by the next measurement: the dials, the
 plausible, every one was reasoned from a number that did not say what it was read to say,
 and every one cost a build. The probes that corrected them cost minutes each.
 
+### Finding 161 -- the region first, which buys seven sites for 1,145 windows
+
+Finding 160 measured the region's loss as its position in `collect`'s chain: offered last,
+920 eligible regions became 70 candidates because the pair and the run had taken the sites.
+Moved to the front of the 256-bit strategies:
+
+```
+                before    region first
+survivors        6,405           6,398        -7
+stub bytes   3,759,667       3,781,597   +21,930
+detours        202,562         202,233      -329
+
+span                70             935      +865
+pair             7,255           6,346      -909
+run              2,050           1,814      -236
+```
+
+**1,145 windows changed hands to gain seven sites.**
+
+#### Which is Finding 123's rule from the winning side
+
+A pair lowers a 256-bit copy as two 128-bit moves through a register helper. A region
+routes the same value through a memory slot -- a store, a load, and sixteen bytes of
+traffic per half. So 1,145 copies are lowered more slowly than they were, and the return is
+seven sites and 22 KB more stub.
+
+Finding 123 stated the rule as a strategy that cannot lower a site must not consume it, and
+Finding 125 built the check for that. **This is the other half, which had no check**: a
+strategy that CAN lower a site may still be the wrong one to do it, and nothing in this
+project compares two strategies' cost for the same site. The site count says +7 and reads
+as progress; the stub size and the window ledger say what it cost.
+
+#### Put back, and kept switchable
+
+`REGION_FIRST` is False again. The switch stays rather than the change being deleted, for
+the reason `--spill=home` stays reachable beside `--spill=tls`: the two orderings are a site
+count against a cost, and the day the region lowers a copy as cheaply as the pair does, the
+switch is there to re-take the measurement in one run.
+
+**What this does NOT settle is whether seven sites are worth 22 KB**, because the project
+has no cost model per site to answer it with. The estimated-cost table prices the whole
+translated binary at +1.34%; nothing prices one strategy against another for the same
+instruction. That is the gap Finding 160's open question named and this measurement
+sharpens rather than closes.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -10161,14 +10206,12 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **Where the region sits in `collect`'s chain**, which Finding 160 measures as the
-     whole of its loss. It is offered last, after the ordinary path, the zero store, the
-     long pair, the constant, the run and the span, and those place 9,982, 7,255 and
-     2,050 respectively. 920 regions pass every filter and 70 become candidates, because
-     the rest are lowered by something earlier. The placer is innocent: it placed every
-     region it was given, overlapping none and refusing none. What is unknown is whether
-     a site lowered by the ordinary path is BETTER lowered by a region, which is a
-     question about cost per site and nobody has asked it.
+  1. **A cost model per strategy**, which is the gap Findings 160 and 161 both end at.
+     Moving the region ahead of the pair takes 1,145 windows to gain seven sites and 22 KB
+     of stub, and **nothing here can say whether that is a good trade** -- the estimated
+     cost table prices the whole binary at +1.34% and nothing prices one strategy against
+     another for the same instruction. Every ordering question on this list is unanswerable
+     until it can. `REGION_FIRST` is the switch that re-takes the measurement in one run.
   2. **The collector and the lowering disagree about 386 regions.** `region_members`
      accepts what `lower_ymm_span` then refuses -- an operand `narrow_piece` cannot move,
      or a second helper the region has not got. `SPAN_EMITTABLE` keeps the survey and the

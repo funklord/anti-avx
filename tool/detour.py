@@ -511,6 +511,23 @@ SPILL_TLS = "tls"
 # TLS on took the home space away from a run and gave it back to nobody --
 # the mode gained its 753 and lost 287 net, which is how it was found.
 HOME_SPILLS = (SPILL_HOME, SPILL_TLS)
+# **Where the region sits among the 256-bit strategies.** True puts it
+# first, ahead of the pair and the run; False leaves it after both, which
+# is where Finding 156 built it and where it stays.
+#
+# Measured both ways (Finding 161). First, it takes 865 more windows and
+# the pair loses 909 and the run 236 -- 1,145 windows changing hands to
+# gain SEVEN sites, at 22 KB more stub. A pair lowers a 256-bit copy
+# through a register helper and the region routes the same value through
+# a memory slot, so those 1,145 copies got slower in order to lower seven
+# more sites. Finding 123's rule, met from the winning side: a strategy
+# that SUCCEEDS can still take work a better one was doing.
+#
+# Kept switchable rather than deleted, for the reason `--spill=home` is
+# kept beside `--spill=tls`: the two answers are a site count against a
+# cost, and the day the region lowers a copy as cheaply as the pair does,
+# the switch is already there to re-take the measurement.
+REGION_FIRST = False
 # **`tls` is the default**, and what it changes from `home` is one thing: a
 # site whose function will lend no home space gets sixteen bytes of its own
 # thread instead of keeping its VEX. Worth 671 sites in the binary (Finding
@@ -5684,6 +5701,27 @@ def collect(binary, listing):
 		# is held back and only recorded if the run declines too -- one
 		# source copied to two destinations was being refused for reading an
 		# upper half that a run would have kept in a register.
+		# **The region goes first among the 256-bit strategies**, which is
+		# what Finding 160 measured the cost of not doing: offered last it
+		# saw 920 eligible regions and became 70 candidates, because the
+		# pair and the run had already taken the sites. Offered first it
+		# competes for the 7,255 the pair places and the 2,050 the run
+		# does.
+		#
+		# **This may be a regression and the measurement is the point.** A
+		# pair lowers a 256-bit copy through a register helper; a region
+		# routes the same value through a memory slot, which is slower per
+		# site. If the site count rises and the stub section rises with it,
+		# the region is buying sites at a price nobody has costed -- and
+		# Finding 123's rule is that a strategy which SUCCEEDS can still
+		# take work a better one was doing.
+		if vex["L"] and REGION_FIRST:
+			regional = region_candidate(instructions, plain, positions,
+			                            index, blocked, home, ranges,
+			                            scope, tls_slot_offset)
+			if regional is not None:
+				candidates.append(regional)
+				continue
 		pair_reason = None
 		if vex["L"] and index + 1 < len(instructions):
 			following = instructions[index + 1]
@@ -5886,18 +5924,6 @@ def collect(binary, listing):
 			                         tls_slot_offset)
 			if spanned is not None:
 				candidates.append(spanned)
-				continue
-			# **And the region, where the span declined.** A span carries
-			# a load through to a store and needs the value dead at the
-			# end; a region needs neither, because the ABI kills every
-			# upper half at its edges. Finding 153 measured what that
-			# costs the span -- every closing span is a copy, and the
-			# arithmetic the design was for never appears in one.
-			regional = region_candidate(instructions, plain, positions,
-			                            index, blocked, home, ranges,
-			                            scope, tls_slot_offset)
-			if regional is not None:
-				candidates.append(regional)
 				continue
 
 		if carried is None:
