@@ -1305,6 +1305,92 @@ def gpr_effect(mnemonic, operands):
 	return (named, frozenset())
 
 
+# **The vector registers a stub may borrow.** Win64 makes xmm0-xmm5
+# volatile and xmm6-xmm15 the callee's to preserve, and Finding 123 settled
+# that only a volatile one may be taken: the stub section has no unwind
+# codes to say where a non-volatile register was put, so a fault inside the
+# bracket loses the caller's value.
+VOLATILE_XMM = (0, 1, 2, 3, 4, 5)
+
+# The four that carry floating-point arguments. A call reads as many as the
+# callee takes and nothing here knows how many.
+ARGUMENT_XMM = frozenset((0, 1, 2, 3))
+
+# What a `ret` hands back.
+RETURN_XMM = frozenset((0,))
+
+# Moves whose last operand is written and not also read, which is what makes
+# a write a KILL rather than another read. Deliberately the plain moves:
+# `addps %xmm1,%xmm0` writes xmm0 and reads it too, and the cost of getting
+# that wrong is a helper taken over a live value.
+XMM_WRITERS = frozenset("""
+	movaps movups movapd movupd movdqa movdqu
+	vmovaps vmovups vmovapd vmovupd vmovdqa vmovdqu
+""".split())
+
+
+def xmm_effect(mnemonic, operands):
+	"""`(read, written)` volatile xmm registers for one instruction.
+
+	`gpr_effect`'s counterpart, and the same conservatism for the same
+	reason: every mention is a read, and almost nothing is a write. A
+	register wrongly called live costs a site; one wrongly called dead
+	destroys a value while something still wants it, and nothing
+	downstream looks wrong.
+
+	**A call reads the argument registers and writes nothing**, which is
+	`gpr_effect`'s decision and rests on the same evidence -- this binary's
+	`__chkstk` preserves registers the ABI lets it destroy, so what the ABI
+	permits a callee to do is not what the program relies on it not doing.
+
+	`%ymm3` and `%xmm3` are the same register here. A helper holds sixteen
+	bytes, and a mention of either name means something is using them.
+	"""
+	named = frozenset(n for n in scratch_finder.xmm_numbers(operands)
+	                  if n in VOLATILE_XMM)
+	if mnemonic.startswith("call"):
+		return (named | ARGUMENT_XMM, frozenset())
+	if mnemonic.startswith("ret"):
+		return (RETURN_XMM, frozenset())
+	if mnemonic in XMM_WRITERS:
+		fields = inplace.split_operands(operands or "")
+		destination = fields[-1] if fields else ""
+		if len(fields) == 2 and destination.startswith("%xmm") \
+				and "(" not in destination:
+			written = scratch_finder.xmm_numbers(destination)
+			if len(written) == 1 and written[0] in VOLATILE_XMM:
+				# The source still reads what it names, this register
+				# included: `movaps (%rax,%xmm0),%xmm0` is not a shape that
+				# occurs, but `movaps %xmm0,%xmm0` is legal and reads it.
+				return (frozenset(n for n in
+				                  scratch_finder.xmm_numbers(fields[0])
+				                  if n in VOLATILE_XMM),
+				        frozenset((written[0],)))
+	return (named, frozenset())
+
+
+def xmm_live_out(plain, first, last, inside_targets, exit_live=None):
+	"""`{position: frozenset}` -- volatile xmm live AFTER each position.
+
+	The question `function_scope` answers for a whole function, asked at a
+	place instead. That rule -- free everywhere because the function names
+	it nowhere -- reaches only `FUNCTION_SCRATCH`, which is xmm4 and xmm5,
+	and Finding 148 measured what it costs: 2,782 of the 3,355 sites a
+	call-free region could represent are refused for want of one xmm free
+	across the region, because over a stretch of up to 192 instructions
+	almost no register is named nowhere.
+
+	**Inside a call-free region the argument registers are candidates
+	too.** xmm0-xmm3 are read by a call and a region contains none, so what
+	disqualifies them is only a real use -- and the call that ENDS the
+	region is a position like any other, where `xmm_effect` reads them.
+	Nothing special is needed to get that right, which is the point of
+	asking liveness rather than asking a rule.
+	"""
+	return register_live_out(plain, first, last, inside_targets, xmm_effect,
+	                         frozenset(VOLATILE_XMM), exit_live)
+
+
 def gpr_function_scope(plain, ranges):
 	"""Per function, the volatile GPRs it provably never touches.
 
@@ -1382,13 +1468,41 @@ def gpr_live_out(plain, first, last, inside_targets):
 	the return value and nothing else, so `r10` and `r11` are dead at
 	every one.
 	"""
+	return register_live_out(plain, first, last, inside_targets, gpr_effect,
+	                         frozenset(VOLATILE_GPRS))
+
+
+def register_live_out(plain, first, last, inside_targets, effect, everything,
+                      exit_live=None):
+	"""`{position: frozenset}` -- which registers are live AFTER each one.
+
+	The backward fixpoint itself, shared by every register family that asks
+	it. What differs between families is `effect` -- what an instruction
+	reads and writes -- and `everything`, the set that is live where control
+	goes somewhere this cannot follow. The WALK is the same question in
+	both cases, and it is written once so the two cannot disagree about a
+	back edge.
+	"""
 	successors, unresolved, leaving = control_successors(
 		plain, first, last, inside_targets)
-	everything = frozenset(VOLATILE_GPRS)
+	# **What is live where control leaves the range.** Everything, unless
+	# the caller knows better -- and over a CALL-FREE REGION it does: a
+	# region ends at a call, and the ABI says every volatile register is
+	# dead there, which is the same fact that makes a region a unit at all.
+	#
+	# The default is not conservatism for its own sake. `gpr_live_out` runs
+	# over whole `.pdata` functions, which end in `ret` and are modelled
+	# exactly; a range ending anywhere else genuinely does not know what
+	# follows. Measured before this was a parameter: seeding a region's
+	# terminating call as unknown floods every position backward with every
+	# register, and per-position liveness answered FEWER free registers
+	# than the whole-function rule it was meant to beat -- 81 against 573.
+	if exit_live is None:
+		exit_live = everything
 	effects = {}
 	for position in range(first, last):
 		_a, _e, mnemonic, operands = plain[position]
-		effects[position] = gpr_effect(mnemonic, operands or "")
+		effects[position] = effect(mnemonic, operands or "")
 
 	# Seeded once: what is live on the way OUT of a position, before any
 	# successor has been accounted for.
@@ -1396,7 +1510,7 @@ def gpr_live_out(plain, first, last, inside_targets):
 	for position in range(first, last):
 		out = set()
 		if position in unresolved or position in leaving:
-			out |= everything
+			out |= exit_live
 		base[position] = out
 
 	live_in, live_out = {}, {}
@@ -6299,6 +6413,7 @@ def selftest():
 	failures += reader_selftest()
 	failures += span_selftest()
 	failures += gpr_selftest()
+	failures += xmm_selftest()
 	failures += tls_selftest()
 	failures += borrow_selftest()
 	failures += splat_selftest()
@@ -7084,6 +7199,85 @@ def tls_selftest():
 	return failures
 
 
+# `(what, rows, position, register, expected)` -- is xmm`register` live
+# after `rows[position]`? Half assert DEAD, because a liveness pass that
+# answered "live" everywhere would be sound, would free nothing, and would
+# pass every case that only checks for corruption.
+XMM_CASES = [
+	("a later read makes it live",
+	 [("movaps", "%xmm1,%xmm4"), ("nop", ""), ("addps", "%xmm4,%xmm0"),
+	  ("ret", "")], 1, 4, True),
+	("nothing reads it again",
+	 [("movaps", "%xmm1,%xmm4"), ("nop", ""), ("addps", "%xmm1,%xmm0"),
+	  ("ret", "")], 1, 4, False),
+	("a plain move kills what was there",
+	 [("nop", ""), ("movaps", "%xmm1,%xmm4"), ("addps", "%xmm4,%xmm0"),
+	  ("ret", "")], 0, 4, False),
+	("an arithmetic write does NOT kill, it reads too",
+	 [("nop", ""), ("addps", "%xmm1,%xmm4"), ("ret", "")], 0, 4, True),
+	("a move whose source names it reads it",
+	 [("nop", ""), ("movaps", "%xmm4,%xmm5"), ("ret", "")], 0, 4, True),
+	("a memory destination is not a write of the register",
+	 [("nop", ""), ("movaps", "%xmm4,(%rax)"), ("ret", "")], 0, 4, True),
+	# **The same register under its wider name.** A helper holds sixteen
+	# bytes and %ymm4 is those bytes; a scan keyed on the xmm spelling
+	# alone would hand out a register the program is using.
+	("the ymm spelling is the same register",
+	 [("nop", ""), ("vaddps", "%ymm4,%ymm1,%ymm1"), ("ret", "")],
+	 0, 4, True),
+	# The call. Reads the argument registers, kills nothing -- xmm_effect's
+	# argument, which is gpr_effect's and rests on the same __chkstk
+	# evidence.
+	("a call reads the argument registers",
+	 [("nop", ""), ("call", "0x2000"), ("ret", "")], 0, 1, True),
+	("a call does not read xmm4",
+	 [("nop", ""), ("call", "0x2000"), ("ret", "")], 0, 4, False),
+	# **In xmm4 and not xmm0**, which the first version got wrong. xmm0 is
+	# an argument register, so a call reads it whatever else is true, and
+	# the case passed against a sabotage that killed every volatile
+	# register at a call -- the very rule it was written to defend. A
+	# register the call does not read is the only one that can show a kill.
+	("a call does not kill, so a value survives it",
+	 [("movaps", "%xmm1,%xmm4"), ("call", "0x2000"),
+	  ("addps", "%xmm4,%xmm2"), ("ret", "")], 0, 4, True),
+	("a ret reads the return register",
+	 [("nop", ""), ("ret", "")], 0, 0, True),
+	("a ret does not read the scratch ones",
+	 [("nop", ""), ("ret", "")], 0, 5, False),
+	("a jump out of the range is a tail call",
+	 [("nop", ""), ("jmp", "0x9000")], 0, 4, True),
+	("falling off the end of the range is not modelled",
+	 [("nop", ""), ("nop", "")], 0, 4, True),
+	# The pair address order gets wrong, as for the GPRs: the read is at a
+	# LOWER address than the site and only the back edge reaches it.
+	("a loop closing above the read carries it back",
+	 [("addps", "%xmm4,%xmm0"), ("nop", ""), ("jne", "0x1000"),
+	  ("ret", "")], 1, 4, True),
+	("a loop closing below the read does not",
+	 [("addps", "%xmm4,%xmm0"), ("nop", ""), ("nop", ""),
+	  ("jne", "0x1008"), ("ret", "")], 1, 4, False),
+]
+
+
+def xmm_selftest():
+	"""Prove `xmm_live_out` frees a register only where it is dead. 0 or n."""
+	failures = 0
+	for what, rows, position, register, expected in XMM_CASES:
+		plain = _flow(rows)
+		live = xmm_live_out(plain, 0, len(plain), ())
+		got = register in live[position]
+		if got != expected:
+			print(f"selftest: {what}: xmm{register} after "
+			      f"{plain[position][2]} {plain[position][3]} is "
+			      f"{'live' if got else 'dead'}, want "
+			      f"{'live' if expected else 'dead'}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(XMM_CASES)} xmm liveness shapes, live and "
+		      f"dead in both directions")
+	return failures
+
+
 def gpr_selftest():
 	"""Prove `gpr_live_out` frees a register only where it is dead. 0 or n.
 
@@ -7563,6 +7757,12 @@ def span_survey(binary, listing, patched):
 	scope = scratch_finder.function_scope(plain, ranges)
 	region_covered, region_refused = set(), Counter()
 	region_cache, region_slots, region_cost = {}, Counter(), Counter()
+	region_whole = 0
+
+	def inside_here(instructions, begin, finish, blocked):
+		"""This region's share of the branch-target set, as positions."""
+		return tuple(position for position in range(begin, finish)
+		             if instructions[position][0] in blocked)
 	covered, refused, fit = set(), Counter(), Counter()
 	tls_covered, tls_reason = set(), Counter()
 	forms = Counter()
@@ -7595,15 +7795,45 @@ def span_survey(binary, listing, patched):
 					- instructions[begin][0]
 				peak, used = region_demand(instructions, begin, finish)
 				at = instructions[begin][0]
-				helpers = set(scratch_finder.scope_free(scope, at))
+				# **Per position, not per function.** `scope_free` asks
+				# whether the function names the register ANYWHERE, which
+				# over a region of up to 192 instructions is nearly always
+				# empty -- Finding 148 measured it at 2,782 of 3,355 sites
+				# refused for exactly that. `xmm_live_out` asks whether it
+				# is dead at every position the region covers, which is a
+				# question about the region rather than about the function.
+				# A region that ends at a CALL knows what is live after
+				# it: nothing volatile, by the ABI. One that ends at a
+				# branch target does not -- control carries on in the same
+				# function and anything may be wanted.
+				closing = instructions[finish - 1][2]
+				live = xmm_live_out(
+					plain, begin, finish,
+					inside_here(instructions, begin, finish, blocked),
+					frozenset() if closing.startswith("call") else None)
+				helpers = set(VOLATILE_XMM)
 				for position in range(begin, finish):
+					helpers -= live[position]
 					helpers -= set(scratch_finder.xmm_numbers(
 						instructions[position][3] or ""))
+				# **The union, because the two are sound for different
+				# reasons and neither contains the other.** The
+				# whole-function rule holds everywhere in the function,
+				# including after control leaves this region -- which is
+				# exactly where per-position liveness has nothing to say,
+				# since a region ending at a branch target does not know
+				# what follows and must seed everything live. Measured
+				# apart: 573 by the function rule, 272 by liveness, and
+				# each finds regions the other refuses.
+				whole = set(scratch_finder.scope_free(scope, at))
+				helpers |= whole
 				region_cache[begin] = (
-					peak, len(helpers),
+					peak, len(helpers), len(whole),
 					window_borrow(home, at, extent) is not None,
 					len(window_gpr_free(home, at, extent)))
-			peak, helpers, frame, gprs = region_cache[begin]
+			peak, helpers, whole_helpers, frame, gprs = region_cache[begin]
+			if whole_helpers:
+				region_whole += 1
 			region_slots[min(peak, 9)] += 1
 			if not helpers:
 				region_cost["no xmm free across the region"] += 1
@@ -7689,6 +7919,9 @@ def span_survey(binary, listing, patched):
 	print("\n  and what the region can afford:")
 	for reason, count in region_cost.most_common():
 		print(f"    {count:>7,}  {reason}")
+	print(f"\n  a helper by the WHOLE-FUNCTION rule       {region_whole:>6,}")
+	print(f"  a helper by per-position liveness         "
+	      f"{sum(c for r, c in region_cost.items() if 'no xmm' not in r):>6,}")
 	if tls_here is not None:
 		print("\nspans that do NOT fit the home space, priced against a "
 		      "per-thread block:")

@@ -9325,6 +9325,69 @@ so `TLS_SLOTS` at four is not measured against the 676 sites wanting nine.
 Fixing the attribution is cheap and was not done here, because the number that decides
 whether to build the design is the 512, and that one does not depend on the ordering.
 
+### Finding 149 -- per-position xmm liveness is WORSE than the blunt rule, and the answer is both
+
+Finding 148 said 2,782 of the 3,355 sites a region could represent were refused for want of
+one xmm free across it, that the register was chosen by `function_scope`'s whole-function
+argument, and that Finding 141 had built the per-position machinery for general-purpose
+registers and nobody had pointed it at xmm. Pointed at xmm, **it answers fewer free
+registers than the rule it was meant to beat.**
+
+```
+a helper by the WHOLE-FUNCTION rule    573
+a helper by per-position liveness      272
+both together                          764
+
+  slots and registers both available   689     (512 by the function rule alone)
+```
+
+They overlap on 81 regions. The function rule finds 492 that liveness refuses and liveness
+finds 191 that the function rule refuses. **Neither contains the other**, which is the
+finding.
+
+#### Why the analogy to Finding 141 was wrong
+
+There, the whole-function rule and per-position liveness asked the same question over the
+same range, and the blunt one lost every site where a register was named once and dead
+everywhere that mattered. Here they ask **different questions**:
+
+  * `function_scope` says the function names the register NOWHERE. That holds at every
+    position in the function, including after control leaves the region -- which is
+    precisely where a region-scoped analysis has nothing to say;
+  * `xmm_live_out` says the register is dead at every position IN THE REGION. A region
+    ending at a call knows what follows, because the ABI kills every volatile register
+    there; a region ending at a BRANCH TARGET does not, so it must seed everything live
+    and the answer floods backward.
+
+So the blunt rule reaches past the region's edge and the sharp one does not. Taking both is
+sound because each is sound for its own reason, and it is worth 689 against 512.
+
+#### The wrong answer announced itself, and a right-looking one would not have
+
+The first run of this measured **81** free helpers against the function rule's 573, because
+`region_end` makes a terminating call the region's last position and `control_successors`
+found its successor outside the range, seeded it unresolved, and flooded every position
+backward with every register. Modelling that exit by the ABI instead -- nothing volatile is
+live after a call -- took it to 272.
+
+**A result worse than the thing it replaces is self-flagging.** Had the first run come back
+at 650 it would have been believed, committed, and the flooding would have sat in the
+instrument making every later region measurement quietly low. The 81 is recorded in
+`register_live_out`'s comment for that reason rather than merely fixed.
+
+#### Where this leaves the item
+
+```
+  the span, built                         342
+  a region, helper by both rules          689
+```
+
+347 sites more than what exists, and the uncounted bounds are now the emittable shapes --
+`span_operand_shape` handles three -- and placement, which cost the ladder's reload rung 49
+sites against a plan that promised 51. `TLS_SLOTS` at four is still untested against the
+676 sites whose region wants nine or more, because the ordered buckets never reach the slot
+test.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9511,14 +9574,14 @@ Ordered by what was measured, not by what looks large.
      can be represented, because the ABI kills every one of them at a call; and at a
      region's edges the span's two hard constraints both dissolve. 3,355 of the 4,494
      surviving 256-bit sites have every ymm they read defined inside their own region,
-     and **512 of those can also afford the slots and registers** (Finding 148) --
-     against 342 for the span that is already built. So the design is worth about 170
-     sites as costed today, and the thing to do BEFORE building it is **per-position xmm
-     liveness**: 2,782 of the 3,355 are refused for want of one xmm free across the
-     region, chosen by `function_scope`'s whole-function rule, and Finding 141 built
-     exactly that machinery for general-purpose registers. Shapes and placement remain
-     uncounted on top. **It is the only large item left**, which is the real state of the
-     project rather than a complaint about it.
+     and **689 of those can also afford the slots and registers** (Findings 148 and 149)
+     -- against 342 for the span that is already built, so the design is worth about 347
+     sites as costed today. The helper comes from the UNION of the whole-function rule
+     and per-position liveness, which are sound for different reasons and neither of
+     which contains the other; per-position alone is worse than the blunt rule, which is
+     Finding 149 and not what was expected. Still uncounted: the emittable shapes, of
+     which `span_operand_shape` handles three, and placement. **It is the only large item
+     left**, which is the real state of the project rather than a complaint about it.
 
 **And do not re-mine these.** Each has a number saying why:
 
