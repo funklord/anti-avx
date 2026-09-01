@@ -9214,6 +9214,62 @@ address has exactly the right shape. What catches arithmetic is running it, and 
 decides whether running it MEANS anything is whether the case exercises the path -- the
 oracle ran three spans and proved nothing at all about this one.
 
+### Finding 147 -- the whole function is the wrong unit, and the right one reaches 3,355
+
+The item this document has deferred five times is "whole-function 256-bit rewriting". **A
+whole function is the wrong frame for it**, and the ABI says so: the upper half of every
+ymm is volatile across a call, so no upper half is ever live at one. A function containing
+calls is not a unit over which anything can be represented.
+
+The unit is a **call-free region** -- bounded by a call, by a branch target, and by a
+function's first instruction. At the start of one, every upper half is dead by the ABI.
+Two consequences, and they are the whole design:
+
+  * **nothing needs loading at the start**, because there is nothing live to load. The
+    span's requirement that it begin at a 256-bit load is an artefact of starting in the
+    middle of a region rather than at its edge;
+  * **closure is free at the end**, because the region ends at a call and a read of an
+    upper half after one would be reading garbage in the ORIGINAL program too. The span's
+    other hard requirement -- every value dead at the end -- is discharged by the ABI
+    rather than by analysis.
+
+What is left is one question per site: **is every ymm this instruction reads defined by a
+256-bit write since the region began?**
+
+```
+surviving 256-bit sites                                4,494
+  covered by a span, home space only                     218
+  covered by a span, plus a per-thread block             342
+  every ymm read defined in its own region             3,355
+    the value is not defined in its own region           940
+    the region start is further than the walk looks      199
+```
+
+The 199 are a walk limit of 192 instructions and not a property of the program.
+
+#### 3,355 is a bound on REACH, and it is not a number of sites
+
+**This is the figure Finding 133 got wrong on this exact item and corrected the same day**,
+from 1,674 to 212, because the first was capacity and the second was reach. 3,355 is the
+same kind of number one level up: it says the REPRESENTATION covers the site. It does not
+say the site can be built.
+
+Not counted, and each is a separate bound to measure before anything is designed on this:
+
+  * the peak number of upper halves live at once in a region, which decides slots;
+  * one xmm free across the region, for the slot traffic;
+  * two general-purpose registers for a block pointer where no frame region will lend, and
+    the pointer must be recomputed after every call because the callee clobbers them;
+  * whether each instruction's shape can be emitted at all -- `span_operand_shape` handles
+    three today and refuses everything else;
+  * placement, which cost the ladder's reload rung 49 sites in the binary against a plan
+    that promised 51 (Finding 126).
+
+**So the finding is that the region is the right unit and the item is worth building, not
+that it is worth 3,355 sites.** Anyone continuing it should take the slot and register
+bounds first, exactly as `make spans` took them for the span -- and should expect the
+number to fall, because every previous measurement on this item has.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9395,13 +9451,16 @@ Ordered by what was measured, not by what looks large.
      unbuilt is the lowering. It is the smaller of the two remaining items by a wide
      margin, and it would be the first thing here to EMIT 256-bit code rather than
      measure it.
-  2. **Whole-function 256-bit rewriting.** The only route to the 3,273 spans that never
-     begin at a 256-bit load, and to the 193 sites that lose their value at a transfer. A
-     much larger design than the span, and the one the project has deferred five times;
-     do not start it on the 1,674 figure, and note that the 443 sites Finding 133 parked
-     as needing eleven slots at once are no longer bounded by slots at all (Finding 143).
-     **It is the only large item left**, which is the real state of the project rather
-     than a complaint about it.
+  2. **Region-based 256-bit rewriting**, which is what "whole-function" should have said
+     -- see Finding 147. A call-free region is the largest unit over which an upper half
+     can be represented, because the ABI kills every one of them at a call; and at a
+     region's edges the span's two hard constraints both dissolve. 3,355 of the 4,494
+     surviving 256-bit sites have every ymm they read defined inside their own region.
+     **That is a bound on reach and not a number of sites** -- slots, one xmm, two GPRs
+     for a block pointer, the emittable shapes and placement are all uncounted, and
+     Finding 133 made exactly this mistake on exactly this item. Take those bounds before
+     designing anything. **It is the only large item left**, which is the real state of
+     the project rather than a complaint about it.
 
 **And do not re-mine these.** Each has a number saying why:
 

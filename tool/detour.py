@@ -3546,6 +3546,101 @@ def lower_ymm_run(strategy, at, pool):
 	return bytes(body)
 
 
+def region_start(instructions, index, blocked, limit=192):
+	"""Where this site's call-free region begins, or None if it cannot be
+	found within `limit` instructions.
+
+	**A region begins where every upper half is known to be dead**, and
+	Win64 says exactly where that is: the upper half of every ymm is
+	volatile across a call, so the instruction after one starts a region.
+	So does a branch target, because control can arrive there from a path
+	this walk did not take, and so does the first instruction of a
+	function.
+
+	This is the unit the whole-function rewrite actually operates on. A
+	whole function is the wrong frame: it can contain calls, and a value
+	cannot live across one anyway. A call-free region is the largest
+	stretch over which an upper half can be represented at all.
+	"""
+	address = instructions[index][0]
+	at = index
+	while at > 0 and index - at < limit:
+		previous = instructions[at - 1]
+		if previous[2].startswith(CONTROL_PREFIXES):
+			return at		# the instruction after a transfer
+		if instructions[at][0] in blocked:
+			return at		# anything can branch here
+		if previous[0] + len(previous[1]) != instructions[at][0]:
+			return at		# a gap: the listing does not join them
+		at -= 1
+	return at if index - at < limit else None
+
+
+def region_defines(instructions, first, index):
+	"""The ymm registers written by a 256-bit instruction in
+	`[first, index)`, which is where an upper half may have come from.
+
+	**Only a 256-bit write defines an upper half.** A VEX.128 write ZEROES
+	bits [255:128], so it defines the upper half too -- as zero -- and that
+	is representable; but the in-place lowerings have already destroyed
+	that zeroing, which is what Finding 40 named and what makes a narrower
+	write a definition this cannot trust. It is counted separately.
+	"""
+	wide, narrow = set(), set()
+	for position in range(first, index):
+		_a, encoding, _m, operands = instructions[position][:4]
+		vex = inplace.decode_vex(encoding)
+		if vex is None:
+			continue
+		fields = inplace.split_operands(operands or "")
+		if not fields:
+			continue
+		destination = fields[-1]
+		if not destination.startswith("%ymm") and not destination.startswith("%xmm"):
+			continue
+		(wide if vex["L"] else narrow).add(canonical_ymm(destination))
+	return wide, narrow
+
+
+def region_reachable(instructions, index, blocked):
+	"""Why a region-based rewrite could not take this site, or None if it
+	could.
+
+	The question a whole-function rewrite has to answer, asked per site:
+	**is every ymm this instruction READS defined by a 256-bit write since
+	the region began?** If it is, the upper half is something the region
+	itself computed and can therefore be kept in a slot; if it is not, the
+	value arrived from somewhere no representation covers.
+
+	Nothing here is emitted. This is the measurement that decides whether
+	the design is worth building, which is what Finding 133 said to take
+	before starting it and what this project has got wrong on this item
+	three times by pricing capacity instead of reach.
+	"""
+	first = region_start(instructions, index, blocked)
+	if first is None:
+		return "the region start is further than the walk looks"
+	_a, encoding, _m, operands = instructions[index][:4]
+	vex = inplace.decode_vex(encoding)
+	if vex is None or not vex["L"]:
+		return "not a 256-bit site"
+	fields = inplace.split_operands(operands or "")
+	read = [f for f in fields[:-1] if f.startswith("%ymm")]
+	# A destination that is also a source is read. `vaddps a,%ymm1,%ymm0`
+	# reads ymm1 and writes ymm0; `vaddps a,%ymm0,%ymm0` reads and writes
+	# the same one.
+	wide, narrow = region_defines(instructions, first, index)
+	for field in read:
+		name = canonical_ymm(field)
+		if name in wide:
+			continue
+		if name in narrow:
+			return "the value's last write was 128-bit, so its upper half " \
+				"is a zeroing the lowering already destroyed"
+		return "the value is not defined in its own region"
+	return None
+
+
 def span_operand_shape(vex, tail, operands, tracked):
 	"""`("load"|"store"|"lane", register)` if this member is one this can
 	emit, else None.
@@ -7402,6 +7497,7 @@ def span_survey(binary, listing, patched):
 	# different claims: the home space is free and limited, the block is
 	# unlimited and costs registers. Finding 143.
 	tls_here = tls_for(binary)
+	region_covered, region_refused = set(), Counter()
 	covered, refused, fit = set(), Counter(), Counter()
 	tls_covered, tls_reason = set(), Counter()
 	forms = Counter()
@@ -7411,6 +7507,19 @@ def span_survey(binary, listing, patched):
 		vex = inplace.decode_vex(encoding)
 		if vex is None or not vex["L"]:
 			continue
+		# **What a region-based rewrite would reach**, asked of every
+		# surviving site whether a span takes it or not. A span must begin
+		# at a 256-bit load and must close; a region begins where the ABI
+		# says every upper half is already dead -- after a call, at a
+		# branch target, at a function's first instruction -- and closes
+		# for free at the next call, because a later read of an upper half
+		# would be reading garbage in the ORIGINAL program too. Finding
+		# 147.
+		refusal = region_reachable(instructions, index, blocked)
+		if refusal is None:
+			region_covered.add(address)
+		else:
+			region_refused[refusal] += 1
 		why = []
 		found = ymm_span(instructions, index, blocked, positions, why=why)
 		if found is None:
@@ -7473,6 +7582,11 @@ def span_survey(binary, listing, patched):
 	for (peak, room), count in sorted(fit.items()):
 		print(f"  wants {peak}, has {room}: {count:>6,}"
 		      f"{'  fits' if peak <= room else ''}")
+	print(f"\nwhat a call-free REGION would reach, span or no span:")
+	print(f"  every ymm it reads defined in its own region  "
+	      f"{len(region_covered):>6,}")
+	for reason, count in region_refused.most_common(6):
+		print(f"  {count:>7,}  {reason}")
 	if tls_here is not None:
 		print("\nspans that do NOT fit the home space, priced against a "
 		      "per-thread block:")
