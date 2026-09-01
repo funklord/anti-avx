@@ -10031,6 +10031,63 @@ translated binary at +1.34%; nothing prices one strategy against another for the
 instruction. That is the gap Finding 160's open question named and this measurement
 sharpens rather than closes.
 
+### Finding 162 -- what each strategy costs, which nothing here could say until now
+
+The project priced a translated binary at +1.34% and priced no strategy within it. Finding
+161 ended at that gap: 1,145 windows changed hands for seven sites and nobody could say
+whether the trade was good. `make detour` prints this now.
+
+```
+kind          windows    sites     stub B   B/site
+plain         179,033  240,529  3,170,360     13.2
+pair            7,255   14,510    180,352     12.4
+zero            9,982   10,367    165,825     16.0
+run             2,050    6,751     94,263     14.0
+spill           3,013    4,895    119,301     24.4
+zerorun           365    1,019      9,612      9.4
+longload          372      372      6,084     16.4
+longstore         351      351      5,868     16.7
+span               21      135      2,281     16.9
+splatrun           23       91        871      9.6
+splatop            19       57        651     11.4
+splat              18       36        260      7.2
+constload          35       35        444     12.7
+construn            4       16        374     23.4
+conststore         14       14        431     30.8
+```
+
+Bytes of stub per VEX site the window removes. A strategy covering four sites in one window
+is charged for four, which is what makes a `pair` and a `span` comparable at all.
+
+#### It settles Finding 161, and agrees with the revert
+
+**`pair` is the cheapest thing done at scale, at 12.4 bytes a site; the region is 16.9.**
+So putting the region first traded 14,510 sites of the cheapest lowering in the project for
+one 36% dearer, and gained seven sites. Finding 161 reverted that on the window ledger
+alone. The cost table says the same thing with a number that can be quoted, which is the
+difference between a judgement and a measurement.
+
+#### Two other things it says
+
+**`spill` at 24.4 is the dearest thing done in quantity.** A borrow writes a save and a
+restore around every site, and that is the price static TLS pays for the 671 sites Finding
+142 bought -- worth knowing, and not an argument against it, because those sites have no
+other lowering at all.
+
+**`zerorun` at 9.4 and `splat` at 7.2 are the cheapest**, both for the same reason: one
+window serving many stores of a value that is already known.
+
+#### What it is not
+
+Bytes are a proxy for time and an imperfect one. A `movups` to a memory slot and a `movaps`
+between registers are the same length and not the same cost -- **which is exactly the
+difference between a region and a pair**, so the table understates the region's true price
+rather than overstating it. It ranks strategies as cheap or dear; it does not count cycles,
+and nothing here does.
+
+The in-place patches are not in the table and are the bulk of the work: 547,716 of them,
+each one instruction replaced by another of the same length, costing nothing.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -10206,12 +10263,13 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **A cost model per strategy**, which is the gap Findings 160 and 161 both end at.
-     Moving the region ahead of the pair takes 1,145 windows to gain seven sites and 22 KB
-     of stub, and **nothing here can say whether that is a good trade** -- the estimated
-     cost table prices the whole binary at +1.34% and nothing prices one strategy against
-     another for the same instruction. Every ordering question on this list is unanswerable
-     until it can. `REGION_FIRST` is the switch that re-takes the measurement in one run.
+  1. **A cost model in TIME rather than bytes.** Finding 162 built the byte version and
+     `make detour` prints it: `pair` 12.4 B/site, `span` 16.9, `spill` 24.4. It settles
+     ordering questions between strategies of similar shape and cannot settle the one that
+     matters most -- a `movups` to a memory slot and a `movaps` between registers are the
+     same length and not the same cost, which is the whole difference between a region and
+     a pair. `icache_bench.c` exists and measures detour placement; nothing measures a
+     lowering.
   2. **The collector and the lowering disagree about 386 regions.** `region_members`
      accepts what `lower_ymm_span` then refuses -- an operand `narrow_piece` cannot move,
      or a second helper the region has not got. `SPAN_EMITTABLE` keeps the survey and the

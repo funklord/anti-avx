@@ -8597,6 +8597,59 @@ def tls_for(binary):
 		return tls_slot(image.read(), TLS_SLOTS * SLOT)
 
 
+def report_cost(candidates, placed, home):
+	"""What each strategy costs per site it lowers.
+
+	**The project prices the whole binary and no strategy within it.** The
+	estimated-cost table puts a translated Starfield at +1.34%, built from
+	operand shapes; nothing says what a `pair` costs against a `region` for
+	the same instruction, and Finding 161 ended at exactly that gap -- 1,145
+	windows changed hands for seven sites and nobody could say whether the
+	trade was good.
+
+	The unit is **bytes of stub per VEX site removed**, and every term of it
+	already exists: `placed` carries each window's length and the length of
+	the body written for it, and the listing says how many VEX instructions
+	that window contained. A strategy that covers four sites in one window
+	is charged for four; one that covers a single site is charged for one.
+
+	Bytes are a proxy for time and an imperfect one -- a `movups` to a slot
+	and a `movaps` between registers are the same length and not the same
+	cost. What the table can say is which strategies are cheap and which are
+	dear per site, which is the question every ordering on the build-next
+	list turns on and none of them could ask.
+	"""
+	if home is None:
+		return
+	plain = home[3]["plain"]
+	starts = [row[0] for row in plain]
+	kind_of = {}
+	for entry in candidates:
+		strategy = entry[8]
+		kind_of[entry[0]] = strategy[0] if strategy is not None else "plain"
+	cost = {}
+	for address, window, _stub, body, _prologue in placed:
+		kind = kind_of.get(address, "plain")
+		row = cost.setdefault(kind, [0, 0, 0, 0])
+		row[0] += 1				# windows
+		row[1] += body				# bytes written
+		row[2] += window			# bytes replaced
+		low = bisect.bisect_left(starts, address)
+		high = bisect.bisect_left(starts, address + window)
+		for position in range(low, high):
+			vex = inplace.decode_vex(plain[position][1])
+			if vex is not None:
+				row[3] += 1			# VEX sites this window removes
+	print("apply: what each strategy costs, per VEX site it removes:")
+	print(f"apply:   {'kind':<12} {'windows':>8} {'sites':>8} "
+	      f"{'stub B':>10} {'B/site':>8}")
+	for kind in sorted(cost, key=lambda k: -cost[k][3]):
+		windows, body, _replaced, sites = cost[kind]
+		per = body / sites if sites else 0
+		print(f"apply:   {kind:<12} {windows:>8,} {sites:>8,} "
+		      f"{body:>10,} {per:>8.1f}")
+
+
 def report_placement(candidates, placed, overlapped, refused):
 	"""What the placer did to each kind of candidate, and what it cost.
 
@@ -8961,6 +9014,7 @@ def apply_all(binary, listing, output):
 	for why, count in stub_reasons.most_common():
 		print(f"apply:   refused, {why:<38} {count:>8,}")
 	report_placement(candidates, placed, overlapped, refused)
+	report_cost(candidates, placed, home)
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "
 	      f"{len(blob):,} bytes")
 	print(f"apply: {len(pdata) // 12:,} function table entries "
