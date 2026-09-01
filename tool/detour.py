@@ -3660,6 +3660,57 @@ def lower_ymm_run(strategy, at, pool):
 	return bytes(body)
 
 
+def span_shape_name(encoding, operands):
+	"""What shape a 256-bit instruction is, as a label.
+
+	`span_operand_shape` answers whether the lowering can emit one, which
+	is a yes or a no; this names the shape whatever the answer, so that the
+	refusals can be ranked. Building the next increment means picking from
+	this histogram rather than from a guess about which form is common.
+
+	The three the lowering emits today come back as "load", "store" and
+	"lane mem,D,D". Everything else is named by what would have to be built
+	for it.
+	"""
+	vex = inplace.decode_vex(encoding)
+	if vex is None or not vex["L"]:
+		return None
+	fields = inplace.split_operands(operands or "")
+	if not fields:
+		return "no operands"
+	wide = [f for f in fields if f.startswith("%ymm")]
+	immediate = [f for f in fields if f.startswith("$")]
+	if len(fields) == 2 and len(wide) == 1:
+		if "(" in fields[0]:
+			return "load"
+		if "(" in fields[1]:
+			return "store"
+		return "a register-to-register move"
+	if len(fields) == 2 and len(wide) == 2:
+		return "a register-to-register move"
+	if len(fields) == 2:
+		return "a broadcast or a narrowing move"
+	if len(fields) == 3 and immediate:
+		return "an immediate form"
+	if len(fields) == 3 and len(wide) == 2 and "(" in fields[0]:
+		if fields[1] == fields[2]:
+			return "lane mem,D,D"
+		return "mem,S,D with a destination of its own"
+	if len(fields) == 3 and len(wide) == 3:
+		if fields[1] == fields[2] or fields[0] == fields[2]:
+			return "a register second source, D reused"
+		return "a register second source, D of its own"
+	if len(fields) == 4:
+		return "four operands -- an insert, a blend or an FMA"
+	return "some other shape"
+
+
+# The shapes `lower_ymm_span` can emit today. Named here rather than
+# inferred, so that the survey and the lowering cannot drift apart about
+# what is built.
+SPAN_EMITTABLE = frozenset(("load", "store", "lane mem,D,D"))
+
+
 def region_start(instructions, index, blocked, limit=192):
 	"""Where this site's call-free region begins, or None if it cannot be
 	found within `limit` instructions.
@@ -7757,7 +7808,8 @@ def span_survey(binary, listing, patched):
 	scope = scratch_finder.function_scope(plain, ranges)
 	region_covered, region_refused = set(), Counter()
 	region_cache, region_slots, region_cost = {}, Counter(), Counter()
-	region_whole = 0
+	region_whole = region_emittable = 0
+	region_shapes = Counter()
 
 	def inside_here(instructions, begin, finish, blocked):
 		"""This region's share of the branch-target set, as positions."""
@@ -7827,13 +7879,29 @@ def span_survey(binary, listing, patched):
 				# each finds regions the other refuses.
 				whole = set(scratch_finder.scope_free(scope, at))
 				helpers |= whole
+				# **Every 256-bit member must be emittable, or none is.**
+				# A region is a representation and half of one is a
+				# program that reads an upper half nobody wrote, which is
+				# `span_operand_shape`'s rule applied to the larger unit.
+				shapes = set()
+				for position in range(begin, finish):
+					name = span_shape_name(instructions[position][1],
+					                       instructions[position][3])
+					if name is not None:
+						shapes.add(name)
 				region_cache[begin] = (
 					peak, len(helpers), len(whole),
 					window_borrow(home, at, extent) is not None,
-					len(window_gpr_free(home, at, extent)))
-			peak, helpers, whole_helpers, frame, gprs = region_cache[begin]
+					len(window_gpr_free(home, at, extent)),
+					frozenset(shapes))
+			peak, helpers, whole_helpers, frame, gprs, shapes = \
+				region_cache[begin]
 			if whole_helpers:
 				region_whole += 1
+			for name in shapes - SPAN_EMITTABLE:
+				region_shapes[name] += 1
+			if not (shapes - SPAN_EMITTABLE):
+				region_emittable += 1
 			region_slots[min(peak, 9)] += 1
 			if not helpers:
 				region_cost["no xmm free across the region"] += 1
@@ -7922,6 +7990,11 @@ def span_survey(binary, listing, patched):
 	print(f"\n  a helper by the WHOLE-FUNCTION rule       {region_whole:>6,}")
 	print(f"  a helper by per-position liveness         "
 	      f"{sum(c for r, c in region_cost.items() if 'no xmm' not in r):>6,}")
+	print(f"\n  every 256-bit member a shape the lowering emits "
+	      f"{region_emittable:>6,}")
+	print("  what the rest would need built, by site:")
+	for name, count in region_shapes.most_common(10):
+		print(f"    {count:>7,}  {name}")
 	if tls_here is not None:
 		print("\nspans that do NOT fit the home space, priced against a "
 		      "per-thread block:")

@@ -9388,6 +9388,58 @@ sites against a plan that promised 51. `TLS_SLOTS` at four is still untested aga
 676 sites whose region wants nine or more, because the ordered buckets never reach the slot
 test.
 
+### Finding 150 -- the shapes, and the one to build next is named by measurement
+
+The last bound Finding 148 left uncounted. A region is a representation, so **every**
+256-bit member of it must be emittable or none is -- `span_operand_shape`'s rule applied
+to the larger unit, and the reason half a region is a program that reads an upper half
+nobody wrote.
+
+```
+  of 3,355 sites a region could represent
+  every 256-bit member a shape the lowering emits  1,237
+
+  what the rest would need built, by site:
+      1,367  a register second source, D of its own
+      1,229  an immediate form
+      1,152  a register-to-register move
+      1,055  four operands -- an insert, a blend or an FMA
+      1,054  mem,S,D with a destination of its own
+        990  a register second source, D reused
+         48  no operands
+```
+
+**The register second source is the one to build**, at 1,367 and 990 for its two forms, and
+it is the shape `slot_tail` was written for and never called: the second source's slot has
+to be a memory OPERAND of the operation rather than something moved in and out. Nothing
+else on the list is a bigger population, and the two forms share an encoding problem.
+
+#### Two things the table does not say
+
+**The buckets overlap.** A region carrying three shapes this cannot emit is counted under
+all three, which is why they sum to 6,895 against a population of 3,355. They rank what to
+build; they do not partition anything.
+
+**The intersection with affordability is not measured.** 1,237 sites sit in a fully
+emittable region and 689 sit in one that can afford the slots and a helper (Finding 149),
+and those are different populations measured over the same 3,355. The buildable number is
+their intersection and is **at most 689** -- so 1,237 is not a site count either, for
+exactly the reason Finding 147's 3,355 was not one.
+
+#### Where the item stands, with every bound taken but one
+
+```
+  the span, built                            342
+  a region: represented                    3,355
+            slots and a helper as well       689
+            fully emittable as well       <= 689, unmeasured
+```
+
+Placement remains on top of that, and it has cost this project sites before -- the ladder's
+reload rung gained 51 by plan and lost 49 in the binary. **Every measurement taken on this
+item has moved the number down**, four times now, and the honest reading is that the design
+is worth a few hundred sites rather than a few thousand.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
