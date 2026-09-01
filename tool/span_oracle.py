@@ -62,6 +62,19 @@ CASES = [
 	 [("load", 0, "%ymm0"), ("load", 1, "%ymm1"), ("lane", 2, "%ymm0"),
 	  ("lane", 3, "%ymm1"), ("store", 4, "%ymm0"), ("store", 5, "%ymm1")],
 	 {"%ymm0": 0, "%ymm1": 1}),
+	# **The register second source**, which is what `slot_tail` was written
+	# for: the operation reaches the other value's slot as a memory OPERAND
+	# rather than having it moved in and out. Both slots are in play at
+	# once and the answer depends on reading the right one -- a span that
+	# addressed the destination's slot twice would return ymm0 + ymm0.
+	("a register second source, with both slots in play",
+	 [("c5fc1006", "vmovups", "(%rsi),%ymm0"),
+	  ("c5fc104e20", "vmovups", "0x20(%rsi),%ymm1"),
+	  ("c5fc58c1", "vaddps", "%ymm1,%ymm0,%ymm0"),
+	  ("c5fc1107", "vmovups", "%ymm0,(%rdi)")],
+	 [("load", 0, "%ymm0"), ("load", 1, "%ymm1"), ("lane", 2, "%ymm0"),
+	  ("store", 3, "%ymm0")],
+	 {"%ymm0": 0, "%ymm1": 1}),
 	# A multiply rather than an add, so the answer depends on the opcode
 	# surviving the split rather than on the operands alone.
 	("a multiply, whose result differs from an add's",
@@ -73,7 +86,7 @@ CASES = [
 ]
 
 # How many bytes each case writes, and how much input it reads.
-OUT_BYTES = {0: 32, 1: 64, 2: 32}
+OUT_BYTES = {0: 32, 1: 64, 2: 32, 3: 32}
 IN_BYTES = 256
 
 
@@ -90,7 +103,8 @@ def rows_of(case):
 def emit(case, helper=5):
 	"""The span's bytes, or None if it refuses."""
 	entries = detour.span_entries(case[2], rows_of(case), case[3], None, [])
-	return detour.lower_ymm_span(entries, 0, helper, 0x2000, 0)
+	return detour.lower_ymm_span(entries, 0, helper, 0x2000, 0,
+	                             second_helper=4)
 
 
 def source(name, body):

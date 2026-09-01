@@ -9496,6 +9496,52 @@ at all.** A design worth 101 sites is not obviously worth building at the size t
 a design worth 101 sites plus whatever the shape adds might be. Nobody can tell yet, and
 that is the honest state.
 
+### Finding 152 -- a slot cannot be an operand, because SSE wants it aligned
+
+`lower_ymm_span` emits the register-second-source shape now -- `op %ymmS,%ymmD,%ymmD`,
+the biggest single population in Finding 150's histogram at 1,367 and 990 for its two
+forms. The route to it was not the one `slot_tail` was written for.
+
+**The obvious emission is one helper and a slot as an operand:**
+
+```
+	movups	slot_D(%base),%xmmH
+	addps	slot_S(%base),%xmmH	<- faults
+	movups	%xmmH,slot_D(%base)
+```
+
+**A packed SSE operation requires its memory operand to be 16-byte aligned, and nothing
+aligns a slot.** Win64 guarantees `rsp` is aligned at a call boundary and says nothing
+about an arbitrary instruction in the middle of a function -- which is exactly why
+`encode_spill` has moved with `movups` rather than `movaps` since it was written, and the
+reason was sitting in its docstring the whole time.
+
+So the source's upper half is MOVED into a second helper, with `movups`, and the operation
+is register to register. `slot_tail` is kept, correct and uncalled: the addressing is
+right and a caller that could guarantee alignment would want it, and none can.
+
+#### Two encoding faults, one caught by shape and one only by running
+
+**The first: `vaddps` assembled as `shrd`.** `sse_encoding` emits the prefix and the escape
+and then whatever tail it is given, and a tail BEGINS with the opcode -- which is why
+`narrow_piece` can hand it the instruction's own. `slot_tail` builds only the addressing,
+so the modrm byte was read as the opcode. The result was a valid instruction of an entirely
+different kind, and it disassembles cleanly.
+
+**The second: the alignment fault**, which assembled correctly, disassembled correctly, and
+segfaulted on its first run.
+
+Neither is a shape error. Both are what `span_oracle` exists for, and the second is the
+kind this project has been caught by twice before with silently wrong arithmetic -- except
+that an alignment fault is loud, which makes it the cheap kind.
+
+#### What it costs
+
+A second helper, which is a register the span did not need before. `span_helper` picks one
+today and the shape needs two, so the population that can use it is smaller than the
+histogram's 2,357 -- **that is unmeasured**, and it is the same mistake as reading 1,237
+emittable as a site count. `make spans` will say, once the collector offers the shape.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

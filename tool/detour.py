@@ -3894,19 +3894,44 @@ def span_operand_shape(vex, tail, operands, tracked):
 		# `op mem,%ymmD,%ymmD` -- src1 IS the destination, so the SSE form
 		# is the prefix dropped and nothing rearranged.
 		return ("lane", canonical_ymm(fields[2]))
+	if len(fields) == 3 and len(wide) == 3 and fields[1] == fields[2]:
+		# `op %ymmS,%ymmD,%ymmD` -- the second source is a REGISTER, so its
+		# upper half is in a slot of its own and the operation has to reach
+		# it there. That is `slot_tail`'s reason for existing. Finding 152.
+		return ("lanereg", canonical_ymm(fields[2]),
+		        canonical_ymm(fields[0]))
 	return None
 
 
-def slot_tail(register, base, slot):
-	"""modrm and SIB for `slot(%rsp)` with modrm.reg = `register`.
+def slot_tail(register, base, slot, block=None):
+	"""modrm (and SIB) addressing a slot, with modrm.reg = `register`.
 
-	The same address `encode_spill` writes, built as a TAIL so that
+	The same address `span_slot_move` writes, built as a TAIL so that
 	`sse_encoding` can put any opcode in front of it -- which is what makes
-	an upper half an operand of the operation rather than only something
-	moved in and out.
+	an upper half an OPERAND of the operation rather than only something
+	moved in and out. That is the whole of what the register-second-source
+	shape needed: `op slot(%base),%xmmH` instead of a load, an operation
+	and a store.
+
+	`(%rsp)` needs a SIB byte because rm=100 is how the encoding says "a
+	base register follows"; a block register is named in rm directly. In
+	both cases a disp32, for `encode_tls_spill`'s reason -- the block runs
+	to kilobytes and a frame's slot can sit a whole frame up.
+
+	**It is NOT safe as the operand of a packed arithmetic instruction**,
+	which is what it was written for and what it cannot do. SSE requires a
+	memory operand to be 16-byte aligned and nothing aligns a slot: Win64
+	guarantees `rsp` at a call boundary and says nothing in between, which
+	is why every slot move here is a `movups`. `lower_ymm_span` moves the
+	value into a second helper instead. Kept because the addressing is
+	right and a caller that can guarantee alignment could use it; nothing
+	does today.
 	"""
 	offset = base + slot * SLOT
-	return bytes([0x80 | ((register & 7) << 3) | 4, 0x24]) \
+	if block is None:
+		return bytes([0x80 | ((register & 7) << 3) | 4, 0x24]) \
+			+ struct.pack("<i", offset)
+	return bytes([0x80 | ((register & 7) << 3) | (block & 7)]) \
 		+ struct.pack("<i", offset)
 
 
@@ -3926,8 +3951,18 @@ def span_entries(members, instructions, slots, scope, plain):
 			moved = (address, encoding, comment, operands, mnemonic,
 			         swallowed_scratch(plain, position, address, encoding,
 			                           operands, mnemonic, scope))
+		# A register-second-source operation needs TWO slots: its
+		# destination's, and the one it reads from. The second is resolved
+		# here because `build_stub` has no operand text to look it up with.
+		second = None
+		vex = inplace.decode_vex(encoding)
+		if vex is not None and vex["L"]:
+			shape = span_operand_shape(vex, encoding[vex["length"]:],
+			                           operands, None)
+			if shape is not None and shape[0] == "lanereg":
+				second = slots.get(shape[2])
 		out.append((kind, address, encoding, mnemonic, operands,
-		            slots.get(register), moved))
+		            slots.get(register), moved, second))
 	return out
 
 
@@ -3954,7 +3989,8 @@ def span_slot_move(helper, save, base, slot, block, at):
 	return encode_tls_spill(helper, save, block[0], base + slot * SLOT)
 
 
-def lower_ymm_span(entries, base, helper, at, pool, block=None):
+def lower_ymm_span(entries, base, helper, at, pool, block=None,
+                   second_helper=None):
 	"""The span, with every upper half kept in a 16-byte slot. Bytes or None.
 
 	**The first thing here that emits 256-bit work rather than measuring
@@ -3979,7 +4015,8 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None):
 		# member would cost three instructions each and a pointer clobbered
 		# mid-span would address somebody else's thread data.
 		body += encode_tls_base(block[0], block[1], block[2], at)
-	for kind, address, encoding, mnemonic, operands, slot, moved in entries:
+	for kind, address, encoding, mnemonic, operands, slot, moved, second \
+			in entries:
 		if kind == "plain":
 			fixed = moved_instruction(moved[:5], at + len(body), pool)
 			if fixed is None:
@@ -3994,6 +4031,11 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None):
 		if shape is None or slot is None:
 			return None
 		what = shape[0]
+		if what == "lanereg" and second is None:
+			# The second source's upper half is in no slot this span
+			# tracks, so the operation has nothing to read. Refused rather
+			# than guessed at.
+			return None
 		if what == "load":
 			low = narrow_piece(vex, tail, 0, address, len(encoding),
 			                   at + len(body))
@@ -4023,6 +4065,47 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None):
 			if piece is None:
 				return None
 			body += piece
+			continue
+		if what == "lanereg":
+			# **TWO helpers, because a slot cannot be an operand.** The
+			# obvious emission is `op slot(%base),%xmmH` -- one helper, the
+			# destination's upper half in it, the source's slot read
+			# directly -- and `slot_tail` was written for exactly that. It
+			# faults. A packed SSE operation requires its memory operand
+			# to be 16-byte ALIGNED, and nothing aligns a slot: Win64
+			# guarantees `rsp` is aligned at a call boundary and says
+			# nothing about an arbitrary instruction, which is the same
+			# reason `encode_spill` moves with `movups` and not `movaps`.
+			# The first build of this segfaulted on its first run.
+			#
+			# So the source's upper half is MOVED into a second helper --
+			# with `movups`, which has no alignment requirement -- and the
+			# operation is register to register.
+			if second_helper is None:
+				return None
+			low = narrow_piece(vex, tail, 0, address, len(encoding),
+			                   at + len(body))
+			if low is None:
+				return None
+			body += low
+			body += span_slot_move(helper, False, base, slot, block,
+			                       at + len(body))
+			body += span_slot_move(second_helper, False, base, second,
+			                       block, at + len(body))
+			# Register to register: modrm mod 11, reg = destination
+			# helper, rm = source helper. The opcode byte is the original
+			# tail's first, which is what `sse_encoding` expects in front
+			# of the addressing -- without it the modrm is read as the
+			# opcode and `vaddps` assembles as `shrd`.
+			operation = inplace.sse_encoding(
+				dict(vex, L=0, R=helper >> 3, X=0, B=second_helper >> 3),
+				tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
+				                  | (second_helper & 7)]))
+			if operation is None:
+				return None
+			body += operation
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
 			continue
 		# A lane-wise operation whose other source is memory. The low half
 		# is the instruction with L cleared; the upper half is the same
