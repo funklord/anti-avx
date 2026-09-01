@@ -10361,6 +10361,66 @@ expensive ones, and refusing the trade at the points where the proxy can differ 
 This session found four such points: a flag flip against a build, a shell exit against a
 process, a residual against a measurement, and a shared count against a per-cause one.
 
+### Finding 168 -- the time model for the rest of the strategies, and the floor under all of them
+
+The byte model ranks the strategies over a 4x spread: `splat` 7.2 bytes per site, `pair`
+12.4, `plain` 13.2, `zero` 16.0, `spill` 24.4, `conststore` 30.8. `cost_bench` timed three
+of them; this took the rest, emitting each body from its real lowering -- `lower_vex` for
+`plain`, `encode_spill` + `lower_vex` + `encode_spill` for `spill` (the shape `build_stub`
+emits), `lower_ymm_zero_store` for `zero`, and `lower_ymm_run` handed a real strategy for
+`run`. There is deliberately no `zerorun`: it has no lowering function of its own to call,
+and writing its sequence by hand would have measured a belief rather than the tool.
+
+**The answer is that the time model does not reproduce the byte model, because at this
+harness's resolution there is almost nothing to reproduce.**
+
+```
+(control) an empty body: the loop's own cost      2.11 ns   +0.00 over floor
+plain: an aliased site, a dead register            1.85 ns   -0.26 over floor
+spill: the same site, the register BORROWED        2.18 ns   +0.07 over floor
+zero: a 256-bit store of an emptied register       2.13 ns   +0.02 over floor
+run: a load, an add and a store, split in place    2.13 ns   +0.02 over floor
+pair: a 256-bit copy, register helper              2.16 ns   +0.05 over floor
+region: the same copy, through a slot              2.14 ns   +0.03 over floor
+region: a copy with an add, a pair cannot do it    2.78 ns   +0.67 over floor
+```
+
+`plain` measured **below an empty body**. That is impossible, and it is the useful number
+in the table: the run-to-run wander is around +-0.3 ns, which is larger than every
+difference except the last row. The floor itself moved from 1.80 ns to 2.11 ns between two
+runs of the same binary.
+
+So the honest reading is three groups, not eight rows. There is the loop. There is
+everything that rearranges the same work across registers and memory -- `plain`, `spill`,
+`zero`, `run`, `pair`, both regions -- all of it indistinguishable from the loop and from
+each other. And there is the region's copy-with-an-add at +0.67, the one case that does
+arithmetic a pair cannot express.
+
+**The consequence for the project is the part worth keeping.** `spill` is priced at 24.4
+bytes against `plain`'s 13.2, nearly double, and it is the dearest thing done in quantity;
+that is the price static TLS was built to pay. In time the save and the reload cost
+nothing measurable -- the store forwards and the pair sits off the critical path. The byte
+model's spread is a statement about instruction cache and stub size, and it should go on
+being used for that, but **it must stop being read as a proxy for speed**. Nothing in this
+table says a cheaper strategy runs faster. What runs faster is removing a VEX site at all.
+
+Two things had to be fixed to get a table that could say this, and both are the session's
+recurring shape:
+
+- **The control was silently dropped.** `cases()` ended `if body`, which was meant to
+  discard a lowering that refused (`None`) and also discarded the empty body. The floor
+  did not appear in the first three runs and every figure was read as a strategy's cost
+  when 2.11 of it was the loop's. Now `if body is not None`, so a strategy that emits
+  nothing is reported rather than vanishing.
+- **The floor is subtracted in the tool, not by the reader.** A column that requires
+  arithmetic before it means anything will be believed without the arithmetic. It was.
+
+The earlier reading of the same harness -- 7.56 ns for the region's copy-with-an-add,
+against 2.71 ns for the identical body a minute later -- was the same wander, seen before
+there was a control to compare it against and briefly believed. A minimum of nine passes
+bounds sampling noise and does nothing about a floor that moves between cases.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -10662,7 +10722,8 @@ why.py            everything known about one address, which is what a
                   fault hands you
 cost_bench.py     times what each lowering emits, because bytes are not
                   cycles; the minimum of nine passes, since nothing makes
-                  code faster
+                  code faster, and an empty body as the floor -- which
+                  turned out to be most of what the table was measuring
 span_oracle.py    runs a lowered 256-bit span natively against the original
                   under qemu, which is how a SEQUENCE is proved rather than
                   an instruction

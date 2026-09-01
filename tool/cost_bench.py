@@ -26,6 +26,13 @@ callee home space is as hot as any other stack line, which is the case the
 rewriter actually creates.
 
 Usage:  cost_bench.py [build directory]
+
+**Read the third column, not the first.** Case 0 is an empty body, so its
+time is the loop's own, and the run-to-run wander is around +-0.3 ns -- one
+case has measured below an empty body, which is impossible and is the honest
+bound on what this can resolve. Everything that merely rearranges the same
+work across registers and memory sits inside that wander. What shows up is
+arithmetic a pair cannot express. See Finding 168.
 """
 
 import subprocess
@@ -39,6 +46,13 @@ import patch as inplace
 
 WORK = Path("build") / "costbench"
 ROUNDS = 4_000_000
+
+# A Class C site whose src2 IS the destination, which is what `plain`
+# lowers and what a borrow is needed for when no register is dead.
+ALIASED = bytes.fromhex("c5f05cd2")		# vsubps %xmm2,%xmm1,%xmm2
+# A 256-bit store of a register a zeroing idiom emptied: two 128-bit
+# stores of the same xmm, no scratch and no second register.
+ZEROSTORE = bytes.fromhex("c5fc111f")		# vmovups %ymm3,(%rdi)
 
 # A 256-bit copy: the work a `pair` does and a region does differently.
 LOAD = bytes.fromhex("c5fc1006")		# vmovups (%rsi),%ymm0
@@ -67,9 +81,78 @@ def span_body(rows, members, slots, helper=5, second=4):
 	return detour.lower_ymm_span(entries, 0, helper, 0x2000, 0, None, second)
 
 
+def plain_body():
+	"""What `lower_vex` emits for an aliased Class C site, with a scratch."""
+	return detour.lower_vex(0x1000, ALIASED, "%xmm2,%xmm1,%xmm2", "vsubps",
+	                        0x2000, scratch=5, pool=0x2000)
+
+
+def spill_body():
+	"""The same site with the scratch BORROWED: save, lower, restore.
+
+	`build_stub`'s `spill` shape exactly. The byte model puts this at 24.4
+	per site against a pair's 12.4 and it is the dearest thing done in
+	quantity -- 3,013 windows, and what the borrow costs static TLS. Two
+	round trips through memory around a lowering is a shape where bytes
+	and cycles have every reason to disagree.
+	"""
+	body = bytearray()
+	body += detour.encode_spill(5, True, 0x2000, 0, 0, 0)
+	lowered = detour.lower_vex(0x1000, ALIASED, "%xmm2,%xmm1,%xmm2",
+	                           "vsubps", 0x2000 + len(body), scratch=5,
+	                           pool=0x2000)
+	if lowered is None:
+		return None
+	body += lowered
+	body += detour.encode_spill(5, False, 0x2000 + len(body), 0, 0, 0)
+	return bytes(body)
+
+
+def zero_body():
+	"""What `lower_ymm_zero_store` emits: two 128-bit stores, no scratch."""
+	vex = inplace.decode_vex(ZEROSTORE)
+	return detour.lower_ymm_zero_store(vex, ZEROSTORE[vex["length"]:],
+	                                   0x1000, len(ZEROSTORE), 0x2000)
+
+
+def run_body():
+	"""What `lower_ymm_run` emits for a load, an add and a store.
+
+	Built by handing the real lowering a strategy, the way `span_body`
+	hands `lower_ymm_span` real entries. Three sites, so it is directly
+	comparable to the region's copy-with-an-add.
+
+	There is no `zerorun_body`: `zerorun` has no lowering function of its
+	own to call, and writing its sequence by hand would measure a belief.
+	"""
+	def entry(kind, raw, address):
+		vex = inplace.decode_vex(raw)
+		return (kind, 5, vex, raw[vex["length"]:], address, len(raw), None)
+
+	strategy = ((5,), [entry("load", LOAD, 0x1000),
+	                   entry("op", ADDM, 0x1000 + len(LOAD)),
+	                   entry("store", STORE,
+	                         0x1000 + len(LOAD) + len(ADDM))])
+	return detour.lower_ymm_run(strategy, 0x2000, 0x2000)
+
+
 def cases():
 	"""[(name, sites, body)] -- `sites` is the VEX instructions it replaces."""
 	out = []
+	# The control. An empty body still pays the loop: the counter, the
+	# branch, and the call and return around it. Whatever this reads is
+	# the floor, and a strategy that measures at the floor has not been
+	# distinguished from doing nothing -- which is a statement about the
+	# harness's resolution, not about the strategy being free.
+	out.append(("(control) an empty body: the loop's own cost", 1, b""))
+	out.append(("plain: an aliased site, a dead register to hand", 1,
+	            plain_body()))
+	out.append(("spill: the same site, the register BORROWED (stack)", 1,
+	            spill_body()))
+	out.append(("zero: a 256-bit store of an emptied register", 1,
+	            zero_body()))
+	out.append(("run: a load, an add and a store, split in place", 3,
+	            run_body()))
 	out.append(("pair: a 256-bit copy, register helper", 2, pair_body()))
 	out.append(("region: the same copy, through a slot", 2, span_body(
 		[("c5fc1006", "vmovups", "(%rsi),%ymm0"),
@@ -82,7 +165,12 @@ def cases():
 		 ("c5fc1107", "vmovups", "%ymm0,(%rdi)")],
 		[("load", 0, "%ymm0"), ("lane", 1, "%ymm0"),
 		 ("store", 2, "%ymm0")], {"%ymm0": 0})))
-	return [(name, sites, body) for name, sites, body in out if body]
+	# `is not None`, not truthiness: a lowering that refused returns None
+	# and belongs dropped, but an EMPTY body is a real measurement -- the
+	# control depends on surviving this line, and a strategy that emitted
+	# nothing would otherwise vanish from the table rather than be seen.
+	return [(name, sites, body) for name, sites, body in out
+	        if body is not None]
 
 
 MAIN = r"""
@@ -146,11 +234,19 @@ def build(rows):
 	# measurements and did not divide -- 3.24 ns printed beside 1.79
 	# ns/site for two sites. A number that cannot be checked against the
 	# one beside it invites being believed separately.
+	# **The floor is subtracted, not left to the reader.** Case 0 is the
+	# empty body, so its time is the loop's own -- counter, branch, call
+	# and return. Every raw figure here sits within about 1 ns of it, and
+	# the first reading of this table took 2.11 ns for a measurement of a
+	# strategy when it was very nearly a measurement of the loop. The
+	# third column is the part that is actually the lowering's.
 	calls = "\n".join(
 		f'\t{{ double t = run(body_{i}) / ROUNDS;'
-		f' printf("%-46s %8.2f ns  %6.2f ns/site\\n", "{name}", t,'
-		f' t / {sites}); }}'
+		f' if ({i} == 0) floor = t;'
+		f' printf("%-46s %8.2f ns  %6.2f ns/site  %+6.2f over floor\\n",'
+		f' "{name}", t, t / {sites}, t - floor); }}'
 		for i, (name, sites, _b) in enumerate(rows))
+	calls = "\tdouble floor = 0.0;\n" + calls
 	(WORK / "bench.c").write_text(MAIN % (ROUNDS, decls, calls))
 	binary = WORK / "bench"
 	subprocess.run(["gcc", "-O2", "-o", str(binary), str(WORK / "bench.c"),
