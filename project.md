@@ -10517,6 +10517,65 @@ Per site, which is the number that decides anything: pair 1.10, run 1.34, zero 1
 2.13, region-with-add 2.73, plain 3.20, spill 4.91 cycles.
 
 
+### Finding 170 -- the region moved last, and the 68 sites it had been taking from the long halves
+
+Finding 169 timed a region at 4.27 cycles for a copy a pair does in 2.20, and found bytes
+understate that gap -- 1.57x by length against 1.94x by machine. Finding 161 had already
+measured the region's EARLY position and rejected it. This takes the other direction: below
+the zero store, the zero run, the long halves and the constants, with nothing under it but
+the refusal.
+
+The switch is now three positions rather than a boolean, and all three call sites exist
+whichever is selected -- Finding 166's lesson, which cost 100 sites when a two-valued switch
+turned the region off instead of moving it. `--region-place=first|middle|last`, default
+`middle`. (`--region=` was already taken by `REGION_RULE`, which decides what a region may
+contain rather than where it is offered.)
+
+```
+                 middle (default)          last
+region           165 win   556 sites    143 win   439 sites   -117 sites
+longload         330 win   330 sites    365 win   365 sites    +35
+longstore        315 win   315 sites    345 win   345 sites    +30
+constload         32 win    32 sites     35 win    35 sites     +3
+pair           7,252 win 14,504 sites  7,253 win 14,506 sites   +2
+zero           9,982 win 10,367 sites  9,982 win 10,367 sites    0
+run            2,050 win  6,751 sites  2,050 win  6,751 sites    0
+span              20 win   132 sites     20 win   132 sites      0
+stub section        3,766,153 B            3,765,218 B        -935 B
+VEX surviving             6,270                 6,279            +9
+```
+
+**What the region was actually competing with is the answer, and it was not the pair or the
+zero store.** Both are unchanged to within two sites: the pair already runs above the region
+in either position, and no zero store ever wanted a site a region had. The competition was
+entirely with the **long halves** -- 65 sites between `longload` and `longstore`, plus three
+constants -- which the region had been taking and which cost 16.4 and 16.7 bytes per site
+against its 19.6.
+
+**And 47 sites went to nobody.** The region gave up 117 and the cheaper strategies took 70.
+The rest were regions whose sites no other strategy can lower at all, which is the whole
+argument for the region existing. After the widened windows are accounted for, that is nine
+more surviving VEX instructions.
+
+**So `middle` stays the default, and the trade is worth stating plainly rather than
+splitting.** Moving the region last is right on both cost measures -- 935 fewer stub bytes,
+and 68 sites moved from a 19.6 B/site strategy to 16.4 and 16.7 -- and wrong on the one that
+decides whether the binary runs, which is how much VEX is left. Nine instructions is small
+against 6,270, but it is the wrong direction on the only metric with a hard target, and the
+cost it buys back is a fraction of a percent of the stub.
+
+The region's own price went UP when it was moved, 19.0 to 19.6 bytes per site. That is the
+expected shape and worth recording as a check on the reasoning: the regions it still wins
+last are the ones nothing else contested, so its average is no longer flattered by the cheap
+sites it used to take from the long halves.
+
+**What would change the answer.** The 47 sites lost are the measurement to attack -- they
+are regions the long halves and the constants could not take, so they are not a competition
+problem but a coverage one, and they sit inside the 386 regions where `region_members`
+accepts what `lower_ymm_span` refuses (still unexplained, still on the build-next list). Fix
+that and `last` becomes free, because the sites the region gives up would be caught below it.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

@@ -511,11 +511,22 @@ SPILL_TLS = "tls"
 # TLS on took the home space away from a run and gave it back to nobody --
 # the mode gained its 753 and lost 287 net, which is how it was found.
 HOME_SPILLS = (SPILL_HOME, SPILL_TLS)
-# **Where the region sits among the 256-bit strategies.** True puts it
-# first, ahead of the pair and the run; False leaves it after both, which
-# is where Finding 156 built it and where it stays.
+# **Where the region sits among the 256-bit strategies**, as one of three
+# positions that all exist in `collect`: `first` ahead of the pair and the
+# run, `middle` after the pair, the run and the span, and `last` after the
+# zero store, the zero run, the long halves and the constants too -- with
+# nothing below it but the refusal.
 #
-# Measured both ways (Finding 161). First, it takes 865 more windows and
+# It is three places and not a boolean for the reason Finding 166 cost 100
+# sites: the first version of this switch deleted one call site and made
+# the other conditional, so turning it off disabled the region rather than
+# moving it. Every position is a call that is present whichever value is
+# set, and `--region-place=` selects between them without editing this
+# file -- `--region=` was already taken by `REGION_RULE`, which decides
+# what a region may contain rather than where it is offered.
+#
+# Measured first against middle (Finding 161). First, it takes 865 more
+# windows and
 # the pair loses 909 and the run 236 -- 1,145 windows changing hands to
 # gain SEVEN sites, at 22 KB more stub. A pair lowers a 256-bit copy
 # through a register helper and the region routes the same value through
@@ -527,7 +538,17 @@ HOME_SPILLS = (SPILL_HOME, SPILL_TLS)
 # kept beside `--spill=tls`: the two answers are a site count against a
 # cost, and the day the region lowers a copy as cheaply as the pair does,
 # the switch is already there to re-take the measurement.
-REGION_FIRST = False
+#
+# Middle against last is Finding 170, and its reason is Finding 169's
+# measurement rather than a guess: a region routes a copy through a memory
+# slot at 4.27 cycles where a pair does it in registers at 2.20, and the
+# zero store -- which sits directly below the region today -- is the
+# cheapest thing here at 1.91. A region that wins a site one of those
+# would have taken has made the binary slower to lower one more.
+REGION_EARLY = "first"
+REGION_MID = "middle"
+REGION_LATE = "last"
+REGION_PLACE = REGION_MID
 # **`tls` is the default**, and what it changes from `home` is one thing: a
 # site whose function will lend no home space gets sixteen bytes of its own
 # thread instead of keeping its VEX. Worth 671 sites in the binary (Finding
@@ -5751,7 +5772,7 @@ def collect(binary, listing):
 		# the region is buying sites at a price nobody has costed -- and
 		# Finding 123's rule is that a strategy which SUCCEEDS can still
 		# take work a better one was doing.
-		if vex["L"] and REGION_FIRST:
+		if vex["L"] and REGION_PLACE == REGION_EARLY:
 			regional = region_candidate(instructions, plain, positions,
 			                            index, blocked, home, ranges,
 			                            scope, tls_slot_offset)
@@ -5962,15 +5983,15 @@ def collect(binary, listing):
 				candidates.append(spanned)
 				continue
 
-		# **The region in its late position**, which `REGION_FIRST = False`
-		# selects. The switch chooses BETWEEN TWO PLACES and not between
-		# on and off: the first version of it deleted this call and made
-		# the early one conditional, so turning the switch back off did
-		# not restore the old order, it disabled the region -- 100 sites,
-		# shipped in a commit whose message said "put it back", and found
-		# only when a later verify came back 6,505 against a 6,405
-		# baseline. Finding 166.
-		if vex["L"] and not REGION_FIRST:
+		# **The region in its middle position**, which `--region-place=middle`
+		# selects and which is the default. The switch chooses BETWEEN
+		# THREE PLACES and not between on and off: the first version of it
+		# deleted this call and made the early one conditional, so turning
+		# the switch back off did not restore the old order, it disabled
+		# the region -- 100 sites, shipped in a commit whose message said
+		# "put it back", and found only when a later verify came back 6,505
+		# against a 6,405 baseline. Finding 166.
+		if vex["L"] and REGION_PLACE == REGION_MID:
 			regional = region_candidate(instructions, plain, positions,
 			                            index, blocked, home, ranges,
 			                            scope, tls_slot_offset)
@@ -6185,6 +6206,19 @@ def collect(binary, listing):
 					                   "something that will not reload it")
 				else:
 					strategy = ("constload", held)
+
+		# **The region in its last position**, which `--region-place=last`
+		# selects: below the zero store, the zero run, the long halves and
+		# the constants, with nothing under it but the refusal. Every
+		# strategy that Finding 169 timed as cheaper than a region has had
+		# its turn before this line is reached.
+		if vex["L"] and strategy is None and REGION_PLACE == REGION_LATE:
+			regional = region_candidate(instructions, plain, positions,
+			                            index, blocked, home, ranges,
+			                            scope, tls_slot_offset)
+			if regional is not None:
+				candidates.append(regional)
+				continue
 
 		if vex["L"] and strategy is None and not needs_sequence:
 			# The reason comes from `ymm_run` itself rather than from a
@@ -8526,6 +8560,7 @@ def main(argv):
 	# site, as it always has, and the other two exist so that all three can
 	# be built and compared. See Finding 46.
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
+	global REGION_PLACE
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -8559,6 +8594,15 @@ def main(argv):
 			RSP_RULE = item.split("=", 1)[1]
 			if RSP_RULE not in (RSP_BLANKET, RSP_FOLLOWED):
 				print(f"detour.py: unknown rsp rule {RSP_RULE!r}",
+				      file=sys.stderr)
+				return 2
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--region-place="):
+			REGION_PLACE = item.split("=", 1)[1]
+			if REGION_PLACE not in (REGION_EARLY, REGION_MID, REGION_LATE):
+				print(f"detour.py: unknown region place {REGION_PLACE!r}",
 				      file=sys.stderr)
 				return 2
 			del argv[i]
