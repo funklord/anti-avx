@@ -435,6 +435,14 @@ gprs: $(LISTING)
 shapes: $(LISTING)
 	$(PYTHON) tool/shape_census.py $(TARGET) $(LISTING)
 
+# Every register-only VEX shape the binary contains, run against its
+# lowering. NOT in the aggregate `check`, and deliberately: three `vdpps`
+# shapes differ with no verdict yet, so this target is red on purpose --
+# see Finding 155. Making it green by widening the exemption is the one
+# thing not to do.
+check-shapes: $(LISTING)
+	$(PYTHON) tool/shape_oracle.py $(LISTING) $(BUILD_DIR)
+
 # What a closed 256-bit span could reach, which is not what Finding 133's
 # capacity figure suggests. A measurement, not a gate: it always exits 0.
 spans: $(LISTING) $(DETOURED)

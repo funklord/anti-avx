@@ -9653,6 +9653,61 @@ instructions.
 **A fixed scratch measures the example's register numbers**, which is the exact thing the
 shape abstraction exists to discard. The census was reporting on its own sample.
 
+### Finding 155 -- the shapes run, and three vdpps have no verdict
+
+`make check-shapes` is the executable half of Finding 154's census. Every register-only
+shape the binary contains is run twice -- the original under qemu, the lowering natively --
+and everything but the scratch register must agree bit for bit.
+
+```
+295 register-only shapes, 877/885 comparisons agree
+
+5 disagreements on a PURE PREFIX STRIP, so both sides ran identical bytes:
+  vrcpps 128 r0,r1            an approximate reciprocal
+  vrsqrtps 128 r0,r1          approximate
+  vdpps 128 imm,r0,r0,r0      on the edges pattern
+  vdpps 128 imm,r0,r1,r1      on the edges pattern
+
+3 unresolved:
+  vdpps 128 imm,r0,r0,r1
+  vdpps 128 imm,r0,r1,r0
+  vdpps 128 imm,r0,r1,r2
+```
+
+**The exemption is a checkable property and not a list of mnemonics.** If the lowered bytes
+are the same instruction with the VEX prefix replaced by the legacy escape, then it IS the
+same instruction and a difference is the two executors disagreeing. That cannot grow to
+cover a real fault, which a forgiving mnemonic list does -- Finding 119 met the same
+question with qemu's NaN defect and answered it by narrowing twice.
+
+**So `vdpps` is PROVEN to diverge** between qemu and this Westmere on the all-sign-bits
+pattern, because two of its shapes are pure strips and still differ.
+
+**The three unresolved ones are the same mnemonic on the same pattern**, and their lowering
+adds a `movaps` because the destination is not the first source. That is consistent with
+the same cause and is not proof of it, and `vdpps` at three shapes is exactly where a real
+fault could hide behind a real divergence. They are left red.
+
+`check-shapes` is deliberately NOT in the aggregate `check`. A target that fails for a
+reason nobody has adjudicated is doing its job; one quietly excluded from the gate is not.
+**The thing not to do is widen the exemption until it goes green.**
+
+#### What the harness cannot ask, stated so the 295 is not read as coverage
+
+  * **memory operands** -- a real instruction's operand points into the binary, and
+    rewriting it to point somewhere runnable means the thing under test is no longer the
+    instruction the program contains. `vex_oracle` covers those with synthesised cases
+    whose addresses it owns;
+  * **a lowering that is not self-contained** -- SSE `blendv` takes its mask in an implicit
+    xmm0, so `lower_vex`'s bytes for a `vblendv` clobber a register the instruction does
+    not name and are correct only inside the sequence that saves it;
+  * **anything writing a general-purpose register** -- this compares xmm state and holds
+    its output pointer in `%rsi`, and `vpextrd $0x2,%xmm2,%esi` overwrote it and took the
+    first run down at shape 206 of 319, both sides stopping at the same line.
+
+Each is a limit of the harness rather than of the lowering, and each is why 295 is smaller
+than the 669 shapes the census counts.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -9942,6 +9997,9 @@ span_oracle.py    runs a lowered 256-bit span natively against the original
 shape_census.py   every VEX shape the binary contains, derived from it
                   rather than written down, and whether the plain path
                   lowers each
+shape_oracle.py   runs each register-only shape against its lowering, the
+                  original under qemu and the lowering natively; the
+                  executable half of the census
 ```
 
 And the targets, since several exist only to carry a measurement:
@@ -9963,6 +10021,8 @@ make gprs          how many volatile GPRs are dead at each starved site,
                    which is what static TLS costs (a measurement)
 make shapes        every VEX shape in the binary and whether it lowers,
                    which is the list no hand-written case set can check
+make check-shapes  and whether each computes the same answer. RED on
+                   purpose: three vdpps shapes have no verdict yet
 ```
 
 ### Practical things that cost time to learn
