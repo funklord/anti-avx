@@ -52,6 +52,7 @@ import re
 import subprocess
 import sys
 import tokenize
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, NoReturn
@@ -980,6 +981,30 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 
 # --------------------------------------------------------------- fixers
 
+@dataclass
+class Frame:
+	"""One open brace, and what the indenter has to remember about it.
+
+	Ten fields, addressed by position until they were named. That is how
+	`stack[-1][6]` came to hold `None` inside a `list[list[int]]`: the
+	annotation said `int`, the comment beside it described three fields
+	("one [is_switch, in_case, paren_depth] per open brace"), and nothing
+	held either to the ten that were there. Two of them mean "not learned
+	yet" and are genuinely optional; the type says so now.
+	"""
+
+	is_switch: bool			# opened by a `switch` head
+	saw_label: bool			# a case/default label has been seen inside
+	paren: int			# ( ) depth where the brace opened
+	virtual: int			# braceless bodies open around it
+	no_level: bool			# `extern "C"` or `namespace`: brace, not level
+	has_tail: bool			# content followed the brace on its own line
+	label_shift: int | None		# the switch's label style, once learned
+	opened_on_label: bool		# the opening line was itself a label
+	access_shift: int | None	# the class's access style, once learned
+	line_no: int			# where it opened
+
+
 def convert_c(text: str, width: int,
                dual: set[int] | None = None,
                short: dict[int, int] | None = None,
@@ -994,8 +1019,7 @@ def convert_c(text: str, width: int,
 	"""
 	lines = text.split("\n")
 	out = []
-	# one [is_switch, in_case, paren_depth] per open brace
-	stack: list[list[int]] = []
+	stack: list[Frame] = []
 	state = "normal"		# normal | block_comment | string | char | raw
 	pp_cont = False			# inside a backslash-continued directive
 	pending_switch = False		# saw `switch`, awaiting its `{`
@@ -1010,7 +1034,7 @@ def convert_c(text: str, width: int,
 	await_body = False		# an `else`/`do` whose body shape is not yet known
 	stmt_level = 0			# level of the line the current statement began on
 
-	def case_extra(frames: list[list[int]]) -> int:
+	def case_extra(frames: list[Frame]) -> int:
 		"""The level a switch's statements take below its labels.
 
 		Not counted when the label opened a brace of its own: `case x: {`
@@ -1020,10 +1044,11 @@ def convert_c(text: str, width: int,
 		and that is the half the gate did not check.
 		"""
 		return sum(1 for i, f in enumerate(frames)
-		           if f[0] and f[1]
-		           and not (i + 1 < len(frames) and frames[i + 1][7]))
+		           if f.is_switch and f.saw_label
+		           and not (i + 1 < len(frames)
+		                    and frames[i + 1].opened_on_label))
 
-	def depth(frames: list[list[int]]) -> int:
+	def depth(frames: list[Frame]) -> int:
 		"""Open braces that actually indent.
 
 		`extern "C" { ... }` is a brace and not a level: every C++ project
@@ -1057,7 +1082,7 @@ def convert_c(text: str, width: int,
 		A rule learned from the tool rather than from the document is the
 		wrong way round.
 		"""
-		return sum(1 for f in frames if not f[4])
+		return sum(1 for f in frames if not f.no_level)
 
 	for line_no, line in enumerate(lines, start=1):
 		line_is_label = False
@@ -1089,7 +1114,7 @@ def convert_c(text: str, width: int,
 		elif state_at_start == "normal" and not pp_cont and rest[0] == "#":
 			new = line			# preprocessor directive
 		else:
-			top_is_switch = bool(stack) and stack[-1][0]
+			top_is_switch = bool(stack) and stack[-1].is_switch
 			is_close = state_at_start == "normal" and rest[0] == "}"
 			is_open = state_at_start == "normal" and rest[0] == "{"
 			is_label = (state_at_start == "normal" and top_is_switch
@@ -1115,7 +1140,7 @@ def convert_c(text: str, width: int,
 				# Closing a case's own brace lands on the label, so the
 				# switch's level is still spent; closing the SWITCH gives
 				# it back.
-				ce = stack if (stack and stack[-1][7]) else frames
+				ce = stack if (stack and stack[-1].opened_on_label) else frames
 				level = depth(frames) + case_extra(ce)
 			elif is_label:
 				frames = stack[:-1]
@@ -1142,25 +1167,28 @@ def convert_c(text: str, width: int,
 			# out than one level is a misindented line, not a third
 			# convention, and calibrating to it would hide everything after
 			# it.
-			level += sum(f[6] for f in frames if f[6])
+			level += sum(f.label_shift or 0 for f in frames)
 			if (is_label and rest[:2] not in ("//", "/*")
-			        and stack and stack[-1][6] is None):
-				stack[-1][6] = max(-1, min(0, own_tabs - level))
+			        and stack and stack[-1].label_shift is None):
+				learned = max(-1, min(0, own_tabs - level))
+				stack[-1].label_shift = learned
 				if shifts is not None:
-					shifts[stack[-1][9]] = stack[-1][6]
+					shifts[stack[-1].line_no] = learned
 			# `or 0` because a comment may BE the label line (it leads one)
 			# before any real label has taught this switch its style. In the
 			# learning pass there is nothing to add yet; the second pass has
 			# it seeded from the first.
 			if is_label and stack:
-				level += stack[-1][6] or 0
+				level += stack[-1].label_shift or 0
 			# The same for a class's access specifiers, except that only the
 			# specifier moves: its members sit at the class's level under
 			# either style, so this shift is never applied to them.
 			if is_access and stack:
-				if stack[-1][8] is None:
-					stack[-1][8] = max(-1, min(0, own_tabs - level))
-				level += stack[-1][8]
+				shift = stack[-1].access_shift
+				if shift is None:
+					shift = max(-1, min(0, own_tabs - level))
+					stack[-1].access_shift = shift
+				level += shift
 			level = max(level, 0)
 
 			# A line that opens inside unclosed parens continues a statement
@@ -1171,7 +1199,7 @@ def convert_c(text: str, width: int,
 			# statement at the head's indentation while its depth is one
 			# deeper, and using the depth would break the alignment at every
 			# tab width except the one it was computed for.
-			base_paren = stack[-1][2] if stack else 0
+			base_paren = stack[-1].paren if stack else 0
 			if paren > base_paren:
 				level = stmt_level
 			else:
@@ -1186,7 +1214,7 @@ def convert_c(text: str, width: int,
 			#
 			# Not the closing brace: that belongs to the line that opened
 			# the construct and has one right answer.
-			if dual is not None and not is_close and stack and stack[-1][5]:
+			if dual is not None and not is_close and stack and stack[-1].has_tail:
 				dual.add(line_no)
 			if lead_cols >= width * level:
 				new = "\t" * level + " " * (lead_cols - width * level) + rest
@@ -1195,8 +1223,8 @@ def convert_c(text: str, width: int,
 					short[line_no] = level
 				new = "\t" * (lead_cols // width) + " " * (lead_cols % width) + rest
 			if is_label and rest[:2] not in ("//", "/*"):
-				stack[-1][1] = True
-			line_is_label = is_label and rest[:2] not in ("//", "/*")
+				stack[-1].saw_label = True
+			line_is_label = bool(is_label and rest[:2] not in ("//", "/*"))
 
 		out.append(new)
 
@@ -1310,7 +1338,7 @@ def convert_c(text: str, width: int,
 					# one's body, and what is left pending is the outer
 					# `for`'s, which this block is inside of. The lambda's
 					# brace opens an expression, not that body.
-					body_floor = stack[-1][3] if stack else 0
+					body_floor = stack[-1].virtual if stack else 0
 					if virtual > body_floor:
 						virtual -= 1
 					await_body = False
@@ -1355,12 +1383,18 @@ def convert_c(text: str, width: int,
 						tail = ""
 					if tail.startswith("/*") and tail.endswith("*/"):
 						tail = ""
-					stack.append([pending_switch, False, paren, virtual,
-					              linkage_spec or namespace_spec,
-					              bool(tail),
-					              None if shifts is None
-					              else shifts.get(line_no),
-					              line_is_label, None, line_no])
+					stack.append(Frame(
+						is_switch       = pending_switch,
+						saw_label       = False,
+						paren           = paren,
+						virtual         = virtual,
+						no_level        = linkage_spec or namespace_spec,
+						has_tail        = bool(tail),
+						label_shift     = (None if shifts is None
+						                   else shifts.get(line_no)),
+						opened_on_label = line_is_label,
+						access_shift    = None,
+						line_no         = line_no))
 					pending_switch = False
 					linkage_extern = False
 					linkage_spec = False
@@ -1392,18 +1426,18 @@ def convert_c(text: str, width: int,
 					# and the tool went quiet.
 					if stack:
 						stack.pop()
-					virtual = stack[-1][3] if stack else 0
+					virtual = stack[-1].virtual if stack else 0
 					await_body = False
 					linkage_extern = False
 					linkage_spec = False
 					namespace_spec = False
-				elif counting and c == ";" and paren == (stack[-1][2] if stack else 0):
+				elif counting and c == ";" and paren == (stack[-1].paren if stack else 0):
 					# End of a statement closes every braceless body that was
 					# waiting on it -- `if (a) if (b) x;` opened two -- but
 					# only those opened inside the current block. Anything
 					# still open around the block is this frame's floor.
 					pending_switch = False
-					virtual = stack[-1][3] if stack else 0
+					virtual = stack[-1].virtual if stack else 0
 					await_body = False
 					# `extern "C" int f(void);` declares rather than opens.
 					linkage_extern = False
@@ -1470,16 +1504,30 @@ def convert_python(text: str, width: int) -> str:
 	protected = python_literal_lines(text)
 
 	row_depth: dict[int, int] = {}
+	# Rows that BEGIN a logical line, which are the only ones this can hold
+	# to a depth. Python fixes a statement's indentation -- every statement
+	# in a block shares one column or the file does not parse -- so a
+	# statement's tab count is answerable. A continuation's is not: nested
+	# literals, hanging indents of one to four tabs and alignment under a
+	# bracket are all in use here, in the thousands, and none of them is
+	# wrong. See project.md for the measurement and for why the obvious
+	# check on continuations cannot be written.
+	stmt_rows: set[int] = set()
 	depth = 0
+	fresh = True
 	for tok in tokenize.generate_tokens(io.StringIO(text).readline):
 		if tok.type == tokenize.INDENT:
 			depth += 1
 		elif tok.type == tokenize.DEDENT:
 			depth -= 1
-		elif tok.type in (tokenize.NL, tokenize.NEWLINE,
-		                  tokenize.COMMENT, tokenize.ENDMARKER):
+		elif tok.type == tokenize.NEWLINE:
+			fresh = True
+		elif tok.type in (tokenize.NL, tokenize.COMMENT, tokenize.ENDMARKER):
 			continue
 		else:
+			if fresh:
+				stmt_rows.add(tok.start[0])
+				fresh = False
 			row_depth.setdefault(tok.start[0], depth)
 			if tok.start[0] not in protected:
 				for r in range(tok.start[0], tok.end[0] + 1):
@@ -1487,14 +1535,36 @@ def convert_python(text: str, width: int) -> str:
 
 	out = []
 	for row, line in enumerate(text.splitlines(keepends=True), 1):
-		body = line.lstrip(" ")
-		col = len(line) - len(body)
+		# Measured in COLUMNS, so a line already indented with tabs is
+		# measured too. This stripped spaces only, which gave every
+		# tab-indented line a column count of zero and passed it straight
+		# through -- so the converter re-expressed a space-indented file
+		# and inspected nothing in a converted one. Every Python file here
+		# is converted, so the structural half was inert wherever it ran:
+		# a block at five tabs where two belong came back unchanged and
+		# compared equal to itself. A sabotaged file was caught only when
+		# it stopped PARSING, which is the syntax check, not this one.
+		col, body = split_leading_ws(line, width)
 		if row in protected or not body.strip() or col == 0:
 			out.append(line)
 			continue
-		if row in row_depth:
+		if row in row_depth and row in stmt_rows:
 			d = row_depth[row]
 			pad = " " * max(0, col - width * d)
+		elif row in row_depth:
+			out.append(line)		# a continuation: see stmt_rows above
+			continue
+		elif line[:1] == "\t":
+			# A comment-only row, already in tabs. It has no structural
+			# depth -- tokenize skips it -- so its own column decides, and
+			# deciding means leaving it where its author put it. Dividing
+			# the column by the width instead is what the branch below
+			# does, which is right for a file still in spaces and wrong
+			# here: a comment inside a continuation sits at whatever
+			# column the continuation aligned to, and division reads that
+			# alignment as levels.
+			out.append(line)
+			continue
 		else:
 			d, pad = col // width, " " * (col % width)
 		out.append("\t" * d + pad + body)
