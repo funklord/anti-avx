@@ -1712,7 +1712,8 @@ def doc_paths(text: str) -> list[tuple[int, str]]:
 	return found
 
 
-def check_docs(root: Path, cfg: Config) -> list[Problem]:
+def check_docs(root: Path, cfg: Config,
+               counts: dict[str, int] | None = None) -> list[Problem]:
 	"""Hold the design document to the tree it describes.
 
 	A map with a module missing from it is worse than no map: a reader looking
@@ -1722,9 +1723,25 @@ def check_docs(root: Path, cfg: Config) -> list[Problem]:
 	"""
 	doc = root / cfg["doc_file"]
 	problems: list[Problem] = []
-	if not doc.is_file():
-		return problems
+	counts = {} if counts is None else counts
 	rel = Path(cfg["doc_file"])
+	if not doc.is_file():
+		# An absent document was zero problems, and zero problems is how
+		# main() spells success -- so this mode passed on a file it had
+		# never opened, and then printed a sentence NAMING that file. The
+		# words it chose for the ambiguity were the reassuring ones:
+		# "project.md says nothing twice and names no missing file", about
+		# a project.md that is not there.
+		#
+		# `doc_file` is a configured name with a default, so a missing one
+		# is a broken configuration rather than a clean tree -- the same
+		# reading `check_submodule_pins` gives "not initialised, cannot
+		# check". Signalled from fuzzypickles 2026-09-01, reproduced
+		# against a directory holding only a .style-gate.toml.
+		problems.append(Problem(rel, 1, 1,
+			"no such file: the document this mode checks is missing, "
+			"which is a broken doc_file rather than a clean tree"))
+		return problems
 	text = doc.read_text(encoding="utf-8", errors="replace")
 
 	seen: dict[str, int] = {}
@@ -1736,11 +1753,14 @@ def check_docs(root: Path, cfg: Config) -> list[Problem]:
 			else:
 				seen[line] = number
 
+	counts["headings"] = len(seen)
 	if not cfg["doc_check_paths"]:
 		return problems
 
 	ignore = set(cfg["doc_ignore"])
-	for number, token in doc_paths(text):
+	tokens = list(doc_paths(text))
+	counts["paths"] = len(tokens)
+	for number, token in tokens:
 		if token in ignore or (root / token).exists():
 			continue
 		# Only complain when the directory it names is real. A path under a
@@ -1786,13 +1806,26 @@ def main(argv: list[str]) -> int:
 		files, raw = discover(root, cfg)
 
 	if mode == "docs":
-		problems = check_docs(root, cfg)
+		counts: dict[str, int] = {}
+		problems = check_docs(root, cfg, counts)
 		for problem in problems:
 			print(problem, file=sys.stderr)
 		if problems:
 			print(f"\n{len(problems)} documentation inconsistency(ies)", file=sys.stderr)
 			return 1
-		print(f"style-gate: {cfg['doc_file']} says nothing twice and names no "
+		# The population, for the same reason `check` prints its file count
+		# and refuses a collapsed list: a verdict with no count cannot tell
+		# a clean document from a document nothing looked at. This mode was
+		# the only one in the run without one -- the idea was already in
+		# this file, one mode over, and this is where it was left out.
+		#
+		# It also covers the quieter half: if doc_paths() stopped matching,
+		# the path check would inspect nothing and the old sentence would
+		# not have changed by a word. Now the number moves.
+		scanned = (f" ({counts.get('headings', 0)} heading(s)"
+		           + (f", {counts['paths']} path(s)" if "paths" in counts
+		              else ", paths not checked") + ")")
+		print(f"style-gate: {cfg['doc_file']}{scanned} says nothing twice and names no "
 		      f"missing file")
 		return 0
 
