@@ -8571,6 +8571,66 @@ def tls_for(binary):
 		return tls_slot(image.read(), TLS_SLOTS * SLOT)
 
 
+def report_placement(candidates, placed, overlapped, refused):
+	"""What the placer did to each kind of candidate, and what it cost.
+
+	**The placer has never been instrumented and it is the dominant term.**
+	Finding 159 measured 920 regions clearing every filter this project can
+	name and about 100 reaching the binary, which makes `place_stubs` a
+	bigger loss than every analysis rule left -- and until now the only
+	numbers it reported were three totals with no way to tell which kind of
+	candidate they fell on.
+
+	Nothing in the placer changes to produce this. It already returns the
+	sets of overlapped and refused addresses, and `apply_all` already holds
+	the candidate list, so the tally is arithmetic on what exists. That is
+	deliberate: instrumenting a placer by changing it risks changing what it
+	places, and the first question is what it does now.
+
+	The second table is what a window COSTS. A region's window is three to
+	twelve instructions where an ordinary site's is five bytes, so a placed
+	region forecloses every candidate that starts inside it -- and those
+	candidates are counted here rather than guessed at.
+	"""
+	kind_of = {}
+	starts = []
+	for entry in candidates:
+		start, strategy = entry[0], entry[8]
+		kind_of[start] = strategy[0] if strategy is not None else "plain"
+		starts.append(start)
+	starts.sort()
+	taken = {address for address, *_rest in placed}
+	tally = {}
+	for start, kind in kind_of.items():
+		row = tally.setdefault(kind, [0, 0, 0])
+		if start in taken:
+			row[0] += 1
+		elif start in overlapped:
+			row[1] += 1
+		elif start in refused:
+			row[2] += 1
+	print("apply: what the placer did, by strategy:")
+	print(f"apply:   {'kind':<12} {'placed':>9} {'overlapped':>11} "
+	      f"{'refused':>9}")
+	for kind in sorted(tally, key=lambda k: -sum(tally[k])):
+		row = tally[kind]
+		print(f"apply:   {kind:<12} {row[0]:>9,} {row[1]:>11,} {row[2]:>9,}")
+
+	# What each placed window forecloses: the candidates starting strictly
+	# inside it, which the placer will meet later and skip for overlap.
+	cost = Counter()
+	for address, window, *_rest in placed:
+		kind = kind_of.get(address, "plain")
+		low = bisect.bisect_right(starts, address)
+		high = bisect.bisect_left(starts, address + window)
+		if high > low:
+			cost[kind] += high - low
+	if cost:
+		print("apply: candidates foreclosed by a placed window, by kind:")
+		for kind, count in cost.most_common():
+			print(f"apply:   {kind:<12} {count:>9,}")
+
+
 def stub_base_of(data):
 	"""Where the stub section will start: past every section, page aligned."""
 	pe = struct.unpack_from("<I", data, 0x3C)[0]
@@ -8874,6 +8934,7 @@ def apply_all(binary, listing, output):
 	      f"{len(overlapped):,} skipped for overlap, {len(refused):,} refused")
 	for why, count in stub_reasons.most_common():
 		print(f"apply:   refused, {why:<38} {count:>8,}")
+	report_placement(candidates, placed, overlapped, refused)
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "
 	      f"{len(blob):,} bytes")
 	print(f"apply: {len(pdata) // 12:,} function table entries "

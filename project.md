@@ -9926,6 +9926,66 @@ remains; it is simply not what limits the region.
 answer points at machinery this project has never instrumented rather than at a rule it
 can relax.
 
+### Finding 160 -- the placer was instrumented, and it exonerates itself
+
+Finding 159 concluded that placement discarded nine in ten regions and put it at the top of
+the build-next list. **It is wrong, and the instrument built to confirm it refuted it.**
+
+```
+apply: what the placer did, by strategy:
+  kind            placed  overlapped   refused
+  plain          179,031      36,071       503
+  zero             9,982         654         4
+  pair             7,255         108         0
+  spill            3,013         763        54
+  run              2,050          13        25
+  span                70           0         0
+```
+
+**Every region candidate that reached the placer was placed.** Zero overlapped, zero
+refused. The placer is not the bound and never was; 159 inferred it as a residual -- 920
+regions pass the filters, about 100 are lowered, therefore placement -- which is the exact
+error this document keeps recording under other names. A residual is not a measurement. It
+is whatever is left when the things you did measure are subtracted, including the things
+you did not think to measure.
+
+#### Where the 850 actually go
+
+`region_candidate` is the LAST strategy offered in `collect`. A 256-bit site reaches it
+only after the ordinary path, the zero store, the long pair, the constant, the run and the
+span have each declined -- and they do not decline often: `zero` places 9,982, `pair`
+7,255, `run` 2,050. The regions my probe counted are real and their sites are already
+lowered by something else before the region is asked.
+
+**Which is the same failure mode as Finding 155**, where the span was wired inside the
+run's own arm and took zero sites because nothing offered it. Offered too late is a weaker
+form of never offered, and it produces the same shape of result: a mechanism that works,
+proves correct, and reaches almost nothing.
+
+#### What the instrumentation cost and what it is worth
+
+Nothing in `place_stubs` changed. It already returned the sets of overlapped and refused
+addresses and `apply_all` already held the candidates, so the tally is arithmetic on what
+existed -- deliberately, because instrumenting a placer by changing it risks changing what
+it places, and the first question is what it does now.
+
+The second table is the cost of a window: candidates foreclosed by one that was placed.
+
+```
+  plain           35,399       spill    1,326       run    1,008
+  zerorun            654       pair       423       span      76
+```
+
+A region forecloses 76 candidates in total, against `plain`'s 35,399. **The windows this
+project worried about are not the ones doing the foreclosing.**
+
+#### The honest tally on this item
+
+Five conclusions in a row, each replaced by the next measurement: the dials, then
+`region_members`, then the shape, then placement, and now strategy ordering. Every one was
+plausible, every one was reasoned from a number that did not say what it was read to say,
+and every one cost a build. The probes that corrected them cost minutes each.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -10101,12 +10161,14 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **Placement for regions**, which Finding 159 measures as nine tenths of the region's
-     loss: 920 regions clear every filter this project can name and about 100 are lowered.
-     A region's window is three to twelve instructions where an ordinary site's is five
-     bytes, so one committed early forecloses every candidate inside it. Nothing here has
-     placed windows that big in quantity and `place_stubs` has never been instrumented for
-     it. Do this before relaxing any rule, because no rule left is worth a tenth of it.
+  1. **Where the region sits in `collect`'s chain**, which Finding 160 measures as the
+     whole of its loss. It is offered last, after the ordinary path, the zero store, the
+     long pair, the constant, the run and the span, and those place 9,982, 7,255 and
+     2,050 respectively. 920 regions pass every filter and 70 become candidates, because
+     the rest are lowered by something earlier. The placer is innocent: it placed every
+     region it was given, overlapping none and refusing none. What is unknown is whether
+     a site lowered by the ordinary path is BETTER lowered by a region, which is a
+     question about cost per site and nobody has asked it.
   2. **The collector and the lowering disagree about 386 regions.** `region_members`
      accepts what `lower_ymm_span` then refuses -- an operand `narrow_piece` cannot move,
      or a second helper the region has not got. `SPAN_EMITTABLE` keeps the survey and the
