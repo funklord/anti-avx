@@ -9873,6 +9873,59 @@ example's registers, a fixed exit set flooding the liveness, a fixed wine prefix
 the rewriter, a fixed frame size failing a correct emission, and now a missing range list.
 Every one was a constant that was right for the case it was written against.
 
+### Finding 159 -- the chain measured to the end, and placement is nine tenths of it
+
+Finding 158 left a factor of thirteen unmeasured between the regions that pass the cheap
+filters and the hundred the binary lowers. Measured:
+
+```
+4,445  256-bit sites
+2,858    a region starts at them              offered
+2,357      every member representable         region_members
+1,343        past .pdata, slots and a helper
+  920          past the frame/GPR and lowering filters
+  ~100            lowered in the binary
+```
+
+Two results, and neither is where four earlier guesses on this item pointed.
+
+#### The lowering refuses 386 regions the collector accepted
+
+`region_members` decides a region is representable by asking `span_operand_shape`. Then
+`lower_ymm_span` declines to emit it -- a `narrow_piece` that cannot move an operand, or a
+second helper the region has not got. **Two functions disagreeing about what is
+emittable**, which is precisely the drift `SPAN_EMITTABLE` exists to prevent between the
+SURVEY and the lowering, and nobody applied the same discipline between the COLLECTOR and
+the lowering.
+
+It is the largest named filter left and it is a defect rather than a bound: a region
+refused by the emitter after the walk said yes is work done twice and a reason recorded
+nowhere.
+
+#### Placement discards nine in ten
+
+920 regions clear every filter this project can name and about 100 are lowered. **The
+placer drops the rest**, and that is far beyond anything in the record: Finding 126
+measured the reload rung at +51 by `detour-plan` and -49 in the binary, and called it the
+reason to cost changes against the binary. This is the same phenomenon an order of
+magnitude larger, and it is now the dominant term by a wide margin.
+
+A region's window is three to twelve instructions where an ordinary site's is five bytes,
+so a region committed early forecloses every candidate inside it, and one that arrives
+after another is `overlapped`. Nothing in this project has previously placed windows that
+big in quantity.
+
+#### And the backing store is not the constraint
+
+37 regions fail for want of a frame region or two dead general-purpose registers. Static
+TLS -- the largest single piece of work in this area -- removes a bound that binds 37
+regions here. It was worth 671 sites through the borrow, which is where its value was and
+remains; it is simply not what limits the region.
+
+**So the next measurement is placement**, and it is the first time on this item that the
+answer points at machinery this project has never instrumented rather than at a rule it
+can relax.
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -10048,7 +10101,18 @@ table are a different question from any of this.
 
 Ordered by what was measured, not by what looks large.
 
-  1. **Region-based 256-bit rewriting**, which is what "whole-function" should have said
+  1. **Placement for regions**, which Finding 159 measures as nine tenths of the region's
+     loss: 920 regions clear every filter this project can name and about 100 are lowered.
+     A region's window is three to twelve instructions where an ordinary site's is five
+     bytes, so one committed early forecloses every candidate inside it. Nothing here has
+     placed windows that big in quantity and `place_stubs` has never been instrumented for
+     it. Do this before relaxing any rule, because no rule left is worth a tenth of it.
+  2. **The collector and the lowering disagree about 386 regions.** `region_members`
+     accepts what `lower_ymm_span` then refuses -- an operand `narrow_piece` cannot move,
+     or a second helper the region has not got. `SPAN_EMITTABLE` keeps the survey and the
+     lowering honest with each other and nothing does the same for the collector. A defect
+     rather than a bound, and a reason recorded nowhere.
+  3. **Region-based 256-bit rewriting**, which is what "whole-function" should have said
      -- see Finding 147. A call-free region is the largest unit over which an upper half
      can be represented, because the ABI kills every one of them at a call; and at a
      region's edges the span's two hard constraints both dissolve. 3,355 of the 4,494
