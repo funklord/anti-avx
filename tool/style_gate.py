@@ -926,7 +926,8 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 	# have quietly weakened two projects' gates, which is the exact failure
 	# the floor above exists to prevent, arriving by a different door.
 	if wants_indent(path, cfg) and has_fixer(path):
-		fixed, error = fixed_text(path, text, cfg)
+		dual: set[int] = set()
+		fixed, error = fixed_text(path, text, cfg, dual)
 		if error:
 			problems.append(Problem(rel, 1, 1, error))
 		else:
@@ -945,7 +946,18 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 					continue
 				want = len(now) - len(now.lstrip("\t"))
 				have = len(was) - len(was.lstrip("\t"))
-				if have != want:
+				# Two legal answers inside a brace that had content after
+				# it: aligned under that content, as a paren continuation
+				# is, or indented one further. `code-style.md` endorses the
+				# first and does not forbid the second, and both are in
+				# this workspace -- raidcfgd writes the indented form and
+				# bbq-predictor the aligned one. The model emits the
+				# indented one, so the aligned one is want - 1.
+				#
+				# This NARROWS what the gate proves on those lines, and
+				# the narrowing is bounded: one alternative level, not any
+				# level. A continuation two levels out is still reported.
+				if have != want and not (n in dual and have == want - 1):
 					problems.append(Problem(rel, n, 1,
 						f"indented {have} tab(s), structure says {want}"))
 	return problems
@@ -953,7 +965,8 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 
 # --------------------------------------------------------------- fixers
 
-def convert_c(text: str, width: int) -> str:
+def convert_c(text: str, width: int,
+               dual: set[int] | None = None) -> str:
 	"""Rewrite leading whitespace in C/C++ so indent is tabs, alignment spaces.
 
 	Structural indent = level * width columns -> level tabs; columns beyond
@@ -1019,7 +1032,7 @@ def convert_c(text: str, width: int) -> str:
 		"""
 		return sum(1 for f in frames if not f[4])
 
-	for line in lines:
+	for line_no, line in enumerate(lines, start=1):
 		state_at_start = state
 		lead_cols, rest = split_leading_ws(line, width)
 
@@ -1080,6 +1093,18 @@ def convert_c(text: str, width: int) -> str:
 				level = stmt_level
 			else:
 				stmt_level = level
+
+			# Inside a brace that had content after it, TWO indentations
+			# are legal and this model can only emit one. Record the line
+			# so check_file() accepts either, rather than picking a side
+			# and reporting every file written the other way -- the
+			# attempt that picked one produced 764 findings across eleven
+			# trees, all of them correct code.
+			#
+			# Not the closing brace: that belongs to the line that opened
+			# the construct and has one right answer.
+			if dual is not None and not is_close and stack and stack[-1][5]:
+				dual.add(line_no)
 			if lead_cols >= width * level:
 				new = "\t" * level + " " * (lead_cols - width * level) + rest
 			else:
@@ -1208,8 +1233,27 @@ def convert_c(text: str, width: int) -> str:
 					# reported a tab too deep -- the level was lost after one
 					# statement rather than never taken, which is what made it
 					# look like an indentation fault in the file.
+					# Does content follow this brace on the same line?
+					#
+					# `= {1,` opens an initialiser whose continuation may
+					# legally be written TWO ways, and the lexer cannot tell
+					# which the author meant: aligned under the content, as
+					# an open paren's is, or indented one further. Both are
+					# in this workspace and `code-style.md` endorses the
+					# first without forbidding the second, so this records
+					# the frame rather than deciding it -- see the dual
+					# acceptance in check_file().
+					#
+					# Trailing comment and whitespace do not count as
+					# content: `{ /* c */` and `{` are the same brace.
+					tail = line[i + 1:].strip()
+					if tail.startswith("//"):
+						tail = ""
+					if tail.startswith("/*") and tail.endswith("*/"):
+						tail = ""
 					stack.append([pending_switch, False, paren, virtual,
-					              linkage_spec or namespace_spec])
+					              linkage_spec or namespace_spec,
+					              bool(tail)])
 					pending_switch = False
 					linkage_extern = False
 					linkage_spec = False
@@ -1359,8 +1403,13 @@ def expand(text: str, width: int) -> str:
 	return "\n".join(out)
 
 
-def fixed_text(path: Path, src: str, cfg: Config) -> tuple[str, str | None]:
-	"""What the fixer would produce, with its proof checked. -> (text, error)."""
+def fixed_text(path: Path, src: str, cfg: Config,
+               dual: set[int] | None = None) -> tuple[str, str | None]:
+	"""What the fixer would produce, with its proof checked. -> (text, error).
+
+	`dual`, when given, collects the lines where two indentations are
+	legal and this model emits only one. See convert_c().
+	"""
 	width = int(cfg["indent_width"])
 	if is_python(path):
 		try:
@@ -1374,7 +1423,7 @@ def fixed_text(path: Path, src: str, cfg: Config) -> tuple[str, str | None]:
 			return src, f"does not parse ({exc})"
 		return dst, None
 	if path.suffix in C_SUFFIXES:
-		dst = convert_c(src, width)
+		dst = convert_c(src, width, dual)
 		if expand(dst, width) != expand(src, width):
 			return src, "conversion would change content (tool bug)"
 		return dst, None
