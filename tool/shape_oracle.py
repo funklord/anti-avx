@@ -267,7 +267,16 @@ def main():
 		return 1
 
 	vex, low = run(vex_binary, True), run(sse_binary, False)
-	if len(vex) != len(low) or len(vex) != len(rows) * len(PATTERNS):
+	# **The lowering under qemu as well**, which is what turns a
+	# disagreement into a verdict. If the original and the lowering agree
+	# when ONE executor runs both, the lowering computes the right answer
+	# and the difference against native silicon is the two executors
+	# disagreeing about the instruction. That is a direct proof rather
+	# than the inference the prefix-strip test makes, and it subsumes it:
+	# identical bytes trivially agree with themselves.
+	same = run(build("lowqemu", rows, "low"), True)
+	if len(vex) != len(low) or len(same) != len(low) \
+			or len(vex) != len(rows) * len(PATTERNS):
 		print(f"shape_oracle: FAILED -- {len(vex)} vex lines and {len(low)} "
 		      f"sse for {len(rows) * len(PATTERNS)} expected",
 		      file=sys.stderr)
@@ -278,20 +287,25 @@ def main():
 	for c, row in enumerate(rows):
 		scratch = row[5]
 		for p, (pname, _blob) in enumerate(PATTERNS):
-			a, b = vex[c * len(PATTERNS) + p], low[c * len(PATTERNS) + p]
+			c_index = c * len(PATTERNS) + p
+			a, b = vex[c_index], low[c_index]
 			# The scratch register is the one a lowering may destroy.
 			cut = slice(scratch * SLOT * 2, (scratch + 1) * SLOT * 2)
 			a = a[:cut.start] + a[cut.stop:]
 			b = b[:cut.start] + b[cut.stop:]
+			# **`q` and not `c`.** The first version named this `c`,
+			# which is the enumerate index two lines above -- so the
+			# second pattern of the first shape indexed a string and the
+			# run died. Shadowing a loop variable inside its own body.
+			q = same[c_index]
+			q = q[:cut.start] + q[cut.stop:]
 			if a == b:
 				agree += 1
-			elif row[6]:
-				# The lowering is the same instruction with the prefix
-				# stripped, so the two sides ran identical bytes and
-				# disagreed. That is qemu against this silicon -- an
-				# approximate reciprocal, or a NaN the manual leaves
-				# implementation-specific -- and it is reported rather
-				# than counted as a failure.
+			elif a == q:
+				# One executor ran both and they agreed, so the lowering
+				# is right and the difference against native silicon is
+				# qemu -- an approximate reciprocal, or a NaN the manual
+				# leaves implementation-specific.
 				executor[row[0]] += 1
 				detail.setdefault(row[0], (pname, a, b))
 			else:
@@ -300,8 +314,9 @@ def main():
 	total = len(rows) * len(PATTERNS)
 	print(f"   {agree:,}/{total:,} comparisons agree bit for bit")
 	if executor:
-		print(f"   {sum(executor.values())} disagreement(s) on a PURE PREFIX "
-		      f"STRIP, so the two sides ran the same instruction:")
+		print(f"   {sum(executor.values())} disagreement(s) where ONE "
+		      f"executor running both sides agreed, so the lowering is "
+		      f"right and qemu and this CPU differ:")
 		for shape, count in executor.most_common(10):
 			print(f"     {shape}  ({count} pattern(s), "
 			      f"{detail[shape][0]})")

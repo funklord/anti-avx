@@ -74,7 +74,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
         census spans gprs shapes check-spill check-tls check-unwind check-vex \
-        check-lanes check-span \
+        check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -436,10 +436,10 @@ shapes: $(LISTING)
 	$(PYTHON) tool/shape_census.py $(TARGET) $(LISTING)
 
 # Every register-only VEX shape the binary contains, run against its
-# lowering. NOT in the aggregate `check`, and deliberately: three `vdpps`
-# shapes differ with no verdict yet, so this target is red on purpose --
-# see Finding 155. Making it green by widening the exemption is the one
-# thing not to do.
+# lowering. A disagreement is a failure unless ONE executor running both
+# sides agrees -- which proves the lowering right and leaves qemu and this
+# CPU differing about the instruction itself. Eight comparisons are that,
+# all `vrcpps`, `vrsqrtps` and `vdpps`.
 check-shapes: $(LISTING)
 	$(PYTHON) tool/shape_oracle.py $(LISTING) $(BUILD_DIR)
 

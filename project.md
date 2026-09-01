@@ -9653,7 +9653,7 @@ instructions.
 **A fixed scratch measures the example's register numbers**, which is the exact thing the
 shape abstraction exists to discard. The census was reporting on its own sample.
 
-### Finding 155 -- the shapes run, and three vdpps have no verdict
+### Finding 155 -- the shapes run, and the exemption is proved rather than inferred
 
 `make check-shapes` is the executable half of Finding 154's census. Every register-only
 shape the binary contains is run twice -- the original under qemu, the lowering natively --
@@ -9662,35 +9662,34 @@ and everything but the scratch register must agree bit for bit.
 ```
 295 register-only shapes, 877/885 comparisons agree
 
-5 disagreements on a PURE PREFIX STRIP, so both sides ran identical bytes:
-  vrcpps 128 r0,r1            an approximate reciprocal
-  vrsqrtps 128 r0,r1          approximate
-  vdpps 128 imm,r0,r0,r0      on the edges pattern
-  vdpps 128 imm,r0,r1,r1      on the edges pattern
-
-3 unresolved:
-  vdpps 128 imm,r0,r0,r1
-  vdpps 128 imm,r0,r1,r0
-  vdpps 128 imm,r0,r1,r2
+8 disagreements where ONE executor running both sides agreed:
+  vrcpps 128 r0,r1        an approximate reciprocal
+  vrsqrtps 128 r0,r1      approximate
+  vdpps 128 imm,...       five shapes, all on the all-sign-bits pattern
 ```
 
-**The exemption is a checkable property and not a list of mnemonics.** If the lowered bytes
-are the same instruction with the VEX prefix replaced by the legacy escape, then it IS the
-same instruction and a difference is the two executors disagreeing. That cannot grow to
-cover a real fault, which a forgiving mnemonic list does -- Finding 119 met the same
-question with qemu's NaN defect and answered it by narrowing twice.
+**The exemption is proved rather than inferred, and that took two attempts.**
 
-**So `vdpps` is PROVEN to diverge** between qemu and this Westmere on the all-sign-bits
-pattern, because two of its shapes are pure strips and still differ.
+The first rule was: if the lowered bytes are the same instruction with the VEX prefix
+replaced by the legacy escape, then it IS the same instruction and a difference is the
+executors disagreeing. Checkable, and it cannot grow to cover a real fault the way a
+forgiving mnemonic list does -- Finding 119 met that question with qemu's NaN defect and
+answered it by narrowing twice.
 
-**The three unresolved ones are the same mnemonic on the same pattern**, and their lowering
-adds a `movaps` because the destination is not the first source. That is consistent with
-the same cause and is not proof of it, and `vdpps` at three shapes is exactly where a real
-fault could hide behind a real divergence. They are left red.
+It left three `vdpps` shapes red, because their destination is not their first source, so
+the lowering adds a `movaps` and the bytes are no longer a pure strip. Consistent with the
+same cause, not proof of it -- and `vdpps` at three shapes is exactly where a real fault
+could hide behind a real divergence.
 
-`check-shapes` is deliberately NOT in the aggregate `check`. A target that fails for a
-reason nobody has adjudicated is doing its job; one quietly excluded from the gate is not.
-**The thing not to do is widen the exemption until it goes green.**
+**The better rule is to run the original AND the lowering under ONE executor.** If they
+agree there, the lowering computes the right answer whatever it emitted, and the difference
+against native silicon is the two executors. That is a direct proof rather than an
+inference, it subsumes the prefix-strip test -- identical bytes trivially agree with
+themselves -- and it cannot be widened into forgiveness, because "one executor ran both and
+they agreed" is a fact about a pair of programs rather than a category.
+
+All five `vdpps` shapes agree under qemu, including the three the first rule could not
+settle. `check-shapes` is in the aggregate `check` now.
 
 #### What the harness cannot ask, stated so the 295 is not read as coverage
 
@@ -10021,8 +10020,8 @@ make gprs          how many volatile GPRs are dead at each starved site,
                    which is what static TLS costs (a measurement)
 make shapes        every VEX shape in the binary and whether it lowers,
                    which is the list no hand-written case set can check
-make check-shapes  and whether each computes the same answer. RED on
-                   purpose: three vdpps shapes have no verdict yet
+make check-shapes  and whether each computes the same answer, with the
+                   original under qemu and the lowering natively
 ```
 
 ### Practical things that cost time to learn
