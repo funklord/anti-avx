@@ -12112,6 +12112,30 @@ the project's largest risk.
 
 ## Honest assessment
 
+**Revised after Finding 173, and the revision is downward.** The numbers below were written
+when the region was believed to lower 560 sites. It lowered 93; the other 467 were lowered
+*wrongly*, leaving sixteen stale bytes in every 32-byte value, and the guard that refuses them
+is now in place. The residue is **6,480 sites of 805,131**, not the 6,405 or 6,270 quoted
+further down, and every count in this section that includes the region is overstated by the
+difference.
+
+Three things follow that are worth more than the numbers:
+
+- **The region is a 93-site strategy**, not a 560-site one, for a large amount of machinery.
+  It still does what nothing else does -- arithmetic across a call-free stretch -- but it
+  should be priced as a small strategy from here.
+- **The shape work queued against it was estimated before the guard existed.** The counts
+  recorded for `vextractf128` (about 56 regions), the inserts (about 21) and `mem,S,D` all
+  measure "passes `region_members`", and the closure guard now removes roughly nine in ten
+  regions downstream of that gate. Those estimates must be re-derived, not spent.
+- **The verification paragraph below undercounted itself.** It lists four defects that
+  produced silently wrong output while passing every structural check. Finding 173 is the
+  fifth, it is the largest, and unlike the others it could not have been caught by execution
+  on this host at all -- on an SSE-only machine the reader faults before the wrong value can
+  be observed. It needed a unit test, and the strategy had none.
+
+The original text follows.
+
 This is a hard but *bounded* engineering project, not a research dead-end. The
 performance argument against it does not hold — the measured instruction mix means a
 translated binary should run at near-native speed.
@@ -12131,7 +12155,8 @@ registers -- a floor of a different kind rather than an analysis gap.
 About 4,400 are 256-bit and are one problem: a value that exists only in a register no SSE
 instruction can reach. **The representation for it is built too.** The span emits (Finding
 144) and the call-free region emits arithmetic no span could (Finding 156), together worth
-about 150 sites, and Findings 158 to 161 measured every link of why it is not more: 2,858
+about 150 sites as measured then -- and about 100 once Finding 173 refused the regions that
+never closed -- and Findings 158 to 161 measured every link of why it is not more: 2,858
 regions offered, 2,357 whose members are all representable, 1,343 past the filters, and
 about 100 lowered -- because earlier strategies take the sites and reordering costs more
 than it gains (Finding 161: 1,145 windows for seven sites).
