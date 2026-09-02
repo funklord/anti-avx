@@ -10907,6 +10907,106 @@ Only after indirect targets are enumerated soundly could the chained-`.pdata` qu
 reopened, and even then 29 pdata-only chained starts remain unexplained.
 
 
+### Finding 175 -- the 6,480 attributed, and one rebound variable holding 396 sites
+
+The residue had never been attributed. `apply`'s histogram accounts for 586 placer refusals
+and says nothing about the rest, so the leading numbers in this file were collector DECLINES,
+which are a different quantity. Joining `declined` against the addresses that actually still
+carry VEX closes the ledger exactly:
+
+```
+VEX sites in build/text.asm                       805,131
+  patched in place                                547,716
+  inside a committed stub window                  279,233
+    (both)                                        -28,298
+  lowered                                         798,651
+  surviving                                         6,480
+  survivors inside a committed window                   0
+```
+
+Disposition: 5,252 declined by the collector, 595 accepted but the stub would not build, 453
+accepted but overlapped, 180 objdump `(bad)`. By width, 4,372 are 256-bit, 1,928 are 128-bit,
+and 180 are not instructions.
+
+**A decline is not a survivor, and the difference reorders everything.** 14,509 sites are
+declined and only 5,351 of them survive -- the other 9,158 are swallowed by a neighbour's
+window and lowered there:
+
+```
+reason                                     declined  lowered  survive
+ymm value has no known upper half            10,023    9,039      984
+256-bit: arithmetic rather than a copy        1,974       48    1,926
+no home space to borrow                         579        0      579
+outside .pdata                                  325        0      325
+```
+
+**`ymm value has no known upper half` costs 984 sites, not the 10,015 this file has led with.**
+Nine tenths of it is the chain working as designed.
+
+#### The rebound variable
+
+`place_stubs` sorts its candidates into `entries`, iterates them, and at each one runs the
+Finding 36 rescue -- `for j in range(i + 1, len(entries))` -- which extends a window over a
+neighbour rather than leaving that neighbour to detour on its own. Twenty lines below, the
+`run` bookkeeping did this:
+
+```python
+entries = strategy[1][1]
+for entry in entries[1:]:
+```
+
+It rebound the loop's own candidate list to a strategy's two-to-ten member list. **The
+`enumerate` iterator holds the original object, so the loop kept running and nothing looked
+wrong** -- no exception, no wrong window, no failed gate. But from the first `run` candidate
+onward the rescue was ranging over a list of three, and it **never fired once in the whole
+binary**. Proved two ways before the fix: an instrumented copy printing `i=6264 len(entries)=3`
+at a real overlap, and a simulation assuming the rescue never fires that reproduces the shipped
+placement exactly -- all 202,537 windows, all 39,458 overlaps, all 586 refusals.
+
+Renaming it:
+
+```
+                    before     after
+surviving VEX        6,480     6,084     -396
+overlapped          39,458    39,249     -209
+placed             202,537   202,537        0
+stub bytes       3,765,218 3,761,015   smaller
+```
+
+**396 sites for one identifier**, and the stub section shrinks rather than grows, because an
+extended window swallows its neighbour instead of leaving it to detour separately. All 396 are
+128-bit and all come out of the overlap bucket. `verify` passes, including the lost-boundary
+check, which is the one that would object if a window swallowed something it had not accounted
+for.
+
+The shape is one this project keeps meeting: **a defect that cannot fail loudly.** A rebound
+name in a language without block scope, in a branch that runs only for one strategy, disabling
+a rescue in a different branch -- there is no output that looks wrong, only output that is
+smaller than it should be. Nothing but attribution finds it, which is why the residue needed
+attributing rather than describing.
+
+#### Three more, named and not yet built
+
+- **290 sites wear a register label for an ISA bound.** `no home space to borrow` (193 of
+  579), `sequence with no usable scratch` (75 of 75) and `sequence shape not handled` (22 of
+  22) refuse for **every one of the sixteen** scratch registers -- asked directly of
+  `lower_vex`, not inferred. They are 256-bit `vfmadd*`, `vbroadcastss`, `vpbroadcastd`,
+  `vblendvps`: no backing store could ever help them, and they have been sitting inside the
+  bucket that five increments of backing-store work were aimed at. The fix is a label, not a
+  mechanism -- decline them before the scratch question is asked.
+- **595 sites where the collector commits to forward widening without checking the passenger
+  lowers**, and **549 of those are the swallowed neighbour refusing, not the site**. The
+  forward branch appends the displaced entry whether or not `swallowed_scratch` and
+  `swallowed_borrow` returned anything, leaving `reason = None`, so backward widening is never
+  tried. At `0x1402add0a` the passenger is a `vpor` whose src2 aliases its destination -- and
+  the very same `vpor` is separately placed as its own candidate with a `spill` strategy. An
+  instruction that lowers fine as a site does not lower as a passenger, and nobody asks.
+- **99 of the 180 `(bad)` bytes were classified with real-sounding reasons** -- 50 as `no
+  direct SSE form`, 49 as `256-bit: arithmetic rather than a copy` -- because the census tested
+  `(bad)` last. `no direct SSE form` is **2** real sites, not 52. Fifth instance of a number
+  meaning something other than it looked like.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

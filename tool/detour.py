@@ -9291,9 +9291,22 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 		if strategy is not None and strategy[0] == "run":
 			# Same again over a longer stretch: every boundary from the one
 			# after the first load to the last store's own disappears.
-			entries = strategy[1][1]
-			for entry in entries[1:]:
-				swallowed.add(entry[4])
+			#
+			# **`run_entries`, not `entries`.** This read `entries`, which
+			# is the loop's own `sorted(candidates, ...)` twenty lines up,
+			# and rebound it to a strategy's two-to-ten member list. The
+			# `enumerate` iterator holds the original object so the loop
+			# kept running and nothing looked wrong -- but the Finding 36
+			# rescue above reads `range(i + 1, len(entries))`, and from the
+			# first `run` candidate onward it was ranging over a list of
+			# three. **The rescue never fired once in the whole binary.**
+			# Renaming it recovers 396 sites and makes the stub section
+			# 42,381 bytes SMALLER, because a window that is extended
+			# swallows a neighbour instead of leaving it to detour on its
+			# own. Finding 175.
+			run_entries = strategy[1][1]
+			for one in run_entries[1:]:
+				swallowed.add(one[4])
 		if strategy is not None and strategy[0] in ("span", "region"):
 			# The window's first byte keeps its boundary because the jump is
 			# written there; every member after the first loses its own.
