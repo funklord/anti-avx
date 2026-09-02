@@ -9891,6 +9891,13 @@ Two results, and neither is where four earlier guesses on this item pointed.
 
 #### The lowering refuses 386 regions the collector accepted
 
+**Wrong, and refuted by Finding 171: the lowering refuses none of them.** Every refusal in
+`lower_ymm_span` is now named and counted, and not one fires. The 386 was never attributed
+to a cause; the population is 301, and its causes are the helper rule, the passenger's
+scratch, and the backing store. Kept because the reasoning below is right about the SHAPE
+of the defect -- two functions disagreeing about what is emittable -- and wrong only about
+which two.
+
 `region_members` decides a region is representable by asking `span_operand_shape`. Then
 `lower_ymm_span` declines to emit it -- a `narrow_piece` that cannot move an operand, or a
 second helper the region has not got. **Two functions disagreeing about what is
@@ -10574,6 +10581,68 @@ are regions the long halves and the constants could not take, so they are not a 
 problem but a coverage one, and they sit inside the 386 regions where `region_members`
 accepts what `lower_ymm_span` refuses (still unexplained, still on the build-next list). Fix
 that and `last` becomes free, because the sites the region gives up would be caught below it.
+
+
+### Finding 171 -- the span refuses no regions at all, and what was actually stopping them
+
+The build-next list carried "the lowering refuses 386 regions the collector accepted" as the
+largest named filter left, and called it a defect rather than a bound because the reason was
+recorded nowhere. Recording it refutes it.
+
+Every refusal in `lower_ymm_span` is now named -- twelve of them, from
+`load high half cannot be narrowed` to `lanereg3 wants a second helper` -- and counted in
+`REGION_REFUSED` beside `region_candidate`'s own. **Not one of the twelve fires.** The
+lowering refuses nothing. The 386 was a number nobody had attributed, and attributing it
+moves every site to a different cause:
+
+```
+                                        before   after both fixes
+members refused the region               5,610   5,610
+no xmm helper free across the region       192     165
+fewer than two dead GPRs for the block      87      87
+passenger cannot be moved                    9      35
+window outside .pdata                        4       4
+more slots than a store holds (6/8/10)       9       9
+region emitted                       165w/556s  166w/560s
+```
+
+Two real defects were behind the two movable rows, and both are the same shape as everything
+else this project has found.
+
+**The collector asked a blunter question than the survey beside it.** `span_survey` computed
+the union of per-position `xmm_live_out` across the region with the whole-function rule, and
+`region_candidate` asked `span_helper`, which is the whole-function rule alone -- the very
+thing `xmm_live_out`'s own docstring was written to replace, citing Finding 148's 2,782 of
+3,355 sites refused for exactly that. Two functions answering one question differently is
+the drift `SPAN_EMITTABLE` prevents between a survey and a lowering, and nobody had
+prevented it between the SURVEY and the COLLECTOR. There is now one `region_helpers` and
+both call it. Worth 27 regions.
+
+**And the span threw away the passenger's scratch.** `span_entries` resolves a sixth field
+for a `plain` member with `swallowed_scratch`, and `lower_ymm_span` called
+`moved_instruction(moved[:5], ...)` -- truncating it away. `moved_instruction`'s docstring
+records that omission costing 2,437 stubs on the ordinary path, and it had been made again
+here, invisibly, for the same reason it was invisible the first time: the refusal had no
+counter.
+
+**The fixes are correct and the yield is four sites.** 27 regions gained a helper and 26 of
+them immediately failed on the passenger, which is why `passenger cannot be moved` rose from
+9 to 35 while the helper row fell by 27; restoring the scratch then recovered one of them.
+Net: one more region, four more sites, 166 windows against 165, and
+**6,268 surviving VEX against 6,270** -- verified against the binary, not inferred from the
+candidate table, because the two have disagreed before.
+
+That is worth stating without dressing it up. Two genuine defects, one of them a repeat of a
+documented mistake, and together they are worth 0.7% of the region's sites. **The reason is
+that the population behind them was never 386.** It is 301, and now 297.
+
+**The real filter is `region_members`, at 5,610, and it has never been broken down.** It is
+nineteen times everything below it put together. Every remaining named row is small enough
+that fixing all of them perfectly -- helper, passenger, GPRs, `.pdata`, slots -- would be
+worth a few hundred sites at most, and only if each unlocked region then survived the next
+filter, which the 27 above did not. The next measurement on this item is a histogram inside
+`region_members`, taken the same way this one was: name every refusal, count it, and let the
+number choose the work.
 
 
 ## Picking this up again

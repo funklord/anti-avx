@@ -4059,8 +4059,17 @@ def span_slot_move(helper, save, base, slot, block, at):
 	return encode_tls_spill(helper, save, block[0], base + slot * SLOT)
 
 
+# **Why a region the collector accepted was not emitted**, counted across a
+# whole run. Module-level because `region_candidate` is called from inside
+# `collect`'s loop and threading a counter through six call sites to answer
+# a diagnostic question is how the loop's signature grows without end; it is
+# cleared at the top of `collect`, so a run reports its own numbers and not
+# the previous one's. Reported by `report_regions`.
+REGION_REFUSED = Counter()
+
+
 def lower_ymm_span(entries, base, helper, at, pool, block=None,
-                   second_helper=None):
+                   second_helper=None, reasons=None):
 	"""The span, with every upper half kept in a 16-byte slot. Bytes or None.
 
 	**The first thing here that emits 256-bit work rather than measuring
@@ -4076,7 +4085,20 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 
 	`helper` is one register and not two, which is what confines this to
 	operations whose second source is memory -- see `span_operand_shape`.
+
+	**`reasons` names every refusal.** `region_members` says a region is
+	representable and then this declines to emit it, which is two functions
+	disagreeing about what is emittable -- the drift `SPAN_EMITTABLE`
+	prevents between the survey and the lowering, and which nobody had
+	prevented between the COLLECTOR and the lowering. It was the largest
+	named filter left with its reason recorded nowhere, so the reason is
+	recorded here and counted in `REGION_REFUSED`. Finding 171.
 	"""
+	def refuse(why):
+		if reasons is not None:
+			reasons.append(why)
+		return None
+
 	body = bytearray()
 	if block is not None:
 		# **Once, at the top.** The block pointer stays in its register for
@@ -4088,35 +4110,46 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 	for kind, address, encoding, mnemonic, operands, slot, moved, second, \
 			third in entries:
 		if kind == "plain":
-			fixed = moved_instruction(moved[:5], at + len(body), pool)
+			# **The whole entry, not its first five fields.** The sixth is
+			# the passenger's OWN scratch, which `span_entries` resolves
+			# with `swallowed_scratch` and this discarded -- so any
+			# passenger that needs one, a `vblendvps` or an FMA or a Class
+			# C whose src2 is its destination, was refused. It is the same
+			# omission `moved_instruction`'s docstring records as having
+			# refused 2,437 stubs on the ordinary path, made again here
+			# and invisible for the same reason: no counter named it.
+			# Finding 171.
+			fixed = moved_instruction(moved, at + len(body), pool)
 			if fixed is None:
-				return None
+				return refuse("passenger cannot be moved")
 			body += fixed
 			continue
 		vex = inplace.decode_vex(encoding)
 		if vex is None or not vex["L"]:
-			return None
+			return refuse("member is not a 256-bit VEX")
 		tail = encoding[vex["length"]:]
 		shape = span_operand_shape(vex, tail, operands, None)
-		if shape is None or slot is None:
-			return None
+		if shape is None:
+			return refuse("no span shape at emit time")
+		if slot is None:
+			return refuse("member has no slot")
 		what = shape[0]
 		if what == "lanereg" and second is None:
 			# The second source's upper half is in no slot this span
 			# tracks, so the operation has nothing to read. Refused rather
 			# than guessed at.
-			return None
+			return refuse("lanereg second source is in no slot")
 		if what == "load":
 			low = narrow_piece(vex, tail, 0, address, len(encoding),
 			                   at + len(body))
 			if low is None:
-				return None
+				return refuse("load low half cannot be narrowed")
 			body += low
 			high_vex, high_tail = retarget(vex, tail, helper)
 			piece = narrow_piece(high_vex, high_tail, SLOT, address,
 			                     len(encoding), at + len(body))
 			if piece is None:
-				return None
+				return refuse("load high half cannot be narrowed")
 			body += piece
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
@@ -4125,7 +4158,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			low = narrow_piece(vex, tail, 0, address, len(encoding),
 			                   at + len(body))
 			if low is None:
-				return None
+				return refuse("store low half cannot be narrowed")
 			body += low
 			body += span_slot_move(helper, False, base, slot, block,
 			                       at + len(body))
@@ -4133,7 +4166,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			piece = narrow_piece(high_vex, high_tail, SLOT, address,
 			                     len(encoding), at + len(body))
 			if piece is None:
-				return None
+				return refuse("store high half cannot be narrowed")
 			body += piece
 			continue
 		if what == "lanereg3":
@@ -4146,8 +4179,10 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# into the destination's slot, which is a THIRD slot and the
 			# reason this shape needs the region's slot count rather than
 			# a span's two.
-			if second_helper is None or second is None or third is None:
-				return None
+			if second_helper is None:
+				return refuse("lanereg3 wants a second helper")
+			if second is None or third is None:
+				return refuse("lanereg3 source is in no slot")
 			destination, source2, source1 = shape[1], shape[2], shape[3]
 			low_dst = scratch_finder.xmm_numbers(destination)[0]
 			low_s2 = scratch_finder.xmm_numbers(source2)[0]
@@ -4158,7 +4193,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 				tail[:1] + bytes([0xC0 | ((low_dst & 7) << 3)
 				                  | (low_s2 & 7)]))
 			if operation is None:
-				return None
+				return refuse("lanereg3 low operation has no SSE form")
 			body += operation
 			# The upper half, between slots.
 			body += span_slot_move(helper, False, base, third, block,
@@ -4170,7 +4205,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 				tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
 				                  | (second_helper & 7)]))
 			if operation is None:
-				return None
+				return refuse("lanereg3 high operation has no SSE form")
 			body += operation
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
@@ -4191,11 +4226,11 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# with `movups`, which has no alignment requirement -- and the
 			# operation is register to register.
 			if second_helper is None:
-				return None
+				return refuse("lanereg wants a second helper")
 			low = narrow_piece(vex, tail, 0, address, len(encoding),
 			                   at + len(body))
 			if low is None:
-				return None
+				return refuse("lanereg low half cannot be narrowed")
 			body += low
 			body += span_slot_move(helper, False, base, slot, block,
 			                       at + len(body))
@@ -4211,7 +4246,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 				tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
 				                  | (second_helper & 7)]))
 			if operation is None:
-				return None
+				return refuse("lanereg operation has no SSE form")
 			body += operation
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
@@ -4232,7 +4267,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		low = narrow_piece(vex, tail, 0, address, len(encoding),
 		                   at + len(body))
 		if low is None:
-			return None
+			return refuse("lane low half cannot be narrowed")
 		body += low
 		body += span_slot_move(helper, False, base, slot, block,
 		                       at + len(body))
@@ -4240,11 +4275,59 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		piece = narrow_piece(high_vex, high_tail, SLOT, address,
 		                     len(encoding), at + len(body))
 		if piece is None:
-			return None
+			return refuse("lane high half cannot be narrowed")
 		body += piece
 		body += span_slot_move(helper, True, base, slot, block,
 		                       at + len(body))
 	return bytes(body)
+
+
+def region_helpers(plain, instructions, first, bound, blocked, scope):
+	"""(free across the region, free by the whole-function rule) as sets.
+
+	**Per position, not per function.** `scope_free` asks whether the
+	function names the register ANYWHERE, which over a region of up to 192
+	instructions is nearly always empty -- Finding 148 measured 2,782 of
+	3,355 representable sites refused for exactly that, and Finding 171
+	found the collector still paying it: 192 regions declined for want of
+	one xmm when this answer was already being computed in the survey
+	beside it. `xmm_live_out` asks whether the register is dead at every
+	position the region covers, which is a question about the region.
+
+	A region that ends at a CALL knows what is live after it: nothing
+	volatile, by the ABI. One that ends at a branch target does not --
+	control carries on in the same function and anything may be wanted --
+	so `exit_live` is seeded only for the call.
+
+	**The union, because the two are sound for different reasons and
+	neither contains the other.** The whole-function rule holds everywhere
+	in the function, including after control leaves this region, which is
+	exactly where per-position liveness has nothing to say. Measured apart:
+	573 by the function rule, 272 by liveness, and each finds regions the
+	other refuses.
+
+	`bound` is the region's end INCLUDING a terminating transfer, which is
+	not where a window may end but is where the liveness question has to be
+	asked -- a call reads the argument registers, and a helper chosen
+	without it would be one the call wants.
+
+	One implementation, called by the collector and by the survey both.
+	Finding 171: the survey computed this union and the collector asked
+	`scope_free` alone, which is the drift `SPAN_EMITTABLE` prevents
+	between a survey and a lowering and which nobody had prevented here.
+	"""
+	inside = tuple(position for position in range(first, bound)
+	               if instructions[position][0] in blocked)
+	closing = instructions[bound - 1][2]
+	live = xmm_live_out(plain, first, bound, inside,
+	                    frozenset() if closing.startswith("call") else None)
+	free = set(VOLATILE_XMM)
+	for position in range(first, bound):
+		free -= live[position]
+		free -= set(scratch_finder.xmm_numbers(
+			instructions[position][3] or ""))
+	whole = set(scratch_finder.scope_free(scope, instructions[first][0]))
+	return free | whole, whole
 
 
 def span_helper(scope, address, entries):
@@ -4395,6 +4478,11 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 		return None
 	if region_anchor(instructions, first, last) != index:
 		return None
+	# **The liveness bound is the region's real end, the window's is not.**
+	# `region_end` includes the terminating transfer because a call reads
+	# the argument registers and the helper question needs that; a window
+	# may not contain it, because a stub is entered by a jump. Keep both.
+	bound = last
 	closing = instructions[last - 1][2]
 	if closing.startswith(CONTROL_PREFIXES):
 		last -= 1
@@ -4402,28 +4490,51 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 		return None
 	found = region_members(instructions, first, last)
 	if found is None:
+		REGION_REFUSED["members refused the region"] += 1
 		return None
 	members, slots = found
+	# Past this line the collector has SAID YES, so every refusal below is
+	# the disagreement Finding 171 went after and each one is named.
 	address = instructions[first][0]
 	tail_entry = instructions[last - 1]
 	window = tail_entry[0] + len(tail_entry[1]) - address
-	if window < 5 or not inplace.covered_by(ranges, address, window):
+	if window < 5:
+		REGION_REFUSED["window under five bytes"] += 1
+		return None
+	if not inplace.covered_by(ranges, address, window):
+		REGION_REFUSED["window outside .pdata"] += 1
 		return None
 	base, block = window_borrow(home, address, window), None
 	if base is None or len(slots) > SLOTS_PER_REGION:
 		if tls is None or len(slots) > TLS_SLOTS:
+			REGION_REFUSED[f"more slots than a store holds ({len(slots)})"] \
+				+= 1
 			return None
 		free = sorted(window_gpr_free(home, address, window), reverse=True)
 		if len(free) < 2:
+			REGION_REFUSED["fewer than two dead GPRs for the block"] += 1
 			return None
 		base, block = tls[1], (free[0], free[1], tls[0])
 	entries = span_entries(members, instructions, slots, scope, plain)
-	helpers = span_helper(scope, address, entries)
+	# **The region's own liveness, not the whole function's.** This asked
+	# `span_helper` -- the blunt whole-function rule -- while the survey
+	# beside it computed the union with per-position liveness and reported
+	# a far larger number. Finding 171 measured the gap at 192 regions
+	# refused for want of one xmm.
+	free, _whole = region_helpers(plain, instructions, first, bound,
+	                              blocked, scope)
+	for entry in entries:
+		free -= set(scratch_finder.xmm_numbers(entry[4] or ""))
+	helpers = tuple(sorted(free))
 	if not helpers:
+		REGION_REFUSED["no xmm helper free across the region"] += 1
 		return None
 	second = helpers[1] if len(helpers) > 1 else None
+	told = []
 	if lower_ymm_span(entries, base, helpers[0], address, address, block,
-	                  second) is None:
+	                  second, told) is None:
+		REGION_REFUSED[told[-1] if told else "lowering refused, no reason"] \
+			+= 1
 		return None
 	# **Labelled `region`, not `span`.** They share a lowering and nothing
 	# else: a span walks from a load and must close, a region is bounded by
@@ -5645,6 +5756,8 @@ def held_back(pair_reason, run_reason):
 
 def collect(binary, listing):
 	"""(in-place patches, class C detour candidates, statistics)."""
+	# A run reports its own numbers, not the previous one's.
+	REGION_REFUSED.clear()
 	# Everything anything can branch to. A window may not contain one of
 	# these anywhere but at its first byte.
 	groups = target_set.collect(binary)
@@ -8225,10 +8338,6 @@ def span_survey(binary, listing, patched):
 	region_buildable = set()
 	region_shapes = Counter()
 
-	def inside_here(instructions, begin, finish, blocked):
-		"""This region's share of the branch-target set, as positions."""
-		return tuple(position for position in range(begin, finish)
-		             if instructions[position][0] in blocked)
 	covered, refused, fit = set(), Counter(), Counter()
 	tls_covered, tls_reason = set(), Counter()
 	forms = Counter()
@@ -8272,27 +8381,10 @@ def span_survey(binary, listing, patched):
 				# it: nothing volatile, by the ABI. One that ends at a
 				# branch target does not -- control carries on in the same
 				# function and anything may be wanted.
-				closing = instructions[finish - 1][2]
-				live = xmm_live_out(
-					plain, begin, finish,
-					inside_here(instructions, begin, finish, blocked),
-					frozenset() if closing.startswith("call") else None)
-				helpers = set(VOLATILE_XMM)
-				for position in range(begin, finish):
-					helpers -= live[position]
-					helpers -= set(scratch_finder.xmm_numbers(
-						instructions[position][3] or ""))
-				# **The union, because the two are sound for different
-				# reasons and neither contains the other.** The
-				# whole-function rule holds everywhere in the function,
-				# including after control leaves this region -- which is
-				# exactly where per-position liveness has nothing to say,
-				# since a region ending at a branch target does not know
-				# what follows and must seed everything live. Measured
-				# apart: 573 by the function rule, 272 by liveness, and
-				# each finds regions the other refuses.
-				whole = set(scratch_finder.scope_free(scope, at))
-				helpers |= whole
+				# The collector asks the same question through the same
+				# function, which is the whole point of it being one.
+				helpers, whole = region_helpers(plain, instructions, begin,
+				                                finish, blocked, scope)
 				# **Every 256-bit member must be emittable, or none is.**
 				# A region is a representation and half of one is a
 				# program that reads an upper half nobody wrote, which is
@@ -8746,6 +8838,26 @@ def report_cost(candidates, placed, home):
 		      f"{body:>10,} {per:>8.1f}")
 
 
+def report_regions(candidates):
+	"""Why regions the collector accepted were not emitted.
+
+	Every line below `members refused the region` is a disagreement between
+	two functions about what is representable: `region_members` said yes and
+	something after it said no. That is the drift `SPAN_EMITTABLE` prevents
+	between the survey and the lowering, and it went unprevented between the
+	collector and the lowering for as long as the reason went unrecorded.
+	Finding 171.
+	"""
+	if not REGION_REFUSED:
+		return
+	made = sum(1 for c in candidates if c[8] and c[8][0] == "region")
+	total = sum(REGION_REFUSED.values())
+	print(f"apply: regions the collector built: {made:,} emitted, "
+	      f"{total:,} refused after the walk said yes")
+	for why, count in REGION_REFUSED.most_common():
+		print(f"apply:   {why:<44} {count:>7,}")
+
+
 def report_placement(candidates, placed, overlapped, refused):
 	"""What the placer did to each kind of candidate, and what it cost.
 
@@ -9109,6 +9221,7 @@ def apply_all(binary, listing, output):
 	      f"{len(overlapped):,} skipped for overlap, {len(refused):,} refused")
 	for why, count in stub_reasons.most_common():
 		print(f"apply:   refused, {why:<38} {count:>8,}")
+	report_regions(candidates)
 	report_placement(candidates, placed, overlapped, refused)
 	report_cost(candidates, placed, home)
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "
