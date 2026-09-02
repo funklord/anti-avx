@@ -3790,6 +3790,36 @@ def region_start(instructions, index, blocked, limit=192):
 	return at if index - at < limit else None
 
 
+def region_boundary(instructions, first, blocked):
+	"""What kind of edge a region begins at, as a label.
+
+	`region_start` stops at ANY control transfer, and only one of them
+	carries the ABI argument the region rests on: **the upper half of every
+	ymm is volatile across a CALL**, and across nothing else. After a
+	conditional branch, or at a target something jumps to, ymm values flow
+	in with their upper halves live and a region cannot see where they came
+	from.
+
+	That difference decides whether "reads a ymm defined outside the
+	region" is a hard bound or a conservatism, and Finding 172 measured it
+	at 5,397 refusals -- the largest single number in the whole region
+	machinery. Which edge they sit behind is the question, so it is asked
+	rather than assumed.
+	"""
+	if first == 0:
+		return "at the listing's start"
+	if instructions[first][0] in blocked:
+		return "at a branch target"
+	previous = instructions[first - 1]
+	if previous[0] + len(previous[1]) != instructions[first][0]:
+		return "after a gap"
+	if previous[2].startswith("call"):
+		return "after a call"
+	if previous[2].startswith("ret"):
+		return "after a return"
+	return "after a jump"
+
+
 def region_defines(instructions, first, index):
 	"""The ymm registers written by a 256-bit instruction in
 	`[first, index)`, which is where an upper half may have come from.
@@ -4066,6 +4096,20 @@ def span_slot_move(helper, save, base, slot, block, at):
 # cleared at the top of `collect`, so a run reports its own numbers and not
 # the previous one's. Reported by `report_regions`.
 REGION_REFUSED = Counter()
+# **And a few addresses for each**, because a count says how big a cause is
+# and never what it is. Finding 172 put 3,376 regions behind "reads a ymm
+# defined outside the region, after a call" -- which is where the ABI says
+# every upper half is dead, so the walk is missing a definition rather than
+# the value arriving from outside. Which definition it misses is a question
+# only an example answers.
+REGION_EXAMPLES = {}
+# **Every refused site, not a sample of six.** Whether a refused region's
+# sites are LOST or merely taken by a cheaper strategy is the difference
+# between 5,610 being a queue of work and being bookkeeping, and a sample of
+# sixteen addresses cannot tell them apart. `apply` writes the whole list to
+# `build/region-refused.txt` so it can be cross-checked against the image it
+# just produced. Finding 172.
+REGION_EXAMPLE_CAP = None
 
 
 def lower_ymm_span(entries, base, helper, at, pool, block=None,
@@ -4359,7 +4403,7 @@ def span_helper(scope, address, entries):
 	return tuple(sorted(free))
 
 
-def region_members(instructions, first, last):
+def region_members(instructions, first, last, reasons=None):
 	"""`(members, slots)` for a whole call-free region, or None.
 
 	The span's walk without its two hard constraints. A span must begin at
@@ -4377,7 +4421,18 @@ def region_members(instructions, first, last):
 	Members carry the same three fields `ymm_span` produces, because
 	`span_entries` and `lower_ymm_span` already read that shape and every
 	member kind a region needs is one they emit.
+
+	**`reasons` names the refusal.** Finding 171 named every refusal below
+	this function and found the lowering refuses nothing, leaving this one
+	at 5,610 -- nineteen times everything else together, and never broken
+	down. A shape refusal names the SHAPE, through `span_shape_name`, so
+	the histogram is a build list rather than a total. Finding 172.
 	"""
+	def refuse(why):
+		if reasons is not None:
+			reasons.append(why)
+		return None
+
 	members, slots, defined = [], {}, set()
 	for position in range(first, last):
 		_a, encoding, _m, operands, _c = instructions[position]
@@ -4388,7 +4443,10 @@ def region_members(instructions, first, last):
 		shape = span_operand_shape(vex, encoding[vex["length"]:], operands,
 		                           None)
 		if shape is None:
-			return None			# a shape the lowering cannot emit
+			# The lowering cannot emit this shape. Which one it is decides
+			# what to build next, so it is named and not just counted.
+			return refuse("shape "
+			              + (span_shape_name(encoding, operands) or "?"))
 		what, register = shape[0], shape[1]
 		if what == "load":
 			if register not in slots:
@@ -4400,7 +4458,7 @@ def region_members(instructions, first, last):
 			# it -- but both sources must be, and the destination needs a
 			# slot of its own.
 			if shape[2] not in defined or shape[3] not in defined:
-				return None
+				return refuse("lanereg3 source from outside the region")
 			if register not in slots:
 				slots[register] = len(slots)
 			defined.add(register)
@@ -4408,11 +4466,16 @@ def region_members(instructions, first, last):
 			# Everything else READS the register it names, so the region
 			# must already have defined it.
 			if register not in defined:
-				return None
+				return refuse("reads a ymm defined outside the region")
 			if what == "lanereg" and shape[2] not in defined:
-				return None
+				return refuse("lanereg second source from outside")
 		members.append((what, position, register))
-	return (members, slots) if slots else None
+	if not slots:
+		# Nothing in the region wrote a 256-bit value, so there is no upper
+		# half to keep and nothing for a slot to hold. Not a defect: a
+		# region of pure reads is simply not a region this represents.
+		return refuse("no 256-bit definition, so no slot")
+	return (members, slots)
 
 
 def region_anchor(instructions, first, last):
@@ -4488,9 +4551,19 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 		last -= 1
 	if last - first < 2:
 		return None
-	found = region_members(instructions, first, last)
+	told = []
+	found = region_members(instructions, first, last, told)
 	if found is None:
-		REGION_REFUSED["members refused the region"] += 1
+		why = told[-1] if told else "no reason"
+		if why.startswith("reads a ymm"):
+			# The dominant refusal, split by the edge it sits behind: only
+			# a call makes the ABI argument, so only behind a call is this
+			# a value the region could ever have owned. Finding 172.
+			why += ", " + region_boundary(instructions, first, blocked)
+		REGION_REFUSED["members: " + why] += 1
+		seen = REGION_EXAMPLES.setdefault("members: " + why, [])
+		if REGION_EXAMPLE_CAP is None or len(seen) < REGION_EXAMPLE_CAP:
+			seen.append((instructions[first][0], instructions[index][0]))
 		return None
 	members, slots = found
 	# Past this line the collector has SAID YES, so every refusal below is
@@ -5758,6 +5831,7 @@ def collect(binary, listing):
 	"""(in-place patches, class C detour candidates, statistics)."""
 	# A run reports its own numbers, not the previous one's.
 	REGION_REFUSED.clear()
+	REGION_EXAMPLES.clear()
 	# Everything anything can branch to. A window may not contain one of
 	# these anywhere but at its first byte.
 	groups = target_set.collect(binary)
@@ -8851,11 +8925,31 @@ def report_regions(candidates):
 	if not REGION_REFUSED:
 		return
 	made = sum(1 for c in candidates if c[8] and c[8][0] == "region")
-	total = sum(REGION_REFUSED.values())
+	walk = {w: n for w, n in REGION_REFUSED.items() if w.startswith("members: ")}
+	after = {w: n for w, n in REGION_REFUSED.items()
+	         if not w.startswith("members: ")}
+	# **Two groups, because they are two different failures.** A `members:`
+	# line is the walk deciding the region is not representable; everything
+	# else is a refusal AFTER it said yes, which is the disagreement
+	# Finding 171 went after. Printing one total for both is how 5,610
+	# walk refusals sat under a heading saying "after the walk said yes".
 	print(f"apply: regions the collector built: {made:,} emitted, "
-	      f"{total:,} refused after the walk said yes")
-	for why, count in REGION_REFUSED.most_common():
-		print(f"apply:   {why:<44} {count:>7,}")
+	      f"{sum(walk.values()):,} not representable, "
+	      f"{sum(after.values()):,} refused after the walk said yes")
+	for why, count in sorted(walk.items(), key=lambda kv: -kv[1]):
+		print(f"apply:   {why:<52} {count:>7,}")
+		for begin, site in REGION_EXAMPLES.get(why, [])[:3]:
+			print(f"apply:       region at {begin:#x}, site {site:#x}")
+	from pathlib import Path		# imported here as elsewhere in this file
+	roll = Path("build") / "region-refused.txt"
+	if roll.parent.is_dir():
+		with roll.open("w", encoding="utf-8") as out:
+			for why, rows in sorted(REGION_EXAMPLES.items()):
+				for begin, site in rows:
+					out.write(f"{why}\t{begin:#x}\t{site:#x}\n")
+		print(f"apply: every refused region written to {roll}")
+	for why, count in sorted(after.items(), key=lambda kv: -kv[1]):
+		print(f"apply:   {why:<52} {count:>7,}")
 
 
 def report_placement(candidates, placed, overlapped, refused):

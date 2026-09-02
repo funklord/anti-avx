@@ -10645,6 +10645,103 @@ filter, which the 27 above did not. The next measurement on this item is a histo
 number choose the work.
 
 
+### Finding 172 -- `region_members` broken down, and 93% of it costs nothing
+
+Finding 171 left `region_members` at 5,610 refusals, nineteen times everything below it, never
+broken down, and called that the next histogram. Taking it changes what the number means.
+
+Every refusal in the walk is now named, and a shape refusal names the SHAPE through
+`span_shape_name` so the histogram is a build list rather than a total:
+
+```
+members: reads a ymm defined outside the region       5,397
+members: shape an immediate form                        105
+members: shape a register-to-register move               31
+members: shape four operands -- insert, blend or FMA      30
+members: shape no operands                               17
+members: shape mem,S,D with a destination of its own      16
+members: lanereg3 source from outside the region          13
+members: shape a register second source, src2 is D         1
+```
+
+One question is 96% of it, and every shape put together is 200. So the dominant refusal was
+split again, by the edge the region begins at -- because `region_start` stops at ANY control
+transfer and only a **call** carries the ABI argument the region rests on. Across a call every
+ymm upper half is volatile; across a branch or into a jump target, values flow in live.
+
+```
+after a call          3,376
+after a jump          1,081
+at a branch target      936
+after a return            4
+```
+
+**63% sit behind a call, which is where a read of an undefined upper half should be impossible**
+-- the program would be reading ABI garbage. So the walk was missing a definition rather than the
+value arriving from outside, and the instrument was made to name addresses instead of guessing.
+All three examples were the same three lines:
+
+```
+vpxor   %xmm0,%xmm0,%xmm0        ; VEX.128 -- zeroes all 256 bits of ymm0
+vmovups %ymm0,0x5f59f42(%rip)    ; 256-bit store of an all-zero ymm0
+vmovups %ymm0,0x5f59f5a(%rip)
+```
+
+A VEX.128 write zeroes bits 255:128 architecturally, so ymm0 IS defined and defined as a known
+zero needing no slot. `region_members` classifies the `vpxor` as a `plain` passenger because it
+is not `VEX.L`, never adds ymm0 to `defined`, and refuses the stores that follow.
+
+**And then the fix turned out not to be worth making, which is the finding.** Reading the
+rewritten image at those addresses shows the `vpxor` patched in place to `pxor` and both stores
+replaced by a `jmp`: they are already lowered, by `zero` -- the cheapest strategy in Finding
+169's table at 1.91 cycles per site. So a census was taken rather than a sample. `apply` now
+writes all 5,610 refused regions to `build/region-refused.txt`, and each anchor site was checked
+against the image the same run produced:
+
+```
+refusal                                          sites  still VEX  lowered
+reads a ymm defined outside, after a call        3,376          1    3,375
+reads a ymm defined outside, after a jump        1,081         39    1,042
+reads a ymm defined outside, at a branch target    936        164      772
+shape an immediate form                            105         96        9
+shape a register-to-register move                   31         31        0
+shape four operands -- insert, blend or FMA         30         30        0
+shape no operands                                   17         17        0
+shape mem,S,D with a destination of its own         16         16        0
+lanereg3 source from outside the region             13         13        0
+reads a ymm defined outside, after a return          4          4        0
+shape a register second source, src2 is D            1          1        0
+TOTAL                                            5,610        412    5,198
+```
+
+**5,198 of 5,610 refusals cost nothing at all.** The site was taken by a cheaper strategy, and
+the region declining it is the chain working rather than failing. The after-a-call bucket, 3,376
+regions and the largest single number in the entire region machinery, loses exactly **one** site.
+
+**The priority inverts.** By raw count the buckets rank calls, jumps, branch targets, then shapes
+a distant last at 200. By surviving sites they rank almost the other way: the shape refusals lose
+204 of their 213 sites, about 96%, while the call bucket loses 0.03%. A count of refusals was
+never a count of work, and this is the fourth time on this item that a number nobody had
+attributed turned out to mean something other than it looked like -- 386 that was zero
+(Finding 171), 920 regions the placer was blamed for (Finding 160), 135 sites measured on a build
+with the region switched off (Finding 165), and now 5,610 that is 412.
+
+**What is actually left, in order of what it would recover:**
+
+1. **164 sites** -- regions at a branch target. The hardest, and the one the region's founding
+   argument cannot serve: values arrive with live upper halves from paths this walk did not take.
+   That is a whole-function join problem, not a bigger region.
+2. **96 sites** -- `shape an immediate form`. The largest buildable single shape, and ordinary
+   work rather than new theory.
+3. **31, 30, 17, 16, 13** -- register-to-register moves, four-operand inserts and blends and FMAs,
+   no-operand forms, `mem,S,D` with its own destination, and `lanereg3` sources from outside.
+
+All of it together is 412 anchor sites against 6,268 survivors, so the whole region item is worth
+at most 6.6% of what remains -- and that is anchor sites only, since a region heads more sites
+than the one it is offered at. It is no longer the frontier, and the record should stop treating
+it as one.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
