@@ -10833,6 +10833,80 @@ each wrote that guard once. The region is the fourth strategy to need it and the
 without it.
 
 
+### Finding 174 -- the switch-table scanner has the wrong base, and has since it was written
+
+Finding 173's investigation asked whether chained `.pdata` entries could be dropped from
+`blocked`. The answer is **no** -- two counterexamples, both real switch targets with a
+fall-through predecessor and nothing else naming them. But the search for the answer found
+something larger underneath.
+
+**`from_switch_tables` computes `table_address + value`.** Its docstring says "an MSVC x64
+switch table holds `target - table`". That is the **x86** form. This binary is x64 and its
+tables hold **RVAs** -- `target - __ImageBase` -- dispatched through the standard sequence:
+
+```
+14181d31c:  movzbl 0x181d4ac(%r9,%rax,1),%eax     # byte index table
+14181d325:  mov    0x181d498(%r9,%rax,4),%ecx     # DWORD table, r9 = __ImageBase
+14181d32d:  add    %r9,%rcx
+14181d330:  jmp    *%rcx
+```
+
+Checked directly against the table at `0x14181d498`: the image-base reading puts 5 of its 5
+real entries on an instruction boundary, the table-relative reading 2, both of those by
+coincidence. The statistical form of the same test is decisive over the whole image -- a real
+code address is on an instruction boundary, arithmetic noise is there at chance, and the
+baseline is 16,542,323 instructions in 61,071,360 bytes of `.text`, or 27.09%:
+
+```
+                                   targets   on a boundary
+switch targets resolved properly    14,109         100.00%
+the tool's .text scan               14,574          24.67%
+the tool's .rdata scan                 216          25.93%
+```
+
+**Both existing scans sit at chance.** Only 3 of the 14,574 `.text` targets are real switch
+targets and 0 of the 216 `.rdata` ones. The worked false positive is the tail of an immediate
+followed by padding -- `mov $0xfffffff8,%r15d` then two `nopl`s -- whose four "entries" yield
+four addresses, none of them an instruction boundary.
+
+This cuts both ways and both ways matter:
+
+- **14,790 addresses are blocked for no reason.** Over-blocking is safe and only costs sites:
+  a window that must not widen past a non-target widens less than it could. This is a pure
+  loss with no compensating protection.
+- **12,869 real switch targets are absent from `blocked` entirely.** 12,722 are shielded by
+  accident, because the instruction before them happens to be a control transfer, which stops
+  a window anyway. **147 have nothing.** `blocked` is the mechanism that stops a window
+  swallowing a place control can arrive at, and for these it is simply not operating.
+
+**The shipped binary is not wrong, and that was checked rather than hoped.** Of the exposed
+addresses, six had their bytes changed by the rewrite and all six were in-place patches that
+keep the address an instruction boundary -- a `vmovss` becoming a `movss`, a `vmovq` becoming
+a `movq`. One, `0x141a0f37f`, has the instruction *after* it detoured, not itself. So this is
+a latent hazard: nothing prevents a window from swallowing an unresolved indirect target, and
+in this build none did.
+
+**Why it went unseen.** `verify` checks that "all 1,191,105 direct branch targets still begin
+an instruction" -- and it passes, because direct branches are exactly the class the tool can
+enumerate. The indirect targets are the ones it cannot enumerate, so they are also the ones it
+cannot check. The gate is sound and its coverage is the same shape as the defect, which is
+Finding 111's rule met from a new direction: a check can only fail where it can see.
+
+**What to build**, in order:
+
+1. **Recognise the image-base-relative form.** Derive tables from the dispatch pattern rather
+   than by scanning for self-consistent runs: a `lea` of `__ImageBase`, a scaled load, an
+   `add` of the base, and an indirect `jmp`. That recovers 14,109 targets at a 100% boundary
+   rate, against 3 correct out of 14,574 today.
+2. **Then delete the `.text` and `.rdata` scans**, which are noise -- but not before, because
+   they are the only switch coverage there is, however bad.
+3. **Then extend `verify`** to check that every resolved indirect target still begins an
+   instruction, which is the check that could have caught this.
+
+Only after indirect targets are enumerated soundly could the chained-`.pdata` question be
+reopened, and even then 29 pdata-only chained starts remain unexplained.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
