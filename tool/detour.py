@@ -4568,6 +4568,39 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 	members, slots = found
 	# Past this line the collector has SAID YES, so every refusal below is
 	# the disagreement Finding 171 went after and each one is named.
+
+	# **The region must close, exactly as the run and the span must.** A
+	# region leaves each represented ymm's upper half in a SLOT and the
+	# machine register's upper half untouched, so a 256-bit read after the
+	# region ends reads whatever was there before -- and there is no
+	# epilogue that could put it back, because writing a ymm's upper half
+	# needs `vinsertf128`, which is itself VEX-256.
+	#
+	# The recorded justification was that "the region ends at a call", where
+	# the ABI makes every upper half volatile. **That was false of all 166
+	# regions the tool emitted**: not one ended at a call, because the
+	# region is offered below the pair, the run and the span, and the span
+	# refuses precisely when a value is still live at the end -- so the
+	# region inherited the live-out cases as its leftovers. The shipped
+	# image detoured 0x1407dac8b, kept the upper half in a slot, and
+	# returned to `vmovups %ymm0,0x10(%rax)` at 0x1407dac98, still VEX,
+	# storing sixteen correct bytes and sixteen stale ones.
+	#
+	# `upper_half_read_later` is the guard the pair got in Finding 38, the
+	# run in Finding 64 and the span in Finding 153. Finding 65's table of
+	# what each lowering leaves behind had no row for the region, and this
+	# is what a missing row cost. Finding 173.
+	# **`last - 1`, because the scan starts strictly after the index given**
+	# -- `for step in range(1, limit + 1)`. `last` is exclusive and already
+	# trimmed of a trailing transfer, so `last - 1` is the region's final
+	# member and the walk begins on the first instruction it does not
+	# cover. Passing `last` instead skips exactly that instruction, which
+	# is the commonest place the stale upper half is read.
+	if any(upper_half_read_later(instructions, last - 1, register,
+	                             positions=positions)
+	       for register in slots):
+		REGION_REFUSED["upper half read after the region ends"] += 1
+		return None
 	address = instructions[first][0]
 	tail_entry = instructions[last - 1]
 	window = tail_entry[0] + len(tail_entry[1]) - address
@@ -7063,6 +7096,7 @@ def selftest():
 	failures += shadow_selftest()
 	failures += reader_selftest()
 	failures += span_selftest()
+	failures += region_selftest()
 	failures += gpr_selftest()
 	failures += xmm_selftest()
 	failures += tls_selftest()
@@ -8113,6 +8147,85 @@ def reader_selftest():
 	if not failures:
 		print(f"selftest: {len(READER_CASES)} region-reader shapes, "
 		      f"refused and allowed in both directions")
+	return failures
+
+
+# **The region's closure rule, which had no test and no row in Finding 65's
+# table.** Every sibling lowering must leave no ymm whose upper half is read
+# later -- the pair since Finding 38, the run since Finding 64, the span
+# since Finding 153 -- and the region shipped without the check for 166
+# regions, 150 of which were wrong. `region_members` decides only what a
+# region can REPRESENT; closure is `region_candidate`'s question, so the
+# cases below ask both, the way the strategy does.
+# The third field is the row whose address is a BRANCH TARGET, which is
+# what ends the region before the rows after it -- the only way to put a
+# reader outside a region in a fixture, since `region_end` otherwise runs
+# to the `ret` and swallows everything. `None` means no target.
+REGION_CASES = [
+	("a load and a store, closed by the ret",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)")], None, True),
+	# **The case the bug was**, and it only bites where the reader is
+	# outside the region: a rule asserted over regions that close anyway
+	# is asserted where it holds already, which is how the span's own
+	# closure case came to be missing until a sabotage run removed the
+	# rule and nothing went red. Finding 111, met a second time -- and
+	# met again here, because the first draft of this case put the reader
+	# INSIDE the region, where `region_members` refused it for an
+	# unrelated reason and the closure rule was never consulted.
+	("a value read as 256-bit after the region ends",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)"),
+	  (SPAN_ADD2, "vaddps", "%ymm0,%ymm1,%ymm2")], 2, False),
+	("a region whose value nothing reads after it ends",
+	 [(SPAN_LOAD0, "vmovups", "(%rsi),%ymm0"),
+	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)"),
+	  (SPAN_LOAD1, "vmovups", "0x20(%rsi),%ymm1")], 2, True),
+]
+
+
+def region_selftest():
+	"""Prove a region closes before it is offered. Failures, or 0.
+
+	Asks the two questions `region_candidate` asks in the order it asks
+	them: can `region_members` represent this, and is every register it
+	slotted dead as a 256-bit value at the end. A region that fails the
+	second cannot be repaired by an epilogue -- writing a ymm's upper half
+	needs `vinsertf128`, which is itself VEX-256 -- so the only answer is
+	to refuse it. Finding 173.
+	"""
+	failures = 0
+	for what, rows, target, expected in REGION_CASES:
+		instructions = _span(rows)
+		positions = {a: i for i, (a, *_r) in enumerate(instructions)}
+		blocked = set() if target is None else {instructions[target][0]}
+		last = region_end(instructions, 0, blocked)
+		# `region_candidate` trims a trailing transfer off the window
+		# before asking either question, so the fixture must too -- with
+		# the `ret` left in, the region's last member IS the terminator
+		# and the scan starts off the end of the listing, which
+		# `upper_half_read_later` conservatively calls a read. That is a
+		# property of the fixture, not of the code under test.
+		if instructions[last - 1][2].startswith(CONTROL_PREFIXES):
+			last -= 1
+		found = region_members(instructions, 0, last)
+		if found is None:
+			closes = False
+		else:
+			_members, slots = found
+			closes = not any(
+				upper_half_read_later(instructions, last - 1, register,
+				                      positions=positions)
+				for register in slots)
+		if closes != expected:
+			print(f"selftest: {what}: region "
+			      f"{'closes' if closes else 'does not close'}, want "
+			      f"{'closes' if expected else 'a refusal'}",
+			      file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(REGION_CASES)} regions, and one is refused "
+		      f"for a value read after it ends")
 	return failures
 
 

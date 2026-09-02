@@ -9228,7 +9228,9 @@ Two consequences, and they are the whole design:
   * **nothing needs loading at the start**, because there is nothing live to load. The
     span's requirement that it begin at a 256-bit load is an artefact of starting in the
     middle of a region rather than at its edge;
-  * **closure is free at the end**, because the region ends at a call and a read of an
+  * ~~**closure is free at the end**, because the region ends at a call~~ **-- FALSE, and it
+    shipped a correctness bug. Not one of the 166 emitted regions ended at a call; see
+    Finding 173.** The original claim ran: because the region ends at a call and a read of an
     upper half after one would be reading garbage in the ORIGINAL program too. The span's
     other hard requirement -- every value dead at the end -- is discharged by the ABI
     rather than by analysis.
@@ -10740,6 +10742,95 @@ All of it together is 412 anchor sites against 6,268 survivors, so the whole reg
 at most 6.6% of what remains -- and that is anchor sites only, since a region heads more sites
 than the one it is offered at. It is no longer the frontier, and the record should stop treating
 it as one.
+
+
+### Finding 173 -- the region never closed, and 150 of its 166 lowerings were wrong
+
+**This is a correctness bug that shipped.** Every other lowering here must leave no ymm whose
+upper half is read later -- the pair since Finding 38, the run since Finding 64, the span since
+Finding 153. Finding 65's table lists what each strategy leaves behind and what guards it.
+**The region has no row in that table, and it had no guard.**
+
+A region keeps each represented ymm's upper half in a 16-byte slot and never touches the
+machine register's upper half. If anything reads that register as 256-bit after the region
+ends, it reads whatever was there before. There is no epilogue that could prevent it: writing
+a ymm's upper half needs `vinsertf128`, which is itself VEX-256, so such a region cannot be
+lowered at all -- it can only be refused.
+
+The recorded justification, in this file at the region's design notes and in commit `a2d88b1`,
+was *"closure is free at the end, because the region ends at a call"*, where the ABI makes
+every upper half volatile. `region_end` stops at **any** control transfer, and the terminators
+of the 166 regions the tool actually emitted were:
+
+```
+branch target        68
+unconditional jump   56
+conditional branch   42
+call                  0
+ret                   0
+```
+
+**Not one ended at a call.** The argument the whole strategy rested on applied to none of its
+output. And the reason is adverse selection rather than luck: the region is offered below the
+pair, the run and the span, and the span refuses *precisely* when a value is still live at the
+end. The region was handed the live-out cases as its leftovers -- 90% of emitted regions have a
+live-out upper half against 6% of merely representable ones.
+
+Reproduced end to end in the shipped image rather than argued. Region at `0x1407dac8b`:
+
+```
+0x1407dac92: vmovups 0x38(%rsp),%ymm0      <- the region's only 256-bit member
+--- region ends; 0x1407dac98 is a branch target ---
+0x1407dac98: vmovups %ymm0,0x10(%rax)      <- 256-bit read, STILL VEX in the output
+```
+
+`0x1407dac8b` holds `e9 ba252108`, a detour to the stub at `0x1489ed24a`:
+
+```
+movups 0x38(%rsp),%xmm0      ; low half -> the real xmm0
+movups 0x48(%rsp),%xmm4      ; upper half -> helper
+movups %xmm4,(%rsp)          ; upper half -> slot
+jmp    0x1407dac98           ; back
+```
+
+Nothing puts the slot back, and `0x1407dac98` is still `c5 fc 11 40 10`. It stores 32 bytes:
+sixteen correct and sixteen stale.
+
+**The fix is the guard the run got**, `upper_half_read_later` over every register the region
+slotted, asked from `last - 1` -- the scan starts strictly after the index it is given, so
+`last` would skip the first instruction outside the region, which is the commonest place the
+stale half is read. What it costs:
+
+```
+                     before    after
+regions emitted         166       16
+region sites            560       93
+region stub bytes    10,600    1,439
+VEX surviving         6,268    6,480
+```
+
+**212 more surviving VEX**, and the region strategy is worth 93 sites rather than 560. The
+100-site gain recorded in `a2d88b1` was measuring wrong output and should be read as such.
+
+**Why no gate caught it, which is the part worth keeping.** On a machine with AVX the wrong
+value is computed silently. On an SSE-only machine -- this host, and what `check-pe` runs
+under wine -- the *reader* is surviving VEX and faults first, so the fixture dies of the
+symptom rather than the disease. Finding 64 records that same argument for the run. The class
+is unreachable by execution here, so it needed a unit test, and **the region had no selftest at
+all**: `span_selftest` drives `ymm_span`, and nothing drove `region_candidate`.
+
+There is one now, and building it repeated the mistake it was written to catch. The first draft
+put the reader INSIDE the region, where `region_members` refuses it for an unrelated reason and
+the closure rule is never consulted -- a case that passes against code with the rule deleted.
+A sabotage run caught it, exactly as Finding 111 requires and exactly as the span's own closure
+case was caught. The reader has to be outside the region, which in a fixture means a branch
+target, because `region_end` otherwise runs to the `ret` and swallows everything.
+
+**The general shape, and it is not new here.** A strategy inherited an older one's obligation
+without inheriting its guard, and the inheritance was invisible because the obligation lived in
+a table (Finding 65) that nobody updated when the strategy was added. Findings 38, 64 and 153
+each wrote that guard once. The region is the fourth strategy to need it and the first to ship
+without it.
 
 
 ## Picking this up again
