@@ -1,0 +1,33 @@
+# anti-avx has no program to build -- `all` is `check` -- so what fmake
+# builds here is the C tests and tool/icache_bench, which holds the one
+# main() that is not a test. The rewriter itself is Python and is nothing
+# fmake compiles; `make detour`, `make scan` and `make census` stay where
+# they are.
+
+[project]
+# These are semantics, not preferences, and they are the Makefile's exactly.
+# The whole point of this code is to run where AVX and F16C do not exist, so
+# -msse4.1 sets the baseline the helpers are written against and the two
+# -mno- flags keep it there if anything ever raises it. Checked rather than
+# assumed: the built f16c_test contains no vcvtph2ps, vcvtps2ph or any other
+# VEX-encoded instruction.
+cflags = ["-std=c11", "-msse4.1", "-mno-avx", "-mno-f16c"]
+
+# The generated case table is written here and included from
+# test/lowering_test.c as a plain "lowering_cases.inc".
+include-dirs = ["gen"]
+
+# One generator run writes both halves, which is why one stanza names two
+# outputs rather than two stanzas repeating the command. The cases are
+# emitted from the lowering rules themselves so they cannot drift from what
+# the rewriter really produces, which is also why the four tools it reads
+# are its inputs: a change to any of them invalidates the table.
+#
+# The .s half is assembled. That is new -- when fmake last looked at this
+# tree it built C and C++ only, generated the file, dropped it, and the
+# reader got a link failure naming 233 case_N symbols that were sitting in
+# a file fmake had just written.
+[generate.lowering_cases]
+command = "python3 tool/lowering_cases.py emit gen/lowering_cases.s gen/lowering_cases.inc"
+inputs  = ["tool/lowering_cases.py", "tool/detour.py", "tool/lower.py", "tool/patch.py"]
+outputs = ["gen/lowering_cases.s", "gen/lowering_cases.inc"]

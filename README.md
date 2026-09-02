@@ -99,6 +99,26 @@ make hooks        install the commit-msg hook into .git/hooks
 make help         every target
 ```
 
+The C half of `make check` also builds with [fmake](../fmake), which needs
+no build file and nothing beyond the Python standard library:
+
+    python3 ~/src/fmake/fmake test    # the five C tests, and they pass
+
+**Not `/usr/bin/fmake`**, which is older than the assembly support this
+needs. `fmake.toml` carries the ISA flags, because here they are semantics
+rather than preference -- `-msse4.1` is the baseline these helpers are
+written against and `-mno-avx -mno-f16c` keep it there -- and one
+`[generate]` stanza for the case table, whose two halves come out of one
+run of `tool/lowering_cases.py`.
+
+**It is the C tests and `tool/icache_bench`, and nothing else.** The
+rewriter is Python: `make detour`, `make scan`, `make census` and the
+`check-pe`, `check-spill`, `check-tls` and `check-unwind` gates run tools
+and wine rather than compiling anything, and `make check` also runs the
+style gate and the lowering proof. `make` remains the interface; fmake is
+the way to build and run the C tests on a machine that has not got this
+project's toolchain set up.
+
 `make check` needs no game binary; the others under `check-` need only `wine`.
 `make coverage`, `make scratch-check` and the `detour` targets need the binary.
 `make coverage` exits non-zero while any VEX site lacks a lowering rule -- it

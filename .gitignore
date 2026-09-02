@@ -15,3 +15,14 @@ build/
 
 __pycache__/
 *.pyc
+
+# fmake's object cache, the generated case table, and the test binaries
+# it leaves at the top level. make writes its own under build/ instead.
+.fmake/
+/gen/
+/icache_bench
+/f16c_test
+/fmaddsub_test
+/lowering_test
+/permd_test
+/permil_test
