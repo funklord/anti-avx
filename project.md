@@ -11007,6 +11007,52 @@ attributing rather than describing.
   meaning something other than it looked like.
 
 
+### Finding 176 -- the collector took a window without asking whether the passenger would move
+
+Finding 175's attribution found 595 sites accepted by the collector whose stub then would not
+build, and **549 of them were the SWALLOWED NEIGHBOUR refusing, not the site**: `moved: the
+aliased form has no usable scratch` 246, `moved: no direct SSE form and not a sequence` 112,
+`moved: vblendv would not lower` 92, `moved: 256-bit, no Y strategy took it` 83.
+
+A site shorter than five bytes cannot hold a jump, so its window must widen over a neighbour.
+The forward branch asked `swallowed_scratch`, then `swallowed_borrow` if that gave nothing,
+and then appended the passenger **whether or not either had returned anything**, leaving
+`reason` unset. So the window was taken, backward widening -- the fallback worth 3,237 sites
+when it was written -- was never tried, and `build_stub` refused the whole candidate later.
+
+The worked case is `0x1402add0a`. Its passenger is a `vpor` whose src2 aliases its
+destination, which needs a scratch and was given none. That same `vpor` is separately placed
+as its own candidate with a `spill` strategy and lowers perfectly well. **An instruction that
+lowers on its own account does not lower as a passenger, and nobody asked.**
+
+The fix is to ask. `moved_instruction` is the function that will decide later, so it decides
+now, at the site's own address -- the convention `lower_ymm_run(run, address, address)`
+already uses two hundred lines above. That address makes the displacement correction smallest,
+so the test errs toward accepting and cannot refuse a passenger a real stub address would have
+taken. Forward sets `reason` on a no, which hands the site to backward widening; backward
+deliberately LEAVES `reason` set on a no, so the site is declined with a reason rather than
+given a window whose stub cannot be built.
+
+```
+                   before     after
+surviving VEX       6,084     5,655     -429
+stub refusals         586        46     -540
+detours           202,537   202,775     +238
+overlapped         39,249    39,238
+removed             99.2%     99.3%
+```
+
+**429 sites, and the refusal bucket all but empties.** The 238 extra detours are the sites
+that went backward instead of forward and now hold a window they could always have held.
+
+The shape, again: **the collector and the emitter disagreed about what is emittable**, and the
+collector was the optimistic one. That is Finding 171's disagreement between `region_members`
+and `lower_ymm_span`, and `SPAN_EMITTABLE`'s reason for existing between the survey and the
+lowering, met a third time -- here between the collector and `build_stub`. The rule that keeps
+coming out of it is worth stating plainly: **whichever function will decide later should decide
+now, by being called, rather than by having its conditions restated.**
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

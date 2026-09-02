@@ -6550,11 +6550,35 @@ def collect(binary, listing):
 						borrow = swallowed_borrow(
 							plain, nxt_address, nxt_encoding, nxt_operands,
 							nxt_mnemonic, home)
-					displaced.append((nxt_address, nxt_encoding, nxt_comment,
-					                  nxt_operands, nxt_mnemonic,
-					                  taken if borrow is None else borrow,
-					                  borrow is not None))
-					window += len(nxt_encoding)
+					passenger = (nxt_address, nxt_encoding, nxt_comment,
+					             nxt_operands, nxt_mnemonic,
+					             taken if borrow is None else borrow,
+					             borrow is not None)
+					# **Ask whether the passenger lowers before committing
+					# to it.** This appended unconditionally -- even where
+					# `swallowed_scratch` AND `swallowed_borrow` both
+					# returned nothing -- and left `reason` unset, so the
+					# window was taken, backward widening was never tried,
+					# and `build_stub` refused the whole thing later. 549
+					# of the 595 stub refusals were the SWALLOWED NEIGHBOUR
+					# refusing rather than the site: an instruction that
+					# lowers perfectly well on its own account does not
+					# lower as a passenger, and nobody asked. At
+					# `0x1402add0a` the passenger is a `vpor` whose src2
+					# aliases its destination -- and that same `vpor` is
+					# separately placed as its own candidate with a `spill`
+					# strategy. Finding 176.
+					#
+					# Asked at the site's own address, which is the
+					# convention `lower_ymm_run` already uses here: the
+					# displacement correction is smallest there, so this
+					# errs toward accepting and never refuses a passenger
+					# that a real stub address would have taken.
+					if moved_instruction(passenger, address, address) is None:
+						reason = "next instruction will not move"
+					else:
+						displaced.append(passenger)
+						window += len(nxt_encoding)
 
 			if reason is not None:
 				# **Backwards instead.** Forward widening leaves the window
@@ -6596,13 +6620,21 @@ def collect(binary, listing):
 						borrow = swallowed_borrow(
 							plain, previous[0], previous[1], previous[3],
 							previous[2], home)
-					preceding.append((previous[0], previous[1], previous[4],
-					                  previous[3], previous[2],
-					                  taken if borrow is None else borrow,
-					                  borrow is not None))
-					start = previous[0]
-					window = len(previous[1]) + len(encoding)
-					reason = None
+					passenger = (previous[0], previous[1], previous[4],
+					             previous[3], previous[2],
+					             taken if borrow is None else borrow,
+					             borrow is not None)
+					# Same question backwards, and here a `no` must LEAVE
+					# `reason` set: this is the fallback, so a passenger
+					# that will not move means the site is declined with a
+					# reason rather than given a window whose stub cannot
+					# be built.
+					if moved_instruction(passenger, previous[0],
+					                     previous[0]) is not None:
+						preceding.append(passenger)
+						start = previous[0]
+						window = len(previous[1]) + len(encoding)
+						reason = None
 
 			if reason is not None:
 				skipped[reason] += 1
