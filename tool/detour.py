@@ -6704,6 +6704,26 @@ def collect(binary, listing):
 				# whole of the question Finding 46 measures -- and the home
 				# space is the one that has to ask permission, because it
 				# belongs to the function rather than to the rewriter.
+				#
+				# **Ask whether ANY register lowers it before asking where
+				# to save one.** The home-space test used to come first and
+				# short-circuit, so a site no register could ever lower was
+				# declined `no home space to borrow` -- a register-pressure
+				# label on a 256-bit ISA bound. 290 sites wore one:
+				# `vbroadcastss %xmm,%ymm`, `vpbroadcastd`, `vfmadd213ps`
+				# and friends, which have no SSE form at any of the sixteen
+				# registers, sitting inside the bucket that five increments
+				# of backing-store work were aimed at. The decline set is
+				# unchanged; only the reason is now true. Finding 178.
+				borrowed = borrow_that_lowers(address, encoding, operands,
+				                              mnemonic, address, address)
+				if borrowed is None:
+					reason = ("aliased, and no SSE form at any register"
+					          if aliased
+					          else "no SSE form at any register")
+					skipped[reason] += 1
+					declined[address] = reason
+					continue
 				if SPILL in HOME_SPILLS \
 						and borrow_offset(home, address) is None:
 					# **The home space first, always.** It needs no
@@ -6716,11 +6736,8 @@ def collect(binary, listing):
 						skipped["no home space to borrow"] += 1
 						declined[address] = "no home space to borrow"
 						continue
-				borrowed = borrow_that_lowers(address, encoding, operands,
-				                              mnemonic, address, address)
-				if borrowed is not None:
-					strategy = ("spill", borrowed)
-					trial = True
+				strategy = ("spill", borrowed)
+				trial = True
 			if trial is None:
 				if aliased:
 					skipped["src2 aliases dst, no scratch"] += 1
@@ -7348,6 +7365,7 @@ def selftest():
 	failures += span_selftest()
 	failures += region_selftest()
 	failures += switch_selftest()
+	failures += isa_bound_selftest()
 	failures += gpr_selftest()
 	failures += xmm_selftest()
 	failures += tls_selftest()
@@ -8473,6 +8491,45 @@ SWITCH_CASES = [
 	  ("add", "%r9,%rcx"),
 	  ("jmp", "0x140001000")], None),
 ]
+
+
+# **Which refusals are about a register and which are about the ISA.**
+# `borrow_that_lowers` returning None means no borrowable register lowers
+# the site, so no backing store could ever help it; a site that lowers at
+# some registers and not others is the register question the spill
+# machinery exists for. The two were reported in one bucket until Finding
+# 178, so 290 sites wore a register-pressure label on a 256-bit ISA bound.
+ISA_BOUND_CASES = [
+	("a 256-bit broadcast has no SSE form at all",
+	 "c4e27d18d4", "%xmm4,%ymm2", "vbroadcastss", False),
+	("nor does the AVX2 integer broadcast",
+	 "c4e27d58d4", "%xmm4,%ymm2", "vpbroadcastd", False),
+	("nor 256-bit lane-wise arithmetic, which needs the upper half",
+	 "c5fc58c1", "%ymm1,%ymm0,%ymm0", "vaddps", False),
+	# The control, and the reason this is a discriminator rather than a
+	# label: a 128-bit site whose src2 is its destination DOES lower, given
+	# a register the operands do not name.
+	("a 128-bit aliased site lowers, given a register",
+	 "c5f9ebd2", "%xmm2,%xmm0,%xmm2", "vpor", True),
+]
+
+
+def isa_bound_selftest():
+	"""Prove the ISA bound and the register bound are told apart. 0 or n."""
+	failures = 0
+	for what, hexenc, operands, mnemonic, expected in ISA_BOUND_CASES:
+		encoding = bytes.fromhex(hexenc)
+		got = borrow_that_lowers(0x1000, encoding, operands, mnemonic,
+		                         0x2000, 0x2000) is not None
+		if got != expected:
+			print(f"selftest: {what}: borrow_that_lowers "
+			      f"{'found' if got else 'found no'} register, want "
+			      f"{'one' if expected else 'none'}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(ISA_BOUND_CASES)} refusals sorted into ISA "
+		      f"bound and register bound")
+	return failures
 
 
 def switch_selftest():
