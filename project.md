@@ -11214,6 +11214,63 @@ evidence to check, not a verdict to accept -- which is the same rule this file a
 own gates, pointed at a subagent.
 
 
+### Finding 179 -- the three region shapes re-priced, and none of them is worth building
+
+Finding 172 ranked the region's remaining shapes by refusal count and two subagents priced
+them at roughly 56, 21 and 1 regions. **Those were upper bounds taken at the `region_members`
+gate, before the closure guard of Finding 173 existed**, and the build-next list said to
+re-derive them rather than spend them. Re-derived, with every gate that follows the walk
+applied in order and the shipped build reproduced first as a control -- 16 regions, 93 sites,
+303 closure refusals, 1,795 switch tables, all matching:
+
+```
+                     repr.  closure  window  .pdata  slots  helper  lowering  EMITTED  sites
+A  vextractf128     61/105      56      56      56     53      39         8        8      66
+B  vinsertf128       7/30        1       1       1      1       1         0        0       0
+C  op mem,S1,D       1/15        0       -       -      -       -         -        0       0
+A+B+C              79/199       64      64      64     61      44         8        8      66
+```
+
+**B and C are worth zero, alone or together.** A+B+C emits exactly the same 8 regions as A by
+itself. And A's 66 sites are worth **21**, because only 21 of them still carry VEX in the
+shipped image -- the other 45 are already taken by cheaper strategies. That is 0.37% of the
+5,623 residue, for a shape whose emission is not the single `movups` it looked like (the
+zeroed destination slot needs a store of its own) and whose regions cost 15.5 stub bytes per
+site against `plain`'s 13.2.
+
+**The expectation this was written to test was wrong.** I predicted the closure guard would be
+the binding constraint. It removes 8% for A and 19% for the three together, and binds only B
+(6 of 7, on a bucket of 7). What actually binds is the walk -- 34 of A's 105 refuse because
+the extract's SOURCE is defined outside the region, and 10 of C's 15 because `S1` is a
+loop-invariant broadcast hoisted above the loop head -- and then `passenger cannot be moved`
+(31) and `no xmm helper free` (14). The same wall as the 5,397-region bucket, met one
+instruction later, which is what Finding 172 said of the `lanereg3` bucket and is now true of
+these too.
+
+**Shape C as specified is unsound, and would have shipped a correctness bug.** The earlier
+pricing described it as `lanereg3` with one helper instead of two, emitting
+`movaps S1,D; op mem,D`. That assumes the destination is a pure definition. For
+`vfmadd*`/`vfnmadd*`/`vfmsub*` the destination is ALSO a source, so the `movaps` destroys the
+addend -- and **66 of the 296 `mem,S1,D` sites in `.text` are FMA**, with the 15 refused C
+regions clustering in one FMA loop family. Handled correctly it needs D defined and a second
+helper, which is not the cheap shape it was sold as. Two agents disagreed here and the second
+was right, because it asked what the instruction does rather than what its operands look like.
+
+**And there is no headroom in relaxing the closure guard.** `upper_half_read_later` ends an
+upper half's life at a full 256-bit write only for a MOVE, so arithmetic that overwrites the
+register still counts as a read. Widening it to every full 256-bit write frees **0 of the 303**
+closure refusals in the current build, and 1 of 15 under A+B+C -- measured, with a positive
+control confirming the substitution really does flip a `vaddps` from "read" to "dead" while
+still refusing a genuine store.
+
+**So the region is finished as a source of sites.** It emits 16 regions and 93 sites, it is
+correct now, and every remaining shape has been priced at zero or near it. If the 375
+`vextractf128` sites in `.text` are wanted, the region is the wrong lever -- a third of the
+candidates fail before any gate because the source is defined outside. That is the same
+whole-function join problem the branch-target bucket names, and nothing shaped like a region
+reaches it.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -11398,13 +11455,12 @@ every one of them (at 6,480, before three of the fixes below).
   1. ~~**Finish the switch-table work.**~~ **Done and measured**: 5,623 surviving VEX,
      99.3% removed, and `verify: all 16,819 switch targets from 1,795 tables still begin an
      instruction` passed on its first run. Findings 174, 177 and 178 are closed.
-  2. **The region's remaining shapes, re-priced.** `vextractf128 $1,%ymmS,%xmmD` is a lane
-     READ and `vinsertf128 $1,%xmmS,%ymmD,%ymmD` a lane WRITE, and in a slot representation
-     each is exactly one `movups` through `span_slot_move` -- no helper, no low half, cheaper
-     than every shape now built. `mem,S,D` is `lanereg3` with one helper instead of two.
-     **The counts recorded for them (about 56, 21 and 1 regions) are upper bounds taken at
-     the `region_members` gate BEFORE the closure guard existed**, and that guard now removes
-     roughly nine in ten regions downstream of it. Re-derive before spending.
+  2. ~~**The region's remaining shapes.**~~ **Re-derived and closed: do not build.**
+     Finding 179 priced all three through every gate. `vinsertf128` and `mem,S,D` emit ZERO
+     regions, alone or combined; `vextractf128` emits 8 regions covering 66 sites of which
+     only 21 still carry VEX -- 0.37% of the residue. `mem,S,D` as previously specified is
+     also unsound for the 66 FMA sites in its population, where the destination is a source.
+     The region is finished as a source of sites.
   3. **`lanereg3 source from outside the region` is closed, not queued.** 0 of 13 under any
      combination of shape work, measured. The missing value is a loop-invariant hoisted above
      the region head; it is the same "arrives from outside" bound as the big bucket, found one
