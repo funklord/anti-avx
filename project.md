@@ -11555,7 +11555,29 @@ every one of them (at 6,480, before three of the fixes below).
      real predecessor. A window-local rule ("a region may contain an interior branch target
      whose predecessors all lie inside the window") reaches 74 of the 164. The residue, about
      90, is a genuine control-flow join and needs a representation this project does not have.
-  5. **`.pdata` chained fragments are NOT droppable from `blocked`.** Measured and settled:
+  5. **The 83-site placer rescue -- designed, priced, deliberately not built.** Every one of
+     the 84 overlap survivors sits EXACTLY at the end of the preceding placed window (distance
+     0 for all 84), and 83 are backward-widened candidates the Finding 36 rescue refuses only
+     because `other[8] is not None`: a passenger carrying its own strategy cannot ride along.
+     All 83 carry `spill`.
+
+     It is the only remaining item whose gain is exact, and it is more delicate than its size
+     suggests. `build_stub` brackets the WHOLE stub with one save/restore, and under the
+     default `--spill=tls` it also plants a block pointer in a GPR. A spill passenger needs a
+     SECOND borrow inside that stub, which means: a slot distinct from the host's (the
+     machinery exists -- `selftest: two borrowed registers get two slots, and a third is
+     refused`); the block pointer set up even when the host is not itself a spill; and the
+     `prologue` offset kept right, because the stack variant's unwind code is measured from it
+     and a backward-widened window emits its swallowed instructions first.
+
+     **The reason it is not built here is the cost of being wrong in this exact place.** Both
+     correctness bugs found in this session -- Findings 173 and 180 -- were a strategy
+     committing to something whose partner then did not work, in the stub builder, invisible to
+     every gate. 83 sites is 1.5% of the residue. Build it in a session that can run
+     `make detour` cheaply and iterate; each measurement here cost a subagent round trip of the
+     better part of an hour.
+
+  6. **`.pdata` chained fragments are NOT droppable from `blocked`.** Measured and settled:
      two counterexamples are real switch targets with a fall-through predecessor and nothing
      else naming them. Do not reopen without sound enumeration of indirect targets, and even
      then 29 pdata-only chained starts remain unexplained.
