@@ -216,47 +216,6 @@ def scope_targets(data, at, base, text):
 	return found
 
 
-def from_switch_tables(data, sections, base, text):
-	"""Switch tables, found by self-consistency rather than by relocation.
-
-	An MSVC x64 switch table holds `target - table`, so a run of entries at
-	address T is a table when T + entry lands in .text for several entries
-	in a row. Nothing in the file says so; this is inference, and it is the
-	one source here that can be incomplete.
-	"""
-	targets = set()
-	tables = 0
-	for name in (".rdata", "_RDATA", ".text"):
-		if name not in sections:
-			continue
-		vaddr, _vsize, raddr, rsize = sections[name]
-		if not raddr:
-			continue
-		blob = data[raddr:raddr + rsize]
-		i = 0
-		limit = len(blob) - 4
-		while i < limit:
-			table_address = vaddr + i
-			run = []
-			j = i
-			while j < limit:
-				value = struct.unpack_from("<i", blob, j)[0]
-				candidate = table_address + value
-				if not in_text(candidate, text):
-					break
-				run.append(candidate)
-				j += 4
-			# Four consecutive plausible entries is a strong signal; two is
-			# noise in a binary this size.
-			if len(run) >= 4:
-				targets.update(run)
-				tables += 1
-				i = j
-			else:
-				i += 4
-	return targets, tables
-
-
 def collect(path):
 	data = open(path, "rb").read()
 	sections, base, opt = sections_of(data)
@@ -264,12 +223,24 @@ def collect(path):
 
 	reloc = from_reloc(data, sections, base, opt, text)
 	starts, handlers = from_pdata(data, sections, base, text)
-	tables, table_count = from_switch_tables(data, sections, base, text)
+	# **No switch tables here any more; see `detour.switch_targets`.**
+	# `from_switch_tables` looked for runs of `table + value`, which is the
+	# MSVC x86 form, and this x64 binary holds RVAs. It found 14,789
+	# addresses of which **3** were real switch targets: they land on an
+	# instruction boundary 24.67% of the time against a 27.09% baseline,
+	# which is chance. Over-blocking is safe and only costs sites, so the
+	# 14,737 that were noise cost sites for nothing.
+	#
+	# It is removed rather than corrected because the correction needs a
+	# disassembly this module does not have: the dispatch is read --
+	# a scaled load off `__ImageBase`, an `add` of the base, an indirect
+	# `jmp` -- and the table walked until an entry stops naming an
+	# instruction. That lives in `detour`, which has the listing, and all
+	# 3 of the real targets are in its set. Findings 174 and 177.
 	return {
 		"reloc (absolute pointers)": reloc,
 		"pdata (function starts)": starts,
 		"xdata (EH handlers)": handlers,
-		f"switch tables ({table_count:,} found)": tables,
 	}
 
 

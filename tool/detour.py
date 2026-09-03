@@ -49,7 +49,7 @@ import re
 import struct
 import subprocess
 import sys
-from collections import Counter
+from collections import Counter, deque
 
 HERE = __import__("pathlib").Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -5926,6 +5926,56 @@ def require_qemu(qemu):
 	raise SystemExit(77)
 
 
+def switch_dispatch(window):
+	"""The RVA of the table a dispatch reads, or None. Pure, so it is tested.
+
+	`window` ends at the indirect `jmp`. The shape sought is the three
+	instructions MSVC emits, in any order within the window and with other
+	work between them:
+
+	    mov  0x181d498(%r9,%rax,4),%ecx    # r9 = __ImageBase
+	    add  %r9,%rcx
+	    jmp  *%rcx
+
+	The `add` names the register holding the image base; the `mov` must
+	load through that same register into the 32-bit half of the jump's
+	target. Both links matter: without the first this matches any scaled
+	load, and without the second it matches a load into an unrelated
+	register.
+
+	**Split out because the enclosing function had no test.** A missing
+	`import collections` in it passed `make style` and the selftest and
+	would have surfaced only in a forty-minute build -- the same shape as
+	the gate defects reported against this tree, in new code. The byte
+	reading still needs a binary; this half does not, so this half is
+	tested. Finding 177.
+	"""
+	rows = list(window)
+	if not rows:
+		return None
+	operands = rows[-1][3] or ""
+	if rows[-1][2] != "jmp" or not operands.startswith("*%"):
+		return None
+	register = operands[2:].strip()
+	back = rows[-2::-1]			# most recent first, excluding the jmp
+	holder = None
+	for prior in back:
+		match = SWITCH_ADD.match(prior[3] or "")
+		if prior[2] == "add" and match and match.group(2) == register:
+			holder = match.group(1)
+			break
+	if holder is None:
+		return None
+	for prior in back:
+		match = SWITCH_LOAD.match(prior[3] or "")
+		if not (prior[2] == "mov" and match):
+			continue
+		offset, holds, _index, into = match.groups()
+		if holds == holder and SWITCH_WIDE.get(into) == register:
+			return int(offset, 16)
+	return None
+
+
 def switch_targets(instructions, binary, starts):
 	"""Where an indirect `jmp` through a switch table can land.
 
@@ -5973,40 +6023,38 @@ def switch_targets(instructions, binary, starts):
 
 	found = set()
 	tables = 0
-	for i, (_a, _e, mnemonic, operands, _c) in enumerate(instructions):
+	# **A sliding window, not a list.** A dispatch spans at most
+	# `SWITCH_BACK` instructions, so that is all this needs to remember --
+	# and `verify` hands it the listing's own generator. Materialising the
+	# rows instead cost several gigabytes on a 927 MB listing (16.5 million
+	# tuples) and got `verify` killed twice before the cause was obvious.
+	# Rows are indexed rather than unpacked so four-field `parse_listing`
+	# output works as well as five-field `parse_with_comments`.
+	window = deque(maxlen=SWITCH_BACK)
+	for row in instructions:
+		window.append(row)
+		mnemonic, operands = row[2], row[3] or ""
 		if mnemonic != "jmp" or not operands.startswith("*%"):
 			continue
-		register = operands[2:].strip()
-		holder = None
-		for j in range(i - 1, max(-1, i - SWITCH_BACK), -1):
-			match = SWITCH_ADD.match(instructions[j][3] or "")
-			if instructions[j][2] == "add" and match \
-					and match.group(2) == register:
-				holder = match.group(1)
-				break
-		if holder is None:
+		offset = switch_dispatch(window)
+		if offset is None:
 			continue
-		for j in range(i - 1, max(-1, i - SWITCH_BACK), -1):
-			match = SWITCH_LOAD.match(instructions[j][3] or "")
-			if not (instructions[j][2] == "mov" and match):
-				continue
-			offset, holds, _index, into = match.groups()
-			if holds != holder or SWITCH_WIDE.get(into) != register:
-				continue
-			where = at(base + int(offset, 16))
-			if where is None:
+		where = at(base + offset)
+		if where is None:
+			continue
+		# The table runs until an entry stops naming an instruction. Two
+		# entries is the floor: a one-armed switch is not one, and a lone
+		# coincidence should not become a table.
+		entries, k = [], 0
+		while where + k * 4 + 4 <= len(data):
+			value = struct.unpack_from("<I", data, where + k * 4)[0]
+			if base + value not in starts:
 				break
-			entries, k = [], 0
-			while where + k * 4 + 4 <= len(data):
-				value = struct.unpack_from("<I", data, where + k * 4)[0]
-				if base + value not in starts:
-					break
-				entries.append(base + value)
-				k += 1
-			if len(entries) >= 2:
-				found.update(entries)
-				tables += 1
-			break
+			entries.append(base + value)
+			k += 1
+		if len(entries) >= 2:
+			found.update(entries)
+			tables += 1
 	return found, tables
 
 
@@ -7299,6 +7347,7 @@ def selftest():
 	failures += reader_selftest()
 	failures += span_selftest()
 	failures += region_selftest()
+	failures += switch_selftest()
 	failures += gpr_selftest()
 	failures += xmm_selftest()
 	failures += tls_selftest()
@@ -8384,6 +8433,71 @@ REGION_CASES = [
 	  (SPAN_STORE0, "vmovups", "%ymm0,(%rdi)"),
 	  (SPAN_LOAD1, "vmovups", "0x20(%rsi),%ymm1")], 2, True),
 ]
+
+
+# A dispatch is three instructions that need not be adjacent, so the cases
+# below vary what sits between them and which register each names. The
+# rows are (address, encoding, mnemonic, operands); only the last two are
+# read, which is what lets `verify` pass `parse_listing` output straight in.
+SWITCH_CASES = [
+	("the ordinary MSVC form",
+	 [("mov", "0x181d498(%r9,%rax,4),%ecx"),
+	  ("add", "%r9,%rcx"),
+	  ("jmp", "*%rcx")], 0x181d498),
+	("with unrelated work between the parts",
+	 [("mov", "0x2000(%r11,%rdx,4),%r8d"),
+	  ("nop", ""),
+	  ("add", "%r11,%r8"),
+	  ("test", "%eax,%eax"),
+	  ("jmp", "*%r8")], 0x2000),
+	# **Both links are load-bearing.** Without the `add` this matches any
+	# scaled load; without the register agreement it matches a load into a
+	# register the jump never uses.
+	("the add names a different base register",
+	 [("mov", "0x181d498(%r9,%rax,4),%ecx"),
+	  ("add", "%rbx,%rcx"),
+	  ("jmp", "*%rcx")], None),
+	("the load goes to a register the jump does not use",
+	 [("mov", "0x181d498(%r9,%rax,4),%edx"),
+	  ("add", "%r9,%rcx"),
+	  ("jmp", "*%rcx")], None),
+	("a scaled load with no add at all",
+	 [("mov", "0x181d498(%r9,%rax,4),%ecx"),
+	  ("jmp", "*%rcx")], None),
+	("an indirect jump through memory, not a register",
+	 [("mov", "0x181d498(%r9,%rax,4),%ecx"),
+	  ("add", "%r9,%rcx"),
+	  ("jmp", "*(%rcx)")], None),
+	("not an indirect jump",
+	 [("mov", "0x181d498(%r9,%rax,4),%ecx"),
+	  ("add", "%r9,%rcx"),
+	  ("jmp", "0x140001000")], None),
+]
+
+
+def switch_selftest():
+	"""Prove the dispatch matcher reads the table address. Failures, or 0.
+
+	`switch_targets` needs a binary to read table bytes from and so cannot
+	run here; `switch_dispatch` is the half that holds the logic and needs
+	nothing. It was split out after a missing import in the combined
+	function passed `make style` AND the selftest, because neither reached
+	it -- a defect only a forty-minute build could have found. Finding 177.
+	"""
+	failures = 0
+	for what, rows, expected in SWITCH_CASES:
+		window = [(0, b"", mnemonic, operands) for mnemonic, operands in rows]
+		got = switch_dispatch(window)
+		if got != expected:
+			shown = "None" if got is None else hex(got)
+			want = "None" if expected is None else hex(expected)
+			print(f"selftest: {what}: switch_dispatch gave {shown}, "
+			      f"want {want}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(SWITCH_CASES)} switch dispatches, read and "
+		      f"refused")
+	return failures
 
 
 def region_selftest():
@@ -9882,6 +9996,29 @@ def verify(original, patched, listing=None):
 	else:
 		print(f"verify: all {len(inside):,} direct branch targets still begin "
 		      f"an instruction")
+
+	# **And the indirect ones, which used to be the named gap.** The comment
+	# above said `targets.py` was the only source for switch targets and the
+	# model-agreement check the only check. `targets.from_switch_tables` was
+	# reading the wrong base and finding noise (Finding 174), so that was
+	# worse than it sounded. `switch_targets` reads the dispatch, so the
+	# same independent question can now be asked of them: an address a
+	# switch table names in the ORIGINAL must still begin an instruction in
+	# the rewritten binary. Finding 177.
+	resolved, resolved_tables = switch_targets(
+		inplace.parse_listing(listing), original, before_bounds)
+	inside_switch = {a for a in resolved
+	                 if vaddr <= a < vaddr + size and a in before_bounds}
+	broken_switch = inside_switch - after_bounds
+	if broken_switch:
+		print(f"verify: FAILED -- {len(broken_switch):,} switch targets no "
+		      f"longer begin an instruction", file=sys.stderr)
+		for address in sorted(broken_switch)[:8]:
+			print(f"    0x{address:x}", file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: all {len(inside_switch):,} switch targets from "
+		      f"{resolved_tables:,} tables still begin an instruction")
 
 	done = subprocess.run(["objdump", "-d", "-j", ".avxsse", patched],
 	                      capture_output=True, text=True, errors="replace")

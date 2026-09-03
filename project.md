@@ -11117,6 +11117,40 @@ it is its own measured build rather than a rider on this one. Step three, extend
 to check resolved indirect targets, belongs with it: `switch_targets` is called from
 `collect` and not from `verify`, so the targets it finds are blocked but not yet checked.
 
+#### Steps two and three, built and partly measured
+
+The `.text`/`.rdata` scans are gone and `verify` now asks of switch targets what it already
+asked of direct branches: an address named in the ORIGINAL must still begin an instruction in
+the rewritten binary. That closes the gap the check's own comment named -- *"it cannot speak
+for indirect targets ... `targets.py` remains the only source"* -- which was worse than it
+read, since that source was scanning on the wrong base.
+
+Three defects were made and fixed on the way, and only the first by anything deliberate:
+
+- **the image base added twice**, so the resolver found zero tables; caught by printing the
+  count, and invisible otherwise because the build's totals came out identical;
+- **the listing materialised** -- `list(parse_listing(...))` over 16.5 million rows, several
+  gigabytes, which got `verify` killed twice before the cause was obvious. It streams now,
+  through a 16-row `deque`, because a dispatch spans at most that many instructions;
+- **`collections` never imported** (only `Counter` is), so `switch_targets` raised
+  `NameError` -- and `make style` AND the full selftest both passed, because neither reaches
+  it. Only a forty-minute build would have found it.
+
+The third is why `switch_dispatch` is now split out and carries seven selftest cases: the
+half holding the logic needs no binary, so it can be tested, and a sabotage run confirms that
+removing either register-agreement link turns three of them red. The refactor is
+behaviour-preserving, checked rather than assumed -- 1,795 tables and 16,819 targets before
+and after.
+
+**What is measured and what is not.** An apply with these changes completed and reported
+detours 202,775 to 202,784, overlaps 39,238 to 39,249, and 15,170 targets not already blocked
+-- **exactly three more than before**, which are the three real switch targets the deleted
+scan used to cover, corroborating "3 real, 14,737 noise" from a different direction. All
+eighteen gates pass. **The survivor count is outstanding**: six consecutive full-binary runs
+were terminated part way on an otherwise idle machine, so the new `verify` check has not yet
+run over the real image. That is a gap in the evidence and is recorded as one rather than
+rounded up.
+
 #### A commit that says the wrong thing
 
 **The code above landed in `25f1df2`, whose subject is about qemu guards.** Staging
