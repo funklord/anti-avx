@@ -210,7 +210,8 @@ check-permd: $(BUILD_DIR)/permd_test
 # `style_gate` refuses a collapsed file list -- and this one did not.
 check-isa: $(OBJS)
 	@$(OBJDUMP) -d $(OBJS) > $(BUILD_DIR)/isa-disasm.txt
-	@awk -F'\t' 'NF>=3 { \
+	@awk -F'\t' -v want=$(words $(OBJS)) '/file format/ { files++ } \
+		NF>=3 { \
 		seen++; \
 		n = split($$2, b, " "); \
 		if (b[1] == "c4" || b[1] == "c5" || b[1] == "62") bad++ } \
@@ -219,7 +220,8 @@ check-isa: $(OBJS)
 		  if (bad) { printf "check-isa: FAILED -- %d VEX/EVEX encodings\n", bad > "/dev/stderr"; exit 1 } \
 		  if (f16) { printf "check-isa: FAILED -- %d F16C instructions\n", f16 > "/dev/stderr"; exit 1 } \
 		  if (seen < 1) { print "check-isa: FAILED -- nothing disassembled, so nothing was checked" > "/dev/stderr"; exit 1 } \
-		  printf "check-isa: no VEX, no EVEX, no F16C in %d instructions\n", seen }' \
+		  if (files != want) { printf "check-isa: FAILED -- disassembled %d of %d objects, so some were not checked\n", files, want > "/dev/stderr"; exit 1 } \
+		  printf "check-isa: no VEX, no EVEX, no F16C in %d instructions across %d objects\n", seen, files }' \
 		$(BUILD_DIR)/isa-disasm.txt
 
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
