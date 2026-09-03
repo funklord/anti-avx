@@ -196,15 +196,31 @@ check-permd: $(BUILD_DIR)/permd_test
 # must not itself contain AVX or F16C. Checked by disassembling what was
 # actually built rather than by trusting the compiler flags -- a flag that
 # silently stopped applying would otherwise look exactly like a clean pass.
+#
+# **It counts what it inspected, and the disassembly is a file rather than
+# a pipe.** The first version counted only OFFENDING lines and had no
+# floor, so zero instructions read and a clean object printed the same
+# sentence and the same exit code -- `objdump -d /nonexistent.o | awk ...`
+# reported "no VEX, no EVEX, no F16C" and exited 0, because make's shell
+# has no `pipefail` and the status was awk's alone. That is the defect
+# this gate exists to catch, in the gate itself: a flag that stopped
+# applying and a gate that stopped looking are indistinguishable from a
+# pass. Four other checks here already refuse an empty input --
+# `f16c_oracle` wants exactly 65,536, `shape_oracle` refuses no rows,
+# `style_gate` refuses a collapsed file list -- and this one did not.
 check-isa: $(OBJS)
-	@$(OBJDUMP) -d $(OBJS) | awk -F'\t' 'NF>=3 { \
+	@$(OBJDUMP) -d $(OBJS) > $(BUILD_DIR)/isa-disasm.txt
+	@awk -F'\t' 'NF>=3 { \
+		seen++; \
 		n = split($$2, b, " "); \
 		if (b[1] == "c4" || b[1] == "c5" || b[1] == "62") bad++ } \
 		/vcvtph2ps|vcvtps2ph/ { f16++ } \
 		END { \
 		  if (bad) { printf "check-isa: FAILED -- %d VEX/EVEX encodings\n", bad > "/dev/stderr"; exit 1 } \
 		  if (f16) { printf "check-isa: FAILED -- %d F16C instructions\n", f16 > "/dev/stderr"; exit 1 } \
-		  print "check-isa: no VEX, no EVEX, no F16C in the built object" }'
+		  if (seen < 1) { print "check-isa: FAILED -- nothing disassembled, so nothing was checked" > "/dev/stderr"; exit 1 } \
+		  printf "check-isa: no VEX, no EVEX, no F16C in %d instructions\n", seen }' \
+		$(BUILD_DIR)/isa-disasm.txt
 
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<

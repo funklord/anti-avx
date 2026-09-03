@@ -228,9 +228,32 @@ def run(binary, under_qemu):
 
 
 def require_oracle():
+	"""qemu present, and able to run AVX2 -- or say so and skip.
+
+	**Absent and working are different claims**, and this asked only the
+	first half while `vex_oracle`, `lane_oracle` and `span_oracle` all ask
+	both. The consequence ran the wrong way: with qemu present but no AVX2
+	model, this did NOT skip. `run(vex_binary, True)` came back short,
+	`main` fell through to the comparison, and it printed
+	`FAILED -- 0 vex lines and N sse for N expected` and returned 1 --
+	"the oracle did not run" delivered as a verdict about the lowerings.
+	A harness that cannot execute the reference must not be allowed to
+	report on it.
+	"""
 	import shutil
 	if shutil.which(QEMU[0]) is None:
 		print("no qemu-x86_64: install qemu-user. SKIPPED, not passed.",
+		      file=sys.stderr)
+		raise SystemExit(77)
+	try:
+		probe = subprocess.run(QEMU + ["-cpu", "help"], capture_output=True,
+		                       text=True, timeout=60)
+	except OSError as error:
+		print(f"{QEMU[0]} will not run ({error}). SKIPPED, not passed.",
+		      file=sys.stderr)
+		raise SystemExit(77)
+	if "avx2" not in probe.stdout:
+		print("qemu-x86_64 reports no avx2 model. SKIPPED, not passed.",
 		      file=sys.stderr)
 		raise SystemExit(77)
 

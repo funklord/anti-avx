@@ -196,8 +196,16 @@ def require_oracle():
 		print("no qemu-x86_64: install qemu-user. SKIPPED, not passed.",
 		      file=sys.stderr)
 		raise SystemExit(77)
-	probe = subprocess.run(QEMU + ["-cpu", "help"], capture_output=True,
-	                       text=True, timeout=60)
+	# On PATH and executable are also different claims: a `qemu-x86_64`
+	# that will not exec gave a traceback here rather than the 77 this
+	# docstring promises. `vex_oracle` and `lane_oracle` both wrap it.
+	try:
+		probe = subprocess.run(QEMU + ["-cpu", "help"], capture_output=True,
+		                       text=True, timeout=60)
+	except OSError as error:
+		print(f"{QEMU[0]} will not run ({error}). SKIPPED, not passed.",
+		      file=sys.stderr)
+		raise SystemExit(77)
 	if "avx2" not in probe.stdout:
 		print("qemu-x86_64 reports no avx2 model. SKIPPED, not passed.",
 		      file=sys.stderr)
