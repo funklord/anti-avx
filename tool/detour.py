@@ -10073,6 +10073,19 @@ def verify(original, patched, listing=None):
 		for address in sorted(broken_switch)[:8]:
 			print(f"    0x{address:x}", file=sys.stderr)
 		problems += 1
+	elif not resolved_tables:
+		# **A floor, because this check passes loudest when it inspects
+		# nothing.** With no tables resolved, `inside_switch` is empty,
+		# `broken_switch` is empty, and the line below would read "all 0
+		# switch targets from 0 tables still begin an instruction" -- a
+		# clean pass over nothing, which is the defect an audit had just
+		# reported in `check-isa` and which this session then reproduced:
+		# an image base added twice made `switch_targets` return zero for
+		# a whole build, and the totals looked neutral. A binary with no
+		# switch statement at all is not one this verifier is pointed at.
+		print("verify: FAILED -- no switch tables resolved, so no indirect "
+		      "target was checked", file=sys.stderr)
+		problems += 1
 	else:
 		print(f"verify: all {len(inside_switch):,} switch targets from "
 		      f"{resolved_tables:,} tables still begin an instruction")
