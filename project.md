@@ -3544,7 +3544,23 @@ lowering leaves that the original would not have left, and the thing that makes 
 | spill | nothing -- the borrowed register is saved and restored | `movups` moves 128 bits and every SSE write leaves [255:128] alone, so the upper half was never at risk |
 | swallowed neighbour | its own scratch clobbered | `find_scratch` at **its** position, not the site's -- Finding 45 |
 | in place | nothing | `classify` returns `B` only when destination equals src1, so the Finding 25 alias cannot reach it |
+| span | every upper half in a 16-byte slot, the machine ymm's upper half stale | `upper_half_read_later` at the span's end, since Finding 153 -- "the span closes or it is worth nothing" |
+| region | the same, over a call-free stretch | `upper_half_read_later` **since Finding 173 and not before**: 166 regions were emitted without it and 150 were wrong |
+| long pair | the load puts the upper half in a SHADOW xmm; the ymm's own upper half is stale | the partner store reads the shadow -- and `long_partner_lowers` **since Finding 180 and not before**: 24 loads committed to stores that then declined |
 | any of them | never a 256-bit instruction | `sse_encoding` refuses `VEX.L` and `narrow_piece` always clears it; `verify` counts zero VEX in the stub section |
+
+**Rows still missing, and that is the finding rather than an aside.** `zerorun`, the splat
+family (`splat`, `splatrun`, `splatop`) and the constant family (`constload`, `conststore`,
+`construn`) have no row here. Two of the three rows added above were added *because the
+strategy had already shipped wrong output* -- the region left sixteen stale bytes in 467
+lowerings, the long pair in 24 -- and in both cases the obligation was discharged correctly by
+three older strategies whose rows were sitting in this table the whole time.
+
+**So the table is not documentation, it is the check.** A strategy added without a row is a
+strategy nobody asked the question of, and the question is cheap: *what does this leave that
+the original would not have left, and what makes that safe?* Four strategies have now
+rediscovered `upper_half_read_later` independently. The next one should read this table
+instead.
 
 Two rows repay reading twice.
 
@@ -3564,6 +3580,12 @@ One defect in seven rows, and it was the row where a new strategy inherited an o
 obligations without inheriting its guard. **That is the shape to look for**, and it is
 cheaper to look for than to test for -- Finding 64 records why `check-pe` cannot reach the
 case at all.
+
+**Three defects in ten rows, as of Finding 180**, and all three are the same shape. The
+sentence above was written after the first and did not prevent the second or the third,
+because the table was treated as a record of what had been checked rather than as the list of
+what must be. Adding a strategy means adding its row, and the row is not a description of the
+guard -- it is where the absence of one becomes visible.
 
 ### Finding 66 -- the next blocker was right behind the first
 
