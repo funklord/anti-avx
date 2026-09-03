@@ -1720,14 +1720,25 @@ def doc_paths(text: str) -> list[tuple[int, str]]:
 	own "describing a layout rather than pointing at a file" guard exists
 	to avoid.
 
-	So a document with no inventory table has a path half that inspects
-	NOTHING, and that is a documentation style rather than a fault. Four
-	of the seventeen are in that state -- and none of them could have been
+	So a document whose tables hold no paths has a path half that
+	inspects NOTHING, and that is a documentation style rather than a
+	fault. Three of the seventeen are in that state on 2026-09-03 --
+	beerssh, openmlx4 and hembygd -- and none of them could have been
 	known to be, because until the count was printed beside the verdict a
 	gate checking 233 headings and 0 paths said exactly what a gate
 	checking both would say. Found by fuzzypickles on the first run after
 	the count landed, in their own tree, which is the case for printing a
-	population rather than a verdict."""
+	population rather than a verdict.
+
+	"Whose tables hold no paths" is the condition, and it is NOT "has no
+	table" -- which is how this said it, and the difference cost a wrong
+	claim. All three have tables: beerssh 149 rows, openmlx4 25,
+	hembygd 23. What they lack is a table that inventories paths; theirs
+	are field/value and option tables, and beerssh's two slash-bearing
+	tokens are `-h/--help` and `-v/--version`, refused by the guard
+	below for the leading dash. A reader who takes the old wording
+	literally greps for a table, finds 149, and concludes this function
+	is broken. One did, and wrote it into a commit message."""
 	found = []
 	for number, line in enumerate(text.splitlines(), start=1):
 		if not line.lstrip().startswith("|"):
