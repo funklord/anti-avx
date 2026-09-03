@@ -11337,51 +11337,49 @@ table are a different question from any of this.
 
 ### What is worth building next
 
-Ordered by what was measured, not by what looks large.
+Ordered by what was measured, not by what looks large. **Rewritten after Findings 169-178;
+the previous list is superseded in every item** -- it led with a 386 that turned out to be
+zero, cited timings taken on a rig that was measuring its own loop, and quoted region counts
+from before the closure guard removed nine in ten of them.
 
-  1. **The region where a pair cannot go.** Finding 163 timed the lowerings: a pair is
-     1.4x faster than a region for the same copy, and a region carrying a load, an
-     arithmetic instruction and a store is the CHEAPEST thing in the table per site. So
-     the ordering is settled -- pair first -- and the open work is making the region take
-     the sites no pair can, which Finding 160 measured at 920 eligible regions against 70
-     candidates and Finding 161 showed cannot be had by reordering alone.
-  2. **The collector and the lowering disagree about 386 regions.** `region_members`
-     accepts what `lower_ymm_span` then refuses -- an operand `narrow_piece` cannot move,
-     or a second helper the region has not got. `SPAN_EMITTABLE` keeps the survey and the
-     lowering honest with each other and nothing does the same for the collector. A defect
-     rather than a bound, and a reason recorded nowhere.
-  3. **Region-based 256-bit rewriting**, which is what "whole-function" should have said
-     -- see Finding 147. A call-free region is the largest unit over which an upper half
-     can be represented, because the ABI kills every one of them at a call; and at a
-     region's edges the span's two hard constraints both dissolve. 3,355 of the 4,494
-     surviving 256-bit sites have every ymm they read defined inside their own region,
-     689 of those can also afford the slots and a helper (Findings 148 and 149), and
-     **443 of those are also emittable, which is the buildable number** -- 101 sites more
-     than the span already ships (Finding 151). The helper comes from the UNION of the
-     whole-function rule and per-position liveness, which are sound for different reasons
-     and neither of which contains the other; per-position alone is worse than the blunt
-     rule, which is Finding 149 and not what was expected. **101 sites is a small return
-     on a design this size**, and placement is still on top of it -- so build item 1
-     first and re-take this number, because the shape raises the 443 as well. It remains
-     the only large item left, which is the real state of the project rather than a
-     complaint about it.
+The frontier is **5,655 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
+every one of them.
 
-**And do not re-mine these.** Each has a number saying why:
+  1. **Finish the switch-table work, which is half-measured.** Findings 174 and 177: the
+     scanner had the wrong base, the dispatch reader replaced it, the noise scan is deleted
+     and `verify` now checks indirect targets. The apply was measured -- detours 202,775 to
+     202,784 -- and **the survivor count was not**, because eight consecutive full-binary
+     runs were terminated part way. Re-run `make detour` and `make detour-verify` and record
+     what they say. Everything else here is downstream of trusting that number.
+  2. **The region's remaining shapes, re-priced.** `vextractf128 $1,%ymmS,%xmmD` is a lane
+     READ and `vinsertf128 $1,%xmmS,%ymmD,%ymmD` a lane WRITE, and in a slot representation
+     each is exactly one `movups` through `span_slot_move` -- no helper, no low half, cheaper
+     than every shape now built. `mem,S,D` is `lanereg3` with one helper instead of two.
+     **The counts recorded for them (about 56, 21 and 1 regions) are upper bounds taken at
+     the `region_members` gate BEFORE the closure guard existed**, and that guard now removes
+     roughly nine in ten regions downstream of it. Re-derive before spending.
+  3. **`lanereg3 source from outside the region` is closed, not queued.** 0 of 13 under any
+     combination of shape work, measured. The missing value is a loop-invariant hoisted above
+     the region head; it is the same "arrives from outside" bound as the big bucket, found one
+     instruction later.
+  4. **The 164 branch-target regions**, of which about half are recoverable without
+     whole-function analysis: 37 sit behind a boundary that is not an entry point at all --
+     29 chained `.pdata` fragments and switch-table false positives -- and 33 have exactly one
+     real predecessor. A window-local rule ("a region may contain an interior branch target
+     whose predecessors all lie inside the window") reaches 74 of the 164. The residue, about
+     90, is a genuine control-flow join and needs a representation this project does not have.
+  5. **`.pdata` chained fragments are NOT droppable from `blocked`.** Measured and settled:
+     two counterexamples are real switch targets with a fall-through predecessor and nothing
+     else naming them. Do not reopen without sound enumeration of indirect targets, and even
+     then 29 pdata-only chained starts remain unexplained.
 
-  * the home-space seam (Finding 137: nine in ten of what refuses is the program);
-  * `outside .pdata` (Finding 137: 52 safe sites, 315 unsafe);
-  * `--spill=stack` (Finding 68: a chained fragment's allocation must equal its primary's,
-    so a stub that moves `rsp` cannot be described -- and a Windows host cannot change
-    that);
-  * `--spill=pool` (Finding 46: it cannot be made thread-safe);
-  * the local 256-bit span design as a build (Finding 133: 212 sites, against 479 and 414
-    for the two home-space increments, at several times the complexity);
-  * **the span walk's vocabulary** (Finding 140: three increments, 77 of its 325 stops
-    removed, four whole forms gone, zero sites gained). What the 218 is short of is not
-    which forms the walk recognises. 3,273 of its refusals never begin at a 256-bit load
-    at all, 193 lose the value at a transfer or a branch target, and 54 spans close and
-    then fail on slots rather than on shape -- so the next attempt here is item 3 or
-    nothing.
+**And one thing that is not a build item but decides several of these.** Long full-binary runs
+were terminated part way eight times in a row on an idle machine (load 3, 30 GB free), while
+a 580-second foreground run completed. Nothing here can be re-measured until that is
+understood, and three separate increments are now sitting on measured code with unmeasured
+output. If it recurs, run `make detour` and `make detour-verify` as the first thing in a
+session rather than the last.
+
 
 #### The frontier is where it was, and that is deliberate
 
