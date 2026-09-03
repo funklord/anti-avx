@@ -9220,7 +9220,10 @@ The upper half was right and the lower was wrong, in the same instruction pair.
 **Nothing that existed could see it.** `detour-verify` was clean: the shape is perfect, a
 rip displacement is a rip displacement. `span_oracle` passed, and could not have failed --
 every case in it uses `(%rsi)` and `0x40(%rsi)`, ordinary displacements, so the correction
-it needed was never exercised. And `make detour` reported 30 more sites lowered, which read
+it needed was never exercised. **That is still true of `span_oracle` and no longer true of the
+project**: `spanblock` carries `vmovups values(%rip),%ymm0` and `vaddps addend(%rip),%ymm0`
+and is executed by `check-pe`, so the class is covered -- by the fixture this bug caused,
+which is the only reason it is. And `make detour` reported 30 more sites lowered, which read
 as progress.
 
 `spanblock` is what caught it, and it returned **5** where it wanted 99. It is a leaf whose
@@ -9408,9 +9411,12 @@ instrument making every later region measurement quietly low. The 81 is recorded
 
 347 sites more than what exists, and the uncounted bounds are now the emittable shapes --
 `span_operand_shape` handles three -- and placement, which cost the ladder's reload rung 49
-sites against a plan that promised 51. `TLS_SLOTS` at four is still untested against the
+sites against a plan that promised 51. ~~`TLS_SLOTS` at four is still untested against the
 676 sites whose region wants nine or more, because the ordered buckets never reach the slot
-test.
+test.~~ **Tested since, by Finding 157**: the dial was raised to eight and the binary did not
+change at all, because the regions this offers run to twelve instructions and rarely hold five
+distinct values. The claim above was true when written and stopped being true one finding
+later.
 
 ### Finding 150 -- the shapes, and the one to build next is named by measurement
 
