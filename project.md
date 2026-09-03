@@ -11259,7 +11259,9 @@ was right, because it asked what the instruction does rather than what its opera
 **And there is no headroom in relaxing the closure guard.** `upper_half_read_later` ends an
 upper half's life at a full 256-bit write only for a MOVE, so arithmetic that overwrites the
 register still counts as a read. Widening it to every full 256-bit write frees **0 of the 303**
-closure refusals in the current build, and 1 of 15 under A+B+C -- measured, with a positive
+closure refusals in the current build, and 1 of 15 under A+B+C. That one is traceable rather
+than merely absent: it dies at the next gate, `fewer than two dead GPRs for the block`, which
+rises from 3 to 4, so the emitted count stays 8 regions and 66 sites. Measured with a positive
 control confirming the substitution really does flip a `vaddps` from "read" to "dead" while
 still refusing a genuine store.
 
