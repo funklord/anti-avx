@@ -9629,12 +9629,33 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			if other[0] >= start + window:
 				break
 			following = other[7]
+			borrowed = None
 			if other[8] is not None:
-				# A site with a strategy of its own cannot ride along:
-				# a passenger is lowered by `moved_instruction`, which
-				# knows only the plain rules and would refuse a 256-bit
-				# one -- costing the stub that was going anyway.
-				continue
+				# A site with a strategy of its own mostly cannot ride
+				# along: a passenger is lowered by `moved_instruction`,
+				# which knows only the plain rules and would refuse a
+				# 256-bit one -- costing the stub that was going anyway.
+				#
+				# **`spill` is the exception, and it was the whole bucket.**
+				# All 84 overlap survivors sat EXACTLY at the end of the
+				# preceding placed window and 83 carried `spill`, refused
+				# only by the blanket test above. A spill site is an
+				# ordinary lowering that needs a register it must give
+				# back, and `emit_swallowed` has emitted exactly that
+				# bracket for forward-widened neighbours since Finding 93:
+				# save, this one lowering, restore, tight by construction.
+				#
+				# The register is the one the candidate's own strategy
+				# chose, from `borrow_that_lowers` at this same address --
+				# the identical call `swallowed_borrow` makes -- so it is
+				# valid here for the same reason. What differs is the
+				# backing store: the site would have used its own, and a
+				# passenger uses the WINDOW's borrow displacement, which
+				# `emit_swallowed` refuses outright when the window has
+				# none. Finding 181.
+				if other[8][0] != "spill":
+					continue
+				borrowed = other[8][1]
 			if not following or other[1][:1] not in (b"\xc4", b"\xc5"):
 				continue
 			site = other[0] + sum(len(e[1]) for e in following)
@@ -9643,8 +9664,15 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			# The passenger carries the scratch its own candidate was given:
 			# it is being lowered here rather than in a stub of its own, and
 			# the register it may destroy does not change with the address.
+			# The seventh field is `emit_swallowed`'s borrow flag. It
+			# brackets the lowering with a save and a restore, refuses a
+			# passenger that transfers control between them, and refuses
+			# when the window holds no displacement to save into -- and
+			# `build_stub` returning None falls back to the plain stub, so
+			# a refusal here costs the passenger and never the site.
 			extension = (j, [(site, other[1], None, other[2], other[3],
-			                  other[6])], len(other[1]))
+			                  other[6] if borrowed is None else borrowed,
+			                  borrowed is not None)], len(other[1]))
 			break
 
 		stub_address = stub_base + len(blob)

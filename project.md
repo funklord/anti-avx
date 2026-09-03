@@ -11361,6 +11361,64 @@ than read it off Finding 65's table, which had no row for it. The table now has 
 omission, not the missing check, is the defect worth fixing, and it is fixed there.
 
 
+### Finding 181 -- the rescue takes a spill passenger, and 53 of the predicted 83 arrive
+
+Finding 179's attribution found all 84 overlap survivors sitting EXACTLY at the end of the
+preceding placed window, 83 of them carrying `spill`, refused by the Finding 36 rescue only
+because it turned away any candidate with a strategy of its own. The reason given was that a
+passenger is lowered by `moved_instruction`, which knows the plain rules alone.
+
+**The machinery for the exception already existed.** `emit_swallowed` has bracketed a borrowed
+passenger since Finding 93 -- save, one lowering, restore, tight by construction -- with
+refusals already written for a control transfer between the two and for a window holding no
+displacement to save into. The rescue simply never offered it one. The register is the
+candidate's own, chosen by `borrow_that_lowers` at that same address, which is the identical
+call `swallowed_borrow` makes.
+
+```
+                     before      after
+VEX surviving         5,647     5,594     -53
+placed              202,760   202,760       0 lost, 0 gained
+refused                  46        46
+stub section      3,767,561 3,768,624  +1,063 B  (20 per passenger)
+```
+
+**Nothing was lost, and that was proved rather than assumed.** An instrumented copy of the
+previous code was run beside the new one on the same inputs and the placed sets compared
+directly: zero placed before and missing now, zero newly placed, zero change in refusals. The
+baseline copy reproduced the shipped figures exactly and the modified copy's image was
+byte-identical to the built one, so both dumps describe real runs.
+
+**The overlap counter understates the gain by construction, and that is worth knowing before
+it misleads someone.** "Skipped for overlap" fell only 6, against 53 sites actually recovered.
+`overlapped` is a set of ADDRESSES, not of candidates -- a rescued candidate's start stays in
+the set whenever another still-overlapped candidate shares that address. The six that left are
+six of the 53 passengers' own starts. **The VEX count is the honest measure here** and the
+overlap counter is not; a session reading the second would conclude the change was worth six
+sites.
+
+All 53 brackets were checked in the shipped image, not sampled: each ends `movups
+disp(%rsp),%xmmN` before the stub's `jmp`, each has a matching save with the same register and
+displacement, none has a control transfer between them, and **none is nested inside a still-live
+outer save at the same displacement** -- the collision `project.md` warned about when this was
+deferred. It cannot happen: `build_stub` closes the host's own borrow inside `body` and the
+displaced entries are appended afterwards, so the brackets are strictly sequential. One stub
+carries three separate borrows of `%xmm0` at `(%rsp)`, each opened and closed before the next.
+
+**30 of the 83 did not arrive**, and the residue agrees (84 - 53 = 31). The fallback is silent
+by design -- `place_stubs` deliberately withholds `reasons` from the extension build, so a
+refusal there costs the passenger and never the site -- so the cause was not measured. The
+likely one is `emit_swallowed`'s `base is None`: a spill SITE can fall back to a per-thread
+slot under `--spill=tls`, and a spill PASSENGER cannot, because this routes it through
+`encode_spill` at the window's home-space displacement only. That is where to look for the
+remaining 30.
+
+**And the deferral in item 5 was half right.** The hazards named there -- slot collision, the
+block pointer, the unwind prologue -- were real questions, and the answer to all three was that
+existing code already handled them. What the deferral got right was insisting they be answered
+before building; what it got wrong was assuming the answers would be work.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -11539,7 +11597,7 @@ the previous list is superseded in every item** -- it led with a 386 that turned
 zero, cited timings taken on a rig that was measuring its own loop, and quoted region counts
 from before the closure guard removed nine in ten of them.
 
-The frontier is **5,647 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
+The frontier is **5,594 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
 every one of them (at 6,480, before three of the fixes below).
 
   1. ~~**Finish the switch-table work.**~~ **Done and measured**: 5,623 surviving VEX,
@@ -11561,7 +11619,12 @@ every one of them (at 6,480, before three of the fixes below).
      real predecessor. A window-local rule ("a region may contain an interior branch target
      whose predecessors all lie inside the window") reaches 74 of the 164. The residue, about
      90, is a genuine control-flow join and needs a representation this project does not have.
-  5. **The 83-site placer rescue -- designed, priced, deliberately not built.** Every one of
+  5. ~~**The 83-site placer rescue.**~~ **Built and measured: 53 sites, Finding 181.** The
+     hazards this entry named were real questions with answers already in the code. 30 of the
+     83 remain, most likely refused because a spill passenger cannot fall back to a per-thread
+     slot the way a spill site can. The original entry follows.
+
+     **The 83-site placer rescue -- designed, priced, deliberately not built.** Every one of
      the 84 overlap survivors sits EXACTLY at the end of the preceding placed window (distance
      0 for all 84), and 83 are backward-widened candidates the Finding 36 rescue refuses only
      because `other[8] is not None`: a passenger carrying its own strategy cannot ride along.
