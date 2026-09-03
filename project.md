@@ -11142,14 +11142,24 @@ removing either register-agreement link turns three of them red. The refactor is
 behaviour-preserving, checked rather than assumed -- 1,795 tables and 16,819 targets before
 and after.
 
-**What is measured and what is not.** An apply with these changes completed and reported
-detours 202,775 to 202,784, overlaps 39,238 to 39,249, and 15,170 targets not already blocked
--- **exactly three more than before**, which are the three real switch targets the deleted
-scan used to cover, corroborating "3 real, 14,737 noise" from a different direction. All
-eighteen gates pass. **The survivor count is outstanding**: six consecutive full-binary runs
-were terminated part way on an otherwise idle machine, so the new `verify` check has not yet
-run over the real image. That is a gap in the evidence and is recorded as one rather than
-rounded up.
+**Measured.** Detours 202,775 to 202,784, overlaps 39,238 to 39,249, and 15,170 targets not
+already blocked -- **exactly three more than before**, which are the three real switch targets
+the deleted scan used to cover, corroborating "3 real, 14,737 noise" from another direction.
+All eighteen gates pass.
+
+```
+verify: VEX in .text 805,131 -> 5,623  (799,508 removed, 99.3%)
+verify: all 16,819 switch targets from 1,795 tables still begin an instruction
+```
+
+**5,655 to 5,623**, and the new check passed on its first run over the real image. That second
+line is one this project could not previously write: `verify` has always been able to say that
+DIRECT branch targets survive, because direct branches are the class the tool can enumerate,
+and the indirect ones went unchecked because they went unresolved.
+
+Nine consecutive full-binary runs were terminated part way in the session that wrote this, on
+an idle machine, and the measurement was finally got by handing the build to a subagent. The
+number is the number; how it was obtained is recorded because the obstacle will recur.
 
 #### A commit that says the wrong thing
 
@@ -11162,6 +11172,46 @@ of a tested OAuth fix shipping under a message about the Android NDK.
 Not rewritten, because the tree is shared and pushed history is not this session's to
 reorder. Recorded here instead so that a `git log --grep` for the switch-table change has
 somewhere to land.
+
+
+### Finding 178 -- 290 sites wearing a register label on an ISA bound
+
+Finding 175 found 290 sites refusing for every one of the sixteen scratch registers while
+being counted as register pressure. The cause was an ordering: the home-space test ran first
+and short-circuited, so a site no register could ever lower was declined `no home space to
+borrow` before anything asked whether a register would have helped.
+
+`borrow_that_lowers` already answers exactly that question -- it tries every borrowable
+register and returns the first that works -- so it is now asked first. A site that borrows and
+then fails the home-space test still declines for that reason; only a site that no register
+lowers gets the new label.
+
+**Measured, and it reconciles exactly.**
+
+```
+before   no home space to borrow          579
+         sequence with no usable scratch   75
+         sequence shape not handled        22     = 676
+after    no home space to borrow          386
+         no SSE form at any register      290     = 676     (290 = 193 + 75 + 22)
+```
+
+The decline set is unchanged and the site count cannot move; what moved is that 290 sites
+stopped claiming to be a backing-store problem. They had been sitting inside the bucket that
+Findings 130-142 spent five increments on, and no backing store could ever have reached one
+of them.
+
+**The discriminator discriminates**, which is the part that needed proving rather than
+asserting. Asked of real encodings: `vbroadcastss %xmm4,%ymm2`, `vpbroadcastd` and 256-bit
+`vaddps` lower at **none** of the sixteen registers, while a 128-bit `vpor` whose src2 aliases
+its destination lowers at **14 of 16**. Without that last case the check would be a relabelling
+rather than a test, and all four are now selftest cases.
+
+**And the agent that measured it flagged this as the one number that did not close**, having
+compared 579 against 386 + 290 without adding back the two buckets its own report showed
+emptied. The arithmetic was in its output and the conclusion was not. A returned result is
+evidence to check, not a verdict to accept -- which is the same rule this file applies to its
+own gates, pointed at a subagent.
 
 
 ## Picking this up again
@@ -11342,15 +11392,12 @@ the previous list is superseded in every item** -- it led with a 386 that turned
 zero, cited timings taken on a rig that was measuring its own loop, and quoted region counts
 from before the closure guard removed nine in ten of them.
 
-The frontier is **5,655 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
-every one of them.
+The frontier is **5,623 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
+every one of them (at 6,480, before three of the fixes below).
 
-  1. **Finish the switch-table work, which is half-measured.** Findings 174 and 177: the
-     scanner had the wrong base, the dispatch reader replaced it, the noise scan is deleted
-     and `verify` now checks indirect targets. The apply was measured -- detours 202,775 to
-     202,784 -- and **the survivor count was not**, because eight consecutive full-binary
-     runs were terminated part way. Re-run `make detour` and `make detour-verify` and record
-     what they say. Everything else here is downstream of trusting that number.
+  1. ~~**Finish the switch-table work.**~~ **Done and measured**: 5,623 surviving VEX,
+     99.3% removed, and `verify: all 16,819 switch targets from 1,795 tables still begin an
+     instruction` passed on its first run. Findings 174, 177 and 178 are closed.
   2. **The region's remaining shapes, re-priced.** `vextractf128 $1,%ymmS,%xmmD` is a lane
      READ and `vinsertf128 $1,%xmmS,%ymmD,%ymmD` a lane WRITE, and in a slot representation
      each is exactly one `movups` through `span_slot_move` -- no helper, no low half, cheaper
