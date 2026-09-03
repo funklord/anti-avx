@@ -5860,6 +5860,156 @@ def held_back(pair_reason, run_reason):
 	return run_reason if pair_reason is None else pair_reason
 
 
+# The 64-bit name a 32-bit register belongs to, for reading a switch
+# dispatch: the table load writes `%ecx` and the `add` that follows names
+# `%rcx`, and matching them means knowing they are one register.
+SWITCH_WIDE = dict(zip(
+	["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"]
+	+ [f"r{i}d" for i in range(8, 16)],
+	["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"]
+	+ [f"r{i}" for i in range(8, 16)]))
+SWITCH_LOAD = re.compile(r"^(0x[0-9a-f]+)\(%(\w+),%(\w+),4\),%(\w+)$")
+SWITCH_ADD = re.compile(r"^%(\w+),%(\w+)$")
+SWITCH_BACK = 16			# how far back a dispatch may be spread
+
+
+def require_qemu(qemu):
+	"""qemu present, able to start, and able to run AVX2 -- or skip at 77.
+
+	**One implementation, because four copies of this have now been wrong
+	twice in the same way.** `vex_oracle`, `lane_oracle`, `span_oracle` and
+	`shape_oracle` each carried their own: one asked presence and not
+	capability, one left the probe outside its `try`, and all four blamed a
+	missing AVX2 model for a qemu that had produced nothing at all.
+
+	Three failures, three messages, because a diagnostic that names a cause
+	the code never tested sends the reader after the wrong thing:
+
+	- not on `$PATH` -- install it;
+	- on `$PATH` and will not exec, or hangs -- `OSError` or a timeout;
+	- exec'd and produced no model list -- typically a missing shared
+	  library, where the loader writes to stderr and the child exits 127.
+	  Empty stdout and no `OSError`, so this used to read as "no avx2".
+
+	**The discriminator is stdout, not the exit status.** Real
+	`qemu-x86_64 -cpu help` exits **1** on this machine while printing 219
+	lines of models including avx2, so a `returncode` check would refuse
+	the working case. What separates "could not tell us" from "told us no"
+	is whether it said anything.
+	"""
+	import shutil
+	if shutil.which(qemu[0]) is None:
+		print(f"no {qemu[0]}: install qemu-user. SKIPPED, not passed.",
+		      file=sys.stderr)
+		raise SystemExit(77)
+	try:
+		probe = subprocess.run(qemu + ["-cpu", "help"], capture_output=True,
+		                       text=True, timeout=60)
+	except OSError as error:
+		print(f"{qemu[0]} will not run ({error}). SKIPPED, not passed.",
+		      file=sys.stderr)
+		raise SystemExit(77)
+	except subprocess.TimeoutExpired:
+		print(f"{qemu[0]} -cpu help timed out. SKIPPED, not passed.",
+		      file=sys.stderr)
+		raise SystemExit(77)
+	if "avx2" in probe.stdout:
+		return
+	if not probe.stdout.strip():
+		first = (probe.stderr or "").strip().splitlines()
+		why = first[0] if first else f"exit {probe.returncode}, no output"
+		print(f"{qemu[0]} -cpu help produced no model list ({why}). "
+		      f"SKIPPED, not passed.", file=sys.stderr)
+	else:
+		print(f"{qemu[0]} reports no avx2 model. SKIPPED, not passed.",
+		      file=sys.stderr)
+	raise SystemExit(77)
+
+
+def switch_targets(instructions, binary, starts):
+	"""Where an indirect `jmp` through a switch table can land.
+
+	**`targets.from_switch_tables` has the wrong base.** Its docstring says
+	an MSVC x64 table holds `target - table`; that is the x86 form. This
+	binary holds RVAs -- `target - __ImageBase` -- so the scan that looks
+	for self-consistent runs of `table + value` finds noise. Measured: its
+	targets land on an instruction boundary 24.67% of the time against a
+	27.09% baseline, which is chance, and 3 of its 14,574 are real. See
+	Finding 174.
+
+	This reads the dispatch instead of guessing at the table, which is what
+	makes it exact rather than statistical:
+
+	    mov  0x181d498(%r9,%rax,4),%ecx    # r9 = __ImageBase
+	    add  %r9,%rcx
+	    jmp  *%rcx
+
+	The table is at `__ImageBase + 0x181d498`, its entries are RVAs, and it
+	runs until an entry stops naming an instruction. `starts` is what makes
+	that terminator sound: a real code address begins an instruction and
+	arithmetic noise does so only by chance.
+
+	**Blocking too much is safe and blocking too little is not.** An
+	address wrongly in `blocked` costs sites, because a window declines to
+	widen past it; one wrongly absent lets a window swallow a place control
+	arrives at, and the program jumps into the middle of a stub.
+	"""
+	data = open(binary, "rb").read()
+	sections, base, _opt = target_set.sections_of(data)
+	# **`targets.sections_of` returns the virtual address ALREADY
+	# absolute** -- `base + vaddr` -- where `detour.sections_of` returns it
+	# relative. Adding the base a second time here put every span
+	# 0x140000000 too high, `at` resolved nothing, and the resolver found
+	# zero tables where the same logic found 1,795 standalone. Caught only
+	# because the count is printed: the build's totals were identical to
+	# the previous one, which reads exactly like "this changed nothing".
+	spans = [(v, r, rs) for v, _vs, r, rs in sections.values() if v and r]
+
+	def at(va):
+		for start, raw, size in spans:
+			if start <= va < start + size:
+				return raw + (va - start)
+		return None
+
+	found = set()
+	tables = 0
+	for i, (_a, _e, mnemonic, operands, _c) in enumerate(instructions):
+		if mnemonic != "jmp" or not operands.startswith("*%"):
+			continue
+		register = operands[2:].strip()
+		holder = None
+		for j in range(i - 1, max(-1, i - SWITCH_BACK), -1):
+			match = SWITCH_ADD.match(instructions[j][3] or "")
+			if instructions[j][2] == "add" and match \
+					and match.group(2) == register:
+				holder = match.group(1)
+				break
+		if holder is None:
+			continue
+		for j in range(i - 1, max(-1, i - SWITCH_BACK), -1):
+			match = SWITCH_LOAD.match(instructions[j][3] or "")
+			if not (instructions[j][2] == "mov" and match):
+				continue
+			offset, holds, _index, into = match.groups()
+			if holds != holder or SWITCH_WIDE.get(into) != register:
+				continue
+			where = at(base + int(offset, 16))
+			if where is None:
+				break
+			entries, k = [], 0
+			while where + k * 4 + 4 <= len(data):
+				value = struct.unpack_from("<I", data, where + k * 4)[0]
+				if base + value not in starts:
+					break
+				entries.append(base + value)
+				k += 1
+			if len(entries) >= 2:
+				found.update(entries)
+				tables += 1
+			break
+	return found, tables
+
+
 def collect(binary, listing):
 	"""(in-place patches, class C detour candidates, statistics)."""
 	# A run reports its own numbers, not the previous one's.
@@ -5897,6 +6047,24 @@ def collect(binary, listing):
 			# through the pointer, which makes it a branch target like any
 			# other -- see outside.lea_targets.
 			blocked.add(comment)
+
+	# **Where an indirect jump can land**, read from the dispatch rather
+	# than guessed at. `targets.from_switch_tables` looks for runs of
+	# `table + value` and this binary's tables hold RVAs, so it finds
+	# noise; 12,869 real switch targets were absent from `blocked`
+	# entirely, 147 of them with nothing else shielding them. Finding 174.
+	starts = {a for a, *_rest in instructions}
+	switched, switch_tables = switch_targets(instructions, binary, starts)
+	fresh = switched - blocked
+	blocked |= switched
+	# **Said out loud, because a count nobody prints cannot be checked.**
+	# The first version of this put the numbers in `stats`, which `apply`
+	# discards as `_stats` -- so "the resolver found nothing" and "the
+	# resolver never ran" produced identical output, which is the whole
+	# defect this session has been removing from other people's gates.
+	print(f"collect: {switch_tables:,} switch tables read, "
+	      f"{len(switched):,} targets, {len(fresh):,} of them not already "
+	      f"blocked", file=sys.stderr)
 
 	# The code oracle, in two parts. .pdata is the binary's own statement
 	# about where its functions are and needs no disassembly to read, but the
@@ -5938,6 +6106,8 @@ def collect(binary, listing):
 	with open(binary, "rb") as image:
 		readonly = readonly_ranges(image.read(1 << 16))
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
+	stats["switch tables read"] = switch_tables
+	stats["switch targets blocked"] = len(switched)
 
 	# Anything already rewritten in place needs nothing further. Everything
 	# else that HAS a lowering is a detour candidate -- not just Class C.

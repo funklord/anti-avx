@@ -282,30 +282,14 @@ def both_nan(a, b, width):
 
 
 def require_oracle():
-	"""qemu present, and able to run AVX2 -- or say so and skip.
+	"""qemu present, able to start, and able to run AVX2.
 
-	**Absent and working are different claims.** A harness that treats a
-	missing qemu as a pass turns its own absence into evidence, which is
-	the failure `evidence.md` names; one that treats it as a failure makes
-	every machine without qemu-user look broken. So it reports which, and
-	exits 77 -- the skip code -- rather than 0.
+	One implementation for all four oracles, in `detour`, because
+	four copies of this guard have been wrong twice: once asking
+	presence where the others asked capability, and once blaming a
+	missing AVX2 model for a qemu that produced no output at all.
 	"""
-	import shutil
-	if shutil.which(QEMU[0]) is None:
-		print("no qemu-x86_64: install qemu-user. SKIPPED, not passed.",
-		      file=sys.stderr)
-		raise SystemExit(77)
-	try:
-		probe = subprocess.run(QEMU + ["-cpu", "help"], capture_output=True,
-		                       text=True, timeout=60)
-	except OSError as error:
-		print(f"{QEMU[0]} will not run ({error}). SKIPPED, not passed.",
-		      file=sys.stderr)
-		raise SystemExit(77)
-	if "avx2" not in probe.stdout:
-		print("qemu-x86_64 reports no avx2 model. SKIPPED, not passed.",
-		      file=sys.stderr)
-		raise SystemExit(77)
+	detour.require_qemu(QEMU)
 
 
 def main():
