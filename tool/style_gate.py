@@ -1691,11 +1691,20 @@ def fix_file(path: Path, cfg: Config, write: bool) -> tuple[bool, str | None]:
 # ------------------------------------------------------------ doc gate
 
 # A backticked token worth testing as a path: no globs, no placeholders, no
-# URLs, no shell. Anything with a directory separator, or a bare filename
-# carrying a suffix we recognise.
+# URLs, no shell. **A directory separator, and nothing else.**
+#
+# The second half of that rule -- "or a bare filename carrying a suffix we
+# recognise" -- was described here and never implemented, with the suffix
+# tuple sitting unreferenced below it for as long as this file has been
+# copied into sixteen trees. Measured before removing it, over six
+# project.md files: 1193 tokens carry a separator and are checked today;
+# 782 more are bare names with a known suffix, and 694 of those do not
+# exist relative to the tree root, because they live in subdirectories --
+# `sync.py` is `tool/sync.py`, `harmonization.md` is
+# `guidelines/harmonization.md`. The pattern also reads a bare `.rs` as a
+# filename. So the unimplemented half would have been 694 false reports,
+# and the code was right where the comment was wrong.
 _DOC_TOKEN = re.compile(r"`([A-Za-z0-9._/-]+)`")
-_DOC_SUFFIX = (".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".py", ".rs", ".situ",
-               ".ebnf", ".lua", ".md", ".toml", ".json", ".sh", ".pro", ".txt")
 
 
 def doc_paths(text: str) -> list[tuple[int, str]]:
