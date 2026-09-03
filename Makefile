@@ -809,10 +809,33 @@ scratch-check: $(LISTING)
 # The hook lives in tool/hooks/ rather than only in .git/hooks so that it
 # survives a clone and can be diffed against its siblings. An untracked hook
 # enforces a rule nobody can see.
+# **Where the hooks live is git's question, not the filesystem's.** This
+# asked `test -d .git`, which is false in a linked worktree and in a
+# submodule checkout: there `.git` is a regular FILE naming the real
+# gitdir, and both are git repositories. So `make hooks` refused with
+# "not a git repository" inside one that is.
+#
+# Testing -e instead would only move the failure one line down, because
+# the install writes into `.git/hooks/`, which is not a directory there
+# either. Asking git answers both halves at once, and from a worktree it
+# returns the MAIN repository's hooks directory -- which is the one git
+# actually runs.
+#
+# git's absence is reported as its own thing rather than as "not a git
+# repository", which would be a message naming a cause nothing tested.
 hooks:
-	@test -d .git || { echo "hooks: not a git repository" >&2; exit 1; }
-	@install -m 0755 tool/hooks/commit-msg .git/hooks/commit-msg
-	@echo "hooks: commit-msg installed from tool/hooks/"
+	@if ! command -v git >/dev/null 2>&1; then \
+		echo "hooks: git is not installed, so there is nowhere to install to." >&2; \
+		exit 1; \
+	fi; \
+	dir=$$(git rev-parse --git-common-dir 2>/dev/null); \
+	if [ -z "$$dir" ]; then \
+		echo "hooks: not a git repository, so there is nowhere to install to." >&2; \
+		exit 1; \
+	fi; \
+	mkdir -p "$$dir/hooks"; \
+	install -m 0755 tool/hooks/commit-msg "$$dir/hooks/commit-msg"; \
+	echo "hooks: commit-msg installed from tool/hooks/ into $$dir/hooks/"
 
 # -- cleaning ----------------------------------------------------------------
 
