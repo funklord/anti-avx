@@ -11295,6 +11295,66 @@ whole-function join problem the branch-target bucket names, and nothing shaped l
 reaches it.
 
 
+### Finding 180 -- the long pair committed a load to a store that then declined
+
+**A second correctness bug in shipped output, and the same shape as Finding 173.** The long
+pair lowers a 256-bit load into a stub that writes the value's UPPER half into a shadow xmm,
+on the promise that a later partner store will read that shadow. It committed the load without
+asking whether the partner store would lower.
+
+24 partner stores then declined -- every one a 4-byte store, below the 5-byte detour
+threshold -- leaving a surviving 256-bit store of a register whose top half nobody wrote.
+Verified in the shipped image before anything was changed:
+
+```
+1402d70ad: vmovups (%r9),%ymm0     ->  e9 1d fd 6b 08      detoured
+1402d70b2: vmovups %ymm0,(%rbx)    ->  c5 fc 11 03         UNCHANGED, still VEX-256
+
+stub 1489ed…: movups 0x10(%r9),%xmm1   ; upper half -> shadow xmm1
+              movups (%r9),%xmm0       ; low half   -> real xmm0
+              jmp 0x1402d70b2
+```
+
+The surviving store writes 32 bytes from `%ymm0`. Sixteen correct, sixteen stale.
+
+**The comment that let it live** sat on the store side and read: *"Only a load that COMMITTED
+to the long pair puts an entry here, so the two ends cannot disagree: the listing is walked in
+address order and the load is always reached first."* That is true, and it guards a store with
+no load. It says nothing about a load whose store then declines -- and the refusal path
+immediately below it was reached 24 times with the load already committed. **An invariant that
+holds in one direction, stated as though it held in both.**
+
+The load now asks `long_partner_lowers` of every partner first, in the store's own three tests
+rather than a restatement of them: too short to detour, outside `.pdata`, or a half that will
+not encode.
+
+```
+                          before   after
+partner stores of placed longloads    -     339
+  lowered                             -     339
+  STILL VEX                          24       0
+longload placed                     358     334
+surviving VEX                     5,623   5,647
+```
+
+**+24, exactly the loads that no longer commit**, and the accounting closes: the old 5,623
+already counted the 24 orphaned stores, so the fix moves their loads into the residue and
+takes 24 sites of wrong bytes out of the binary. Removal holds at 99.3%. `0x1402d70ad` is now
+neither placed nor even a candidate -- both instructions survive untranslated and correct,
+which is the right answer where the alternative is half-written.
+
+**Not proven, and recorded as such:** the reverse direction. A placed `longstore` whose LOAD
+was overlapped at placement rather than declined at collection would be the mirror defect. The
+counts are consistent with that set being empty -- 339 placed longstores against 339 distinct
+partners of placed longloads -- but the two sets were not shown to be identical, and consistent
+is not the same as checked.
+
+**This is the fourth strategy to need this guarantee** -- pair (Finding 38), run (64), span
+(153), region (173), long pair (180) -- and the fourth to rediscover it independently rather
+than read it off Finding 65's table, which had no row for it. The table now has one. That
+omission, not the missing check, is the defect worth fixing, and it is fixed there.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -11473,7 +11533,7 @@ the previous list is superseded in every item** -- it led with a 386 that turned
 zero, cited timings taken on a rig that was measuring its own loop, and quoted region counts
 from before the closure guard removed nine in ten of them.
 
-The frontier is **5,623 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
+The frontier is **5,647 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
 every one of them (at 6,480, before three of the fixes below).
 
   1. ~~**Finish the switch-table work.**~~ **Done and measured**: 5,623 surviving VEX,

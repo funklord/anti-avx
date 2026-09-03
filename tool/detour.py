@@ -5310,6 +5310,37 @@ def lower_long_half(vex, tail, address, length, at, shadow):
 	return bytes(body)
 
 
+def long_partner_lowers(instructions, position, ranges, shadow):
+	"""Whether a long pair's partner store will actually lower.
+
+	**The load must ask this before it commits.** `lower_long_half` writes
+	the upper half into a shadow register and leaves the ymm's own upper
+	half stale, which is safe only because the partner store is going to
+	read the shadow. A load that commits to a store which then declines
+	leaves a surviving 256-bit store of a register whose top half nobody
+	wrote -- sixteen correct bytes and sixteen stale, in the shipped image.
+
+	24 sites were exactly that, all of them 4-byte stores refused by the
+	length test the load never applied to them. `0x1402d70ad` detoured to a
+	stub that put the upper half in `%xmm1` and returned to
+	`0x1402d70b2`, still `c5 fc 11 03`, storing 32 bytes from `%ymm0`.
+
+	The three tests are the store's own, asked in its words rather than
+	restated: too short to detour, outside `.pdata`, or a half that will
+	not encode. Finding 180.
+	"""
+	address, encoding, _m, _o, _c = instructions[position]
+	if len(encoding) < 5:
+		return False
+	vex = inplace.decode_vex(encoding)
+	if vex is None:
+		return False
+	if not inplace.covered_by(ranges, address, len(encoding)):
+		return False
+	return lower_long_half(vex, encoding[vex["length"]:], address,
+	                       len(encoding), address, shadow) is not None
+
+
 def long_pair_stores(instructions, index, blocked, end):
 	"""Every store this 256-bit load's value reaches, or None.
 
@@ -6499,6 +6530,16 @@ def collect(binary, listing):
 					# long pair puts an entry here, so the two ends cannot
 					# disagree: the listing is walked in address order and
 					# the load is always reached first. Finding 104.
+					#
+					# **That guarded one direction only.** It rules out a
+					# store with no load; it said nothing about a load whose
+					# store then declines, and the refusal below was reached
+					# 24 times with the load already committed -- leaving a
+					# surviving 256-bit store of a register whose upper half
+					# went to a shadow. The load now asks
+					# `long_partner_lowers` of every partner before it
+					# commits, so reaching the refusal below means the load
+					# did not commit. Finding 180.
 					tail = encoding[vex["length"]:]
 					if len(encoding) >= 5 and inplace.covered_by(
 							ranges, address, len(encoding)) \
@@ -6606,8 +6647,16 @@ def collect(binary, listing):
 				if free and inplace.covered_by(ranges, address,
 				                               len(encoding)):
 					shadow = min(free)
+					# **Every partner, or none.** The comment on the store
+					# side said the two ends cannot disagree because the
+					# load is reached first -- which guards a store with no
+					# load, and not a load whose store then declines. That
+					# second case shipped 24 stale upper halves.
 					if lower_long_half(vex, tail, address, len(encoding),
-					                   address, shadow) is not None:
+					                   address, shadow) is not None \
+							and all(long_partner_lowers(instructions, one,
+							                            ranges, shadow)
+							        for one in partners):
 						for partner in partners:
 							long_shadow[instructions[partner][0]] = shadow
 						candidates.append(
