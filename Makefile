@@ -824,7 +824,9 @@ clean:
 	      $(BUILD_DIR)/sse-spill-none.exe $(BUILD_DIR)/sse-spill-stack.exe \
 	      $(BUILD_DIR)/sse-spill-pool.exe \
 	      $(BUILD_DIR)/icache_bench \
-	      $(BUILD_DIR)/after.asm $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
+	      $(BUILD_DIR)/after.asm $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm \
+	      $(BUILD_DIR)/isa-disasm.txt $(BUILD_DIR)/region-refused.txt \
+	      $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@# The wine prefix is a directory this build created, so it goes
 	@# wholesale -- but only after checking the variable is non-empty and
