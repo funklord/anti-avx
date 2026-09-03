@@ -11053,6 +11053,83 @@ coming out of it is worth stating plainly: **whichever function will decide late
 now, by being called, rather than by having its conditions restated.**
 
 
+### Finding 177 -- the switch targets read from the dispatch, at no cost in sites
+
+Finding 174 found `from_switch_tables` computing `table_address + value` on an x86 premise
+where this x64 binary holds RVAs, and set out three steps. **Step one is done.**
+
+`switch_targets` reads the dispatch rather than guessing at the table:
+
+```
+mov  0x181d498(%r9,%rax,4),%ecx    # r9 = __ImageBase
+add  %r9,%rcx
+jmp  *%rcx
+```
+
+The table is at `__ImageBase + disp`, its entries are RVAs, and it runs until an entry stops
+naming an instruction -- the instruction-start set is what makes that terminator sound, since
+a real code address begins an instruction and arithmetic noise does so at 27%.
+
+```
+1,795 tables, 16,819 targets
+  15,167 not already in `blocked`
+    14,931 shielded anyway by a preceding transfer or gap
+       236 GENUINELY EXPOSED before this change
+surviving VEX  5,655 -> 5,655   (no change)
+```
+
+**236 addresses control can reach had nothing protecting them**, and closing that costs
+nothing measurable. The other 14,931 were already safe because a window cannot widen past a
+control transfer -- but that is **luck, not a mechanism**: it depends on the game's
+instruction layout and on the current widening rules, and either could change and remove the
+protection silently. The guarantee no longer rests on either.
+
+**The bug in it, and why it was nearly invisible.** `targets.sections_of` returns the virtual
+address ALREADY absolute -- `base + vaddr` -- where `detour.sections_of` returns it relative.
+The first version added the base a second time, so every span sat 0x140000000 too high, the
+file-offset lookup resolved nothing, and the resolver found **zero** tables where identical
+logic found 1,795 standalone. The build's totals came out byte-identical to the previous one,
+which reads exactly like "this change was neutral".
+
+It was caught only because the count is printed. The first version put it in `stats`, which
+`apply` discards as `_stats` -- so "found nothing" and "never ran" produced identical output.
+That is the defect two peer audits had just reported in this tree's own gates, reproduced in
+code written an hour after reading them. **A counter nobody prints is not a measurement.**
+
+#### Step two measured, and deferred
+
+Removing the `.text`/`.rdata` scans is Finding 174's next step, and the numbers are ready:
+
+```
+switch-scan addresses          14,789
+  also named elsewhere             49
+  ONLY from that scan          14,740
+    of those, really targets        3   <- and all 3 are found by the dispatch reader
+    noise                      14,737   <- blocked for nothing
+```
+
+Independently reproducing the audit's "3 of 14,574 are real". But the blast radius is wider
+than `collect`: `targets.collect` also feeds **`verify`**, `outside.leaf_ranges`,
+`scratch.py` and `probe.py`. `leaf_ranges` uses `blocked` to decide a range is *entered*, so
+removing 14,740 spurious addresses makes leaf recovery STRICTER and may cost sites through
+`outside .pdata` -- the opposite of the intended direction. Which way it nets is unknown, so
+it is its own measured build rather than a rider on this one. Step three, extending `verify`
+to check resolved indirect targets, belongs with it: `switch_targets` is called from
+`collect` and not from `verify`, so the targets it finds are blocked but not yet checked.
+
+#### A commit that says the wrong thing
+
+**The code above landed in `25f1df2`, whose subject is about qemu guards.** Staging
+`tool/detour.py` for an unrelated oracle fix carried in 170 lines of switch-table work with
+it. `git diff --cached --name-only` was run and the FILENAMES were read; the contents were
+not. A path list is not a review, and this is the failure the guidelines record as 130 lines
+of a tested OAuth fix shipping under a message about the Android NDK.
+
+Not rewritten, because the tree is shared and pushed history is not this session's to
+reorder. Recorded here instead so that a `git log --grep` for the switch-table change has
+somewhere to land.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
