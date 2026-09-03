@@ -11419,6 +11419,62 @@ existing code already handled them. What the deferral got right was insisting th
 before building; what it got wrong was assuming the answers would be work.
 
 
+### Finding 182 -- a passenger gets a per-thread slot too, and the last 29 arrive
+
+Finding 181 seated 53 spill passengers and left about 30 unseated with the cause unmeasured,
+because the rescue withholds `reasons` from the extension build by design -- a refusal there
+must cost the passenger and never the site. Measured with an instrumented copy instead:
+
+```
+29 of 29 refusals: "the window will not hold one borrow displacement"
+                   -- emit_swallowed's `base is None`, and no other path fired
+```
+
+A spill SITE has been able to fall back to a per-thread slot since Finding 142. A passenger
+could not: it was routed through `encode_spill` at the window's home-space displacement only.
+The hosts split two ways, and the split decided the fix -- 5 were themselves spills already
+holding a block pointer, and 24 were plain stubs where no block existed.
+
+Both are now served. The displaced loop reuses the block the site's own spill planted, or
+plants one with `encode_tls_base` where two GPRs are free across the window, and the passenger
+takes **the site's own slot** -- safe because the brackets are strictly sequential, which
+Finding 181 verified across all 53 of its own.
+
+```
+                     before      after
+VEX surviving         5,594     5,565     -29, the full prediction
+placed              202,760   202,760     0 missing, 0 newly placed
+refused                  46        46     same set
+stub section      3,768,624 3,769,837     +1,213 B, about 42 per passenger
+```
+
+**Routes, and they match the diagnosis exactly**: 53 home-space, 24 planted, 5 reused. The 53
+are provably untouched -- their host windows are byte-for-byte the same width before and after,
+and the only 29 windows that changed are the 29 per-thread hosts.
+
+Every one of the 29 brackets was checked in the image rather than sampled: save and restore
+bytes compared against an independently reconstructed `encode_tls_spill`, same xmm, same block
+register, same displacement, one lowering between them, no control transfer, and the
+`encode_tls_base` sequence ending strictly before the save with the register it loads being the
+one the save uses. **And the hazard this change introduces was checked directly**: every
+instruction from the block load through the restore was decoded looking for a write to the
+block register, across all widths and the implicit writers. Zero, in all 29. That is the
+failure this could have had -- a clobbered pointer writes the upper half somewhere else and
+nothing crashes.
+
+The five reuse stubs show the sequential property as a pattern rather than an argument:
+`saves@[20, 52] restores@[37, 69]`, `SRSR`, depth never above 1.
+
+**Two traps recorded for whoever measures this next.** The overlap counter moved 28 against 29
+sites recovered, for Finding 181's reason -- `overlapped` holds addresses, not candidates. And
+a naive count of borrowing displaced entries gives 262 rather than 53: the other 209 are
+Finding 93's forward-widened neighbours that happen to share a stub with a rescue passenger.
+**Only the last entry in `displaced` is the rescue's.**
+
+53 + 29 = 82 of the 83 Finding 179 predicted. The last one died somewhere other than
+`base is None`, which is what the diagnosis said when it found 29 of 30 on that line.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -11597,7 +11653,7 @@ the previous list is superseded in every item** -- it led with a 386 that turned
 zero, cited timings taken on a rig that was measuring its own loop, and quoted region counts
 from before the closure guard removed nine in ten of them.
 
-The frontier is **5,594 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
+The frontier is **5,565 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
 every one of them (at 6,480, before three of the fixes below).
 
   1. ~~**Finish the switch-table work.**~~ **Done and measured**: 5,623 surviving VEX,

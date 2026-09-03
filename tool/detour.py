@@ -5214,7 +5214,7 @@ def upper_half_read_later(instructions, index, register, limit=40,
 
 
 def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons,
-                   base):
+                   base, block=None, slot=0):
 	"""One swallowed instruction, bracketed by a save and restore if it
 	borrowed a register. Returns the bytes, or None.
 
@@ -5236,14 +5236,28 @@ def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons,
 		if reasons is not None:
 			reasons["a borrow bracket would wrap a control transfer"] += 1
 		return None
-	if borrowing and base is None:
+	# **A per-thread slot where the window lends no frame slot.** A spill
+	# SITE has fallen back to one since Finding 142; a passenger could not,
+	# and was refused here instead. Measured: 29 of the 29 spill passengers
+	# the rescue could not seat died on exactly this line, and on no other.
+	# `block` is a register already holding the thread's block pointer --
+	# planted by the caller, which knows whether the site's own spill put
+	# one there. Finding 182.
+	if borrowing and base is None and block is None:
 		if reasons is not None:
 			reasons["the window will not hold one borrow displacement"] += 1
 		return None
 	out = bytearray()
 	if borrowing:
-		saved = encode_spill(entry[5], True, stub_address + len(body),
-		                     spill_base, 0, base)
+		# The same slot the site's own borrow uses, and safely: the
+		# brackets are strictly sequential. `build_stub` closes the site's
+		# borrow inside `body` and the displaced entries are appended
+		# after, so no two saves are ever live at once -- checked over all
+		# 53 brackets in the image at Finding 181.
+		saved = (encode_tls_spill(entry[5], True, block, slot)
+		         if block is not None else
+		         encode_spill(entry[5], True, stub_address + len(body),
+		                      spill_base, 0, base))
 		if saved is None:
 			if reasons is not None:
 				reasons["the swallowed borrow could not be saved"] += 1
@@ -5255,9 +5269,11 @@ def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons,
 		return None
 	out += fixed
 	if borrowing:
-		restored = encode_spill(entry[5], False,
-		                        stub_address + len(body) + len(out),
-		                        spill_base, 0, base)
+		restored = (encode_tls_spill(entry[5], False, block, slot)
+		            if block is not None else
+		            encode_spill(entry[5], False,
+		                         stub_address + len(body) + len(out),
+		                         spill_base, 0, base))
 		if restored is None:
 			if reasons is not None:
 				reasons["the swallowed borrow could not be restored"] += 1
@@ -5602,6 +5618,10 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 
 	body = bytearray()
 	prologue = 0
+	# Hoisted, because the displaced loop asks whether the site's own spill
+	# already planted a block pointer it can share. Inside the spill branch
+	# alone it is undefined everywhere else.
+	tls_pair = None
 	for entry in preceding:
 		fixed = emit_swallowed(entry, body, stub_address, pool,
 		                       spill_base, reasons, base)
@@ -5624,7 +5644,6 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		# addressing is written once and the clobber lasts until the
 		# restore, so a widened window that asked only about the site would
 		# destroy a register its swallowed neighbour still wanted.
-		tls_pair = None
 		if base is None and tls is not None:
 			available = sorted(window_gpr_free(home, start, window))
 			if len(available) >= 2:
@@ -5764,9 +5783,30 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		return None, 0
 	body += lowered
 
+	# **A block pointer for a borrowing passenger, where the window lends
+	# no frame slot.** Two cases, measured at 5 and 24 of the 29 that were
+	# refused here: the site's own spill already planted one and it is
+	# still live -- nothing between there and here touches a GPR -- or the
+	# site is not a spill at all and none exists, so one is planted now.
+	# Either way the passenger uses the site's slot, which is free because
+	# the brackets are sequential. Finding 182.
+	passenger_block = None
+	if base is None and tls is not None and any(
+			len(entry) > 6 and entry[6] for entry in displaced):
+		if tls_pair is not None:
+			passenger_block = tls_pair[0]
+		else:
+			available = sorted(window_gpr_free(home, start, window))
+			if len(available) >= 2:
+				ordered = sorted(available, key=lambda n: -n)
+				body += encode_tls_base(ordered[0], ordered[1], tls[0],
+				                        stub_address + len(body))
+				passenger_block = ordered[0]
 	for entry in displaced:
 		fixed = emit_swallowed(entry, body, stub_address, pool,
-		                       spill_base, reasons, base)
+		                       spill_base, reasons, base,
+		                       block=passenger_block,
+		                       slot=tls[1] if tls is not None else 0)
 		if fixed is None:
 			if reasons is not None:
 				reasons["a displaced instruction will not move"] += 1
