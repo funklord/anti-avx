@@ -12030,6 +12030,37 @@ a correct refusal wearing a label about lane structure, and removing the rest on
 each span's death to the next obstacle. The 54 spans that close and then fail on the slot
 table are a different question from any of this.
 
+### The ranked list, and how it is kept
+
+**Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
+an item may not sit above another on an estimate when the two can be compared on a
+measurement. Five large numbers here turned out to be artefacts -- 386 that was zero, 5,610
+that was 412, 10,015 that was 984, three shapes priced at 56/21/1 that were 8/0/0, 39,249
+overlaps that were 84 -- so every row carries its figure AND where the figure came from.
+
+Impact is in two currencies and they do not convert. **Wrong bytes removed** outranks **sites
+lowered**, because a site not lowered is a site the binary keeps and a site lowered wrongly is
+a binary that computes the wrong answer.
+
+| # | item | impact | currency | provenance |
+|---|---|---|---|---|
+| 1 | Finish the join-resolving walk | ~32 more producers reverted | wrong bytes | measured: 61 stale reads visible after the fix against 29 before |
+| 2 | The loop-aware back-edge rule | 10 more stale reads | wrong bytes | measured, but wants a fixpoint before it may gate |
+| 3 | Price the 164 branch-target regions | 74 representable, real gain UNKNOWN | sites | representable count measured; the shapes it resembles priced at 21 real of 66 covered |
+| 4 | The residual unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable |
+| 5 | A gate that runs `detour.py verify` | 0 today | robustness | structural: a crash there shipped green |
+
+**Items 1-2 are the head because they are in the currency that outranks.** Item 3 is the
+largest number on the page and sits third because its currency is weaker AND its figure is a
+representability count, which this project has learned is not a gain -- Finding 179 measured a
+shape covering 66 sites that was worth 21.
+
+**Closed, and recorded so they are not re-opened:** the region's remaining shapes (Finding 179,
+8/0/0 regions), the 84-site overlap bucket (181-183, all recovered), the switch-table work
+(174, 177, 178), `lanereg3` sources from outside (0 of 13 under any combination), and
+`.pdata` chained fragments as droppable from `blocked` (two counterexamples).
+
+
 ### What is worth building next
 
 Ordered by what was measured. **Rewritten after Findings 179-187**, which closed most of the
