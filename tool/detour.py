@@ -4786,8 +4786,58 @@ def value_survives_loop(instructions, index, register, blocked, sources,
 	return False
 
 
+def predecessors_of(instructions, position, sources):
+	"""Positions that can fall or branch into `position`, or None.
+
+	`None` means the set is not knowable -- a `.pdata` function start is
+	reachable by an indirect call that no direct-branch map enumerates, and
+	answering from the edges that ARE known would be answering about some
+	of the ways in. 121 of the 605 joins the stale-read walk stalls on are
+	that shape. Finding 190.
+	"""
+	if sources is None:
+		return None
+	address = instructions[position][0]
+	ways = []
+	before = position - 1
+	if before >= 0:
+		prior = instructions[before]
+		if prior[0] + len(prior[1]) == address:
+			if not prior[2].startswith(CONTROL_PREFIXES) \
+					or conditional_branch(prior[2]):
+				ways.append(before)
+	index_of = {row[0]: i for i, row in enumerate(instructions)} \
+		if len(instructions) < 4096 else None
+	for origin in sources.get(address, ()):
+		if index_of is not None:
+			if origin not in index_of:
+				return None
+			ways.append(index_of[origin])
+		else:
+			found = address_position(instructions, origin)
+			if found is None:
+				return None
+			ways.append(found)
+	return ways or None
+
+
+def address_position(instructions, address):
+	"""The index of `address`, by bisection over a sorted listing."""
+	low, high = 0, len(instructions) - 1
+	while low <= high:
+		middle = (low + high) // 2
+		here = instructions[middle][0]
+		if here == address:
+			return middle
+		if here < address:
+			low = middle + 1
+		else:
+			high = middle - 1
+	return None
+
+
 def reaching_definition(instructions, index, register, blocked, limit=640,
-                        sources=None, depth=4):
+                        sources=None, depth=4, visiting=frozenset()):
 	"""Where `register`'s value at `index` was decided, or None.
 
 	Returns the position of the nearest instruction that writes it. Sound
@@ -4840,7 +4890,12 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 	# ...unless it heads a loop that cannot disturb the register, which is
 	# what nineteen of the twenty-one turned out to be. See
 	# `value_survives_loop`; without `sources` this stays the flat refusal.
-	if instructions[index][0] in blocked:
+	# **Not when this call IS the enumeration of those paths.** A non-empty
+	# `visiting` means a join below asked each way in, so refusing here for
+	# "another path reaches this point" would refuse the very question that
+	# was posed -- and the fall-through way re-enters at the join itself.
+	# Finding 190.
+	if not visiting and instructions[index][0] in blocked:
 		if not value_survives_loop(instructions, index, register, blocked,
 		                           sources):
 			return None
@@ -4896,8 +4951,47 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 			# stays "no definition", which is the safe direction.
 			if depth <= 0:
 				return None
-			return reaching_definition(instructions, position, register,
-			                           blocked, limit, sources, depth - 1)
+			# **Every predecessor, not just the fall-through.** Recursing
+			# here re-enters at the target and the `blocked` test at the
+			# top refuses it, so this resolved almost nothing: 605 of the
+			# 736 sources the stale-read gate cannot speak for stall on
+			# exactly this, and 61 of the 736 are real stale reads it
+			# therefore cannot see -- against 29 it does see. The answer
+			# is the same however control arrived only if EVERY way in
+			# agrees, so ask each and require agreement. Finding 190.
+			#
+			# `sources` maps a target to the addresses that branch to it;
+			# the fall-through is the instruction before, when it does not
+			# transfer control. 484 of the 605 joins have all their
+			# predecessors known this way -- the rest are `.pdata` starts,
+			# reachable by an indirect call nothing here enumerates, and
+			# stay refused.
+			ways = predecessors_of(instructions, position, sources)
+			if ways is None or position in visiting:
+				return None
+			answers = set()
+			for way in ways:
+				if way > position or way in visiting:
+					# **A back edge, and `value_survives_loop` already
+					# answers it.** Findings 83 and 84 built that rule for
+					# exactly this shape -- a loop head whose zero the body
+					# cannot disturb -- and `check-pe`'s `zerochain` is its
+					# positive control. Refusing every back edge instead
+					# discards it: the fixture stopped returning 33,
+					# because the body store could no longer prove the head
+					# was zero. An edge the loop cannot disturb contributes
+					# nothing and is skipped; one that might, refuses.
+					if value_survives_loop(instructions, position, register,
+					                       blocked, sources):
+						continue
+					return None
+				answer = reaching_definition(
+					instructions, way + 1, register, blocked, limit,
+					sources, depth - 1, visiting | {position})
+				if answer is None:
+					return None
+				answers.add(answer)
+			return answers.pop() if len(answers) == 1 else None
 		# A pure source, or no mention at all: the value is unchanged.
 	return None
 
@@ -7650,6 +7744,7 @@ def selftest():
 	failures += switch_selftest()
 	failures += rescue_selftest()
 	failures += upper_source_selftest()
+	failures += join_selftest()
 	failures += isa_bound_selftest()
 	failures += gpr_selftest()
 	failures += xmm_selftest()
@@ -8845,6 +8940,47 @@ UPPER_SOURCE_CASES = [
 	("and so does the fused multiply-subtract",
 	 "vfnmadd213ps", "%ymm1,%ymm2,%ymm0", ["%ymm1", "%ymm2", "%ymm0"]),
 ]
+
+
+# **A join is answerable when every way in agrees.** `reaching_definition`
+# used to refuse at any branch target, which left 605 of the 736 sources
+# the stale-read gate cannot speak for -- and 61 real stale reads inside
+# them. The cases below are the three answers it must give.
+JOIN_CASES = [
+	("both ways in reach the same write", True, False, 0),
+	("the ways disagree, so nothing is decided", False, False, None),
+	("the predecessors are not knowable", True, True, None),
+]
+
+
+def join_selftest():
+	"""Prove a join resolves only when every way in agrees. 0 or n."""
+	vpxor = bytes.fromhex("c5f9efc0")
+	branch = bytes.fromhex("7401")
+	store = bytes.fromhex("c5fc1107")
+	load = bytes.fromhex("c5fc1006")
+	failures = 0
+	for what, agree, opaque, expected in JOIN_CASES:
+		middle = (b"\x90", "nop", "") if agree \
+			else (load, "vmovups", "(%rsi),%ymm0")
+		rows, at = [], 0x1000
+		for encoding, mnemonic, operands in [
+				(vpxor, "vpxor", "%xmm0,%xmm0,%xmm0"),
+				(branch, "je", "0x1007"), middle, (b"\x90", "nop", ""),
+				(store, "vmovups", "%ymm0,(%rdi)")]:
+			rows.append((at, encoding, mnemonic, operands, None))
+			at += len(encoding)
+		join = rows[3][0]
+		sources = None if opaque else {join: [rows[1][0]]}
+		got = reaching_definition(rows, 4, "%ymm0", {join}, sources=sources)
+		if got != expected:
+			print(f"selftest: {what}: reaching_definition gave {got}, want "
+			      f"{expected}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(JOIN_CASES)} joins, resolved only where every "
+		      f"way in agrees")
+	return failures
 
 
 def upper_source_selftest():

@@ -11819,6 +11819,46 @@ earlier version was defensible and wrong, which is the argument for asking a cou
 population it is over before believing it.
 
 
+### Finding 190 -- the blind spot was a join, and asking every way in closes most of it
+
+Finding 189 left 736 upper-half sources `reaching_definition` would not resolve, reported
+rather than counted clean. Characterised, they are almost entirely one shape:
+
+```
+a branch target intervenes (a join)   605     of which 484 have ALL predecessors known
+the reader is itself a branch target  108
+a call intervenes                      18
+a ret intervenes                        5
+```
+
+**97% are control-flow joins**, and only 23 are the architecturally unanswerable call/ret. And
+the blind spot is not idle: **61 of the 736 are real stale reads the gate cannot see**, against
+29 it does see. One verified in the image -- `0x140336417` `vpxor` patched to `pxor`, a `je`
+join at `0x14033642a` whose BOTH predecessors reach that same `vpxor`, and two surviving
+`vmovups %ymm0` writing sixteen stale bytes each where the original wrote 32 zeros.
+
+The old recursion followed the fall-through only, re-entered at the target, and was refused by
+the `blocked` test at the top -- so it resolved almost nothing. It now asks **every** way in,
+through `predecessors_of`, and accepts only if they all agree. `sources` gives the branch
+edges; the fall-through is the instruction before when it does not transfer control. Where the
+predecessors are not knowable -- a `.pdata` start reachable by an indirect call, 121 of the 605
+-- it still refuses, because answering from the edges that ARE known would answer about some of
+the ways in.
+
+**Two things had to be got right, and a fixture taught the second.**
+
+The top-of-function `blocked` test must not fire inside the enumeration: it exists to say
+"another path reaches this point", which is precisely the question being posed, and the
+fall-through way re-enters at the join itself.
+
+And a back edge is not simply refused. Refusing every one discarded Findings 83 and 84 --
+`value_survives_loop`, the rule that a loop head keeps its zero -- and `check-pe`'s `zerochain`
+stopped returning 33, because the body store could no longer prove the head was zero. That
+fixture exists for this shape and caught it immediately. A back edge the loop cannot disturb
+contributes nothing and is skipped; one that might, refuses. The rule is not new: it is the one
+already built and tested for the case.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
