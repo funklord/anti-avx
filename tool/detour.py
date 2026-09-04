@@ -10254,7 +10254,11 @@ def apply_all(binary, listing, output):
 		image = bytearray(set_tls_zero_fill(bytes(image), tls_here[2]))
 
 	open(output, "wb").write(bytes(image))
-	print(f"apply: {len(patches):,} in-place patches, {len(placed):,} detours, "
+	# `len(patches)` is the PLAN; the reverts of Finding 187 mean the image
+	# carries fewer. Reporting the plan overstated it by 27 and would drift
+	# further the more this repairs.
+	print(f"apply: {len(patches) - len(reverted):,} in-place patches, "
+	      f"{len(placed):,} detours, "
 	      f"{len(overlapped):,} skipped for overlap, {len(refused):,} refused")
 	for why, count in stub_reasons.most_common():
 		print(f"apply:   refused, {why:<38} {count:>8,}")
@@ -10512,11 +10516,28 @@ def verify(original, patched, listing=None):
 	# which stops zeroing [255:128] -- then the reader takes bytes the
 	# original would not have given it. Finding 186.
 	instructions, _plain, blocked, sources, _tables, _seen = context
-	# The patched set, keyed the way `apply` keys it: the first field of a
-	# patch tuple is its address.
-	patched = {row[0] for row in _patches}
+	# **From the IMAGE, not from the plan.** `_patches` is what `collect`
+	# intended; `apply` then reverts any patch whose zeroing a surviving
+	# reader still observes (Finding 187), so the planned list names sites
+	# whose bytes never moved. Asking it reports defects the binary does
+	# not have -- and would keep reporting them however many were repaired.
+	# A site is narrowed only if its bytes actually changed. The rule this
+	# broke is the file's own: check the artifact, not a fresh measurement
+	# of where it came from.
+	#
+	# **And it is `narrowed_sites`, not `patched`.** `patched` is this
+	# function's parameter holding the output binary's path. Rebinding it
+	# to a set made the `objdump` call below raise `TypeError`, which
+	# aborted `verify` before its last two checks -- one of them the stub
+	# section's zero-VEX property. The same rebound-name defect as Finding
+	# 175, written by the hand that recorded it. Finding 188.
+	narrowed_sites = set()
+	for row in _patches:
+		where = raddr + (row[0] - vaddr)
+		if bytes(b[where:where + len(row[1])]) != row[1]:
+			narrowed_sites.add(row[0])
 	stale, unresolved = stale_upper_reads(instructions, blocked, sources,
-	                                      placed, patched)
+	                                      placed, narrowed_sites)
 	if stale:
 		print(f"verify: {len(stale):,} surviving 256-bit read(s) take an "
 		      f"upper half this rewrite left stale", file=sys.stderr)

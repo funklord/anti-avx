@@ -11741,6 +11741,53 @@ it once. `stale_upper_reads` is likewise one function, called by both, so the ga
 repair cannot disagree about what counts as stale.
 
 
+### Finding 188 -- the repair worked; the gate was reading the plan, and crashed
+
+Finding 187's revert does what it claims. Measured against the IMAGE:
+
+```
+planned in-place patches    547,716
+patched in the image        547,689
+reverted                         27
+stale reads by the PLAN          29
+stale reads by the IMAGE          0
+surviving VEX      5,750 -> 5,777   exactly +27
+```
+
+The 27 reverted addresses are exactly the 27 distinct producers behind the 29 reads; two of
+them feed two readers each. Seven were disassembled in the output and stand in their VEX form
+again, their readers byte-identical to the original.
+
+**But `verify` reported 29, because it asked the plan.** `_patches` is what `collect` INTENDED;
+`apply` then reverts the patches whose zeroing a surviving reader observes, so the planned list
+names sites whose bytes never moved. The check would have gone on reporting them however many
+were repaired. It now derives the narrowed set from the output -- a site is narrowed only if
+its bytes actually changed -- which is this file's own rule, **check the artifact and not a
+fresh measurement of where it came from**, broken in the one gate whose entire subject is what
+the bytes ended up being.
+
+**And it crashed.** The set was bound to `patched`, which is `verify`'s parameter holding the
+output binary's PATH. The `objdump` call below it then raised `TypeError`, aborting `verify`
+before its last two checks -- one of them **the stub section's zero-VEX property**, the single
+assertion that the appended code contains no AVX. That went unchecked in that run.
+
+Two things about how it shipped. It is the **rebound-name defect of Finding 175**, written by
+the hand that had recorded it that morning: there, `entries` was rebound in a branch and
+silently disabled a rescue; here, a parameter was rebound and silently disabled two checks. And
+the commit said "all gates green" truthfully, because **nothing in `make check` runs
+`detour.py verify`** -- so a crash on the first line of new code in it is invisible to the
+suite. That is now the standing note at the head of the build list.
+
+`apply`'s summary was overstating too: it printed `len(patches)`, the plan, which after the
+reverts is 27 more than the image holds.
+
+**One number moved for a reason worth recording.** Unresolved sources went 733 to 736, and it
+is not the context sharing -- two builds of the context, one fresh and one after `collect`, are
+identical by hash. The three are FMA accumulators, which only became queryable when the FMA
+clause was added to `upper_half_sources`. `apply` and `verify` now agree at 736: one witness,
+two consumers.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
