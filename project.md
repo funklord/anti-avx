@@ -12094,7 +12094,7 @@ Ordered by what was measured. **Rewritten after Findings 179-187**, which closed
 previous list and replaced its subject: the remaining work is no longer about lowering more
 sites but about the ones already lowered being right.
 
-The frontier is **5,750 surviving VEX of 805,131, 99.3% removed**. It has RISEN four times
+The frontier is **5,758 surviving VEX of 805,131, 99.3% removed**. It has RISEN four times
 today and every rise was a correctness fix -- 467 region lowerings, 24 long-pair stores, 78
 stale reads across four strategies, and the in-place patches of Finding 187. A count that only
 falls is a count nobody is checking.
