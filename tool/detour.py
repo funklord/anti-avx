@@ -10254,10 +10254,18 @@ def apply_all(binary, listing, output):
 		image = bytearray(set_tls_zero_fill(bytes(image), tls_here[2]))
 
 	open(output, "wb").write(bytes(image))
-	# `len(patches)` is the PLAN; the reverts of Finding 187 mean the image
-	# carries fewer. Reporting the plan overstated it by 27 and would drift
-	# further the more this repairs.
-	print(f"apply: {len(patches) - len(reverted):,} in-place patches, "
+	# **What the image actually holds, which is neither the plan nor the
+	# plan minus the reverts.** `len(patches)` is what `collect` intended;
+	# subtracting the reverts of Finding 187 was closer but still counted
+	# 28,513 sites that were patched and then OVERWRITTEN by a placed
+	# detour window -- they are detours in the shipped binary, not in-place
+	# patches, and the label says in-place patches. Finding 189.
+	covered_bytes = set()
+	for site, length, _stub, _size, _prologue in placed:
+		covered_bytes.update(range(site, site + length))
+	in_place = sum(1 for row in patches
+	               if row[0] not in reverted and row[0] not in covered_bytes)
+	print(f"apply: {in_place:,} in-place patches, "
 	      f"{len(placed):,} detours, "
 	      f"{len(overlapped):,} skipped for overlap, {len(refused):,} refused")
 	for why, count in stub_reasons.most_common():

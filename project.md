@@ -11788,6 +11788,37 @@ clause was added to `upper_half_sources`. `apply` and `verify` now agree at 736:
 two consumers.
 
 
+### Finding 189 -- the repair confirmed, and a count that still did not mean its label
+
+Finding 188's fixes hold. Measured against the image:
+
+```
+verify exit 0, no traceback
+verify: no surviving 256-bit read takes an upper half this rewrite left stale
+verify: 384 call(s) in the stub section, every one an instruction a window covered
+verify: stub section has 0 VEX instructions (must be 0) and 203,722 jmp instructions
+apply:  547,689 in-place patches, independently counted at 547,689 changed / 27 unchanged
+image identical: 202,592 detours, 39,214 overlaps, 46 refused, 3,768,467 B, 5,777 surviving
+```
+
+**Zero stale reads**, and the two checks the crash had swallowed are back -- including the stub
+section's zero-VEX assertion, which is the only statement anywhere that the code this project
+appends is itself free of the thing it removes. It went unrun in one shipped measurement and
+nobody would have known.
+
+**And the patch count still did not mean what it said.** 547,689 is "planned sites whose bytes
+changed", which was the fix for counting the plan. But 28,513 of those were patched and then
+OVERWRITTEN by a placed detour window: they are detours in the shipped binary, sitting in a
+window's `0f 1f` padding after an `e9`, and the label says in-place patches. The true figure is
+**519,176**. The error was an order of magnitude larger than the 27 the previous fix corrected,
+and it survived that fix because the fix asked the right question of the wrong population.
+
+Three revisions of one number -- the plan, the plan minus reverts, and the sites that are
+actually in-place patches in the image -- and only the third is what the word means. Each
+earlier version was defensible and wrong, which is the argument for asking a count what
+population it is over before believing it.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
