@@ -12030,6 +12030,33 @@ a correct refusal wearing a label about lane structure, and removing the rest on
 each span's death to the next obstacle. The 54 spans that close and then fail on the slot
 table are a different question from any of this.
 
+### Finding 191 -- resolving joins paid for itself, and the prediction was wrong three ways
+
+```
+unresolved sources     736 -> 603     -133   (predicted ~413)
+reverts             27/29 -> 30/32     +3    (predicted ~42/61)
+surviving VEX        5,777 -> 5,758    -19   (predicted a RISE)
+```
+
+**An analysis improvement helps every consumer of that analysis, not only the one it was built
+for.** `zeroed_ymm` walks with `reaching_definition` too, and resolving joins let it prove a
+ymm zero at **22 more windows, 24 more sites** -- more than the 3 the new reverts cost. Only
+the `zero` row moved in the whole strategy table, and +379 stub bytes is the entire stub delta.
+The fix was bought as correctness and returned sites.
+
+**The named case resolved the better way.** `0x140336417`'s `pxor` was NOT reverted. Both its
+readers became zero-store windows instead, writing 32 zero bytes -- which is what the original
+`vmovups %ymm0` wrote. The join feeding `zeroed_ymm` reached the site before the stale-read
+gate did, so it was lowered rather than repaired. Lowering correctly beats reverting.
+
+**And the resolution figure fell short: 133 against the 323 a prototype measured.** The
+prototype and this implementation are not the same rule -- mine consults `value_survives_loop`
+at a back edge, which the prototype's strict form refused outright, and refuses where the
+prototype may have accepted. **190 sources are the gap and it has not been attributed**, which
+is now a list item rather than a footnote: it is the difference between two rules that were
+both called "strict", and this project has been caught before by two things sharing a name.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12044,8 +12071,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | Finish the join-resolving walk | ~32 more producers reverted | wrong bytes | measured: 61 stale reads visible after the fix against 29 before |
-| 2 | The loop-aware back-edge rule | 10 more stale reads | wrong bytes | measured, but wants a fixpoint before it may gate |
+| 1 | Attribute the 190-source gap: 133 resolved against a prototype's 323 | unknown, up to 190 sources | wrong bytes | measured both ends; the rules differ and the difference is not characterised |
+| 2 | The loop-aware back-edge rule | 10 more stale reads, 185 more resolved | wrong bytes | measured, but wants a fixpoint before it may gate |
 | 3 | Price the 164 branch-target regions | 74 representable, real gain UNKNOWN | sites | representable count measured; the shapes it resembles priced at 21 real of 66 covered |
 | 4 | The residual unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable |
 | 5 | A gate that runs `detour.py verify` | 0 today | robustness | structural: a crash there shipped green |
