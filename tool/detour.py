@@ -6162,11 +6162,17 @@ def switch_targets(instructions, binary, starts):
 	return found, tables
 
 
-def collect(binary, listing):
-	"""(in-place patches, class C detour candidates, statistics)."""
-	# A run reports its own numbers, not the previous one's.
-	REGION_REFUSED.clear()
-	REGION_EXAMPLES.clear()
+def analysis_context(binary, listing):
+	"""(instructions, plain, blocked, sources) -- the walk's shared inputs.
+
+	**One construction, because two would drift.** `verify` asks
+	`reaching_definition` the same question `collect` asks, and a `blocked`
+	set built twice is two answers to "can anything reach here" -- the
+	failure `SPAN_EMITTABLE` exists to prevent between a survey and a
+	lowering, and which this file has now met between the collector and the
+	lowering, the survey and the collector, and the collector and the
+	emitter. Finding 186.
+	"""
 	# Everything anything can branch to. A window may not contain one of
 	# these anywhere but at its first byte.
 	groups = target_set.collect(binary)
@@ -6218,6 +6224,16 @@ def collect(binary, listing):
 	      f"{len(switched):,} targets, {len(fresh):,} of them not already "
 	      f"blocked", file=sys.stderr)
 
+	return instructions, plain, blocked, sources, switch_tables, len(switched)
+
+
+def collect(binary, listing):
+	"""(in-place patches, class C detour candidates, statistics)."""
+	# A run reports its own numbers, not the previous one's.
+	REGION_REFUSED.clear()
+	REGION_EXAMPLES.clear()
+	instructions, plain, blocked, sources, switch_tables, switch_seen = \
+		analysis_context(binary, listing)
 	# The code oracle, in two parts. .pdata is the binary's own statement
 	# about where its functions are and needs no disassembly to read, but the
 	# x64 ABI lets a leaf function omit its unwind data -- and refusing those
@@ -6259,7 +6275,7 @@ def collect(binary, listing):
 		readonly = readonly_ranges(image.read(1 << 16))
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
 	stats["switch tables read"] = switch_tables
-	stats["switch targets blocked"] = len(switched)
+	stats["switch targets blocked"] = switch_seen
 
 	# Anything already rewritten in place needs nothing further. Everything
 	# else that HAS a lowering is a detour candidate -- not just Class C.
@@ -10321,6 +10337,62 @@ def verify(original, patched, listing=None):
 	else:
 		print(f"verify: all {len(inside):,} direct branch targets still begin "
 		      f"an instruction")
+
+	# **Does anything still read an upper half this rewrite left stale?**
+	# Six lowerings leave one, and each is supposed to have proved nothing
+	# reads it -- yet three of them shipped without the proof (Findings 173,
+	# 180, 184) and two guards rest on facts the rewrite itself destroys
+	# (185). None of that is reachable by execution here: on an SSE-only CPU
+	# the surviving reader faults before the wrong value is observable. So
+	# it is asked statically, of the output, from the READER's end.
+	#
+	# For every 256-bit instruction still in `.text`, the upper half it
+	# reads was decided somewhere. If that somewhere was rewritten -- a
+	# window that lowered it, or a VEX.128 write patched to legacy SSE,
+	# which stops zeroing [255:128] -- then the reader takes bytes the
+	# original would not have given it. Finding 186.
+	instructions, plain, blocked, sources, _tables, _seen = \
+		analysis_context(original, listing)
+	inside_window = set()
+	for start, length, _stub, _size, _pro in placed:
+		inside_window.update(range(start, start + length))
+	stale = []
+	for position, row in enumerate(instructions):
+		address, encoding, mnemonic, operands, _comment = row
+		if address not in after_vex or address in inside_window:
+			continue
+		wide = inplace.decode_vex(encoding)
+		if wide is None or not wide["L"] or not operands:
+			continue
+		for field in inplace.split_operands(operands):
+			if not field.startswith("%ymm"):
+				continue
+			where = reaching_definition(plain, position, field, blocked,
+			                            sources=sources)
+			if where is None:
+				continue
+			producer = instructions[where][0]
+			was_lowered = producer in inside_window
+			narrowed = False
+			if not was_lowered:
+				# A VEX.128 write patched in place stops zeroing the upper
+				# half, so a reader downstream of one sees what the
+				# lowering left rather than the zero the original wrote.
+				produced = inplace.decode_vex(instructions[where][1])
+				narrowed = (produced is not None and not produced["L"]
+				            and producer not in after_vex)
+			if was_lowered or narrowed:
+				stale.append((address, field, producer))
+				break
+	if stale:
+		print(f"verify: {len(stale):,} surviving 256-bit read(s) take an "
+		      f"upper half this rewrite left stale", file=sys.stderr)
+		for address, field, producer in sorted(stale)[:8]:
+			print(f"    0x{address:x} reads {field}, decided at "
+			      f"0x{producer:x}", file=sys.stderr)
+	else:
+		print("verify: no surviving 256-bit read takes an upper half this "
+		      "rewrite left stale")
 
 	# **And the indirect ones, which used to be the named gap.** The comment
 	# above said `targets.py` was the only source for switch targets and the

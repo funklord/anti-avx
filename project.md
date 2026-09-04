@@ -11634,6 +11634,31 @@ instances, and the pair/run/span/region guards rest on the same two destroyed fa
 soundly, but by luck of what else lies downstream rather than by anything checked.
 
 
+### Finding 186 -- the audit becomes a gate, asked from the reader's end
+
+Findings 173, 180, 184 and 185 are one defect met five times: a lowering leaves a ymm's upper
+half stale and something later reads it. Each was found by hand, none by any gate, and none
+CAN be found by execution here -- on an SSE-only CPU the surviving reader faults before the
+wrong value is observable, which Finding 64 recorded and four strategies then rediscovered.
+
+`verify` now asks it statically, of the output, and from the READER's end rather than the
+lowering's. For every 256-bit instruction still in `.text`, the upper half it reads was decided
+somewhere; if that somewhere was rewritten -- a window that lowered it, or a VEX.128 write
+patched to legacy SSE, which stops zeroing [255:128] -- the reader takes bytes the original
+would not have given it.
+
+**From the reader's end, because the lowering's end cannot see the whole class.** The forward
+walk only covers registers some strategy claimed; the backward walk found 33 reads whose upper
+half was decided by a plain in-place patch with no strategy involved at all, which no
+per-strategy guard would ever examine.
+
+**And it needed `analysis_context`.** `reaching_definition` wants the same `instructions`,
+`plain`, `blocked` and `sources` the collector builds, and building them twice is two answers
+to "can anything reach here" -- the drift `SPAN_EMITTABLE` prevents between a survey and a
+lowering, and which this file has now met between the collector and the lowering, the survey
+and the collector, and the collector and the emitter. One construction, called by both.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
