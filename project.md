@@ -11652,6 +11652,29 @@ walk only covers registers some strategy claimed; the backward walk found 33 rea
 half was decided by a plain in-place patch with no strategy involved at all, which no
 per-strategy guard would ever examine.
 
+**The first version of it was wrong in three ways, and the gates said nothing.**
+
+- It passed `plain` where `reaching_definition` unpacks five fields, so it raised `ValueError`
+  on its first query and **never ran at all**. `detour-verify` exited 2 and the line it was
+  added to print never appeared.
+- **No gate executes this code.** `make check`'s `verify` target is `lower.py verify`, a
+  different tool; nothing in the suite runs `detour.py verify`, which needs the game binary and
+  is therefore deliberately outside `check`. "All gates green" was true and told me nothing.
+  The rule is now split into `upper_half_sources` and carries selftest cases, because that half
+  needs no binary and so can be reached by a gate.
+- Corrected, it reported **470** where 39 were expected. 338 named the reader's own
+  DESTINATION, wholly overwritten; 101 were `vinsertf128 $0x1`, which takes only src1's low
+  half; 2 were `vperm2f128 $0x20`. 93% noise, from treating every `%ymm` operand as a read.
+
+**And the fourth error was the serious one: the polarity was inverted.**
+`reaching_definition` returns `None` for "I cannot tell you what reaches here" -- correct for
+the collector, which must not claim to know a value it cannot prove. Used as a gate that reads
+as "nothing to report", so the check was **silent exactly where the analysis is weakest**.
+Three of the four known-bad readers land there, refused because a branch target intervenes.
+Measured over the same output: 2,150 of 7,275 queries refused, 699 surviving readers with a
+source the walk cannot resolve. Refusals are now counted and printed as what this cannot speak
+for, rather than passed.
+
 **And it needed `analysis_context`.** `reaching_definition` wants the same `instructions`,
 `plain`, `blocked` and `sources` the collector builds, and building them twice is two answers
 to "can anything reach here" -- the drift `SPAN_EMITTABLE` prevents between a survey and a

@@ -6162,6 +6162,33 @@ def switch_targets(instructions, binary, starts):
 	return found, tables
 
 
+def upper_half_sources(mnemonic, operands):
+	"""The `%ymm` operands whose UPPER half this instruction reads.
+
+	**Sources, and not the destination.** In AT&T the last field is written,
+	so a reader's own destination is not a read of anything -- and counting
+	it made 338 of 470 reports noise. A store's ymm is `fields[:-1]` and its
+	memory operand is last, so the same rule reads a store correctly.
+
+	**And not every source's upper half is read.** `vinsertf128 $0x1`
+	replaces the destination's high lane and takes only src1's LOW half, so
+	the stale bits are discarded rather than observed -- 101 more of the
+	470. `vperm2f128 $0x20` selects both operands' low lanes, 2 more.
+	Finding 186.
+	"""
+	fields = inplace.split_operands(operands or "")
+	if len(fields) < 2:
+		return []
+	immediate = fields[0] if fields[0].startswith("$") else None
+	sources = [f for f in fields[:-1] if f.startswith("%ymm")]
+	if mnemonic.startswith(("vinsertf128", "vinserti128")) \
+			and immediate in ("$0x1", "$1"):
+		return []
+	if mnemonic.startswith("vperm2f128") and immediate in ("$0x20", "$32"):
+		return []
+	return sources
+
+
 def analysis_context(binary, listing):
 	"""(instructions, plain, blocked, sources) -- the walk's shared inputs.
 
@@ -7562,6 +7589,7 @@ def selftest():
 	failures += region_selftest()
 	failures += switch_selftest()
 	failures += rescue_selftest()
+	failures += upper_source_selftest()
 	failures += isa_bound_selftest()
 	failures += gpr_selftest()
 	failures += xmm_selftest()
@@ -8726,6 +8754,45 @@ def isa_bound_selftest():
 	if not failures:
 		print(f"selftest: {len(ISA_BOUND_CASES)} refusals sorted into ISA "
 		      f"bound and register bound")
+	return failures
+
+
+# **Which `%ymm` operands a surviving reader actually reads the upper half
+# of.** `verify`'s stale-read check reported 470 where 39 were expected:
+# 338 named the reader's own destination and 101 an insert that discards
+# the half it names. The rule below is the fix, and these are its cases --
+# including a `vperm2f128 $0x1`, which is a lane SWAP and does read the
+# high half, so a rule that skipped every `vperm2f128` would be wrong.
+UPPER_SOURCE_CASES = [
+	("a store: the ymm is a source, the memory the destination",
+	 "vmovups", "%ymm0,(%rdi)", ["%ymm0"]),
+	("a load: the ymm is written, not read",
+	 "vmovups", "(%rsi),%ymm0", []),
+	("a destination is overwritten, never read",
+	 "vmulps", "0xf0(%rbp),%ymm4,%ymm0", ["%ymm4"]),
+	("src2 that is also the destination is still a source",
+	 "vaddps", "%ymm1,%ymm0,%ymm0", ["%ymm1", "%ymm0"]),
+	("insert at lane 1 takes src1's LOW half only",
+	 "vinsertf128", "$0x1,%xmm4,%ymm4,%ymm4", []),
+	("perm2f128 $0x20 selects both low lanes",
+	 "vperm2f128", "$0x20,%ymm1,%ymm0,%ymm0", []),
+	("perm2f128 $0x1 is a lane swap and DOES read the high half",
+	 "vperm2f128", "$0x1,%ymm0,%ymm0,%ymm0", ["%ymm0", "%ymm0"]),
+]
+
+
+def upper_source_selftest():
+	"""Prove the reader rule names sources and not destinations. 0 or n."""
+	failures = 0
+	for what, mnemonic, operands, expected in UPPER_SOURCE_CASES:
+		got = upper_half_sources(mnemonic, operands)
+		if got != expected:
+			print(f"selftest: {what}: upper_half_sources gave {got}, want "
+			      f"{expected}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(UPPER_SOURCE_CASES)} reader shapes, sources "
+		      f"told from destinations")
 	return failures
 
 
@@ -10356,7 +10423,7 @@ def verify(original, patched, listing=None):
 	inside_window = set()
 	for start, length, _stub, _size, _pro in placed:
 		inside_window.update(range(start, start + length))
-	stale = []
+	stale, unknown = [], 0
 	for position, row in enumerate(instructions):
 		address, encoding, mnemonic, operands, _comment = row
 		if address not in after_vex or address in inside_window:
@@ -10364,12 +10431,23 @@ def verify(original, patched, listing=None):
 		wide = inplace.decode_vex(encoding)
 		if wide is None or not wide["L"] or not operands:
 			continue
-		for field in inplace.split_operands(operands):
-			if not field.startswith("%ymm"):
-				continue
-			where = reaching_definition(plain, position, field, blocked,
-			                            sources=sources)
+		for field in upper_half_sources(mnemonic, operands):
+			# **`instructions`, not `plain`.** `reaching_definition`
+			# unpacks five fields. Passing the four-field liveness shape
+			# raised `ValueError` on the first query, so this check never
+			# ran at all -- and no gate said so, because `make check`'s
+			# `verify` target is `lower.py verify`, a different tool.
+			# Nothing in the suite executes `detour.py verify`.
+			where = reaching_definition(instructions, position, field,
+			                            blocked, sources=sources)
 			if where is None:
+				# **A refusal is not a pass.** `reaching_definition`
+				# returns None for "I cannot tell you what reaches here",
+				# which is right for the collector and inverted for a
+				# gate: counting it clean makes this silent exactly where
+				# the analysis is weakest, which is where the defects
+				# were. 3 of the 4 known-bad readers land here.
+				unknown += 1
 				continue
 			producer = instructions[where][0]
 			was_lowered = producer in inside_window
@@ -10383,7 +10461,6 @@ def verify(original, patched, listing=None):
 				            and producer not in after_vex)
 			if was_lowered or narrowed:
 				stale.append((address, field, producer))
-				break
 	if stale:
 		print(f"verify: {len(stale):,} surviving 256-bit read(s) take an "
 		      f"upper half this rewrite left stale", file=sys.stderr)
@@ -10393,6 +10470,9 @@ def verify(original, patched, listing=None):
 	else:
 		print("verify: no surviving 256-bit read takes an upper half this "
 		      "rewrite left stale")
+	if unknown:
+		print(f"verify: and {unknown:,} upper-half source(s) the walk could "
+		      f"not resolve, which this cannot speak for", file=sys.stderr)
 
 	# **And the indirect ones, which used to be the named gap.** The comment
 	# above said `targets.py` was the only source for switch targets and the
