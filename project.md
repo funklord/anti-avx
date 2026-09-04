@@ -11515,6 +11515,93 @@ alone; but if it is ever suspected, it must be exercised deliberately, because t
 will not do it.
 
 
+### Finding 184 -- the splat family never asked, and one window shipped stale bytes
+
+Filling in the rows Finding 65's table was missing meant establishing each strategy's guard
+rather than asserting one, and the first family examined had an unasked question in it.
+
+`vinsertf128 $0x1,%xmmN,%ymmN,%ymmN` sets the upper half equal to the low one. The `splat` and
+`splatrun` lowerings emit **only stores** -- the insert emits nothing, because the value it
+built is already in the register the lowered program keeps -- so memory receives the right 32
+bytes and the machine `ymmN[255:128]` is never written. `splatop` leaves TWO registers stale,
+the splat's and the operation's destination. That is the pair's obligation (Finding 38), and
+none of the three paths called `upper_half_read_later`.
+
+Measured over the 60 placed windows: **1 of 18 `splat`, 0 of 23 `splatrun`, 0 of 19
+`splatop`.** The one is `0x1434dc07b`, verified in the shipped image:
+
+```
+1434dc07b: vinsertf128 $1,%xmm0,%ymm0,%ymm0  ->  e9 ...   detoured
+stub:      movdqu %xmm0,0x0(%rbp) ; movdqu %xmm0,0x10(%rbp) ; jmp back
+1434dc170: vmovdqu %ymm0,(%rbx)       c5 fe 7f 03   STILL VEX
+1434dc174: vmovdqu %ymm0,0x20(%rbx)   c5 fe 7f 43   STILL VEX
+1434dc1a0: vmovdqu %ymm0,(%rbx)       c5 fe 7f 03   STILL VEX
+```
+
+Three surviving readers on two paths out of one window, each storing sixteen correct bytes and
+sixteen stale into a fill routine's buffer.
+
+**Why the other 59 are clean is not a guard, and that is the part worth keeping.** 55 of the 79
+register obligations end at a call or ret, 19 on both branch edges, 4 at a full redefinition.
+What keeps the family out of trouble is that `splat_pair` demands the very next instruction be
+a 256-bit store of the register, so MSVC's dangerous shape -- broadcast, then arithmetic on the
+broadcast several instructions later -- never becomes a candidate. **Adverse selection working
+FOR the strategy.** Luck of the input, not protection, and it would evaporate the day the
+pairing rule widened.
+
+Guard added to all three paths. Cost: one site.
+
+### Finding 185 -- the guard reasons about the program this tool read, not the one it writes
+
+The splat audit noticed in passing that 50 of its 79 obligations were discharged by the rule
+"a VEX.128 write to the low half zeroes the upper one" -- and that **not one** of those killer
+instructions is still VEX in the shipped image. Chasing that found four causes and **113
+distinct wrong reads**, measured from both ends: a forward walk over the placed windows, and a
+backward walk from all 3,069 surviving 256-bit readers through `reaching_definition`, agreeing
+on 30 and unioning to 113.
+
+`upper_half_read_later` returns "not read later" at six exits. Two survive the rewrite and
+three do not:
+
+```
+survives   a call or ret          Win64 volatility, untouched by rewriting   3,379 of 10,083
+survives   a cycle with no mention of the register
+DESTROYED  a VEX.128 write        4,240 of 4,240 killers are no longer VEX
+DESTROYED  a full 256-bit move    2,742 of 2,829 killers are themselves lowered
+NEVER HELD limit exhaustion       reports "dead" having examined 40 and proved nothing
+```
+
+**Three fixed, one recorded.**
+
+- **`longload` called the guard at no point at all** -- 56 of the 84. At `0x140470003` the
+  `pair` strategy refuses that very site for exactly the right reason, because
+  `vextractf128 $0x1,%ymm0,%xmm0` five bytes on reads the upper half; the long pair took it
+  without asking and handed the extract sixteen stale bytes. Finding 180's shape, a third time
+  in the same strategy.
+- **Limit exhaustion returned False** -- 21 constload sites, the use sitting 48 instructions
+  past the 40 the walk looks at. Unsound against the ORIGINAL program, never mind the image,
+  and inconsistent with the budget exhaustion a few lines above which correctly returns True.
+  It now returns True, which is what the docstring already promised: "an unresolved answer is
+  yes, leave it alone".
+- **The splat gap**, Finding 184.
+- **The two destroyed credits are KEPT, with the exposure recorded.** Withdrawing them outright
+  is wrong, and `check-pe` said so: `lowwrite` is a positive control for exactly this pattern
+  -- a pair, a `vpxor`, and a 256-bit store that must land as 32 zeros -- and it returned 29
+  instead of 77, because the credit is sound wherever the later reader is ITSELF lowered. A
+  read after a zeroing write is precisely what `zeroed_ymm` recognises and the zero store
+  lowers, so the reader never touches the machine upper half. The remaining exposure is where
+  the reader SURVIVES: 2 sites forward and 33 through plain in-place patches. **The right guard
+  is not "never credit" but "credit unless a surviving reader follows", and that needs the
+  placer's answer at collect time.** Not built.
+
+**The general statement, which is what the next strategy should read.** Every one of these is
+the same error: a guard that reasons about the listing it was handed rather than the image the
+tool emits. A fact can be true of the original, load-bearing in the analysis, and destroyed by
+the rewrite that the analysis exists to license. Findings 173, 180, 184 and 185 are four
+instances, and the pair/run/span/region guards rest on the same two destroyed facts today --
+soundly, but by luck of what else lies downstream rather than by anything checked.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the

@@ -5170,6 +5170,27 @@ def upper_half_read_later(instructions, index, register, limit=40,
 		# **The VEX test is load-bearing.** A legacy SSE write to xmm leaves
 		# bits [255:128] alone, so matching on the destination alone would be
 		# wrong on precisely the instructions this project emits.
+		# **The rewrite destroys this fact, and it is credited anyway --
+		# deliberately, with the exposure measured.** A VEX.128 write
+		# zeroes [255:128] in the ORIGINAL; the tool patches that very
+		# instruction to legacy SSE, which does not, and 4,240 of 4,240
+		# such killers are no longer VEX in the shipped image.
+		#
+		# It is still sound wherever the later 256-bit reader is ITSELF
+		# lowered, because a lowered reader never touches the machine upper
+		# half -- and that is the common case, because a read after a
+		# zeroing write is exactly what `zeroed_ymm` recognises and the
+		# zero store lowers. `check-pe`'s `lowwrite` is the positive
+		# control for it: a pair, a `vpxor`, and a 256-bit store that must
+		# land as 32 zeros. Withdrawing the credit outright refuses that
+		# pair and the fixture returns 29 instead of 77 -- tried, and it is
+		# how the limit of this reasoning was found.
+		#
+		# Where the reader SURVIVES it is wrong, and Finding 185 measured
+		# that at 2 sites forward and 33 through plain in-place patches.
+		# The correct guard is not "never credit" but "credit unless a
+		# surviving reader follows", which needs the placer's answer at
+		# collect time and is not built. Recorded rather than papered over.
 		if narrow in operands:
 			fields = inplace.split_operands(operands)
 			if fields and fields[-1] == narrow:
@@ -5193,6 +5214,11 @@ def upper_half_read_later(instructions, index, register, limit=40,
 		# scratch.py's FULL_WRITE is: one missing from the list costs a pair
 		# that was available, and one wrongly on it costs correctness.
 		fields = inplace.split_operands(operands)
+		# **Same exposure, same reasoning**: 2,742 of the 2,829 killers
+		# this credits are themselves lowered, and a lowered 256-bit move
+		# writes the low half only. Sound where the later reader is lowered
+		# too, wrong where it survives -- 4 sites, Finding 185.
+		fields = inplace.split_operands(operands)
 		if mnemonic in YMM_MOVES and fields[-1] == register \
 				and register not in fields[:-1]:
 			vex = inplace.decode_vex(encoding)
@@ -5210,7 +5236,15 @@ def upper_half_read_later(instructions, index, register, limit=40,
 		if covered is not None and covered(position):
 			continue
 		return True
-	return False
+	# **Running out of instructions is not a proof.** This reported "dead"
+	# having examined `limit` of them and established nothing, which is
+	# unsound against the original program, never mind the rewritten one --
+	# and it disagreed with the budget exhaustion above, which returns True.
+	# 21 constload sites shipped wrong bytes through here, the use sitting
+	# eight instructions past the forty this looks at. Conservative now, in
+	# the direction the docstring already claims: "an unresolved answer is
+	# yes, leave it alone". Finding 185.
+	return True
 
 
 def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons,
@@ -6321,15 +6355,38 @@ def collect(binary, listing):
 						one_vex = inplace.decode_vex(one[1])
 						entries.append((one_vex, one[1][one_vex["length"]:],
 						                one[0], len(one[1])))
+					# **The insert emits nothing, so the machine ymm's
+					# upper half is never written.** The lowering stores
+					# the low xmm twice -- memory gets the right 32 bytes
+					# -- and the register keeps whatever preceded the
+					# insert, where the original had the low half copied
+					# up. A surviving 256-bit read of it therefore takes
+					# sixteen stale bytes, which is the pair's obligation
+					# (Finding 38), the run's (64), the span's (153), the
+					# region's (173) and the long pair's (180). This path
+					# never asked. Finding 184.
 					if inplace.covered_by(ranges, address, span) \
-							and lower_zero_run(entries, address) is not None:
+							and lower_zero_run(entries, address) is not None \
+							and not upper_half_read_later(
+								instructions, last, held,
+								positions=positions):
 						candidates.append(
 							(address, encoding, operands, mnemonic, span,
 							 [], None, [], ("splatrun", entries)))
 						continue
+				# `index + 1` is the store, and the scan begins strictly
+				# after the index it is given, so this asks about
+				# everything past the window. Measured cost: one site,
+				# `0x1434dc07b`, whose stub stored `%xmm0` twice and
+				# returned to three surviving `vmovdqu %ymm0` readers on
+				# two paths, each writing sixteen correct bytes and
+				# sixteen stale. Finding 184.
 				if inplace.covered_by(ranges, address, window) \
 						and lower_ymm_zero_store(*splat, at=address) \
-						is not None:
+						is not None \
+						and not upper_half_read_later(
+							instructions, index + 1, held,
+							positions=positions):
 					candidates.append(
 						(address, encoding, operands, mnemonic, window,
 						 [], None, [], ("splat", splat)))
@@ -6344,9 +6401,30 @@ def collect(binary, listing):
 				if triple is not None and following[0] not in blocked \
 						and third[0] not in blocked:
 					window = (third[0] + len(third[1])) - address
+					# **Two registers, not one.** The splat's own ymm
+					# keeps a stale upper half exactly as above, and so
+					# does the operation's destination: the lowering
+					# writes its low sixteen and never its high. Both are
+					# asked. Finding 184.
+					# `following` is the operation and `third` the store:
+					# the destination left holding only a low half is the
+					# OPERATION's, and the first draft of this took the
+					# store's last operand, which is a memory reference.
+					# `check-pe`'s `splatop` fixture returned 29 for 69.
+					splatted = inplace.split_operands(operands)[3]
+					op_fields = inplace.split_operands(following[3] or "")
+					op_dest = op_fields[-1] if op_fields else None
+					if op_dest is not None and not op_dest.startswith("%ymm"):
+						op_dest = None
 					if inplace.covered_by(ranges, address, window) \
 							and lower_splat_operation(*triple, at=address) \
-							is not None:
+							is not None \
+							and not upper_half_read_later(
+								instructions, index + 2, splatted,
+								positions=positions) \
+							and not (op_dest and upper_half_read_later(
+								instructions, index + 2, op_dest,
+								positions=positions)):
 						candidates.append(
 							(address, encoding, operands, mnemonic, window,
 							 [], None, [], ("splatop", triple)))
@@ -6692,11 +6770,25 @@ def collect(binary, listing):
 					# load is reached first -- which guards a store with no
 					# load, and not a load whose store then declines. That
 					# second case shipped 24 stale upper halves.
+					# **And nothing may read the upper half afterwards.**
+					# This path asked the question of no one: the load puts
+					# the upper half in a SHADOW register, so a surviving
+					# 256-bit read of the ymm itself takes sixteen stale
+					# bytes. 56 sites shipped that way -- at `0x140470003`
+					# the `pair` strategy refuses the very same site for
+					# exactly this reason, because `vextractf128
+					# $0x1,%ymm0,%xmm0` five bytes later reads it, and the
+					# long pair took it without asking. The fourth strategy
+					# to need the guard the other five have. Finding 185.
+					held = inplace.split_operands(operands)[-1]
 					if lower_long_half(vex, tail, address, len(encoding),
 					                   address, shadow) is not None \
 							and all(long_partner_lowers(instructions, one,
 							                            ranges, shadow)
-							        for one in partners):
+							        for one in partners) \
+							and not upper_half_read_later(
+								instructions, partners[-1], held,
+								positions=positions):
 						for partner in partners:
 							long_shadow[instructions[partner][0]] = shadow
 						candidates.append(
