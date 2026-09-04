@@ -6181,6 +6181,16 @@ def upper_half_sources(mnemonic, operands):
 		return []
 	immediate = fields[0] if fields[0].startswith("$") else None
 	sources = [f for f in fields[:-1] if f.startswith("%ymm")]
+	# **A read-modify-write destination is a source too.** `fields[:-1]`
+	# is right for everything that only writes its last operand, and wrong
+	# for an FMA, whose accumulator is read as well -- the rule claimed
+	# "sources" generally and these are the counterexample. It costs
+	# nothing in this binary (no FMA reader has a stale field under any
+	# operand rule) and it would cost correctness in one that did.
+	if fields[-1].startswith("%ymm") and (
+			mnemonic.startswith(("vfmadd", "vfmsub", "vfnmadd", "vfnmsub",
+			                     "vfmaddsub", "vfmsubadd", "vpdp"))):
+		sources.append(fields[-1])
 	if mnemonic.startswith(("vinsertf128", "vinserti128")) \
 			and immediate in ("$0x1", "$1"):
 		return []
@@ -8778,6 +8788,12 @@ UPPER_SOURCE_CASES = [
 	 "vperm2f128", "$0x20,%ymm1,%ymm0,%ymm0", []),
 	("perm2f128 $0x1 is a lane swap and DOES read the high half",
 	 "vperm2f128", "$0x1,%ymm0,%ymm0,%ymm0", ["%ymm0", "%ymm0"]),
+	# An FMA accumulates into its destination, so that destination is read
+	# as well as written -- the one shape `fields[:-1]` gets wrong.
+	("an FMA reads its accumulator as well as writing it",
+	 "vfmadd231ps", "(%rdx),%ymm4,%ymm3", ["%ymm4", "%ymm3"]),
+	("and so does the fused multiply-subtract",
+	 "vfnmadd213ps", "%ymm1,%ymm2,%ymm0", ["%ymm1", "%ymm2", "%ymm0"]),
 ]
 
 

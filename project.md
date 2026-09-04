@@ -11675,6 +11675,35 @@ Measured over the same output: 2,150 of 7,275 queries refused, 699 surviving rea
 source the walk cannot resolve. Refusals are now counted and printed as what this cannot speak
 for, rather than passed.
 
+**Measured, from the tool rather than from a hand repeat of it:**
+
+```
+verify: 29 surviving 256-bit read(s) take an upper half this rewrite left stale
+verify: and 733 upper-half source(s) the walk could not resolve, which this cannot speak for
+```
+
+**All 29 producers are in-place VEX.128 patches; none is a lowered window.** The strategies'
+own guards are, as far as this can see, discharged -- what is left is the Finding 40 debt: a
+128-bit VEX patched to legacy SSE stops zeroing [255:128], and 29 surviving 256-bit readers
+observe that. The producers are mostly zeroing idioms that stopped zeroing (`vxorps` 20,
+`vpxor` 2), and the sharpest case is `0x1426d580a`, a `vextractf128 $0x1,%ymm2,%xmm0` reading
+the very lane a `vpxor` one instruction earlier no longer clears.
+
+The 733 refusals over 699 readers are the honest half: this cannot speak for them, and says so
+rather than counting them clean.
+
+**The exclusions were checked rather than assumed.** Cutting 470 to 29 drops 441, and a rule
+that drops too much is as wrong as one that keeps too little. Three kept and three dropped were
+disassembled from both images, and then the whole dropped set: its 34 distinct mnemonics are
+all destination-write-only in AT&T VEX form, so `fields[:-1]` is sound across all 441 and not
+merely on the sample.
+
+**One counterexample to the rule, found and fixed the same way.** An FMA's destination is also
+a source -- `vfmadd231ps (%rdx),%ymm4,%ymm3` reads `%ymm3` -- and `fields[:-1]` never queried
+it. 190 FMAs and 3 `vpdpbusd` survive in this binary, none of them with a stale field under any
+operand rule, so it cost nothing here and would have cost correctness in a binary where it did.
+The docstring claimed "sources" and these were the shape it did not mean.
+
 **And it needed `analysis_context`.** `reaching_definition` wants the same `instructions`,
 `plain`, `blocked` and `sources` the collector builds, and building them twice is two answers
 to "can anything reach here" -- the drift `SPAN_EMITTABLE` prevents between a survey and a
