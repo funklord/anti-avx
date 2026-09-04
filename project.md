@@ -11475,6 +11475,46 @@ Finding 93's forward-widened neighbours that happen to share a stub with a rescu
 `base is None`, which is what the diagnosis said when it found 29 of 30 on that line.
 
 
+### Finding 183 -- the rescue makes its own next seat, and the overlap bucket closes
+
+Taking a passenger moves the window's end along by that instruction's length, and a second
+candidate's site can land exactly there. The loop `break`s after one seat and never looked
+again, which cost two sites -- `0x140e072c8` and `0x14126a10f`, where the first passenger is
+non-borrowing and a `spill` candidate begins at its site.
+
+It chains now, bounded at `RESCUE_CHAIN = 4`, with the finder extracted to `rescue_seat` so it
+can be driven in a loop and tested. **5,565 to 5,563, both sites**, nothing placed before
+missing now, nothing newly placed, and the instrumented copy's blob byte-identical to the
+shipped `.avxsse`.
+
+```
+chains of length 1   664
+chains of length 2     2
+chains of length 3+    0    -- and none was OFFERED a third seat
+largest growth       8 B    against a bound of 4 * RESCUE_CHAIN = 16
+```
+
+The cap never bound: the geometry ran out first. That is worth knowing before someone raises
+it hoping for more.
+
+**With this the overlap bucket is empty.** Finding 179 counted 84 overlap survivors, all
+sitting exactly at the end of the preceding placed window. Finding 181 seated 53, Finding 182
+the 29 that needed a per-thread slot, and this the last 2. 53 + 29 + 2 = 84.
+
+#### The fallback ladder has no witness, and that is recorded rather than glossed
+
+The chain is built longest-first and drops its last seat and retries if the stub will not
+build, down to the plain stub. **It never fired**: every chain built at full length on the
+first call, 666 of 666, and the single-extension fallback it replaced never fired either.
+
+So the property is correct by construction and has **no live witness in this binary**. That is
+a different claim from "tested", and the difference is exactly what Finding 111 is about -- a
+branch nothing exercises is a branch nobody checked. It is kept because the cost is nothing
+and the alternative is a chain that fails taking down a passenger that would have ridden
+alone; but if it is ever suspected, it must be exercised deliberately, because this binary
+will not do it.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
@@ -11653,7 +11693,7 @@ the previous list is superseded in every item** -- it led with a 386 that turned
 zero, cited timings taken on a rig that was measuring its own loop, and quoted region counts
 from before the closure guard removed nine in ten of them.
 
-The frontier is **5,565 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
+The frontier is **5,563 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
 every one of them (at 6,480, before three of the fixes below).
 
   1. ~~**Finish the switch-table work.**~~ **Done and measured**: 5,623 surviving VEX,

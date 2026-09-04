@@ -7454,6 +7454,7 @@ def selftest():
 	failures += span_selftest()
 	failures += region_selftest()
 	failures += switch_selftest()
+	failures += rescue_selftest()
 	failures += isa_bound_selftest()
 	failures += gpr_selftest()
 	failures += xmm_selftest()
@@ -8621,6 +8622,49 @@ def isa_bound_selftest():
 	return failures
 
 
+def rescue_selftest():
+	"""Prove the rescue chains, and stops. Failures, or 0.
+
+	The second seat exists only because the first was taken -- the window's
+	end moves by the first passenger's length and the next candidate's site
+	lands there. The loop used to `break` after one and never look again,
+	which cost two sites. Finding 183.
+	"""
+	vex = bytes.fromhex("c5f9ebd2")
+
+	def candidate(at, strategy):
+		return (at, vex, "%xmm2,%xmm0,%xmm2", "vpor", 8, [], None,
+		        [(at, b"\x90\x90\x90\x90", "nop", "", None)], strategy)
+
+	entries = [None, candidate(0x2004, ("spill", 5)),
+	           candidate(0x2008, ("spill", 6))]
+	failures = 0
+	chain, reach = [], 8
+	while len(chain) < RESCUE_CHAIN:
+		seat = rescue_seat(entries, 0, 0x2000, reach, chain)
+		if seat is None:
+			break
+		chain.append(seat)
+		reach += seat[2]
+	if len(chain) != 2:
+		print(f"selftest: the rescue seated {len(chain)} passenger(s), want 2",
+		      file=sys.stderr)
+		failures += 1
+	elif not all(entry[6] for _j, entry, _n in chain):
+		print("selftest: a spill passenger rode without its borrow flag",
+		      file=sys.stderr)
+		failures += 1
+	# **And it stops.** A seat that is not at the window's end is not a
+	# seat: without this the chain would walk down the candidate list.
+	if rescue_seat(entries, 0, 0x2000, 8 + 4 + 4, chain) is not None:
+		print("selftest: the rescue found a seat past the last passenger",
+		      file=sys.stderr)
+		failures += 1
+	if not failures:
+		print("selftest: the rescue chains two passengers and then stops")
+	return failures
+
+
 def switch_selftest():
 	"""Prove the dispatch matcher reads the table address. Failures, or 0.
 
@@ -9604,6 +9648,53 @@ def stub_base_of(data):
 	return image_base + (highest + alignment - 1) // alignment * alignment
 
 
+# How many passengers one rescue may chain. Each seat lengthens the window
+# by its instruction, and the next seat is looked for at the new end, so an
+# unbounded walk would grow a window until it swallowed a function. Four is
+# well past the two the binary actually offers (Finding 183) and short
+# enough that the extended window stays the shape the safety argument was
+# made about.
+RESCUE_CHAIN = 4
+
+
+def rescue_seat(entries, i, start, reach, taken):
+	"""The next candidate that would ride at `start + reach`, or None.
+
+	`(index, entry, length)`. The entry is `emit_swallowed`'s shape, whose
+	seventh field is the borrow flag -- a `spill` passenger carries the
+	register its own candidate was given, from `borrow_that_lowers` at this
+	same address, so it is as valid here as there.
+	"""
+	seated = {index for index, _entry, _grew in taken}
+	for j in range(i + 1, len(entries)):
+		if j in seated:
+			continue
+		other = entries[j]
+		if other[0] >= start + reach:
+			break
+		following = other[7]
+		borrowed = None
+		if other[8] is not None:
+			# A site with a strategy of its own mostly cannot ride along: a
+			# passenger is lowered by `moved_instruction`, which knows only
+			# the plain rules and would refuse a 256-bit one. `spill` is the
+			# exception and was the whole bucket -- an ordinary lowering
+			# that needs a register it gives back, which `emit_swallowed`
+			# has bracketed since Finding 93.
+			if other[8][0] != "spill":
+				continue
+			borrowed = other[8][1]
+		if not following or other[1][:1] not in (b"\xc4", b"\xc5"):
+			continue
+		site = other[0] + sum(len(e[1]) for e in following)
+		if site != start + reach:
+			continue
+		return (j, (site, other[1], None, other[2], other[3],
+		            other[6] if borrowed is None else borrowed,
+		            borrowed is not None), len(other[1]))
+	return None
+
+
 def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
                 detail=None, home=None, tls=None):
 	"""Choose and build the stubs. (placed, blob, swallowed, overlap, refused)
@@ -9663,75 +9754,44 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 		# been allowed to swallow it; and the extended window stays inside
 		# one function, because the two windows overlap and each was
 		# already checked to lie within one.
-		extension = None
-		for j in range(i + 1, len(entries)):
-			other = entries[j]
-			if other[0] >= start + window:
+		# **A chain, because the extension makes its own next seat.** Taking
+		# one passenger moves the window's end four bytes on, and a second
+		# candidate's site can land exactly there -- measured at two sites,
+		# `0x140e072c8` and `0x14126a10f`, where the first passenger is
+		# non-borrowing and a `spill` candidate begins at its site. The loop
+		# used to `break` after one and never look again. Bounded, because
+		# each seat lengthens the window and an unbounded walk would swallow
+		# a function. Finding 183.
+		chain = []
+		reach = window
+		while len(chain) < RESCUE_CHAIN:
+			seat = rescue_seat(entries, i, start, reach, chain)
+			if seat is None:
 				break
-			following = other[7]
-			borrowed = None
-			if other[8] is not None:
-				# A site with a strategy of its own mostly cannot ride
-				# along: a passenger is lowered by `moved_instruction`,
-				# which knows only the plain rules and would refuse a
-				# 256-bit one -- costing the stub that was going anyway.
-				#
-				# **`spill` is the exception, and it was the whole bucket.**
-				# All 84 overlap survivors sat EXACTLY at the end of the
-				# preceding placed window and 83 carried `spill`, refused
-				# only by the blanket test above. A spill site is an
-				# ordinary lowering that needs a register it must give
-				# back, and `emit_swallowed` has emitted exactly that
-				# bracket for forward-widened neighbours since Finding 93:
-				# save, this one lowering, restore, tight by construction.
-				#
-				# The register is the one the candidate's own strategy
-				# chose, from `borrow_that_lowers` at this same address --
-				# the identical call `swallowed_borrow` makes -- so it is
-				# valid here for the same reason. What differs is the
-				# backing store: the site would have used its own, and a
-				# passenger uses the WINDOW's borrow displacement, which
-				# `emit_swallowed` refuses outright when the window has
-				# none. Finding 181.
-				if other[8][0] != "spill":
-					continue
-				borrowed = other[8][1]
-			if not following or other[1][:1] not in (b"\xc4", b"\xc5"):
-				continue
-			site = other[0] + sum(len(e[1]) for e in following)
-			if site != start + window:
-				continue
-			# The passenger carries the scratch its own candidate was given:
-			# it is being lowered here rather than in a stub of its own, and
-			# the register it may destroy does not change with the address.
-			# The seventh field is `emit_swallowed`'s borrow flag. It
-			# brackets the lowering with a save and a restore, refuses a
-			# passenger that transfers control between them, and refuses
-			# when the window holds no displacement to save into -- and
-			# `build_stub` returning None falls back to the plain stub, so
-			# a refusal here costs the passenger and never the site.
-			extension = (j, [(site, other[1], None, other[2], other[3],
-			                  other[6] if borrowed is None else borrowed,
-			                  borrowed is not None)], len(other[1]))
-			break
+			chain.append(seat)
+			reach += seat[2]
 
 		stub_address = stub_base + len(blob)
 		body, prologue = None, 0
-		if extension:
-			j, extra, grew = extension
+		# **Longest chain first, then shorter, then none.** A chain that
+		# will not build must not cost the passenger that would have ridden
+		# alone, so the last seat is dropped and the rest retried. The floor
+		# is the plain stub, which is what this did before there were
+		# chains: taking a passenger along must never cost the stub that was
+		# going anyway.
+		while chain:
+			grew = sum(length for _j, _entry, length in chain)
+			extra = [entry for _j, entry, _length in chain]
 			body, prologue = build_stub(
 				start, encoding, operands, mnemonic, window + grew,
 				list(displaced) + extra, stub_address, scratch, pool,
 				preceding, strategy, spill_base, home=home, tls=tls)
-			if body is None:
-				# The extended stub would not build. Fall back to the plain
-				# one rather than lose both -- taking a passenger along must
-				# never cost the stub that was going anyway.
-				extension = None
-			else:
+			if body is not None:
 				window += grew
 				displaced = list(displaced) + extra
-				rescued.add(j)
+				rescued.update(j for j, _entry, _length in chain)
+				break
+			chain.pop()
 		if body is None:
 			# **Only this call decides a refusal.** The extension above
 			# failing is ordinary -- it falls back to the plain stub -- so
