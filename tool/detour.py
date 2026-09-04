@@ -6162,6 +6162,49 @@ def switch_targets(instructions, binary, starts):
 	return found, tables
 
 
+def stale_upper_reads(instructions, blocked, sources, placed, patched):
+	"""[(reader, register, producer)] -- reads of an upper half left stale.
+
+	Asked from the READER's end, because the lowering's end cannot see the
+	whole class: a per-strategy guard only covers registers some strategy
+	claimed, and the producer here is usually a plain in-place patch that
+	no strategy ever touched. Findings 185 and 186.
+
+	A 256-bit instruction survives the rewrite unless a window swallowed
+	it -- 256-bit sites are never patched in place -- so `placed` decides
+	which readers are still there. `patched` is the set of addresses the
+	in-place pass rewrote: a VEX.128 write among them stops zeroing bits
+	255:128, which is the fact the original relied on.
+
+	`None` from `reaching_definition` means "cannot tell", not "clean", so
+	it is counted apart and returned to the caller to report rather than
+	folded into a pass. That inversion is what made the first version of
+	this silent exactly where the analysis is weakest.
+	"""
+	inside = set()
+	for start, length, _stub, _size, _prologue in placed:
+		inside.update(range(start, start + length))
+	found, unknown = [], 0
+	for position, row in enumerate(instructions):
+		address, encoding, mnemonic, operands, _comment = row
+		if address in inside or not operands:
+			continue
+		wide = inplace.decode_vex(encoding)
+		if wide is None or not wide["L"]:
+			continue
+		for field in upper_half_sources(mnemonic, operands):
+			where = reaching_definition(instructions, position, field,
+			                            blocked, sources=sources)
+			if where is None:
+				unknown += 1
+				continue
+			producer = instructions[where][0]
+			narrowed = producer in patched
+			if producer in inside or narrowed:
+				found.append((address, field, producer))
+	return found, unknown
+
+
 def upper_half_sources(mnemonic, operands):
 	"""The `%ymm` operands whose UPPER half this instruction reads.
 
@@ -6264,13 +6307,20 @@ def analysis_context(binary, listing):
 	return instructions, plain, blocked, sources, switch_tables, len(switched)
 
 
-def collect(binary, listing):
-	"""(in-place patches, class C detour candidates, statistics)."""
+def collect(binary, listing, context=None):
+	"""(in-place patches, class C detour candidates, statistics).
+
+	`context` is `analysis_context`'s tuple, passed in by a caller that
+	needs it as well -- `apply` reverts in-place patches with it and
+	`verify` checks them. Building it twice parses a 927 MB listing twice
+	and holds 16.5 million rows twice; the second copy is what ran `verify`
+	out of memory before it was noticed. One build, shared.
+	"""
 	# A run reports its own numbers, not the previous one's.
 	REGION_REFUSED.clear()
 	REGION_EXAMPLES.clear()
 	instructions, plain, blocked, sources, switch_tables, switch_seen = \
-		analysis_context(binary, listing)
+		context if context is not None else analysis_context(binary, listing)
 	# The code oracle, in two parts. .pdata is the binary's own statement
 	# about where its functions are and needs no disassembly to read, but the
 	# x64 ABI lets a leaf function omit its unwind data -- and refusing those
@@ -10079,8 +10129,9 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 
 
 def apply_all(binary, listing, output):
+	context = analysis_context(binary, listing)
 	patches, candidates, _stats, _skipped, _declined, home = collect(
-		binary, listing)
+		binary, listing, context)
 	data = bytearray(open(binary, "rb").read())
 	# Read from the ORIGINAL bytes, before anything is appended: the
 	# directory's own contents do not move, and reading it later would make
@@ -10090,10 +10141,12 @@ def apply_all(binary, listing, output):
 
 	# The in-place work first: it does not move anything, so the addresses
 	# the detours are computed against are unaffected either way.
+	undo = {}
 	for address, original, replacement, _kind, _mnemonic in patches:
 		offset = raddr + (address - vaddr)
 		if bytes(data[offset:offset + len(original)]) != original:
 			raise SystemExit(f"0x{address:x}: bytes on disk do not match")
+		undo[address] = (offset, original)
 		data[offset:offset + len(original)] = replacement
 
 	# Lay the stubs out. The section's address is not known until its size
@@ -10119,6 +10172,30 @@ def apply_all(binary, listing, output):
 	placed, blob, _swallowed, overlapped, refused = place_stubs(
 		candidates, stub_base, spill_base, stub_reasons, home=home,
 		tls=tls_pair_of(tls_here))
+
+	# **A VEX.128 write that stops zeroing, where somebody still looks.**
+	# Patching one in place turns it into legacy SSE, which leaves bits
+	# 255:128 alone -- and 29 surviving 256-bit readers observed exactly
+	# that. There is no SSE instruction that writes an upper half, so the
+	# only repair is to leave the VEX form standing: it costs the site and
+	# keeps the bytes right. Reverting cannot cascade, because a 128-bit
+	# write reads no upper half of its own. Finding 187.
+	instructions, _plain, blocked, sources, _tables, _seen = context
+	stale, unresolved = stale_upper_reads(instructions, blocked, sources,
+	                                      placed, set(undo))
+	reverted = set()
+	for _reader, _field, producer in stale:
+		if producer in undo and producer not in reverted:
+			offset, original = undo[producer]
+			data[offset:offset + len(original)] = original
+			reverted.add(producer)
+	if reverted:
+		print(f"apply: {len(reverted):,} in-place patch(es) reverted, their "
+		      f"zeroing still read by {len(stale):,} surviving 256-bit "
+		      f"instruction(s)")
+	if unresolved:
+		print(f"apply: {unresolved:,} upper-half source(s) the walk could "
+		      f"not resolve, which this cannot speak for")
 
 	for site, window, stub_address, _length, _prologue in placed:
 		offset = raddr + (site - vaddr)
@@ -10333,9 +10410,9 @@ def verify(original, patched, listing=None):
 			       "to check they were swallowed deliberately")
 		return 1 if problems else 0
 
+	context = analysis_context(original, listing)
 	_patches, candidates, _stats, _skipped, _declined, home = collect(
-		original,
-	                                                           listing)
+		original, listing, context)
 	# The same call apply makes, so the two cannot drift apart.
 	placed, _blob, swallowed, _overlapped, _refused = place_stubs(
 		candidates, stub_base_of(open(original, "rb").read()), home=home,
@@ -10434,49 +10511,12 @@ def verify(original, patched, listing=None):
 	# window that lowered it, or a VEX.128 write patched to legacy SSE,
 	# which stops zeroing [255:128] -- then the reader takes bytes the
 	# original would not have given it. Finding 186.
-	instructions, plain, blocked, sources, _tables, _seen = \
-		analysis_context(original, listing)
-	inside_window = set()
-	for start, length, _stub, _size, _pro in placed:
-		inside_window.update(range(start, start + length))
-	stale, unknown = [], 0
-	for position, row in enumerate(instructions):
-		address, encoding, mnemonic, operands, _comment = row
-		if address not in after_vex or address in inside_window:
-			continue
-		wide = inplace.decode_vex(encoding)
-		if wide is None or not wide["L"] or not operands:
-			continue
-		for field in upper_half_sources(mnemonic, operands):
-			# **`instructions`, not `plain`.** `reaching_definition`
-			# unpacks five fields. Passing the four-field liveness shape
-			# raised `ValueError` on the first query, so this check never
-			# ran at all -- and no gate said so, because `make check`'s
-			# `verify` target is `lower.py verify`, a different tool.
-			# Nothing in the suite executes `detour.py verify`.
-			where = reaching_definition(instructions, position, field,
-			                            blocked, sources=sources)
-			if where is None:
-				# **A refusal is not a pass.** `reaching_definition`
-				# returns None for "I cannot tell you what reaches here",
-				# which is right for the collector and inverted for a
-				# gate: counting it clean makes this silent exactly where
-				# the analysis is weakest, which is where the defects
-				# were. 3 of the 4 known-bad readers land here.
-				unknown += 1
-				continue
-			producer = instructions[where][0]
-			was_lowered = producer in inside_window
-			narrowed = False
-			if not was_lowered:
-				# A VEX.128 write patched in place stops zeroing the upper
-				# half, so a reader downstream of one sees what the
-				# lowering left rather than the zero the original wrote.
-				produced = inplace.decode_vex(instructions[where][1])
-				narrowed = (produced is not None and not produced["L"]
-				            and producer not in after_vex)
-			if was_lowered or narrowed:
-				stale.append((address, field, producer))
+	instructions, _plain, blocked, sources, _tables, _seen = context
+	# The patched set, keyed the way `apply` keys it: the first field of a
+	# patch tuple is its address.
+	patched = {row[0] for row in _patches}
+	stale, unresolved = stale_upper_reads(instructions, blocked, sources,
+	                                      placed, patched)
 	if stale:
 		print(f"verify: {len(stale):,} surviving 256-bit read(s) take an "
 		      f"upper half this rewrite left stale", file=sys.stderr)
@@ -10486,9 +10526,10 @@ def verify(original, patched, listing=None):
 	else:
 		print("verify: no surviving 256-bit read takes an upper half this "
 		      "rewrite left stale")
-	if unknown:
-		print(f"verify: and {unknown:,} upper-half source(s) the walk could "
-		      f"not resolve, which this cannot speak for", file=sys.stderr)
+	if unresolved:
+		print(f"verify: and {unresolved:,} upper-half source(s) the walk "
+		      f"could not resolve, which this cannot speak for",
+		      file=sys.stderr)
 
 	# **And the indirect ones, which used to be the named gap.** The comment
 	# above said `targets.py` was the only source for switch targets and the

@@ -11711,6 +11711,30 @@ lowering, and which this file has now met between the collector and the lowering
 and the collector, and the collector and the emitter. One construction, called by both.
 
 
+### Finding 187 -- the 29 fixed by not patching, and one context instead of two
+
+Finding 186 measured 29 surviving 256-bit reads of an upper half this rewrite left stale, and
+attributed every one to the same cause: **a 128-bit VEX write patched in place to legacy SSE
+stops zeroing bits 255:128.** None came from a lowered window; the strategies' own guards are
+discharged. This is the Finding 40 debt, met from the reader's end.
+
+**There is no repair inside SSE.** No legacy instruction writes an upper half, so a lowering
+cannot restore what the VEX form zeroed. The only fix is to leave the VEX form standing: after
+placement, `apply` reverts the in-place patch of any producer whose zeroing a surviving 256-bit
+reader still observes. It costs that site and keeps the bytes right.
+
+**Reverting cannot cascade**, which is what makes one pass enough: a 128-bit write reads no
+upper half of its own, so restoring one can create no new stale read.
+
+**And it needed one analysis context, not two.** The check wants the same `instructions`,
+`blocked` and `sources` the collector builds. Building them again parses a 927 MB listing twice
+and holds 16.5 million rows twice -- the second copy is what ran `verify` out of memory in
+Finding 186's first attempt, and the same shape made `check-pe` take four minutes where it had
+taken one. `collect` now takes the context as an argument and `apply` and `verify` each build
+it once. `stale_upper_reads` is likewise one function, called by both, so the gate and the
+repair cannot disagree about what counts as stale.
+
+
 ## Picking this up again
 
 Everything below is what a fresh start needs and none of it is derivable from the
