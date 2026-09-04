@@ -3547,14 +3547,20 @@ lowering leaves that the original would not have left, and the thing that makes 
 | span | every upper half in a 16-byte slot, the machine ymm's upper half stale | `upper_half_read_later` at the span's end, since Finding 153 -- "the span closes or it is worth nothing" |
 | region | the same, over a call-free stretch | `upper_half_read_later` **since Finding 173 and not before**: 166 regions were emitted without it and 150 were wrong |
 | long pair | the load puts the upper half in a SHADOW xmm; the ymm's own upper half is stale | the partner store reads the shadow -- and `long_partner_lowers` **since Finding 180 and not before**: 24 loads committed to stores that then declined |
+| zero run | nothing, for the zero store's reason, per member | no obligation -- and where its register's upper half IS stale, a `vpxor` patched in place put it there, which is Finding 187's row and not this one |
+| splat, splat run | the ymm's upper half stale: the insert emits NOTHING, because the value it built is already in the register the lowered program keeps | `upper_half_read_later` **since Finding 184 and not before**: one window shipped with three surviving readers |
+| splat op | the same, and the operation's destination too -- the lowering writes its low sixteen and never its high | both registers asked, since Finding 184 |
+| constant load | the upper half stale ON PURPOSE: it emits one move, the low half into the register's own xmm | `upper_half_read_later` with a `covered` predicate -- a reader that is a `conststore` reloads BOTH halves from the read-only bytes, so it observes nothing. One decision, asked from both ends through `constant_ymm` |
+| constant store, constant run | nothing of its own: it writes memory, and the register state it leaves is the constant load's | discharged by the row above |
 | any of them | never a 256-bit instruction | `sse_encoding` refuses `VEX.L` and `narrow_piece` always clears it; `verify` counts zero VEX in the stub section |
 
-**Rows still missing, and that is the finding rather than an aside.** `zerorun`, the splat
-family (`splat`, `splatrun`, `splatop`) and the constant family (`constload`, `conststore`,
-`construn`) have no row here. Two of the three rows added above were added *because the
-strategy had already shipped wrong output* -- the region left sixteen stale bytes in 467
-lowerings, the long pair in 24 -- and in both cases the obligation was discharged correctly by
-three older strategies whose rows were sitting in this table the whole time.
+**The table is complete as of Finding 187, and completing it is what found two of the bugs in
+it.** Three rows were added because the strategy had already shipped wrong output -- the region
+left sixteen stale bytes in 467 lowerings, the long pair in 24, the splat family in 1 -- and in
+each case the obligation was discharged correctly by older strategies whose rows were sitting
+here the whole time. The splat row is the clearest case for the practice: it was written by
+going to fill a gap in this table, and the act of establishing the guard rather than asserting
+it is what turned up the missing one.
 
 **So the table is not documentation, it is the check.** A strategy added without a row is a
 strategy nobody asked the question of, and the question is cheap: *what does this leave that
