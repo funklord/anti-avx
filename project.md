@@ -11578,8 +11578,8 @@ NEVER HELD limit exhaustion       reports "dead" having examined 40 and proved n
   `vextractf128 $0x1,%ymm0,%xmm0` five bytes on reads the upper half; the long pair took it
   without asking and handed the extract sixteen stale bytes. Finding 180's shape, a third time
   in the same strategy.
-- **Limit exhaustion returned False** -- 21 constload sites, the use sitting 48 instructions
-  past the 40 the walk looks at. Unsound against the ORIGINAL program, never mind the image,
+- **Limit exhaustion returned False** -- 21 constload sites, the worked case having its
+  use at instruction 48, eight beyond the 40 the walk looks at. Unsound against the ORIGINAL program, never mind the image,
   and inconsistent with the budget exhaustion a few lines above which correctly returns True.
   It now returns True, which is what the docstring already promised: "an unresolved answer is
   yes, leave it alone".
@@ -11593,6 +11593,38 @@ NEVER HELD limit exhaustion       reports "dead" having examined 40 and proved n
   the reader SURVIVES: 2 sites forward and 33 through plain in-place patches. **The right guard
   is not "never credit" but "credit unless a surviving reader follows", and that needs the
   placer's answer at collect time.** Not built.
+
+#### Measured
+
+```
+                        before    after
+surviving VEX            5,563    5,750    +187
+stale reads (forward)       84        6
+  longload                  56        3
+  constload                 21        0
+  splat                      1        0
+  pair                       5        2
+  span                       1        1
+longload windows placed    334      272
+constload windows placed    36       15
+```
+
+**84 stale reads down to 6, and the 6 are the exposure this finding keeps deliberately** -- 5
+on the VEX.128 credit, 1 on the full-256-move credit, which is the 2+4 split predicted,
+redistributed now that longload sites fall under the credits rather than under "never asked".
+
+**The cost is 187 sites for 78 wrong reads, and the gap is worth understanding.** The direct
+exposures were 1 + 56 + 21 = 78. Refusing a `longload` also de-registers its partner stores
+through Finding 180's "every partner, or none" coupling, so `longstore` lost 64 alongside
+`longload`'s 62; the reshuffle then moved windows between strategies, `pair` losing 24 while
+`span` gained 5 and `spill` 20. **A guard on one strategy is not paid for by that strategy
+alone**, which is the thing to expect next time rather than to rediscover.
+
+Direct evidence the new guards run: the splat family's terminal conditions are now recorded
+rather than absent (`splat: callret 10, vex128 7`; `splatrun: callret 3, vex128 17, both 2`;
+`splatop: callret 11, vex128 27`), and `constload`'s limit-exhaustion rows vanished entirely.
+`0x1434dc07b` is no longer detoured and its three readers are untouched; `0x140470003` is no
+longer placed under any strategy.
 
 **The general statement, which is what the next strategy should read.** Every one of these is
 the same error: a guard that reasons about the listing it was handed rather than the image the
@@ -11780,7 +11812,7 @@ the previous list is superseded in every item** -- it led with a 386 that turned
 zero, cited timings taken on a rig that was measuring its own loop, and quoted region counts
 from before the closure guard removed nine in ten of them.
 
-The frontier is **5,563 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
+The frontier is **5,750 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
 every one of them (at 6,480, before three of the fixes below).
 
   1. ~~**Finish the switch-table work.**~~ **Done and measured**: 5,623 surviving VEX,

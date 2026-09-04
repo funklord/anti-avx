@@ -5213,7 +5213,6 @@ def upper_half_read_later(instructions, index, register, limit=40,
 		# The mnemonics are restricted to the moves for the reason
 		# scratch.py's FULL_WRITE is: one missing from the list costs a pair
 		# that was available, and one wrongly on it costs correctness.
-		fields = inplace.split_operands(operands)
 		# **Same exposure, same reasoning**: 2,742 of the 2,829 killers
 		# this credits are themselves lowered, and a lowered 256-bit move
 		# writes the low half only. Sound where the later reader is lowered
