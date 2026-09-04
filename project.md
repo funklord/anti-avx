@@ -12057,6 +12057,47 @@ is now a list item rather than a footnote: it is the difference between two rule
 both called "strict", and this project has been caught before by two things sharing a name.
 
 
+### Finding 192 -- the window-local region rule is worth 0, and could not have been sound
+
+The list's third item was "74 of the 164 branch-target regions, reachable by a window-local
+rule". Priced through the funnel that priced the shapes:
+
+```
+bounds differ from the shipped walk   338
+  representable                        21      the estimate said 74
+  past the closure guard               17
+  past .pdata coverage                  0
+  EMITTED                               0      real gain: 0 sites
+```
+
+**Two gates turn out to be one fact seen twice.** All 22 targets the rule crosses are `.pdata`
+BeginAddresses with no direct branch naming them -- which is exactly why the rule may cross
+them -- and `covered_by` then refuses the window for that same fact. The ceiling, if that gate
+were deleted, is 43 sites, and deleting it is unsound.
+
+**And the rule does not attack the 164 at all.** It moves the bounds at 29 of 926 branch-target
+refusals; 20 of the 21 representable regions have boundary "after a jump" and are existing
+regions made LONGER, not branch-target regions rescued.
+
+**The safety argument is unsatisfiable by construction, which is the part worth keeping.** The
+offer was "cross an interior target when all its predecessors lie inside the window". But
+`region_end` stops at the first `CONTROL_PREFIXES` mnemonic and `region_candidate` trims it, so
+**a region window contains no branch instruction at all**. The only in-window predecessor an
+interior target can have is its fall-through; every branch predecessor is necessarily outside.
+So "all predecessors inside" holds only when the enumerable set is EMPTY -- which means the
+address was blocked for a reason the walk cannot enumerate, and the guarantee is precisely as
+absent as before. Measured rather than argued: the strict form crossed 7,432 times, refused 721
+on that test, and validated once, with an empty crossed set.
+
+**Both halves of the price had aged.** The "164" is 151 in the current image, and the control
+figures quoted from Finding 189 had moved -- 202,592 detours is now 202,614, because Finding
+190's walk feeds `zeroed_ymm`. A stale control is the one thing a control may not be.
+
+**Fourth time on this item, fourth "no"** -- and this one rests on a structural argument rather
+than a count, which is stronger: the rule could not have been made sound, so no future
+measurement reopens it.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12073,7 +12114,7 @@ a binary that computes the wrong answer.
 |---|---|---|---|---|
 | 1 | Attribute the 190-source gap: 133 resolved against a prototype's 323 | unknown, up to 190 sources | wrong bytes | measured both ends; the rules differ and the difference is not characterised |
 | 2 | The loop-aware back-edge rule | 10 more stale reads, 185 more resolved | wrong bytes | measured, but wants a fixpoint before it may gate |
-| 3 | Price the 164 branch-target regions | 74 representable, real gain UNKNOWN | sites | representable count measured; the shapes it resembles priced at 21 real of 66 covered |
+| - | ~~The 164 branch-target regions~~ **CLOSED at 0** | 0 emitted, 0 sites | sites | Finding 192: 21 representable of an estimated 74, none emitted, and the rule could not have been sound |
 | 4 | The residual unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable |
 | 5 | A gate that runs `detour.py verify` | 0 today | robustness | structural: a crash there shipped green |
 
