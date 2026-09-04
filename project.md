@@ -11914,71 +11914,50 @@ table are a different question from any of this.
 
 ### What is worth building next
 
-Ordered by what was measured, not by what looks large. **Rewritten after Findings 169-178;
-the previous list is superseded in every item** -- it led with a 386 that turned out to be
-zero, cited timings taken on a rig that was measuring its own loop, and quoted region counts
-from before the closure guard removed nine in ten of them.
+Ordered by what was measured. **Rewritten after Findings 179-187**, which closed most of the
+previous list and replaced its subject: the remaining work is no longer about lowering more
+sites but about the ones already lowered being right.
 
-The frontier is **5,750 surviving VEX of 805,131, 99.3% removed**, and Finding 175 attributed
-every one of them (at 6,480, before three of the fixes below).
+The frontier is **5,750 surviving VEX of 805,131, 99.3% removed**. It has RISEN four times
+today and every rise was a correctness fix -- 467 region lowerings, 24 long-pair stores, 78
+stale reads across four strategies, and the in-place patches of Finding 187. A count that only
+falls is a count nobody is checking.
 
-  1. ~~**Finish the switch-table work.**~~ **Done and measured**: 5,623 surviving VEX,
-     99.3% removed, and `verify: all 16,819 switch targets from 1,795 tables still begin an
-     instruction` passed on its first run. Findings 174, 177 and 178 are closed.
-  2. ~~**The region's remaining shapes.**~~ **Re-derived and closed: do not build.**
-     Finding 179 priced all three through every gate. `vinsertf128` and `mem,S,D` emit ZERO
-     regions, alone or combined; `vextractf128` emits 8 regions covering 66 sites of which
-     only 21 still carry VEX -- 0.37% of the residue. `mem,S,D` as previously specified is
-     also unsound for the 66 FMA sites in its population, where the destination is a source.
-     The region is finished as a source of sites.
-  3. **`lanereg3 source from outside the region` is closed, not queued.** 0 of 13 under any
-     combination of shape work, measured. The missing value is a loop-invariant hoisted above
-     the region head; it is the same "arrives from outside" bound as the big bucket, found one
-     instruction later.
-  4. **The 164 branch-target regions**, of which about half are recoverable without
-     whole-function analysis: 37 sit behind a boundary that is not an entry point at all --
-     29 chained `.pdata` fragments and switch-table false positives -- and 33 have exactly one
-     real predecessor. A window-local rule ("a region may contain an interior branch target
-     whose predecessors all lie inside the window") reaches 74 of the 164. The residue, about
-     90, is a genuine control-flow join and needs a representation this project does not have.
-  5. ~~**The 83-site placer rescue.**~~ **Built and measured: 53 sites, Finding 181.** The
-     hazards this entry named were real questions with answers already in the code. 30 of the
-     83 remain, most likely refused because a spill passenger cannot fall back to a per-thread
-     slot the way a spill site can. The original entry follows.
+  1. **The 733 unresolved upper-half sources, which is the honest gap.** `verify`'s stale-read
+     check reports them rather than counting them clean, and cannot speak for them:
+     `reaching_definition` refuses when a branch target intervenes, and 699 surviving readers
+     have a source it will not resolve. Three of the four readers Finding 185 found by hand
+     land in exactly that set. **This is where the next real defect is**, and closing it means
+     a path-sensitive walk rather than one that refuses at the first join.
+  2. **The Finding 40 debt, beyond the 29.** A 128-bit VEX patched in place stops zeroing bits
+     255:128. Finding 187 reverts the patches whose zeroing a SURVIVING reader observes, which
+     is sound for what the walk can see -- and item 1 is what it cannot. The population is
+     547,716 in-place patches; only the ones a survivor observes matter, and only the resolved
+     ones are known.
+  3. **The 164 branch-target regions**, of which about half are reachable without whole-function
+     analysis: 37 sit behind a boundary that is not an entry point (29 chained `.pdata`
+     fragments, plus switch-table false positives) and 33 have exactly one real predecessor. A
+     window-local rule -- a region may contain an interior branch target whose predecessors all
+     lie inside the window -- reaches 74 of the 164. The residue, about 90, is a genuine
+     control-flow join.
+  4. **`lanereg3 source from outside the region` is closed, not queued.** 0 of 13 under any
+     combination of shape work, measured. Same wall as the big bucket, found one instruction
+     later.
+  5. **`.pdata` chained fragments are NOT droppable from `blocked`.** Settled with two
+     counterexamples: real switch targets with a fall-through predecessor and nothing else
+     naming them. Do not reopen without sound enumeration of indirect targets.
+  6. ~~The region's remaining shapes~~ (Finding 179: 8/0/0 regions, 21 real sites -- do not
+     build), ~~the 83-site rescue~~ (Findings 181-183: all 84 recovered), ~~the switch-table
+     work~~ (Findings 174, 177, 178) and ~~the guard table's missing rows~~ (Finding 187) are
+     all done.
 
-     **The 83-site placer rescue -- designed, priced, deliberately not built.** Every one of
-     the 84 overlap survivors sits EXACTLY at the end of the preceding placed window (distance
-     0 for all 84), and 83 are backward-widened candidates the Finding 36 rescue refuses only
-     because `other[8] is not None`: a passenger carrying its own strategy cannot ride along.
-     All 83 carry `spill`.
-
-     It is the only remaining item whose gain is exact, and it is more delicate than its size
-     suggests. `build_stub` brackets the WHOLE stub with one save/restore, and under the
-     default `--spill=tls` it also plants a block pointer in a GPR. A spill passenger needs a
-     SECOND borrow inside that stub, which means: a slot distinct from the host's (the
-     machinery exists -- `selftest: two borrowed registers get two slots, and a third is
-     refused`); the block pointer set up even when the host is not itself a spill; and the
-     `prologue` offset kept right, because the stack variant's unwind code is measured from it
-     and a backward-widened window emits its swallowed instructions first.
-
-     **The reason it is not built here is the cost of being wrong in this exact place.** Both
-     correctness bugs found in this session -- Findings 173 and 180 -- were a strategy
-     committing to something whose partner then did not work, in the stub builder, invisible to
-     every gate. 83 sites is 1.5% of the residue. Build it in a session that can run
-     `make detour` cheaply and iterate; each measurement here cost a subagent round trip of the
-     better part of an hour.
-
-  6. **`.pdata` chained fragments are NOT droppable from `blocked`.** Measured and settled:
-     two counterexamples are real switch targets with a fall-through predecessor and nothing
-     else naming them. Do not reopen without sound enumeration of indirect targets, and even
-     then 29 pdata-only chained starts remain unexplained.
-
-**And one thing that is not a build item but decides several of these.** Long full-binary runs
-were terminated part way eight times in a row on an idle machine (load 3, 30 GB free), while
-a 580-second foreground run completed. Nothing here can be re-measured until that is
-understood, and three separate increments are now sitting on measured code with unmeasured
-output. If it recurs, run `make detour` and `make detour-verify` as the first thing in a
-session rather than the last.
+**And one thing that is not a build item.** `detour.py verify` is where the correctness checks
+live, and **no gate runs it** -- `make check`'s `verify` target is `lower.py verify`, a
+different tool, and `detour-verify` needs the game binary, which `check` excludes by design. A
+defect in that code is invisible to the suite: the stale-read check shipped raising
+`ValueError` on its first query and every gate stayed green. Anything added there wants its
+logic split into a function a selftest can reach, as `upper_half_sources` and
+`stale_upper_reads` now are.
 
 
 #### The frontier is where it was, and that is deliberate
