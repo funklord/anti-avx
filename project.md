@@ -12098,6 +12098,54 @@ than a count, which is stronger: the rule could not have been made sound, so no 
 measurement reopens it.
 
 
+### Finding 193 -- the 190 was a contract mismatch, and it hid an unsoundness of mine
+
+The gap between 133 resolved and a prototype's 323 was attributed, and it is mostly not about
+strictness at all. **The prototype returns a SET of definitions and unions the ways in; the
+shipped rule returns a single position and refuses when they disagree.** Of its 323, only 112
+are singletons; of the 248-source difference set, **211 are multi-valued** and the single-value
+contract could not express them however the walk were written.
+
+The rest is four repairs, three mechanical and one a soundness bug I wrote:
+
+```
+                                             resolved  refused  STALE
+shipped e0685df                                 3,655      603     32
+F1  walk back FROM a branch edge, not through   3,649      609     48
+F2  route the reader's own blocked address
+    into the same enumeration                   3,669      589     58
+F3  keep the set when the ways disagree         3,777      481     83
+U1  refuse a join reachable indirectly          3,724      534     66
+```
+
+**F1 is an off-by-one in my own code.** The recursion passes `way + 1` for every predecessor.
+For a fall-through that is right -- it is an ordinary instruction that may write the register.
+For a BRANCH edge it lands step 1 on the `jmp` and refuses it as a control transfer. 73 of the
+248, 8 of them real stale reads. `predecessors_of` now says which kind each way is.
+
+**U1 is worse: it is unsound, and my own docstring says so.** `predecessors_of` detected
+unknowability only when the way list came out EMPTY, which happens just when the target is
+preceded by `int3` padding. A chained `.pdata` fragment starting mid-block kept its fall-through
+and was answered from it -- **57 resolutions resting on the assumption that a `.pdata` start is
+reachable only the ways a direct-branch map can see**, which this file closed as unsafe with two
+counterexamples. It refuses now when no branch names the address.
+
+**The prototype was not unsound.** Its set-union at a join is a sound over-approximation and on
+the indirect-entry class it was STRICTER than mine. What was wrong was the label: 323 was never
+a count of single reaching definitions, and comparing it to 133 compared two different
+questions. Its one genuinely optimistic variant -- "a back edge contributes nothing", the
+508/61 figure -- is unsound as a general rule and must not gate.
+
+**The gap is not bookkeeping.** 35 of the 248 would be stale reads, and the repaired sound rule
+reports **66 against today's 32** -- 34 more surviving readers taking an upper half this rewrite
+left stale, each one wrong bytes the gate currently files as "cannot speak for".
+
+**And the selftest for F1 had to be built twice.** The first used a `je`, which is not refused
+as a control transfer, so both readings walked through it to the same answer and the sabotage
+run passed. Only an unconditional `jmp`, as the sole way into the join, discriminates. A case
+that cannot fail is not a case -- Finding 111, met again in the test written to close it.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12112,7 +12160,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | Attribute the 190-source gap: 133 resolved against a prototype's 323 | unknown, up to 190 sources | wrong bytes | measured both ends; the rules differ and the difference is not characterised |
+| 1 | F2 and F3: the reader's own blocked address, and keeping the set when ways disagree | 34 more stale reads (32 -> 66) | wrong bytes | Finding 193 measured the full ladder; F3 needs `reaching_definition` to return a set |
 | 2 | The loop-aware back-edge rule | 10 more stale reads, 185 more resolved | wrong bytes | measured, but wants a fixpoint before it may gate |
 | - | ~~The 164 branch-target regions~~ **CLOSED at 0** | 0 emitted, 0 sites | sites | Finding 192: 21 representable of an estimated 74, none emitted, and the rule could not have been sound |
 | 4 | The residual unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable |

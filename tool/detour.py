@@ -4798,26 +4798,44 @@ def predecessors_of(instructions, position, sources):
 	if sources is None:
 		return None
 	address = instructions[position][0]
+	# **Blocked, but no branch names it: the ways in are not enumerable.**
+	# This only refused when the way list came out EMPTY, which happens
+	# just when the target is preceded by `int3` padding. A chained
+	# `.pdata` fragment starting mid-block kept its fall-through and was
+	# answered from it -- 57 resolutions resting on the assumption this
+	# file already closed as unsafe, that a `.pdata` start is reachable
+	# only the ways a direct-branch map can see. Two counterexamples
+	# settled that; this is the same assumption wearing a different hat.
+	# Finding 193.
+	if address not in sources:
+		return None
 	ways = []
+	# Each way is `(position, inclusive)`. A FALL-THROUGH predecessor is an
+	# ordinary instruction that may itself write the register, so the walk
+	# must examine it; a BRANCH predecessor is the edge's terminator, which
+	# defines nothing, and the walk must start behind it. Passing the same
+	# index for both landed step 1 on the `jmp` and refused it as a control
+	# transfer -- 73 of the 248 sources this could not resolve, and 8 of
+	# them are real stale reads. Finding 193.
 	before = position - 1
 	if before >= 0:
 		prior = instructions[before]
 		if prior[0] + len(prior[1]) == address:
 			if not prior[2].startswith(CONTROL_PREFIXES) \
 					or conditional_branch(prior[2]):
-				ways.append(before)
+				ways.append((before, True))
 	index_of = {row[0]: i for i, row in enumerate(instructions)} \
 		if len(instructions) < 4096 else None
 	for origin in sources.get(address, ()):
 		if index_of is not None:
 			if origin not in index_of:
 				return None
-			ways.append(index_of[origin])
+			ways.append((index_of[origin], False))
 		else:
 			found = address_position(instructions, origin)
 			if found is None:
 				return None
-			ways.append(found)
+			ways.append((found, False))
 	return ways or None
 
 
@@ -4970,7 +4988,7 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 			if ways is None or position in visiting:
 				return None
 			answers = set()
-			for way in ways:
+			for way, inclusive in ways:
 				if way > position or way in visiting:
 					# **A back edge, and `value_survives_loop` already
 					# answers it.** Findings 83 and 84 built that rule for
@@ -4986,8 +5004,9 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 						continue
 					return None
 				answer = reaching_definition(
-					instructions, way + 1, register, blocked, limit,
-					sources, depth - 1, visiting | {position})
+					instructions, way + 1 if inclusive else way, register,
+					blocked, limit, sources, depth - 1,
+					visiting | {position})
 				if answer is None:
 					return None
 				answers.add(answer)
@@ -8951,6 +8970,12 @@ JOIN_CASES = [
 	("the ways disagree, so nothing is decided", False, False, None),
 	("the predecessors are not knowable", True, True, None),
 ]
+# **An UNCONDITIONAL branch predecessor is walked back FROM, not through.**
+# A conditional one is not refused as a control transfer, so it does not
+# discriminate -- the first draft of this case used `je` and passed with the
+# bug restored. `jmp` is the shape that cost 73 of the 248 unresolved
+# sources. Finding 193.
+BRANCH_EDGE_CASE = ("an unconditional branch edge is walked back from", 0)
 
 
 def join_selftest():
@@ -8977,9 +9002,29 @@ def join_selftest():
 			print(f"selftest: {what}: reaching_definition gave {got}, want "
 			      f"{expected}", file=sys.stderr)
 			failures += 1
+	# The branch edge, whose predecessor IS the `je`: the walk must start
+	# behind it and reach the `vpxor`, not stop on it.
+	what, expected = BRANCH_EDGE_CASE
+	rows, at = [], 0x1000
+	for encoding, mnemonic, operands in [
+			(vpxor, "vpxor", "%xmm0,%xmm0,%xmm0"),
+			(bytes.fromhex("eb00"), "jmp", "0x1006"),
+			(b"\x90", "nop", ""), (store, "vmovups", "%ymm0,(%rdi)")]:
+		rows.append((at, encoding, mnemonic, operands, None))
+		at += len(encoding)
+	# The `jmp` is the join's ONLY way in: it does not fall through, so
+	# `predecessors_of` offers the branch edge alone and the case turns
+	# entirely on whether the walk starts on that `jmp` or behind it.
+	join = rows[2][0]
+	got = reaching_definition(rows, 3, "%ymm0", {join},
+	                          sources={join: [rows[1][0]]})
+	if got != expected:
+		print(f"selftest: {what}: reaching_definition gave {got}, want "
+		      f"{expected}", file=sys.stderr)
+		failures += 1
 	if not failures:
-		print(f"selftest: {len(JOIN_CASES)} joins, resolved only where every "
-		      f"way in agrees")
+		print(f"selftest: {len(JOIN_CASES) + 1} joins, resolved only where "
+		      f"every way in agrees")
 	return failures
 
 
