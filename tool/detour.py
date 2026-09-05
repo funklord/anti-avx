@@ -6512,8 +6512,65 @@ def switch_targets(instructions, binary, starts):
 	return found, tables, dispatches
 
 
+# How far back a conservative scan looks for a producer when the walk could
+# not name one. It stops at the first `call` regardless -- the Win64 ABI
+# makes every ymm upper half volatile across one, so nothing before a call
+# can be the producer -- and this is only the ceiling for a stretch with no
+# call in it. Finding 198.
+CONSERVATIVE_LIMIT = 640
+
+
+def conservative_producers(instructions, position, field, patched, inside):
+	"""Sites that could have decided this reader's upper half, or [].
+
+	**For the readers the walk cannot speak for.** `reaching_definitions`
+	returns None for 208 of them -- an indirect entry it cannot enumerate,
+	a call it cannot see through, a join whose ways decide nothing -- and
+	`stale_upper_reads` counts those apart rather than calling them clean,
+	which is right and is where it stopped. Counting a risk is not
+	carrying it.
+
+	So ask the weaker question that can be answered: which sites this
+	rewrite touched COULD be the producer. The Win64 ABI makes every ymm
+	upper half volatile across a call, which is the fact this whole project
+	rests on, so the producer must lie between the reader and the nearest
+	preceding call. Every in-place-patched VEX.128 write to the register in
+	that stretch is a candidate, and every one of them is kept in its VEX
+	form.
+
+	**It does not stop at the nearest write**, because the walk failed
+	exactly where control can arrive by a path that skips one -- that is
+	what a join it could not resolve means. All of them, or none.
+
+	**The span is bounded by a call, not by a function.** A `.pdata` start
+	is not always a function entry in this binary -- chained fragments are
+	settled fact here -- so a per-function scan is narrower than the truth
+	and would under-collect. The ABI bound needs no boundary at all.
+	Finding 198.
+	"""
+	narrow = "%xmm" + field[len("%ymm"):]
+	found = []
+	for step in range(1, CONSERVATIVE_LIMIT + 1):
+		at = position - step
+		if at < 0:
+			break
+		address, encoding, mnemonic, operands, _comment = instructions[at]
+		if mnemonic.startswith("call"):
+			break
+		if not operands:
+			continue
+		wide = inplace.decode_vex(encoding)
+		if wide is None or wide["L"]:
+			continue
+		names = inplace.split_operands(operands)
+		if names and names[-1] in (narrow, field) \
+				and (address in patched or address in inside):
+			found.append(address)
+	return found
+
+
 def stale_upper_reads(instructions, blocked, sources, placed, patched,
-                      reasons=None):
+                      reasons=None, conservative=False):
 	"""[(reader, register, producer)] -- reads of an upper half left stale.
 
 	Asked from the READER's end, because the lowering's end cannot see the
@@ -6535,7 +6592,7 @@ def stale_upper_reads(instructions, blocked, sources, placed, patched,
 	inside = set()
 	for start, length, _stub, _size, _prologue in placed:
 		inside.update(range(start, start + length))
-	found, unknown = [], 0
+	found, unknown, unsure = [], 0, []
 	for position, row in enumerate(instructions):
 		address, encoding, mnemonic, operands, _comment = row
 		if address in inside or not operands:
@@ -6559,6 +6616,10 @@ def stale_upper_reads(instructions, blocked, sources, placed, patched,
 				where = refuse(why, "join cycle escaped")
 			if where is None:
 				unknown += 1
+				if conservative:
+					for producer in conservative_producers(
+							instructions, position, field, patched, inside):
+						unsure.append((address, field, producer))
 				if reasons is not None:
 					# The FIRST entry is the deepest refusal. Later ones are
 					# the same refusal propagating out through the joins
@@ -6580,7 +6641,7 @@ def stale_upper_reads(instructions, blocked, sources, placed, patched,
 				producer = instructions[one][0]
 				if producer in inside or producer in patched:
 					found.append((address, field, producer))
-	return found, unknown
+	return found, unknown, unsure
 
 
 def upper_half_sources(mnemonic, operands):
@@ -8054,6 +8115,7 @@ def selftest():
 	failures += upper_source_selftest()
 	failures += join_selftest()
 	failures += loop_selftest()
+	failures += conservative_selftest()
 	failures += isa_bound_selftest()
 	failures += gpr_selftest()
 	failures += xmm_selftest()
@@ -9467,6 +9529,83 @@ def loop_selftest():
 	return failures
 
 
+CONSERVATIVE_CASES = [
+	("a patched VEX.128 write to the register is a candidate",
+	 False, True, "%ymm0", [0]),
+	("a call between them is not: the ABI makes the upper half volatile",
+	 True, True, "%ymm0", []),
+	("an unpatched write is nothing this rewrite did", False, False,
+	 "%ymm0", []),
+	("a write to another register is not a candidate", False, True,
+	 "%ymm3", []),
+]
+
+
+def conservative_selftest():
+	"""Prove the conservative scan, and its ABI bound. 0 or n.
+
+	**The `call` case is the whole rule.** Without it the scan would run
+	back to the start of the listing and collect writes that cannot
+	possibly be the producer, because every ymm upper half is volatile
+	across a call. Finding 198.
+	"""
+	vpxor = bytes.fromhex("c5f9efc0")
+	wide = bytes.fromhex("c5fc57c0")
+	store = bytes.fromhex("c5fc1107")
+	failures = 0
+	for what, with_call, patch_it, field, expected in CONSERVATIVE_CASES:
+		spec = [(vpxor, "vpxor", "%xmm0,%xmm0,%xmm0")]
+		if with_call:
+			spec.append((bytes.fromhex("e800000000"), "call", "0x100a"))
+		spec.append((store, "vmovups", "%ymm0,(%rdi)"))
+		rows, at = [], 0x1000
+		for encoding, mnemonic, operands in spec:
+			rows.append((at, encoding, mnemonic, operands, None))
+			at += len(encoding)
+		patched = {rows[0][0]} if patch_it else set()
+		got = conservative_producers(rows, len(rows) - 1, field, patched,
+		                             set())
+		want = [rows[i][0] for i in expected]
+		if got != want:
+			print(f"selftest: {what}: conservative_producers gave "
+			      f"{[hex(a) for a in got]}, want {[hex(a) for a in want]}",
+			      file=sys.stderr)
+			failures += 1
+	# **It does not stop at the nearest write.** The walk failed exactly
+	# where control can arrive by a path that skips one, so all of them are
+	# candidates or none is.
+	rows, at = [], 0x1000
+	for encoding, mnemonic, operands in [
+			(vpxor, "vpxor", "%xmm0,%xmm0,%xmm0"),
+			(b"\x90", "nop", ""),
+			(vpxor, "vpxor", "%xmm0,%xmm0,%xmm0"),
+			(store, "vmovups", "%ymm0,(%rdi)")]:
+		rows.append((at, encoding, mnemonic, operands, None))
+		at += len(encoding)
+	got = conservative_producers(rows, 3, "%ymm0",
+	                             {rows[0][0], rows[2][0]}, set())
+	if got != [rows[2][0], rows[0][0]]:
+		print(f"selftest: two writes, both candidates: gave "
+		      f"{[hex(a) for a in got]}", file=sys.stderr)
+		failures += 1
+	# A 256-bit write is never patched in place, so it cannot be one.
+	rows, at = [], 0x1000
+	for encoding, mnemonic, operands in [
+			(wide, "vxorps", "%ymm0,%ymm0,%ymm0"),
+			(store, "vmovups", "%ymm0,(%rdi)")]:
+		rows.append((at, encoding, mnemonic, operands, None))
+		at += len(encoding)
+	got = conservative_producers(rows, 1, "%ymm0", {rows[0][0]}, set())
+	if got:
+		print(f"selftest: a 256-bit write is not a candidate: gave "
+		      f"{[hex(a) for a in got]}", file=sys.stderr)
+		failures += 1
+	if not failures:
+		print(f"selftest: {len(CONSERVATIVE_CASES) + 2} conservative scans, "
+		      f"bounded by the nearest call")
+	return failures
+
+
 def upper_source_selftest():
 	"""Prove the reader rule names sources and not destinations. 0 or n."""
 	failures = 0
@@ -10410,8 +10549,10 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 		keep = [item for item in candidates if item[0] not in dropped]
 		placed, _blob, _swallowed, _over, _refused = place_stubs(
 			keep, stub_base, spill_base, Counter(), home=home, tls=tls)
-		stale, _unresolved = stale_upper_reads(instructions, blocked,
-		                                       sources, placed, patched)
+		stale, _unresolved, unsure = stale_upper_reads(
+			instructions, blocked, sources, placed, patched,
+			conservative=True)
+		stale = stale + unsure
 		covers = {}
 		for site, window, _stub, _size, _prologue in placed:
 			for address in range(site, site + window):
@@ -10453,9 +10594,9 @@ def source_census(binary, listing):
 		tls=tls_pair_of(tls_for(binary)))
 	instructions, _plain, blocked, sources, _tables, _seen = context
 	reasons = []
-	stale, unknown = stale_upper_reads(instructions, blocked, sources, placed,
-	                                   set(row[0] for row in _patches),
-	                                   reasons)
+	stale, unknown, _unsure = stale_upper_reads(
+		instructions, blocked, sources, placed,
+		set(row[0] for row in _patches), reasons)
 	readers = len({reader for reader, _f, _p in stale})
 	print(f"sources: {readers:,} stale reader(s), {unknown:,} unresolved")
 	counted = Counter(reason for (reason, _at), _reader, _field in reasons)
@@ -10970,8 +11111,14 @@ def apply_all(binary, listing, output):
 	# only repair is to leave the VEX form standing: it costs the site and
 	# keeps the bytes right. Reverting cannot cascade, because a 128-bit
 	# write reads no upper half of its own. Finding 187.
-	stale, unresolved = stale_upper_reads(instructions, blocked, sources,
-	                                      placed, set(undo))
+	stale, unresolved, unsure = stale_upper_reads(
+		instructions, blocked, sources, placed, set(undo), conservative=True)
+	# **The conservative rows are repaired exactly like the certain ones.**
+	# A candidate the walk could not rule out is kept in its VEX form, at
+	# the price of the site: `apply` cannot tell the two apart and must not
+	# try. Finding 198.
+	kept = len({producer for _r, _f, producer in unsure})
+	stale = stale + unsure
 	covered = set()
 	for site, window, _stub, _size, _prologue in placed:
 		covered.update(range(site, site + window))
@@ -11007,6 +11154,10 @@ def apply_all(binary, listing, output):
 		print(f"apply: {len(reverted):,} in-place patch(es) reverted, their "
 		      f"zeroing still read by {readers:,} surviving 256-bit "
 		      f"instruction(s)")
+	if kept:
+		print(f"apply: {kept:,} of those are conservative -- a reader the "
+		      f"walk could not resolve, and a patched VEX.128 write to its "
+		      f"register before the nearest call")
 	if unresolved:
 		print(f"apply: {unresolved:,} upper-half source(s) the walk could "
 		      f"not resolve, which this cannot speak for")
@@ -11380,8 +11531,21 @@ def verify(original, patched, listing=None):
 		where = raddr + (row[0] - vaddr)
 		if bytes(b[where:where + len(row[1])]) != row[1]:
 			narrowed_sites.add(row[0])
-	stale, unresolved = stale_upper_reads(instructions, blocked, sources,
-	                                      placed, narrowed_sites)
+	stale, unresolved, unsure = stale_upper_reads(
+		instructions, blocked, sources, placed, narrowed_sites,
+		conservative=True)
+	if unsure:
+		# **A candidate still narrowed in the IMAGE is a repair that did not
+		# happen.** `apply` keeps every one of these in its VEX form; asking
+		# the output whether it did is the same artifact-not-plan rule as
+		# the check below. Finding 198.
+		print(f"verify: FAILED -- {len({p for _r, _f, p in unsure}):,} "
+		      f"conservative candidate(s) were narrowed anyway",
+		      file=sys.stderr)
+		for reader, field, producer in sorted(unsure)[:8]:
+			print(f"    0x{reader:x} reads {field}, could be 0x{producer:x}",
+			      file=sys.stderr)
+		problems += 1
 	if stale:
 		readers = len({reader for reader, _field, _producer in stale})
 		print(f"verify: {readers:,} surviving 256-bit read(s) take an "

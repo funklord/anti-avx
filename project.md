@@ -12407,6 +12407,58 @@ converging on "no definition reaches this point". `detour.py sources` re-derives
 the next reader is not obliged to believe this paragraph.
 
 
+### Finding 198 -- counting a risk is not carrying it
+
+Finding 197 put a floor under the COUNT of readers the walk cannot speak for -- 208, of which
+181 are architectural -- and stopped there, which is where this project has stopped every time
+it has met that number since Finding 186. `stale_upper_reads` reports them apart rather than
+folding them into a pass, and that is honest, and it leaves 208 readers whose upper half
+nothing vouches for.
+
+**So ask the weaker question that can be answered.** Not "what decided this reader's upper
+half", which is the question that fails, but "which sites this rewrite touched COULD have".
+Every in-place-patched VEX.128 write to the register between the reader and the nearest
+preceding call is a candidate, and every candidate keeps its VEX form.
+
+**The bound is the ABI, and that choice is the finding.** The first version was priced against
+`.pdata` spans -- 225 patches over 236,427 function starts, with 108 of the 208 readers having
+no candidate at all. It was replaced before it was built, because **a `.pdata` start is not a
+function entry in this binary**: chained fragments are settled fact here, so a per-function
+scan is NARROWER than the truth and would under-collect, which is the unsound direction. The
+Win64 rule that every ymm upper half is volatile across a call needs no boundary at all, and
+it is the fact this whole project rests on.
+
+**It does not stop at the nearest write**, because the walk failed exactly where control can
+arrive by a path that skips one -- that is what an unresolved join means. All of them, or none.
+
+```
+                                    before    after
+windows withheld                         9      141
+in-place patches reverted               53      184     131 of them conservative
+surviving VEX in .text               5,782    6,049     +267
+unresolved sources                     208      208     unchanged, by design
+stale reads left in the IMAGE            0        0
+```
+
+**267 sites, 4.6% of the frontier, and the frontier is the right thing to spend.** This
+project's currency ordering says wrong bytes removed outranks sites lowered, and this is the
+first time that ordering has cost anything worth noticing. 99.2% of the VEX is still gone.
+
+**The pricing run reported a clean zero first, and it was the instrument.** `groups.get("pdata")`
+against a dictionary whose key is `"pdata (function starts)"` returned an empty set, every
+reader fell into `no function`, and the cost printed as **0** -- which for a rule that KEEPS
+sites reads as "free". Two things caught it: the per-reader histogram beside the total said
+`{'no function': 208}`, and zero was too good for the shape of the rule. The re-run refuses to
+start when the start list is empty, so the same failure cannot present as a measurement twice.
+That is *a failing check is not evidence either*, met in the one direction that flatters the
+person running it.
+
+**And `verify` asks the image whether the repair happened**, rather than trusting that `apply`
+meant to: a conservative candidate still narrowed in the output is a failure with its reader
+and its candidate named. Same rule as Finding 187's -- check the artifact, not a fresh
+measurement of where it came from.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12421,16 +12473,24 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| - | ~~The 208 readers the gate cannot speak for~~ **CARRIED** | 131 conservative reverts, 132 more windows withheld, +267 frontier | wrong bytes | Finding 198: still unresolved, but every site that could have decided them keeps its VEX form |
+| 1 | A census of the 6,049 surviving VEX | unknown | sites | never taken; the source census found 77 of 257 to be a knob, and nobody has asked the same of the frontier |
 | - | ~~F2 and F3~~ **DONE** | 118 sources resolved, 20 more stale readers, 19 reverts | wrong bytes | Finding 194: and the set-valued walk exposed a repair loop that closed one path of a join and left the other |
 | - | ~~The loop-aware back-edge rule~~ **DONE** | 228 resolved, 9 more stale readers | wrong bytes | Finding 195: the fixpoint it wanted, and the skip is now a sabotage case |
 | - | ~~The 164 branch-target regions~~ **CLOSED at 0** | 0 emitted, 0 sites | sites | Finding 192: 21 representable of an estimated 74, none emitted, and the rule could not have been sound |
 | - | ~~The residual unresolved sources~~ **AT THE FLOOR** | 257 -> 208; 181 architectural, 27 honest | wrong bytes | Finding 197: the quoted floor was wrong on both halves, and 77 of it was `depth=4`. Re-derive with `detour.py sources` |
 | - | ~~A gate that runs `detour.py verify`~~ **DONE** | 35 fixtures, 2 controls | robustness | Finding 196: and two of its checks only worked on the one image it had been pointed at |
 
-**The head is still in the currency that outranks.** Item 3 is the
-largest number on the page and sits third because its currency is weaker AND its figure is a
-representability count, which this project has learned is not a gain -- Finding 179 measured a
-shape covering 66 sites that was worth 21.
+**The one open row carries "unknown", and that is the honest state after a day of closing
+things.**
+Neither may be attacked before it is priced -- the list's own rule, and the last three findings
+are what it cost to learn: 77 of a quoted floor was a constant in this file, a 34-stale-read
+ladder was measured against a contract that could not express half of it, and an item ranked
+at 41 reachable sources was ranked on numbers taken when the total was something else.
+
+**The wrong-bytes currency is empty for the first time since Finding 185**, which is why a
+sites row is at the head. That is not a promotion: it means every reader the gate can see is
+repaired and every reader it cannot see is carried, so what is left to gain is sites.
 
 **Closed, and recorded so they are not re-opened:** the region's remaining shapes (Finding 179,
 8/0/0 regions), the 84-site overlap bucket (181-183, all recovered), the switch-table work
@@ -12444,7 +12504,7 @@ Ordered by what was measured. **Rewritten after Findings 179-187**, which closed
 previous list and replaced its subject: the remaining work is no longer about lowering more
 sites but about the ones already lowered being right.
 
-The frontier is **5,782 surviving VEX of 805,131, 99.3% removed**. It has RISEN seven times
+The frontier is **6,049 surviving VEX of 805,131, 99.2% removed**. It has RISEN eight times
 today and every rise was a correctness fix -- 467 region lowerings, 24 long-pair stores, 78
 stale reads across four strategies, the in-place patches of Finding 187, and the 11 and 2 sites
 Findings 194 and 195 keep in their VEX form. A count that only falls is a count nobody is
