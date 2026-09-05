@@ -6371,6 +6371,14 @@ def switch_targets(instructions, binary, starts):
 
 	found = set()
 	tables = 0
+	# **Dispatches recognised, which is a different question from tables
+	# read.** A resolver that has broken still recognises the dispatch --
+	# Finding 174's doubled base found every one of them and then read
+	# noise out of the table -- so "no tables" means the resolver where a
+	# dispatch exists, and means nothing at all where none does. Counting
+	# both is what lets `verify` tell a broken read from a binary with no
+	# switch statement in it. Finding 196.
+	dispatches = 0
 	# **A sliding window, not a list.** A dispatch spans at most
 	# `SWITCH_BACK` instructions, so that is all this needs to remember --
 	# and `verify` hands it the listing's own generator. Materialising the
@@ -6387,6 +6395,7 @@ def switch_targets(instructions, binary, starts):
 		offset = switch_dispatch(window)
 		if offset is None:
 			continue
+		dispatches += 1
 		where = at(base + offset)
 		if where is None:
 			continue
@@ -6403,7 +6412,7 @@ def switch_targets(instructions, binary, starts):
 		if len(entries) >= 2:
 			found.update(entries)
 			tables += 1
-	return found, tables
+	return found, tables, dispatches
 
 
 def stale_upper_reads(instructions, blocked, sources, placed, patched):
@@ -6551,7 +6560,8 @@ def analysis_context(binary, listing):
 	# noise; 12,869 real switch targets were absent from `blocked`
 	# entirely, 147 of them with nothing else shielding them. Finding 174.
 	starts = {a for a, *_rest in instructions}
-	switched, switch_tables = switch_targets(instructions, binary, starts)
+	switched, switch_tables, _dispatches = switch_targets(
+		instructions, binary, starts)
 	fresh = switched - blocked
 	blocked |= switched
 	# **Said out loud, because a count nobody prints cannot be checked.**
@@ -7703,6 +7713,29 @@ def tls_directory(data):
 			offset = raddr + (rva - vaddr)
 			return offset, struct.unpack_from(TLS_FIELDS, data, offset)
 	return None
+
+
+def tls_directory_span(data):
+	"""`(first VA, last VA + 1)` of the TLS directory, or None.
+
+	**Data inside `.text` that this rewrite deliberately edits.** `verify`
+	compares instruction boundaries before and after, and a linear sweep
+	decodes the directory's bytes as instructions like anything else -- so
+	raising `SizeOfZeroFill`, which `verify` sanctions two checks earlier,
+	re-synchronises the sweep and three boundaries that were never
+	instructions vanish. Two of the 35 PE fixtures put their TLS directory
+	in `.text` and both failed on it. Finding 196.
+	"""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	opt = pe + 24
+	count = struct.unpack_from("<I", data, opt + 108)[0]
+	if count <= TLS_DIRECTORY:
+		return None
+	rva, size = struct.unpack_from("<II", data, opt + 112 + TLS_DIRECTORY * 8)
+	if not rva or size < struct.calcsize(TLS_FIELDS):
+		return None
+	base = struct.unpack_from("<Q", data, opt + 24)[0]
+	return base + rva, base + rva + struct.calcsize(TLS_FIELDS)
 
 
 def tls_slot(data, want=SLOT):
@@ -10123,8 +10156,70 @@ def main(argv):
 	if mode == "verify":
 		return verify(argv[1], argv[2], argv[3] if len(argv) > 3 else None)
 
+	if mode == "sabotage":
+		return sabotage(argv[1], argv[2], argv[3])
+
 	print(f"detour.py: unknown mode {mode!r}", file=sys.stderr)
 	return 2
+
+
+SABOTAGE = {
+	# name: (which check must reject it, what is broken)
+	"stubvex": "the stub section holds no VEX",
+	"section": "every section after .text is byte-identical",
+}
+
+
+def sabotage(patched, output, kind):
+	"""Write a deliberately broken copy of a rewritten image. 0, or 2.
+
+	**A verifier nobody has watched fail is a green light.** Finding 188's
+	`verify` rebound its own parameter, raised `TypeError`, and aborted
+	before its last two checks -- and no gate noticed, because nothing ran
+	it. `make check-verify` runs it over all 35 PE fixtures now, and this
+	is what stops that being 35 vacuous passes.
+
+	The two kinds are chosen for WHERE they fail, not for what they break.
+	`section` trips an early check and `stubvex` trips one of the last, so
+	a `verify` that dies in the middle passes neither -- which is exactly
+	the failure that shipped. Finding 196.
+	"""
+	if kind not in SABOTAGE:
+		print(f"detour.py: unknown sabotage {kind!r}, want one of "
+		      f"{', '.join(sorted(SABOTAGE))}", file=sys.stderr)
+		return 2
+	data = bytearray(open(patched, "rb").read())
+	if kind == "stubvex":
+		# `c5 fc 10 06` is `vmovups (%rsi),%ymm0` -- a VEX prefix in the one
+		# section this whole rewrite exists to keep free of them.
+		found = section_named(bytes(data), SECTION_NAME)
+		if found is None:
+			print("detour.py: no stub section to sabotage", file=sys.stderr)
+			return 2
+		_vaddr, _vsize, raddr, rsize = found
+		if rsize < 4:
+			print("detour.py: stub section is too small to sabotage",
+			      file=sys.stderr)
+			return 2
+		data[raddr:raddr + 4] = bytes.fromhex("c5fc1006")
+	else:
+		# Any section after `.text`: the check is about all of them, and the
+		# fixtures do not all carry the same ones. The stub section is
+		# skipped because it is APPENDED rather than carried over, so it is
+		# not one of the sections that must be byte-identical.
+		stub = section_named(bytes(data), SECTION_NAME)
+		after = [(r, rs) for _v, _vs, r, rs in sections_of(bytes(data))[1:]
+		         if rs and not (stub and r == stub[2])]
+		if not after:
+			print("detour.py: no section after .text to sabotage",
+			      file=sys.stderr)
+			return 2
+		raddr, _rsize = after[0]
+		data[raddr] ^= 0xFF
+	with open(output, "wb") as image:
+		image.write(bytes(data))
+	print(f"sabotage: {kind} -- {SABOTAGE[kind]} must now be false")
+	return 0
 
 
 def tls_pair_of(found):
@@ -10886,6 +10981,21 @@ def verify(original, patched, listing=None):
 		reachable |= values
 
 	unexplained = lost - swallowed
+	# **A boundary inside the TLS directory is not a boundary.** The
+	# directory is data, it sits in `.text` in some images, and this rewrite
+	# raises its `SizeOfZeroFill` on purpose -- so the sweep decodes those
+	# bytes differently afterwards and reports lost instructions that never
+	# existed. Excluding the structure the PE header names is exact; an
+	# ignore list of the three addresses would not be. Finding 196.
+	span = tls_directory_span(open(original, "rb").read())
+	if span and unexplained:
+		low, high = span
+		inside_tls = {a for a in unexplained if low <= a < high}
+		if inside_tls:
+			print(f"verify: {len(inside_tls):,} lost boundary/ies are inside "
+			      f"the TLS directory at 0x{low:x}, which is data this "
+			      f"rewrite edits on purpose")
+			unexplained = unexplained - inside_tls
 	if unexplained:
 		print(f"verify: FAILED -- {len(unexplained):,} boundaries lost that "
 		      f"were not swallowed on purpose", file=sys.stderr)
@@ -11020,7 +11130,7 @@ def verify(original, patched, listing=None):
 	# same independent question can now be asked of them: an address a
 	# switch table names in the ORIGINAL must still begin an instruction in
 	# the rewritten binary. Finding 177.
-	resolved, resolved_tables = switch_targets(
+	resolved, resolved_tables, dispatches = switch_targets(
 		inplace.parse_listing(listing), original, before_bounds)
 	inside_switch = {a for a in resolved
 	                 if vaddr <= a < vaddr + size and a in before_bounds}
@@ -11031,7 +11141,7 @@ def verify(original, patched, listing=None):
 		for address in sorted(broken_switch)[:8]:
 			print(f"    0x{address:x}", file=sys.stderr)
 		problems += 1
-	elif not resolved_tables:
+	elif not resolved_tables and dispatches:
 		# **A floor, because this check passes loudest when it inspects
 		# nothing.** With no tables resolved, `inside_switch` is empty,
 		# `broken_switch` is empty, and the line below would read "all 0
@@ -11039,11 +11149,23 @@ def verify(original, patched, listing=None):
 		# clean pass over nothing, which is the defect an audit had just
 		# reported in `check-isa` and which this session then reproduced:
 		# an image base added twice made `switch_targets` return zero for
-		# a whole build, and the totals looked neutral. A binary with no
-		# switch statement at all is not one this verifier is pointed at.
-		print("verify: FAILED -- no switch tables resolved, so no indirect "
-		      "target was checked", file=sys.stderr)
+		# a whole build, and the totals looked neutral.
+		#
+		# **The floor asks about DISPATCHES, not about the binary.** It
+		# said "a binary with no switch statement at all is not one this
+		# verifier is pointed at", which was true only while the verifier
+		# was pointed at one binary. Pointing it at the 35 PE fixtures --
+		# which is the whole of the gate that now runs it -- makes every
+		# one of them fail a check about a construct they do not contain.
+		# A broken resolver still recognises the dispatch and reads noise
+		# from the table, so dispatches without tables is the resolver and
+		# no dispatches is an honest nothing. Finding 196.
+		print(f"verify: FAILED -- {dispatches:,} switch dispatch(es) "
+		      f"recognised and no table resolved", file=sys.stderr)
 		problems += 1
+	elif not dispatches:
+		print("verify: no switch dispatch in this image, so there is no "
+		      "indirect target to check")
 	else:
 		print(f"verify: all {len(inside_switch):,} switch targets from "
 		      f"{resolved_tables:,} tables still begin an instruction")

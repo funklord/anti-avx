@@ -67,7 +67,8 @@ GENERATED  = $(BUILD_DIR)/lowering_cases.s $(BUILD_DIR)/lowering_cases.inc
 TEST_BIN   = $(BUILD_DIR)/f16c_test
 DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
-.PHONY: all test check style style-source style-docs verify check-f16c \
+.PHONY: all test check style style-source style-docs verify check-verify \
+        check-f16c \
         check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
         check-isa \
         scan report \
@@ -93,8 +94,8 @@ all: check
 test: check-aliasing check-lowering check-f16c check-fmaddsub \
       check-permil check-permd
 
-check: style verify check-aliasing check-lowering check-isa check-f16c \
-       check-f16c-oracle check-fmaddsub check-permil check-permd
+check: style verify check-verify check-aliasing check-lowering check-isa \
+       check-f16c check-f16c-oracle check-fmaddsub check-permil check-permd
 
 style: style-source style-docs
 
@@ -565,6 +566,67 @@ $(BUILD_DIR)/sse-%.exe: $(BUILD_DIR)/pe-%.exe $(BUILD_DIR)/pe-%.asm \
 	$(PYTHON) tool/detour.py apply $(BUILD_DIR)/pe-$*.exe \
 	          $(BUILD_DIR)/pe-$*.asm $@
 
+# Run the verifier, which until now nothing did. `detour.py verify` is the
+# only check that reads the rewritten IMAGE rather than the plan, and it is
+# what found the five wrong readers of Finding 194 -- so it was the one
+# check no gate ran, and a crash in it shipped green for a whole session
+# (Finding 188). It needs no game binary: every PE fixture is an original,
+# a rewrite and a listing, which is exactly its three arguments.
+#
+# **The controls are the point, not the 35 passes.** A verifier nobody has
+# watched fail is a green light, and two of these checks had been dead --
+# one to a rebound name, one to a `TypeError` that aborted the run before
+# its last two checks. So one fixture is deliberately broken twice: once in
+# a way an EARLY check must catch and once in a way one of the LAST checks
+# must catch, and each is required to fail with the words of the check that
+# owns it. A `verify` that dies in the middle passes neither.
+#
+# Termination: one bounded invocation per fixture, plus two, each under a
+# timeout, over a fixed list. Output goes to a file per fixture and is read
+# from there -- never piped, so a failure keeps everything it printed.
+check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
+	@set -e; \
+	ran=0; \
+	for name in $(PE_NAMES); do \
+		if timeout 300 $(PYTHON) tool/detour.py verify \
+			$(BUILD_DIR)/pe-$$name.exe $(BUILD_DIR)/sse-$$name.exe \
+			$(BUILD_DIR)/pe-$$name.asm \
+			> $(BUILD_DIR)/verify-$$name.log 2>&1; then \
+			ran=`expr $$ran + 1`; \
+		else \
+			echo "check-verify: FAILED on $$name"; \
+			cat $(BUILD_DIR)/verify-$$name.log; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "check-verify: the verifier passed on $$ran rewritten fixtures"
+	@set -e; \
+	for kind in stubvex section; do \
+		$(PYTHON) tool/detour.py sabotage $(BUILD_DIR)/sse-ymm.exe \
+			$(BUILD_DIR)/bad-$$kind.exe $$kind; \
+		if timeout 300 $(PYTHON) tool/detour.py verify \
+			$(BUILD_DIR)/pe-ymm.exe $(BUILD_DIR)/bad-$$kind.exe \
+			$(BUILD_DIR)/pe-ymm.asm \
+			> $(BUILD_DIR)/verify-bad-$$kind.log 2>&1; then \
+			echo "check-verify: the $$kind control PASSED verify, so the"; \
+			echo "              35 results above mean nothing"; \
+			exit 1; \
+		fi; \
+	done
+	@set -e; \
+	grep -q "1 VEX instructions (must be 0)" \
+		$(BUILD_DIR)/verify-bad-stubvex.log || \
+		{ echo "check-verify: the stubvex control failed, but not through"; \
+		  echo "              the stub-section check -- so verify may have"; \
+		  echo "              died before reaching it, which is the defect"; \
+		  echo "              this control exists for"; exit 1; }
+	@set -e; \
+	grep -q "sections after .text changed" \
+		$(BUILD_DIR)/verify-bad-section.log || \
+		{ echo "check-verify: the section control failed, but not through"; \
+		  echo "              the section-identity check"; exit 1; }
+	@echo "check-verify: both controls rejected, each by its own check"
+
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
 # own expected answer.
@@ -851,6 +913,10 @@ clean:
 	      $(BUILD_DIR)/icache_bench \
 	      $(BUILD_DIR)/after.asm $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm \
 	      $(BUILD_DIR)/isa-disasm.txt $(BUILD_DIR)/region-refused.txt \
+	      $(BUILD_DIR)/bad-stubvex.exe $(BUILD_DIR)/bad-section.exe \
+	      $(PE_NAMES:%=$(BUILD_DIR)/verify-%.log) \
+	      $(BUILD_DIR)/verify-bad-stubvex.log \
+	      $(BUILD_DIR)/verify-bad-section.log \
 	      $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@# The wine prefix is a directory this build created, so it goes

@@ -12281,6 +12281,53 @@ wrong because of it, which is the point: it was found by asking what the new ret
 mean and not by anything going red.
 
 
+### Finding 196 -- the verifier now runs in the gate set, and it had to be made portable first
+
+`detour.py verify` is the only check that reads the rewritten IMAGE rather than the plan. It
+found the five wrong readers of Finding 194, and it was the one check nothing in `make check`
+ran -- so when Finding 188's rebound name made it raise `TypeError` and abort before its last
+two checks, every gate stayed green for a session.
+
+`make check-verify` runs it over all 35 PE fixtures. Each is an original, a rewrite and a
+listing, which is exactly its three arguments, so it needs no game binary and no wine.
+
+**Two of its checks had to be fixed first, and both are the same shape: a passing condition
+that encoded an assumption about the one image it had ever been pointed at.**
+
+  * **The switch-table floor failed all 35.** It read "no tables resolved" as "the resolver is
+    broken" -- Finding 174's guarantee, and worth keeping -- and its own comment said "a binary
+    with no switch statement at all is not one this verifier is pointed at". True, while it was
+    pointed at one binary. It counts DISPATCHES recognised separately from TABLES read now:
+    dispatches with no tables is the resolver, and no dispatches is an honest nothing. The
+    guarantee survives intact, because a resolver with a doubled base still recognises every
+    dispatch and then reads noise out of the table -- which is exactly what Finding 174 was.
+  * **Two fixtures failed on lost boundaries, and the cause was another check's sanctioned
+    change.** `tlsspill` and `spanblock` keep their TLS directory inside `.text`; the boundary
+    comparison is a linear sweep, so it decodes those bytes as instructions; and raising
+    `SizeOfZeroFill` -- which `verify` announces as intended two checks earlier -- re-syncs the
+    sweep so three "boundaries" that were never instructions disappear. It excludes the
+    structure the PE header names. An ignore list of the three addresses would have passed the
+    same fixtures and taught nothing.
+
+**The controls are the point, not the 35 passes.** One fixture is broken twice by
+`detour.py sabotage`: `section` trips an early check, `stubvex` trips the last one. Each must
+fail with THE WORDS OF THE CHECK THAT OWNS IT, so a `verify` that dies in the middle passes
+neither -- which is how 188 shipped. Both were watched failing in both directions: handed an
+un-sabotaged image the control step reports the control passed and the gate exits 1, and the
+grep half refuses a failure that is not its own failure.
+
+**And the same defect was written into the gate built to catch it.** The `sabotage` helper
+defined a second `section_named`, returning a 2-tuple where the existing one 2,700 lines above
+returns 4. Python took the later definition, `verify` crashed on an unrelated unpack, and both
+controls "failed" -- rc 1, which is what the gate asks for. **Checking the exit status alone
+would have recorded a working control.** What caught it was grepping for the check's own words,
+which is the same instrument this file has been reaching for since Finding 111: read what
+happened, not whether something happened.
+
+That is now the third instance of a rebound name in this file -- `entries` in Finding 175,
+`patched` in 188, `section_named` here -- and the third was written while reading the second.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12298,8 +12345,8 @@ a binary that computes the wrong answer.
 | - | ~~F2 and F3~~ **DONE** | 118 sources resolved, 20 more stale readers, 19 reverts | wrong bytes | Finding 194: and the set-valued walk exposed a repair loop that closed one path of a join and left the other |
 | - | ~~The loop-aware back-edge rule~~ **DONE** | 228 resolved, 9 more stale readers | wrong bytes | Finding 195: the fixpoint it wanted, and the skip is now a sabotage case |
 | - | ~~The 164 branch-target regions~~ **CLOSED at 0** | 0 emitted, 0 sites | sites | Finding 192: 21 representable of an estimated 74, none emitted, and the rule could not have been sound |
-| 2 | The residual 257 unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable; 346 of the old 603 were closed by Findings 194 and 195 |
-| 1 | A gate that runs `detour.py verify` | 0 today | robustness | structural: a crash there shipped green, and Finding 194 shipped 5 wrong readers that only `verify` could see |
+| 1 | The residual 257 unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable; 346 of the old 603 were closed by Findings 194 and 195 |
+| - | ~~A gate that runs `detour.py verify`~~ **DONE** | 35 fixtures, 2 controls | robustness | Finding 196: and two of its checks only worked on the one image it had been pointed at |
 
 **The head is still in the currency that outranks.** Item 3 is the
 largest number on the page and sits third because its currency is weaker AND its figure is a
