@@ -13804,3 +13804,27 @@ grep -cP "\tv[a-z0-9]+ " sf.asm                    # VEX total
 grep -cP "\tv[a-z0-9]+ .*ymm" sf.asm               # 256-bit
 grep -oP "\tv[a-z0-9]+ " sf.asm | sort | uniq -c | sort -rn   # inventory
 ```
+
+## Shared tooling: the commit-msg hook's fourth spared name
+
+Recorded because this tree was one of the last to take it and nobody
+here was reachable to be told: the shared commit-msg hook gained a
+fourth spared name on 2026-09-05, and `tool/hooks/commit-msg` carries
+it as of fbbd7f2.
+
+The hook substitutes a fixed set of names before its vendor check, and
+the per-uid session scratch directory under /tmp was not among them --
+so a commit recording which directory had filled a disk could not name
+the path, and the message had to describe it instead. That is the
+argument the third exemption already makes, arriving for a fourth name;
+the copyright holder settled it after it was filed as a signal.
+
+**It can only loosen the check.** Nothing that passed before is refused
+now, so nothing in this tree's history or habits changes. The
+attribution rule is untouched and cannot be reached from the scrub: that
+check reads the raw message rather than the scrubbed prose, which the
+source's suite now asserts with a control that fails when the scrub is
+widened.
+
+`make hooks` has been run here, so the installed hook under `.git` is
+the new one rather than only the tracked copy.
