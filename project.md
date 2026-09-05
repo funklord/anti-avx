@@ -12146,6 +12146,80 @@ run passed. Only an unconditional `jmp`, as the sole way into the join, discrimi
 that cannot fail is not a case -- Finding 111, met again in the test written to close it.
 
 
+### Finding 194 -- the set-valued walk, and the repair loop that was written for a single value
+
+F2 and F3 from Finding 193's ladder, built together with the reporting defect they exposed.
+
+**F3 changes what the walk answers.** `reaching_definition` returned one position and refused
+when the ways into a join disagreed; `reaching_definitions` returns the SET the ways reach, and
+the old name is now a wrapper handing back the single element when there is exactly one. That
+keeps `zeroed_ymm` and `constant_ymm` on the contract they have always had -- both ask "is this
+value a zero / a known constant", and disagreement is correctly no answer. `stale_upper_reads`
+asks a different question, "is ANY of these a site this rewrite touched", and the set is what
+answers it.
+
+**F2 removes a special case that was not one.** The walk refused outright when the reader's own
+address was a branch target, unless `value_survives_loop` rescued it. The ways into that
+address are enumerable or they are not, exactly as one line further down; where they are, the
+answer is the union over them.
+
+```
+                                    before    after
+unresolved upper-half sources          603      485    -118
+in-place patches reverted               30       49     +19
+stale readers found at apply time       32       52     +20
+surviving VEX in .text               5,758    5,769     +11
+stale reads left in the IMAGE            0        0
+```
+
+The frontier rises for the fifth time and again because a correctness gate got sharper: eleven
+sites keep their VEX form rather than being lowered wrongly.
+
+**And the first build of it shipped five wrong readers, which is the part worth keeping.** At
+45 reverts and 5,765 surviving, `verify` found
+5 surviving 256-bit reads of an upper half this rewrite left stale, where the residual has been
+0 since Finding 187. All five producers are `vpxor %xmm0,%xmm0,%xmm0` patched to `pxor`, which
+stops zeroing bits 255:128.
+
+**The cause is F3's own consequence.** `stale_upper_reads` named the FIRST rewritten producer
+in the set and stopped. `apply` repairs a reader by reverting the producer it is handed, so it
+reverted the producer on one path and left the other patched. A join reaching two definitions
+has two ways to be stale and the repair only ever closed one.
+
+**What made it legible was that the two reports were disjoint.**
+
+```
+patches 547,716   narrowed 547,671   placed 202,622    (the difference IS the 45 reverted)
+apply-inputs   52 stale
+verify-inputs   5 stale
+only in verify: 5    only in apply: 52    shared: 0
+```
+
+`verify`'s patch set is `apply`'s minus the reverted 45, so `apply` sees a superset of the
+inputs and must find a superset of the defects. Two disjoint results over a superset and its
+subset are impossible unless the REPORTED PRODUCER MOVES -- which is what `break` did. Same
+readers, seen through different definitions. With every rewritten producer reported the sets
+nest as they should: `apply` 57, `verify` 5, and nothing only in `verify`.
+
+**The generalisation, which is bigger than this rewriter.** An analysis that becomes set-valued
+does not break its consumers loudly. A consumer that reads one element and acts on it goes on
+compiling, goes on passing, and under-repairs by exactly the elements it never looked at. The
+guard here reported honestly at every step -- 52 found, 45 reverted -- and the arithmetic
+between those two numbers was the whole defect, visible nowhere. **When a value becomes plural,
+every consumer that acts on it is a site, not just every consumer that type-errors.**
+
+**`apply` now says when it cannot repair one.** A stale read whose producer is not an in-place
+patch has nothing on disk to put back, and silence there would be the same defect wearing the
+other hat. It reports zero today; the check exists so that the next one speaks.
+
+**The three new selftest cases each had to be shown failing.** Restoring `answers.pop() if
+len(answers) == 1` makes the disagreeing join answer None; restoring the top-of-function refusal
+makes the reader-is-a-branch-target case answer None. The third is F2's own negative control --
+the same reader with unknowable predecessors must still refuse -- without which the F2 clause
+would pass by answering every blocked reader from its fall-through alone, which is U1's
+unsoundness pointed at a different address.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12160,13 +12234,13 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | F2 and F3: the reader's own blocked address, and keeping the set when ways disagree | 34 more stale reads (32 -> 66) | wrong bytes | Finding 193 measured the full ladder; F3 needs `reaching_definition` to return a set |
-| 2 | The loop-aware back-edge rule | 10 more stale reads, 185 more resolved | wrong bytes | measured, but wants a fixpoint before it may gate |
+| - | ~~F2 and F3~~ **DONE** | 118 sources resolved, 20 more stale readers, 19 reverts | wrong bytes | Finding 194: and the set-valued walk exposed a repair loop that closed one path of a join and left the other |
+| 1 | The loop-aware back-edge rule | 10 more stale reads, 185 more resolved | wrong bytes | measured, but wants a fixpoint before it may gate |
 | - | ~~The 164 branch-target regions~~ **CLOSED at 0** | 0 emitted, 0 sites | sites | Finding 192: 21 representable of an estimated 74, none emitted, and the rule could not have been sound |
-| 4 | The residual unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable |
-| 5 | A gate that runs `detour.py verify` | 0 today | robustness | structural: a crash there shipped green |
+| 2 | The residual 485 unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable; 118 of the old 603 were closed by Finding 194 |
+| 3 | A gate that runs `detour.py verify` | 0 today | robustness | structural: a crash there shipped green, and Finding 194 shipped 5 wrong readers that only `verify` could see |
 
-**Items 1-2 are the head because they are in the currency that outranks.** Item 3 is the
+**The head is still in the currency that outranks.** Item 3 is the
 largest number on the page and sits third because its currency is weaker AND its figure is a
 representability count, which this project has learned is not a gain -- Finding 179 measured a
 shape covering 66 sites that was worth 21.
@@ -12183,12 +12257,13 @@ Ordered by what was measured. **Rewritten after Findings 179-187**, which closed
 previous list and replaced its subject: the remaining work is no longer about lowering more
 sites but about the ones already lowered being right.
 
-The frontier is **5,758 surviving VEX of 805,131, 99.3% removed**. It has RISEN four times
+The frontier is **5,769 surviving VEX of 805,131, 99.3% removed**. It has RISEN five times
 today and every rise was a correctness fix -- 467 region lowerings, 24 long-pair stores, 78
-stale reads across four strategies, and the in-place patches of Finding 187. A count that only
-falls is a count nobody is checking.
+stale reads across four strategies, the in-place patches of Finding 187, and the 11 sites
+Finding 194's sharper walk keeps in their VEX form. A count that only falls is a count nobody
+is checking.
 
-  1. **The 733 unresolved upper-half sources, which is the honest gap.** `verify`'s stale-read
+  1. **The 485 unresolved upper-half sources, which is the honest gap.** `verify`'s stale-read
      check reports them rather than counting them clean, and cannot speak for them:
      `reaching_definition` refuses when a branch target intervenes, and 699 surviving readers
      have a source it will not resolve. Three of the four readers Finding 185 found by hand

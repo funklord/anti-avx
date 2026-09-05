@@ -4856,6 +4856,25 @@ def address_position(instructions, address):
 
 def reaching_definition(instructions, index, register, blocked, limit=640,
                         sources=None, depth=4, visiting=frozenset()):
+	"""The single position `register`'s value was decided at, or None.
+
+	A wrapper on `reaching_definitions`, which answers with the SET of
+	positions the ways into a join reach. A caller wanting one answer --
+	`zeroed_ymm` asking whether the value is a zeroing idiom,
+	`constant_ymm` asking where a constant came from -- gets one only when
+	the ways agree, which is the conservative reading and what both have
+	always had. `stale_upper_reads` wants the set, because its question is
+	"is ANY of them a site this rewrite touched". Finding 194.
+	"""
+	found = reaching_definitions(instructions, index, register, blocked,
+	                             limit, sources, depth, visiting)
+	if found is None or len(found) != 1:
+		return None
+	return next(iter(found))
+
+
+def reaching_definitions(instructions, index, register, blocked, limit=640,
+                         sources=None, depth=4, visiting=frozenset()):
 	"""Where `register`'s value at `index` was decided, or None.
 
 	Returns the position of the nearest instruction that writes it. Sound
@@ -4914,9 +4933,28 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 	# was posed -- and the fall-through way re-enters at the join itself.
 	# Finding 190.
 	if not visiting and instructions[index][0] in blocked:
+		# **The reader's own address is a join like any other.** This
+		# refused outright unless `value_survives_loop` rescued it, which
+		# left 95 of the 248 unresolved sources -- 18 of them real stale
+		# reads -- for want of asking the same question one line lower
+		# down asks. The ways in are enumerable or they are not; where
+		# they are, the answer is the union over them. Finding 194.
 		if not value_survives_loop(instructions, index, register, blocked,
 		                           sources):
-			return None
+			ways = predecessors_of(instructions, index, sources)
+			if ways is None:
+				return None
+			answers = set()
+			for way, inclusive in ways:
+				if way >= index or way in visiting:
+					return None
+				answer = reaching_definitions(
+					instructions, way + 1 if inclusive else way, register,
+					blocked, limit, sources, depth - 1, visiting | {index})
+				if answer is None:
+					return None
+				answers |= answer
+			return answers or None
 	narrow = "%xmm" + register[len("%ymm"):]
 	for step in range(1, limit + 1):
 		position = index - step
@@ -4936,7 +4974,7 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 			# reaches have one between the idiom and the store, because MSVC
 			# emits `vzeroupper` before a call or a return and the walk stops
 			# at either.
-			return position
+			return {position}
 		if narrow in operands or register in operands:
 			# In AT&T the destination is the last operand, and the one family
 			# that writes a non-last one is `vgather*`, which zeroes its mask.
@@ -4950,7 +4988,7 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 				# recursion tested `blocked` before looking at the write,
 				# which for a target that writes the register would have
 				# answered about the value BEFORE it. Finding 84.
-				return position
+				return {position}
 		if address in blocked:
 			# **A branch target is only opaque if the value AT it is.** The
 			# refusal here says another path reaches this point without
@@ -5003,14 +5041,20 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 					                       blocked, sources):
 						continue
 					return None
-				answer = reaching_definition(
+				answer = reaching_definitions(
 					instructions, way + 1 if inclusive else way, register,
 					blocked, limit, sources, depth - 1,
 					visiting | {position})
 				if answer is None:
 					return None
-				answers.add(answer)
-			return answers.pop() if len(answers) == 1 else None
+				answers |= answer
+			# **The set, not one of it.** The ways into a join may reach
+			# different definitions and that is an answer, not a refusal:
+			# `stale_upper_reads` asks whether ANY of them is a site this
+			# rewrite touched, and refusing on disagreement hid 128 of the
+			# 248 unresolved sources. A caller needing one answer gets None
+			# from the `reaching_definition` wrapper. Finding 194.
+			return answers
 		# A pure source, or no mention at all: the value is unchanged.
 	return None
 
@@ -6306,15 +6350,30 @@ def stale_upper_reads(instructions, blocked, sources, placed, patched):
 		if wide is None or not wide["L"]:
 			continue
 		for field in upper_half_sources(mnemonic, operands):
-			where = reaching_definition(instructions, position, field,
-			                            blocked, sources=sources)
+			# **The set, because the question is "any of them".** Where the
+			# ways into a join reach different definitions, this read is
+			# stale if ANY of them is a site the rewrite touched -- the
+			# reader takes whatever that path left. Asking for a single
+			# definition and refusing on disagreement filed 128 of the 248
+			# sources as "cannot speak for". Finding 194.
+			where = reaching_definitions(instructions, position, field,
+			                             blocked, sources=sources)
 			if where is None:
 				unknown += 1
 				continue
-			producer = instructions[where][0]
-			narrowed = producer in patched
-			if producer in inside or narrowed:
-				found.append((address, field, producer))
+			# **Every rewritten producer, not the first one.** A join
+			# reaching two definitions has two ways to be stale, and
+			# `apply` repairs a reader by reverting the producer this
+			# names -- so naming one and stopping repaired one path and
+			# left the other. Measured: `apply` found 52 readers and
+			# reverted 45 producers, `verify` then found 5 of those same
+			# readers again against the producer on the path nobody had
+			# named, and the two reports were disjoint because each saw
+			# the reader through a different definition. Finding 194.
+			for one in sorted(where):
+				producer = instructions[one][0]
+				if producer in inside or producer in patched:
+					found.append((address, field, producer))
 	return found, unknown
 
 
@@ -9022,8 +9081,54 @@ def join_selftest():
 		print(f"selftest: {what}: reaching_definition gave {got}, want "
 		      f"{expected}", file=sys.stderr)
 		failures += 1
+	# **The set the disagreeing join reaches is an answer, not a refusal.**
+	# The wrapper says None above, which is what a caller wanting one
+	# definition needs; the plural walk must still name both, because
+	# `stale_upper_reads` is stale if EITHER way was rewritten. A walk that
+	# refused here would pass the case above and cost 128 sources.
+	# Finding 194.
+	rows, at = [], 0x1000
+	for encoding, mnemonic, operands in [
+			(vpxor, "vpxor", "%xmm0,%xmm0,%xmm0"),
+			(branch, "je", "0x1007"), (load, "vmovups", "(%rsi),%ymm0"),
+			(b"\x90", "nop", ""), (store, "vmovups", "%ymm0,(%rdi)")]:
+		rows.append((at, encoding, mnemonic, operands, None))
+		at += len(encoding)
+	join = rows[3][0]
+	got = reaching_definitions(rows, 4, "%ymm0", {join},
+	                           sources={join: [rows[1][0]]})
+	if got != {0, 2}:
+		print(f"selftest: the disagreeing join names every way's write: "
+		      f"reaching_definitions gave {got}, want {{0, 2}}",
+		      file=sys.stderr)
+		failures += 1
+	# **The reader's own address is a join like any other.** Here the store
+	# IS the branch target, and the walk used to refuse at the top rather
+	# than enumerate the one way in. Both ways reach the `vpxor`, so a
+	# single answer survives. Finding 194.
+	rows, at = [], 0x1000
+	for encoding, mnemonic, operands in [
+			(vpxor, "vpxor", "%xmm0,%xmm0,%xmm0"),
+			(branch, "je", "0x1006"), (store, "vmovups", "%ymm0,(%rdi)")]:
+		rows.append((at, encoding, mnemonic, operands, None))
+		at += len(encoding)
+	reader = rows[2][0]
+	got = reaching_definition(rows, 2, "%ymm0", {reader},
+	                          sources={reader: [rows[1][0]]})
+	if got != 0:
+		print(f"selftest: the reader is itself a branch target: "
+		      f"reaching_definition gave {got}, want 0", file=sys.stderr)
+		failures += 1
+	# ... and it stays refused where that reader's ways are NOT knowable,
+	# which is the sabotage half: without it the clause above would pass by
+	# answering every blocked reader from its fall-through alone.
+	got = reaching_definition(rows, 2, "%ymm0", {reader}, sources=None)
+	if got is not None:
+		print(f"selftest: the reader's ways are not knowable: "
+		      f"reaching_definition gave {got}, want None", file=sys.stderr)
+		failures += 1
 	if not failures:
-		print(f"selftest: {len(JOIN_CASES) + 1} joins, resolved only where "
+		print(f"selftest: {len(JOIN_CASES) + 4} joins, resolved only where "
 		      f"every way in agrees")
 	return failures
 
@@ -10364,15 +10469,34 @@ def apply_all(binary, listing, output):
 	instructions, _plain, blocked, sources, _tables, _seen = context
 	stale, unresolved = stale_upper_reads(instructions, blocked, sources,
 	                                      placed, set(undo))
-	reverted = set()
-	for _reader, _field, producer in stale:
-		if producer in undo and producer not in reverted:
-			offset, original = undo[producer]
-			data[offset:offset + len(original)] = original
-			reverted.add(producer)
+	reverted, stuck = set(), []
+	for reader, field, producer in stale:
+		if producer in undo:
+			if producer not in reverted:
+				offset, original = undo[producer]
+				data[offset:offset + len(original)] = original
+				reverted.add(producer)
+			continue
+		# **A stale read whose producer is not an in-place patch cannot be
+		# repaired by reverting one.** The producer is inside a window a
+		# detour swallowed, so its zeroing was re-emitted as legacy SSE in
+		# the stub and there is nothing on disk to put back. Silence here
+		# shipped 5 wrong readers: `apply` counted them among the 52 it
+		# reported and reverted only the 45 it could, and the difference
+		# was visible nowhere until `verify` read the image. Finding 194.
+		stuck.append((reader, field, producer))
+	if stuck:
+		print(f"apply: {len(stuck):,} stale read(s) whose producer is not an "
+		      f"in-place patch and cannot be reverted", file=sys.stderr)
+		for reader, field, producer in sorted(stuck)[:8]:
+			print(f"    0x{reader:x} reads {field}, decided at "
+			      f"0x{producer:x}", file=sys.stderr)
 	if reverted:
+		# Distinct READERS, because `stale` now carries one row per
+		# rewritten producer and a reader at a join has several.
+		readers = len({reader for reader, _field, _producer in stale})
 		print(f"apply: {len(reverted):,} in-place patch(es) reverted, their "
-		      f"zeroing still read by {len(stale):,} surviving 256-bit "
+		      f"zeroing still read by {readers:,} surviving 256-bit "
 		      f"instruction(s)")
 	if unresolved:
 		print(f"apply: {unresolved:,} upper-half source(s) the walk could "
@@ -10728,7 +10852,8 @@ def verify(original, patched, listing=None):
 	stale, unresolved = stale_upper_reads(instructions, blocked, sources,
 	                                      placed, narrowed_sites)
 	if stale:
-		print(f"verify: {len(stale):,} surviving 256-bit read(s) take an "
+		readers = len({reader for reader, _field, _producer in stale})
+		print(f"verify: {readers:,} surviving 256-bit read(s) take an "
 		      f"upper half this rewrite left stale", file=sys.stderr)
 		for address, field, producer in sorted(stale)[:8]:
 			print(f"    0x{address:x} reads {field}, decided at "
