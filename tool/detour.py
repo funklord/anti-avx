@@ -4910,6 +4910,14 @@ REPAIR_ROUNDS = 6
 # few readers that need it. Finding 197.
 JOIN_DEPTH = 16
 
+# The same budget for the COLLECTOR's two questions -- `zeroed_ymm` asking
+# whether a register is all zero, `constant_ymm` asking where a constant
+# came from. It was 4 while the gate's was raised to 16, which is how one
+# walk came to be counted twice: 1,046 sites declined "ymm value has no
+# known upper half" and 208 readers the gate cannot resolve are the same
+# analysis at two budgets. Finding 201.
+VALUE_DEPTH = 16
+
 
 def loop_fixpoint(instructions, position, register, blocked, limit, sources,
                   depth, visiting, assume, ways, why=None):
@@ -5244,7 +5252,7 @@ def join_answer(instructions, position, register, blocked, limit, sources,
 
 
 def zeroed_ymm(instructions, index, register, blocked, limit=640,
-               sources=None, depth=4):
+               sources=None, depth=None):
 	"""True if every bit of `register` is zero when `index` executes.
 
 	**A VEX.128 instruction zeroes bits [255:128] of its destination**, which
@@ -5264,6 +5272,7 @@ def zeroed_ymm(instructions, index, register, blocked, limit=640,
 	`ZEROING` set names -- `vpxor %xmm0,%xmm0,%xmm0` and not `vpxor` of two
 	different registers, which computes something.
 	"""
+	depth = VALUE_DEPTH if depth is None else depth
 	position = reaching_definition(instructions, index, register, blocked,
 	                              limit, sources, depth)
 	if position is None:
@@ -5327,7 +5336,7 @@ def constant_reload(instructions, position, blocked, readonly, sources,
 
 
 def constant_ymm(instructions, index, register, blocked, readonly,
-                 limit=640, sources=None, depth=4):
+                 limit=640, sources=None, depth=None):
 	"""The read-only load `register` still holds at `index`, or None.
 
 	**A constant needs no shadow register, because memory is the shadow.**
@@ -5355,6 +5364,7 @@ def constant_ymm(instructions, index, register, blocked, readonly,
 	`wide_move` load of the wide spelling is the only one of those two that
 	gets past `constant_load` at all.
 	"""
+	depth = VALUE_DEPTH if depth is None else depth
 	position = reaching_definition(instructions, index, register, blocked,
 	                              limit, sources, depth)
 	if position is None:

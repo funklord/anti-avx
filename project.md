@@ -12601,6 +12601,55 @@ message cannot present itself as an empty class -- which is the failure that rep
 zero in Finding 198's pricing run hours earlier.
 
 
+### Finding 201 -- the two counts are one walk, and the frame that reconciled them was wrong
+
+Finding 199 left one open row: 1,046 sites declined "ymm value has no known upper half" and
+208 readers `stale_upper_reads` cannot resolve are the same analysis counted from opposite
+ends, never compared. The reconciliation is that they ARE one walk with two callers -- and
+every other part of the reasoning that got there was wrong.
+
+**The hypothesis was depth, and it is not.** Finding 197 raised `JOIN_DEPTH` to 16 for the
+GATE and left the collector's `zeroed_ymm` and `constant_ymm` at the `depth=4` Finding 84 chose
+for a memset loop. That looked like the same knob left un-turned in the second consumer.
+Measured, with the budget named `VALUE_DEPTH` so it can be:
+
+```
+VALUE_DEPTH= 0: candidates 242,413  'no known upper half' 10,182  declined 14,921
+VALUE_DEPTH= 4: candidates 242,551  'no known upper half' 10,074  declined 14,783
+VALUE_DEPTH=16: candidates 242,551  'no known upper half' 10,074  declined 14,783
+```
+
+**4 and 16 are identical to the site.** The collector's refusals are not depth-bound at all;
+whatever stops them stops them within four joins.
+
+**And identical-at-both-budgets is exactly what an unwired knob looks like**, which is why the
+0 row is in the table. It costs 138 candidates and 108 extra refusals, so the constant reaches
+the walk and the null result is a measurement rather than a plumbing fault. Reading the code
+had already shown `depth` being passed through; reading is not a control, and this file has
+been caught by that distinction before.
+
+**The frame was six hours old and had been right once.** `depth=4` really was 77 of the gate's
+257 refusals that morning. Applying it to the collector's queries -- a different population,
+never tested -- is *a proxy tested only where you know the answer will separate anything*, and
+*a frame that has just been right is the hardest one to drop*. The tell was there: the answer
+arrived before the evidence did.
+
+**The population was never 1,046.** That is the count of SURVIVING VEX carrying the reason;
+the declined set holds **10,074**, so about nine thousand sites are refused for it and lowered
+by some other strategy anyway. Ranking the row on 1,046 ranked it on a number measuring
+something else -- the third scope error of the day, after `depth=4` inside a floor and 1,925
+read as available work.
+
+**What the two counts actually share.** 85 of the 195 distinct unresolved readers are also
+declined sites: neither the same population nor independent ones, but a common cause and a
+minority of common addresses. The gate asks about readers of a 256-bit value and the collector
+about candidate sites, and they fail for different reasons at the same wall.
+
+**`VALUE_DEPTH` stays named and stays at 16**, matching `JOIN_DEPTH`. It buys nothing measured
+-- 4 is past the knee for these queries -- and it removes the difference between two callers of
+one walk that is what sent this investigation down the wrong path to begin with.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12617,7 +12666,7 @@ a binary that computes the wrong answer.
 |---|---|---|---|---|
 | - | ~~The 208 readers the gate cannot speak for~~ **CARRIED** | 131 conservative reverts, 132 more windows withheld, +267 frontier | wrong bytes | Finding 198: still unresolved, but every site that could have decided them keeps its VEX form |
 | - | ~~256-bit arithmetic, which no strategy handles~~ **CLOSED at 75** | 1,925 sites, ceiling 75 | sites | Finding 200: the class is a graph and its exits bound it; 482 of it is `vextractf128`/`vinsertf128`, unlowerable by construction |
-| 1 | Reconcile the 1,046 sites with the 208 readers | unknown | sites | Finding 199: the same walk failing, counted from both ends and never compared |
+| - | ~~Reconcile the 1,046 sites with the 208 readers~~ **RECONCILED** | one walk, two callers; 85 of 195 readers overlap | sites | Finding 201: depth is not the constraint (4 == 16, control at 0 costs 138), and the population is 10,074 not 1,046 |
 | - | ~~A census of the 6,049 surviving VEX~~ **TAKEN** | 24 classes, and 476 of the count are not code | sites | Finding 199: `detour.py frontier` re-derives it; the real ceiling is 5,573 |
 | - | ~~F2 and F3~~ **DONE** | 118 sources resolved, 20 more stale readers, 19 reverts | wrong bytes | Finding 194: and the set-valued walk exposed a repair loop that closed one path of a join and left the other |
 | - | ~~The loop-aware back-edge rule~~ **DONE** | 228 resolved, 9 more stale readers | wrong bytes | Finding 195: the fixpoint it wanted, and the skip is now a sabotage case |
