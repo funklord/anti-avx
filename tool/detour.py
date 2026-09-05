@@ -6519,6 +6519,12 @@ def switch_targets(instructions, binary, starts):
 # call in it. Finding 198.
 CONSERVATIVE_LIMIT = 640
 
+# How far forward `chain_census` looks for the consumer of a result. It is a
+# survey bound rather than a correctness one: a consumer further away than
+# this is reported as "nothing found", which is honest and is not a claim
+# that the value dies. Finding 200.
+CHAIN_REACH = 64
+
 
 def conservative_producers(instructions, position, field, patched, inside):
 	"""Sites that could have decided this reader's upper half, or [].
@@ -10459,6 +10465,9 @@ def main(argv):
 	if mode == "frontier":
 		return frontier_census(argv[1], argv[2], argv[3])
 
+	if mode == "chains":
+		return chain_census(argv[1], argv[2], argv[3])
+
 	print(f"detour.py: unknown mode {mode!r}", file=sys.stderr)
 	return 2
 
@@ -10578,6 +10587,92 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 		[item for item in candidates if item[0] not in dropped], stub_base,
 		spill_base, stub_reasons, home=home, tls=tls)
 	return placed, blob, overlapped, refused, dropped, swallowed
+
+
+CHAIN_LOADS = ("vmovup", "vmovdqu", "vmovap", "vmovdqa", "vbroadcast",
+               "vmovss", "vmovsd")
+CHAIN_ZEROS = ("vxorps", "vxorpd", "vpxor")
+
+
+def chain_census(original, listing, reason):
+	"""What a declined class is shaped like, as a dataflow. Always 0.
+
+	**For a class that is a graph rather than a list.** 1,976 sites are
+	declined "256-bit: arithmetic rather than a copy", and reading that as
+	1,976 sites of available work is the mistake Finding 179 already paid
+	for once. An SSE-only CPU cannot READ bits 255:128 of a ymm register at
+	all -- that is what `vextractf128` is for, and it is itself AVX -- so
+	such a site is reachable only if the value never sits in a ymm at all.
+	That is a property of the whole chain and not of the instruction.
+
+	So this reports what produced each ymm source and what consumes each
+	result. A chain is closed only when every source is a load or a
+	zeroing idiom and every consumer ends in memory, which makes the store
+	count the ceiling on the class however many sites it holds.
+	Finding 200.
+	"""
+	context = analysis_context(original, listing)
+	_patches, _cand, _stats, _skipped, declined, _home = collect(
+		original, listing, context)
+	instructions, _plain, blocked, sources, _tables, _seen = context
+	index_of = {row[0]: i for i, row in enumerate(instructions)}
+	sites = sorted(a for a, why in declined.items() if why == reason)
+	print(f"chains: {len(sites):,} site(s) declined as {reason!r}")
+	if not sites:
+		# A renamed message must not present itself as an empty class.
+		print(f"chains: FAILED -- no site carries that reason; the reasons "
+		      f"in use are:", file=sys.stderr)
+		for name, count in Counter(declined.values()).most_common(12):
+			print(f"    {name}  ({count:,})", file=sys.stderr)
+		return 1
+	mnemonics, sourcing, consuming = Counter(), Counter(), Counter()
+	for address in sites:
+		position = index_of[address]
+		_a, _e, mnemonic, operands, _c = instructions[position]
+		mnemonics[mnemonic] += 1
+		fields = inplace.split_operands(operands or "")
+		for field in [f for f in fields[:-1] if f.startswith("%ymm")]:
+			where = reaching_definitions(instructions, position, field,
+			                             blocked, sources=sources,
+			                             depth=JOIN_DEPTH)
+			if where is None:
+				sourcing["producer unknown"] += 1
+				continue
+			kinds = set()
+			for one in where:
+				made = instructions[one][2]
+				kinds.add("a load or a move" if made.startswith(CHAIN_LOADS)
+				          else "a zeroing idiom" if made in CHAIN_ZEROS
+				          else "more arithmetic")
+			sourcing["+".join(sorted(kinds))] += 1
+		destination = fields[-1] if fields else None
+		found = "nothing found"
+		if destination and destination.startswith("%ymm"):
+			for step in range(1, CHAIN_REACH):
+				at = position + step
+				if at >= len(instructions):
+					break
+				later = instructions[at]
+				if later[2].startswith(("call", "ret")):
+					found = "a call or a return"
+					break
+				if destination in (later[3] or ""):
+					names = inplace.split_operands(later[3])
+					found = ("a 256-bit store"
+					         if later[2].startswith("vmov") and names
+					         and names[-1].startswith("(")
+					         else "a move" if later[2].startswith("vmov")
+					         else "more arithmetic")
+					break
+		consuming[found] += 1
+	for title, counted in (("mnemonics", mnemonics),
+	                       ("what produced each ymm source", sourcing),
+	                       ("what consumes the result", consuming)):
+		print(f"chains: {title}")
+		width = max((len(str(name)) for name in counted), default=0)
+		for name, count in counted.most_common(10):
+			print(f"  {str(name):<{width}}  {count:>6,}")
+	return 0
 
 
 def frontier_census(original, patched, listing):

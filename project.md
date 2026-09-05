@@ -12550,6 +12550,57 @@ changes is the residue, which is the number every remaining work item is ranked 
 *a price has two halves and both age*, met in the denominator for the second time today.
 
 
+### Finding 200 -- the largest class on the page is a graph, and its ceiling is 75
+
+Finding 199 found 1,925 surviving VEX declined as "256-bit: arithmetic rather than a copy" --
+a third of the frontier, and the only class large enough to be worth a new strategy. It is
+worth 75 at the very most, and the reason is architectural rather than a matter of effort.
+
+**An SSE-only CPU cannot READ bits 255:128 of a ymm register at all.** That is what
+`vextractf128` is for and it is itself AVX. So a 256-bit arithmetic instruction cannot be
+lowered in place under any encoding, and the only route is for the value never to sit in a ymm
+register -- which is a property of its whole live range, not of the instruction. This is
+exactly why every strategy built so far is about COPIES: a 256-bit load or store splits
+because the value passes through memory, where both halves are addressable.
+
+`detour.py chains` reports the class as the dataflow it is:
+
+```
+sites declined with that reason                    1,976
+  (199 counted 1,925 SURVIVING; the rest were lowered by something else)
+
+what produced each ymm source        what consumes the result
+  more arithmetic       1,699          more arithmetic     1,264
+  a load or a move        876          nothing found         476
+  producer unknown        123          a move                128
+  a zeroing idiom          58          a 256-bit store        75
+                                       a call or a return     33
+```
+
+**61% of sources come from other arithmetic and 64% of results feed more arithmetic.** These
+are long chains, not load-compute-store triples. A chain is lowerable only in its entirety --
+every source back to a load or a zeroing idiom, every consumer lowered too and ending in
+memory -- so **the 75 results that reach a 256-bit store are the ceiling on the class**,
+whatever its site count.
+
+**And a quarter of it cannot be lowered by construction.** `vextractf128` at 383 and
+`vinsertf128` at 99 are the two instructions whose entire purpose is to read and write the
+upper half. 482 sites are structurally unreachable rather than hard.
+
+**1,925 against 75 is a 26x overstatement**, which is worse than Finding 179's 66-that-was-21
+and is the same error: a count of sites carrying a label read as a count of sites available.
+The rule this project already has -- representable is not gained -- did not prevent it,
+because the label was not "representable", it was a refusal reason. **A refusal reason names
+what stopped ONE site; it says nothing about what it would take to start it.**
+
+**Do not build a 256-bit arithmetic strategy.** Recorded so it is not reopened: the class is
+closed at a measured ceiling of 75, the ceiling is set by chain exits rather than by lowering
+rules, and `detour.py chains <binary> <listing> <reason>` re-derives all of it. That mode
+refuses and prints the reasons actually in use when its argument matches nothing, so a renamed
+message cannot present itself as an empty class -- which is the failure that reported a clean
+zero in Finding 198's pricing run hours earlier.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12565,8 +12616,8 @@ a binary that computes the wrong answer.
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
 | - | ~~The 208 readers the gate cannot speak for~~ **CARRIED** | 131 conservative reverts, 132 more windows withheld, +267 frontier | wrong bytes | Finding 198: still unresolved, but every site that could have decided them keeps its VEX form |
-| 1 | 256-bit arithmetic, which no strategy handles | 1,925 sites, a third of the frontier | sites | Finding 199's census; not yet priced -- representable is not gained |
-| 2 | Reconcile the 1,046 sites with the 208 readers | unknown | sites | Finding 199: the same walk failing, counted from both ends and never compared |
+| - | ~~256-bit arithmetic, which no strategy handles~~ **CLOSED at 75** | 1,925 sites, ceiling 75 | sites | Finding 200: the class is a graph and its exits bound it; 482 of it is `vextractf128`/`vinsertf128`, unlowerable by construction |
+| 1 | Reconcile the 1,046 sites with the 208 readers | unknown | sites | Finding 199: the same walk failing, counted from both ends and never compared |
 | - | ~~A census of the 6,049 surviving VEX~~ **TAKEN** | 24 classes, and 476 of the count are not code | sites | Finding 199: `detour.py frontier` re-derives it; the real ceiling is 5,573 |
 | - | ~~F2 and F3~~ **DONE** | 118 sources resolved, 20 more stale readers, 19 reverts | wrong bytes | Finding 194: and the set-valued walk exposed a repair loop that closed one path of a join and left the other |
 | - | ~~The loop-aware back-edge rule~~ **DONE** | 228 resolved, 9 more stale readers | wrong bytes | Finding 195: the fixpoint it wanted, and the skip is now a sabotage case |
