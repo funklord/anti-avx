@@ -1223,6 +1223,33 @@ class CommitMsgHook(unittest.TestCase):
 		self.assertEqual(out.returncode, 1, out.stderr)
 		self.assertIn("tooling reference", out.stderr)
 
+	def test_a_persons_trailer_is_accepted(self):
+		"""The boundary the vendor cases cannot show, reported by beerssh
+		2026-09-05 after their own control confused them for a minute.
+
+		Every attribution case here names the vendor, so together they
+		establish that a VENDOR trailer is refused and say nothing about
+		trailers as such -- and a reader who takes one as "sign-offs are
+		refused" is wrong in the direction that matters, because
+		`CLAUDE.md` says a person's trailer is theirs to write and the
+		hook never claimed otherwise. Without this case the controls
+		cannot fail the way the thing they control for fails."""
+		for trailer in ("Co-Authored-By: Jane Roe <jane@example.invalid>",
+		                "Signed-off-by: Jane Roe <jane@example.invalid>"):
+			out = self.run_hook("core: a change\n\nbody.\n\n%s\n" % trailer)
+			self.assertEqual(out.returncode, 0,
+			                 "%s was refused: %s" % (trailer, out.stderr))
+
+	def test_a_spared_name_does_not_carry_a_sign_off_past_the_check(self):
+		"""The case that would show the fourth exemption had opened a
+		bypass: one message holding both the newly spared path and a
+		vendor sign-off. beerssh's, and stronger than testing either
+		alone, which is all this suite did before."""
+		out = self.run_hook("core: a change\n\nit names /tmp/claude-1001 "
+		                    "here.\n\nCo-Authored-By: Claude "
+		                    "<noreply@example.invalid>\n")
+		self.assertEqual(out.returncode, 1, out.stderr)
+
 	def test_an_attribution_trailer_is_still_refused(self):
 		"""And it is refused for a reason no scrub can reach: the
 		attribution check reads the raw message rather than the scrubbed
