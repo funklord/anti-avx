@@ -12650,6 +12650,105 @@ about candidate sites, and they fail for different reasons at the same wall.
 one walk that is what sent this investigation down the wrong path to begin with.
 
 
+### Finding 202 -- the default backing store already wins, and the 386 need a fallback not a switch
+
+`no home space to borrow` was the largest tractable class left: 386 sites, and the project has
+five backing stores built with one in use. The obvious move is to try the others. Measured with
+`detour.py spills`:
+
+```
+--spill=none   candidates 238,194            no home space:     0
+--spill=stack  candidates 242,357 (+4,163)   no home space:     0
+--spill=pool   candidates 242,357 (+4,163)   no home space:     0
+--spill=home   candidates 241,832 (+3,638)   no home space: 1,110
+--spill=tls    candidates 242,551 (+4,357)   no home space:   386
+```
+
+**`stack` and `pool` close all 386 and end with 194 FEWER candidates**, so they lose 580 sites
+elsewhere to buy 386. `tls` is the best of the five, and the borrow mechanism as a whole is
+worth 4,357 candidates over `none` -- which is what five increments of backing-store work
+actually bought, stated in one line for the first time.
+
+**Reporting only the class under attack would have shown a clean win.** The 386 going to zero
+is true under both alternatives and is the number a session hunting that class would print. The
+candidate total is what says the trade is negative, and it is only visible because the sweep
+counted four reasons and the total rather than the one being aimed at.
+
+**So the 386 are reachable only by a PER-SITE fallback.** `tls` fails them for one specific
+reason -- its addressing needs two free GPRs and fewer than two are live -- and `stack` and
+`pool` need none. Keeping `tls` everywhere and falling back only where the registers are
+missing would gain up to 386 without the 194, because that loss comes from using the
+alternative everywhere. **A different default and a fallback are different questions, and the
+comparison is what separates them.**
+
+**Which fallback is settled by the currency ordering rather than by measurement.** `pool` is a
+single global slot whose race Finding 46 recorded and which no single-threaded test on this
+machine can reach: 386 sites is the weaker currency and a race is the stronger one, so a pool
+fallback is refused whatever it would gain. `stack` costs unwind correctness at those sites,
+and `check-unwind` can test that. **The stack fallback is the only buildable form**, and it is
+not yet built or priced beyond this ceiling.
+
+**And the comment that named this class carried a stale count.** `CALLER_SHADOW`'s note calls
+it "the largest named cause anywhere in the residue -- 1,916 of the 3,533 surviving 128-bit
+sites". It is 386 of 6,049 today. That is the fourth stale countable claim found in one day,
+after `depth=4` inside a floor, 1,046 that was 10,074, and 193+23 that was 118+42 -- and the
+third of them quoted as a reason to work on something.
+
+
+### Finding 203 -- the residue is concentrated, and it is concentrated in the impossible part
+
+A new lens, derived from Finding 199 rather than chosen: that finding showed the residue
+enriched 3.6x in sites outside any declared function, which is a statement about LOCATION, and
+every measurement before it had asked what stopped a site rather than where the sites are.
+
+```
+original VEX 805,131, surviving 6,049
+functions containing VEX at all       46,902
+functions with a survivor                936      2% of them
+   64 functions hold  3,079 sites               51% of the frontier
+    6 functions hold  1,396 sites               23%
+  872 functions hold  2,494 sites               the thin tail
+  476 sites outside any function                Finding 199
+functions where EVERY VEX survived        59      115 sites
+```
+
+**98% of VEX-bearing functions lowered completely.** The rewriter is not broadly failing; it
+fails in a very small number of places. And it is not failing to ENTER them -- only 59
+functions kept all their VEX, and the worst offenders are 44% to 88% lowered, so it got well
+inside and stalled repeatedly.
+
+**The concentration looked like leverage and is the opposite.** Comparing the 64's refusal mix
+against every other function holding a survivor:
+
+```
+                                             the 64    the rest    gap
+256-bit: arithmetic rather than a copy        48.9%      15.0%    +33.8
+no SSE form at any register                    9.1%       0.4%     +8.7
+constant read by something that will not
+  reload it                                    6.1%       0.5%     +5.7
+no home space to borrow                        3.8%      10.5%     -6.7
+next instruction is a branch target            0.1%       8.5%     -8.4
+ymm value has no known upper half             11.9%      25.4%    -13.5
+```
+
+Two thirds of the concentration is architecturally unreachable: 256-bit arithmetic, which
+Finding 200 ceilinged at 75 for the whole binary, plus shapes with no SSE form at any register.
+These 64 are AVX-dense vector code -- 33 functions in one address neighbourhood, 4 in another,
+so two compilation units rather than 64 unrelated problems -- doing precisely the thing that
+has no SSE lowering. **A function-level rule aimed at them buys nothing beyond the 75.**
+
+**The tractable refusals live in the thin tail instead**, which is where `no home space to
+borrow` (10.5% against 3.8%) and `next instruction is a branch target` (8.5% against 0.1%)
+actually are. Those are mechanism failures -- a scratch register not found, a window that would
+not widen -- rather than instruction-set ones.
+
+**Only the side-by-side comparison could show this.** A histogram of the 64 alone would have
+named 256-bit arithmetic as their cause, which is true, and read as a finding; the control that
+makes it mean something is the same histogram of everything else. **A profile is not evidence
+without the profile it differs from** -- *corroboration has to be independent*, met in the
+shape of a population rather than a claim.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12664,6 +12763,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| 1 | A per-site `stack` fallback where TLS lacks two free GPRs | up to 386 sites | sites | Finding 202: a wholesale switch is -194, so only a fallback pays; `pool` is refused for its race |
+| - | ~~What the 64 worst functions share~~ **CLOSED at ~0** | 3,079 sites, two thirds architectural | sites | Finding 203: they share being full of 256-bit arithmetic, already ceilinged at 75 |
 | - | ~~The 208 readers the gate cannot speak for~~ **CARRIED** | 131 conservative reverts, 132 more windows withheld, +267 frontier | wrong bytes | Finding 198: still unresolved, but every site that could have decided them keeps its VEX form |
 | - | ~~256-bit arithmetic, which no strategy handles~~ **CLOSED at 75** | 1,925 sites, ceiling 75 | sites | Finding 200: the class is a graph and its exits bound it; 482 of it is `vextractf128`/`vinsertf128`, unlowerable by construction |
 | - | ~~Reconcile the 1,046 sites with the 208 readers~~ **RECONCILED** | one walk, two callers; 85 of 195 readers overlap | sites | Finding 201: depth is not the constraint (4 == 16, control at 0 costs 138), and the population is 10,074 not 1,046 |

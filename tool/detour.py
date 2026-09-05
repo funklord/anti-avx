@@ -10478,6 +10478,9 @@ def main(argv):
 	if mode == "chains":
 		return chain_census(argv[1], argv[2], argv[3])
 
+	if mode == "spills":
+		return spill_census(argv[1], argv[2])
+
 	print(f"detour.py: unknown mode {mode!r}", file=sys.stderr)
 	return 2
 
@@ -10602,6 +10605,42 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 CHAIN_LOADS = ("vmovup", "vmovdqu", "vmovap", "vmovdqa", "vbroadcast",
                "vmovss", "vmovsd")
 CHAIN_ZEROS = ("vxorps", "vxorpd", "vpxor")
+
+
+SPILL_WATCH = ("no home space to borrow", "no SSE form at any register",
+               "src2 aliases dst, no scratch", "sequence with no usable scratch")
+
+
+def spill_census(original, listing):
+	"""What each backing store is worth, measured. Always 0.
+
+	**A wholesale switch is not the only shape the question has, and the
+	numbers say so.** `tls` declines 386 sites "no home space to borrow"
+	because its addressing needs two free GPRs; `stack` and `pool` need
+	none and decline zero -- and both end with 194 FEWER candidates than
+	`tls`, having lost 580 elsewhere to buy 386. The default is the best of
+	the five and the borrow mechanism as a whole is worth 4,357 candidates
+	over `none`.
+
+	So the 386 are reachable only by a per-site fallback, which is a
+	different thing from a different default, and the comparison has to be
+	run to see that at all. Finding 202.
+	"""
+	global SPILL
+	context = analysis_context(original, listing)
+	first = None
+	for mode in (SPILL_NONE, SPILL_STACK, SPILL_POOL, SPILL_HOME, SPILL_TLS):
+		SPILL = mode
+		_patches, candidates, _stats, _skipped, declined, _home = collect(
+			original, listing, context)
+		counted = Counter(declined.values())
+		if first is None:
+			first = len(candidates)
+		print(f"spills: --spill={mode:<5} candidates {len(candidates):>9,} "
+		      f"({len(candidates) - first:+,})  declined {len(declined):>7,}")
+		for name in SPILL_WATCH:
+			print(f"    {name:<34} {counted.get(name, 0):>6,}")
+	return 0
 
 
 def chain_census(original, listing, reason):
