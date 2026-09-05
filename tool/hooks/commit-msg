@@ -48,12 +48,30 @@ TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # workaround is to describe a path instead of writing it, making the log
 # vaguer exactly where it is trying to be exact.
 #
-# What is spared is exactly three NAMES: the directory `.claude`, written
-# with its leading dot; the file `CLAUDE.md`; and `claude-guidelines`, the
-# repository the guidelines live in. None is a plausible spelling of
-# attribution -- nobody credits a tool as ".claude" -- while all three are
-# unavoidable when writing about these files. The bare vendor word on its
-# own is untouched and still refused.
+# What is spared is exactly four NAMES: the directory `.claude`, written
+# with its leading dot; the file `CLAUDE.md`; `claude-guidelines`, the
+# repository the guidelines live in; and `claude-<digits>`, the per-uid
+# session scratch directory under /tmp. None is a plausible spelling of
+# attribution -- nobody credits a tool as ".claude" or signs off as
+# "claude-1001" -- while all four are unavoidable when writing about these
+# files. The bare vendor word on its own is untouched and still refused.
+#
+# The fourth arrived on 2026-09-05, the same way the third did. A commit
+# recording which directory held eleven gigabytes of a full filesystem
+# could not name it, and the message had to say "a per-uid directory this
+# user cannot read" -- the vaguer log, in the entry whose whole subject
+# was which directory it was.
+#
+# It is spelled with digits rather than as a path so that it matches the
+# name wherever it is written, which is what the other three do. Digits
+# and not `[0-9a-f]` deliberately: the transient `claude-<hex>-cwd` files
+# beside those directories are harness droppings nobody needs to name in a
+# message, and widening the class to hex would forgive far more of the
+# alphabet than the one name being spared. A model identifier of the form
+# `claude-3` is forgiven as a side effect; that is subject matter rather
+# than attribution, which `CLAUDE.md` already permits, and it cannot reach
+# a trailer -- the attribution check below reads the RAW message, so no
+# addition here can let a signed-off-by through.
 #
 # The third arrived the way the first two did: a commit reconciling a
 # project style file against its source could not name the repository the
@@ -81,7 +99,7 @@ TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # here makes the line longer than the one somebody wrote.
 body=$(sed -e '/^#.*>8/,$d' -e '/^#/d' -e '/[^[:space:]]/,$!d' "$msg")
 prose=$(printf '%s\n' "$body" \
-	| sed -E 's#claude-guidelines#tooling-guidelines#g; s#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
+	| sed -E 's#claude-guidelines#tooling-guidelines#g; s#claude-([0-9]+)#tooling-\1#g; s#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
 
 # 1. No AI or tooling attribution. The single deviation from kernel practice,
 #    and it is absolute. Human co-authors and reviewers are fine; a generator
