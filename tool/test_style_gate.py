@@ -970,6 +970,53 @@ class RustIsGated(unittest.TestCase):
 RustIsGated.run_gate = EndToEnd.run_gate
 
 
+class RetabColumnArithmetic(unittest.TestCase):
+	"""`split_leading_ws` had no test, and it is the retab's arithmetic.
+
+	Reported by beerssh 2026-09-05 after wiring this suite into their gate
+	and breaking the tool on purpose to prove the wiring speaks. It is
+	called only from the conversion and column paths and never from
+	`check_text`, so the converter's tab-stop sum can be wrong with the
+	whole suite green -- and `harmonization.md` says that arithmetic is
+	the thing which must be proved independently of the tool that
+	performed the retab.
+
+	Their first attempt was an invalid control and the reason is the
+	finding. Changing `col += width - (col % width)` to `col += width`
+	left all 106 tests green, because the two differ only where a tab
+	follows something that leaves the column off a tab stop -- and in
+	LEADING whitespace that is a space-before-tab, which an earlier rule
+	already rejects. So no fixture reaching `check_text` can separate
+	them; only calling the function can. Probed directly, the broken form
+	returns 11 where the correct one returns 8.
+
+	The cases below are the ones where the two forms disagree, and they
+	are asserted against the definition of a tab stop -- a tab advances to
+	the next multiple of the width -- rather than against what this
+	implementation happens to return.
+	"""
+
+	def test_a_tab_advances_to_the_next_stop_not_by_a_whole_width(self):
+		for line, width, want in (
+			("  \tx", 8, 8),		# 2 spaces then a tab: 8, not 10
+			("   \tx", 8, 8),		# beerssh's case: 8, not 11
+			("\t \tx", 8, 16),		# tab, space, tab: 16, not 17
+			("  \tx", 4, 4),		# the width is read, not assumed
+			("\tx", 8, 8),		# already on a stop: one width
+			("       \tx", 8, 8),	# 7 spaces then a tab: still 8
+		):
+			col, rest = sg.split_leading_ws(line, width)
+			self.assertEqual(col, want,
+			                 "%r at width %d" % (line, width))
+			self.assertEqual(rest, "x")
+
+	def test_the_remainder_is_the_line_after_the_indent(self):
+		"""The other half of the pair it returns, which nothing else
+		asserts either."""
+		col, rest = sg.split_leading_ws("\t\treturn 0\n", 8)
+		self.assertEqual((col, rest), (16, "return 0\n"))
+
+
 class ColumnHeuristicIsReached(unittest.TestCase):
 	"""The whole tab rule for every language with no fixer, untested.
 
