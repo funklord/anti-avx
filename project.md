@@ -12459,6 +12459,97 @@ and its candidate named. Same rule as Finding 187's -- check the artifact, not a
 measurement of where it came from.
 
 
+### Finding 199 -- what the frontier is made of, and that up to 8% of it is not code
+
+The frontier has been quoted as one number since the beginning and attacked by whichever
+strategy somebody was thinking about. `detour.py frontier` classifies every surviving VEX
+against what the rewriter actually did to it, read from the IMAGE:
+
+```
+frontier: 6,049 surviving VEX instruction(s)
+  256-bit: arithmetic rather than a copy                            1,925   32%
+  ymm value has no known upper half                                 1,046   17%
+  no home space to borrow                                             386
+  outside .pdata                                                       319
+  256-bit: no store before 256-bit arithmetic on the value             297
+  no SSE form at any register                                          290
+  next instruction is a branch target                                  221
+  256-bit: the constant is read by something that will not reload it   202
+  kept: a repair left it in VEX form                                   184
+  256-bit: no store before the value is touched                        167
+  256-bit: no store before a control transfer                          161
+  kept: its window was withheld                                        145
+  ... 12 smaller classes                                             1,027
+  total                                                              6,049
+```
+
+**It reconciles to `verify`'s own count and carries its own control**: a site inside a placed
+window cannot also be surviving VEX, so that row must be zero, and it is. A classifier whose
+classes do not total the population has sorted something other than the population.
+
+**One class is a third of the frontier and has no strategy at all.** 1,925 sites are 256-bit
+ARITHMETIC -- `vmulps`, `vaddps`, `vfmadd231ps` on ymm -- and every existing strategy moves
+256-bit values rather than computing with them. That is a gap in what was built, not a
+condition that failed, which makes it a different kind of item from anything the list has
+carried.
+
+**A second, 1,046, is the same analysis this session spent the day on, seen from the other
+end.** "ymm value has no known upper half" is `reaching_definitions` failing at a SITE; the
+source census counts 208 READERS it cannot resolve. The two numbers have never been
+reconciled and they measure one thing from opposite directions.
+
+#### And 180 of the count are not instructions
+
+```
+(bad) among the surviving:              180
+begin an instruction in ORIGINAL:       180      the sweep is consistently desynchronised
+begin an instruction in PATCHED:        180
+are a known branch/entry target:          1      the binary does not call them code
+decode_vex accepts:                      99
+```
+
+The bytes settle it, which is the rule this file keeps arriving at -- read the input before
+theorising about the mechanism:
+
+```
+1404fc520:  c3              ret
+1404fc521:  0f 1f 00        nopl (%rax)        <- alignment padding, function ends
+1404fc524:  b3 c4           mov $0xc4,%bl      <- the sweep walks into data
+1404fc52d:  c4              (bad)
+1404fc531:  c4              (bad)
+```
+
+Raw: `c4 4f 00 bb . c4 4f 00 c3 . c4 4f 00 cb . c4 4f 00 d3` -- a table of 4-byte records
+whose last byte steps by 8. **Code does not emit identical undecodable bytes at a fixed
+pitch.** `verify` counts VEX by prefix byte, so every `c4` in that table is a surviving site.
+
+**180 is a floor and not the figure**, because data that decodes as a VALID VEX instruction
+shows no `(bad)` at all. The better question is how many surviving sites lie outside every
+`.pdata` `[begin, end)`, which is the binary's own statement about where its code is:
+
+```
+surviving VEX                6,049
+  inside a function range    5,573
+  OUTSIDE every range          476    7.87%
+control: of the ORIGINAL's 805,131 VEX, 17,604 are outside   2.19%
+```
+
+**The residue is 3.6x enriched in sites outside any declared function**, which is the
+signature of accumulation: bytes that are not code cannot be lowered, so they survive every
+pass while real instructions leave. An unbiased residue would hold about 132.
+
+**The control is what keeps this honest rather than making it stronger.** `.pdata` does not
+cover every function -- a true leaf may be omitted -- so "outside a range" is not by itself
+"not code", and 2.19% is the rate at which ordinary VEX sits outside one. What can be claimed
+exactly: 180 are demonstrably data, 476 sit outside anything the binary declares as code, and
+**the honest ceiling on remaining work is 5,573 rather than 6,049**.
+
+**This does not move any delta this project has reported.** The phantom sites are counted in
+the before and the after alike, so "805,131 -> 6,049, 99.2% removed" is unaffected. What it
+changes is the residue, which is the number every remaining work item is ranked against --
+*a price has two halves and both age*, met in the denominator for the second time today.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12474,7 +12565,9 @@ a binary that computes the wrong answer.
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
 | - | ~~The 208 readers the gate cannot speak for~~ **CARRIED** | 131 conservative reverts, 132 more windows withheld, +267 frontier | wrong bytes | Finding 198: still unresolved, but every site that could have decided them keeps its VEX form |
-| 1 | A census of the 6,049 surviving VEX | unknown | sites | never taken; the source census found 77 of 257 to be a knob, and nobody has asked the same of the frontier |
+| 1 | 256-bit arithmetic, which no strategy handles | 1,925 sites, a third of the frontier | sites | Finding 199's census; not yet priced -- representable is not gained |
+| 2 | Reconcile the 1,046 sites with the 208 readers | unknown | sites | Finding 199: the same walk failing, counted from both ends and never compared |
+| - | ~~A census of the 6,049 surviving VEX~~ **TAKEN** | 24 classes, and 476 of the count are not code | sites | Finding 199: `detour.py frontier` re-derives it; the real ceiling is 5,573 |
 | - | ~~F2 and F3~~ **DONE** | 118 sources resolved, 20 more stale readers, 19 reverts | wrong bytes | Finding 194: and the set-valued walk exposed a repair loop that closed one path of a join and left the other |
 | - | ~~The loop-aware back-edge rule~~ **DONE** | 228 resolved, 9 more stale readers | wrong bytes | Finding 195: the fixpoint it wanted, and the skip is now a sabotage case |
 | - | ~~The 164 branch-target regions~~ **CLOSED at 0** | 0 emitted, 0 sites | sites | Finding 192: 21 representable of an estimated 74, none emitted, and the rule could not have been sound |
@@ -12491,6 +12584,11 @@ at 41 reachable sources was ranked on numbers taken when the total was something
 **The wrong-bytes currency is empty for the first time since Finding 185**, which is why a
 sites row is at the head. That is not a promotion: it means every reader the gate can see is
 repaired and every reader it cannot see is carried, so what is left to gain is sites.
+
+**And the denominator those rows are ranked against is 5,573, not 6,049.** Finding 199 showed
+476 of the frontier to be outside every function the binary declares and 180 of it to be data
+outright. Neither open row has been priced against the corrected figure, and neither may be
+started before it is.
 
 **Closed, and recorded so they are not re-opened:** the region's remaining shapes (Finding 179,
 8/0/0 regions), the 84-site overlap bucket (181-183, all recovered), the switch-table work

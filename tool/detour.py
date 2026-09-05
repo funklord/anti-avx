@@ -10456,6 +10456,9 @@ def main(argv):
 	if mode == "sources":
 		return source_census(argv[1], argv[2])
 
+	if mode == "frontier":
+		return frontier_census(argv[1], argv[2], argv[3])
+
 	print(f"detour.py: unknown mode {mode!r}", file=sys.stderr)
 	return 2
 
@@ -10575,6 +10578,75 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 		[item for item in candidates if item[0] not in dropped], stub_base,
 		spill_base, stub_reasons, home=home, tls=tls)
 	return placed, blob, overlapped, refused, dropped, swallowed
+
+
+def frontier_census(original, patched, listing):
+	"""Why each surviving VEX instruction is still there. Always 0.
+
+	**Nobody has ever asked.** The frontier is quoted as one number and
+	attacked by whichever strategy somebody was thinking about; the source
+	census found 77 of 257 refusals to be a constant in this file, and the
+	same question has never been put to the sites themselves.
+
+	Classified against what the rewriter DID, in the order that a site
+	stops being available: kept on purpose by a repair, kept because its
+	window was withheld, declined by the collector with its reason, lost to
+	an overlap, or never a candidate at all. Read from the IMAGE, so a site
+	counted here is one that really survived. Finding 199.
+	"""
+	context = analysis_context(original, listing)
+	patches, candidates, _stats, _skipped, declined, home = collect(
+		original, listing, context)
+	instructions, _plain, blocked, sources, _tables, _seen = context
+	placed, _blob, _over, _refused, dropped, _swallowed = repaired_placement(
+		instructions, blocked, sources, candidates,
+		set(row[0] for row in patches),
+		stub_base_of(open(original, "rb").read()), 0, Counter(), home,
+		tls_pair_of(tls_for(original)))
+
+	_bounds, surviving = inplace.disassemble(patched)
+	surviving = set(surviving)
+	vaddr, raddr, _size = inplace.text_mapping(original)
+	image = open(patched, "rb").read()
+	reverted = {row[0] for row in patches
+	            if image[raddr + (row[0] - vaddr):
+	                     raddr + (row[0] - vaddr) + len(row[1])] == row[1]}
+	inside_dropped = set()
+	for site, window, _s, _z, _p in place_stubs(
+			[item for item in candidates if item[0] in dropped],
+			stub_base_of(open(original, "rb").read()), 0, Counter(),
+			home=home, tls=tls_pair_of(tls_for(original)))[0]:
+		inside_dropped.update(range(site, site + window))
+	wanted = {item[0] for item in candidates}
+	got = {site for site, _w, _s, _z, _p in placed}
+
+	counted, shapes = Counter(), Counter()
+	by_address = {row[0]: row for row in instructions}
+	for address in surviving:
+		row = by_address.get(address)
+		if row is not None:
+			shapes[row[2]] += 1
+		if address in reverted:
+			counted["kept: a repair left it in VEX form"] += 1
+		elif address in inside_dropped:
+			counted["kept: its window was withheld"] += 1
+		elif address in declined:
+			counted[f"declined: {declined[address]}"] += 1
+		elif address in wanted and address not in got:
+			counted["lost to an overlap or a refused stub"] += 1
+		elif address in wanted:
+			counted["a placed window covered it (should not happen)"] += 1
+		else:
+			counted["never a candidate"] += 1
+	print(f"frontier: {len(surviving):,} surviving VEX instruction(s)")
+	width = max((len(name) for name in counted), default=0)
+	for name, count in counted.most_common():
+		print(f"  {name:<{width}}  {count:>6,}")
+	print(f"  {'total':<{width}}  {sum(counted.values()):>6,}")
+	print("frontier: the ten commonest mnemonics among them")
+	for name, count in shapes.most_common(10):
+		print(f"  {name:<{width}}  {count:>6,}")
+	return 0
 
 
 def source_census(binary, listing):
