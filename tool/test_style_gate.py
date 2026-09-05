@@ -321,6 +321,33 @@ class EndToEnd(unittest.TestCase):
 		findings = [l for l in err.splitlines() if l.startswith("a.py:")]
 		self.assertEqual(len(findings), 1, findings)
 
+	def test_lexable_python_ascii_is_checked_through_the_tokeniser(self):
+		"""fuzznet, 2026-09-05: wiring this suite into `make check` and
+		then sabotaging it. Neutering `python_ascii_problems` to return
+		no findings silenced the gate on a VALID Python file whose em
+		dash sits in a comment, and the whole suite still passed.
+
+		Nothing here was wrong. The Python case above is deliberately
+		unlexable and says so, and the C case below is deliberately
+		lexable -- so C's tokeniser path was covered and Python's was
+		not, which is an asymmetry rather than a mistaken fixture. The
+		gap is exactly the shape the rule exists for: `code-style.md`
+		records 437 em dashes and 369 section signs that had collected
+		in comments across 163 files of one Qt tree, all of them in
+		files that lex perfectly.
+
+		The control that matters is the FIRST assertion: a file that
+		parses, so the byte fallback cannot be what answers."""
+		import ast
+
+		src = "X = 1  # an em dash \u2014 here\n"
+		ast.parse(src)  # the fallback must not be what catches this
+		rc, err = self.run_gate_err(
+			{"a.py": src}, "floor = 0.1\nascii_only = true\n")
+		self.assertNotEqual(rc, 0)
+		self.assertRegex(err, r"non-ASCII")
+		self.assertIn("a.py:1:", err)
+
 	def test_ascii_finding_does_not_shadow_indent_findings(self):
 		"""hembygd, 2026-08-26: check_file returned at the ASCII block,
 		so one em dash suppressed every indentation finding in the file --
@@ -941,6 +968,54 @@ class RustIsGated(unittest.TestCase):
 
 
 RustIsGated.run_gate = EndToEnd.run_gate
+
+
+class ColumnHeuristicIsReached(unittest.TestCase):
+	"""The whole tab rule for every language with no fixer, untested.
+
+	`check_text`'s column branch fires only where `wants_column_heuristic`
+	is true, which is neither C nor Python (they have a depth-aware fixer
+	that decides first) nor `.rs` (deliberately stood down, pinned in
+	`RustIsGated`). What is left is `.situ`, `.ebnf` and `.lua` -- and for
+	those that one condition IS the tab rule, with nothing else behind it.
+
+	Reported by respec 2026-09-05 and reproduced here: blinding the branch
+	left all 103 tests green AND let a space-indented `.lua` through the
+	gate reporting "2 file(s) pass". The suite's indentation fixtures are
+	C, Python and Rust, so every one of them is decided somewhere else.
+
+	How they found it is the part worth keeping. They deleted their own
+	control as redundant -- every rule it planted looked covered -- and the
+	sabotage verdict for "accept a space-indented line" went from caught to
+	NOT CAUGHT on that deletion alone. Reading the two test lists against
+	each other would not have shown it: both contain space-indent cases and
+	they are not the same rule.
+
+	`.lua` rather than `.situ` because nothing else in this suite touches
+	it, so the verdict cannot be accounted for by anything but this branch.
+	"""
+
+	def gate(self, src: str, name: str) -> tuple[int, str]:
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			(root / ".style-gate.toml").write_text("floor = 0.1\n")
+			(root / name).write_text(src)
+			gate = Path(__file__).resolve().parent / "style_gate.py"
+			r = subprocess.run([sys.executable, str(gate), "check"], cwd=root,
+			                   capture_output=True, text=True)
+			return r.returncode, r.stdout + r.stderr
+
+	def test_a_space_indented_line_is_refused_where_there_is_no_fixer(self):
+		rc, out = self.gate("function f()\n    return 0\nend\n", "a.lua")
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("space-indented line; use tabs", out)
+
+	def test_the_same_file_tab_indented_passes(self):
+		"""The other half of the pair, and it is not decoration: a gate
+		that refused every `.lua` would satisfy the case above and be
+		useless. Only the pair says the rule reads the indent."""
+		rc, out = self.gate("function f()\n\treturn 0\nend\n", "a.lua")
+		self.assertEqual(rc, 0, out)
 
 
 class DocsModeReportsWhatItRead(unittest.TestCase):
