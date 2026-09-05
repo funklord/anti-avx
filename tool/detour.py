@@ -4858,11 +4858,61 @@ def address_position(instructions, address):
 # up. The lattice is finite -- subsets of the definitions in one function --
 # so it terminates on its own; the bound is a cost ceiling, and exhausting
 # it is a refusal like every other budget here.
+class JoinCycle(Exception):
+	"""The walk re-entered a join it is already inside.
+
+	**A cycle through the predecessor graph is a loop, and this project
+	already knows what to do with one.** `loop_fixpoint` handles the back
+	edge it can see in listing order -- a predecessor at a higher index --
+	and refused the ones it could only see as recursion, 27 of the 230
+	unresolved sources at depth 16. The ancestor that owns the cycle
+	catches this and re-runs itself as a fixpoint, with itself assumed;
+	the re-entry then reads the assumption instead of raising. A cycle
+	naming a different ancestor propagates to it. Finding 197.
+	"""
+
+	def __init__(self, position):
+		super().__init__(position)
+		self.position = position
+
+
+def refuse(why, reason, address=None):
+	"""Record why the walk gave up, and give up. Always None.
+
+	**A count of unresolved sources is not a list of reasons**, and the
+	project has twice acted on a breakdown measured when the total was
+	something else. `why` is None on every hot path; the census passes a
+	list and reads the FIRST entry, which is the deepest refusal rather
+	than the one that propagated out. Finding 197.
+	"""
+	if why is not None:
+		why.append((reason, address))
+	return None
+
+
 LOOP_ROUNDS = 6
+
+# How many times `apply` may drop windows and re-place. Dropping one
+# un-swallows what it covered, which can expose a producer that was hidden
+# inside it, so the repair has to settle rather than run once. Finding 197.
+REPAIR_ROUNDS = 6
+
+# How many joins deep the stale-read walk may recurse. It was 4 because 4
+# was enough for the memset shape Finding 84 built it for, and a census of
+# the unresolved sources found **77 of 257 refused on it** -- the largest
+# attackable class, quoted for months as part of an indirect-entry floor it
+# has nothing to do with.
+#
+# Swept 4/8/16/32/64 over one setup: the class empties at 16 and 32 and 64
+# find nothing more, so this is where it converges rather than where the
+# budget ran out. It costs nothing measurable -- 9 seconds against 8, in a
+# step whose setup is 514 -- because a deeper walk is only entered by the
+# few readers that need it. Finding 197.
+JOIN_DEPTH = 16
 
 
 def loop_fixpoint(instructions, position, register, blocked, limit, sources,
-                  depth, visiting, assume, ways):
+                  depth, visiting, assume, ways, why=None):
 	"""The definitions reaching a join with a back edge, or None.
 
 	**Assume the back edge contributes nothing, then check the assumption
@@ -4902,20 +4952,21 @@ def loop_fixpoint(instructions, position, register, blocked, limit, sources,
 			answer = reaching_definitions(
 				instructions, way + 1 if inclusive else way, register,
 				blocked, limit, sources, depth - 1, visiting | {position},
-				seen)
+				seen, why)
 			if answer is None:
 				return None
 			answers |= answer
 		if answers <= current:
 			# The assumption reproduced itself: a fixpoint, and sound.
-			return set(current) or None
+			return set(current) or refuse(
+				why, "loop decided nothing", instructions[position][0])
 		current = frozenset(current | answers)
-	return None
+	return refuse(why, "loop did not converge", instructions[position][0])
 
 
 def reaching_definition(instructions, index, register, blocked, limit=640,
                         sources=None, depth=4, visiting=frozenset(),
-                        assume=None):
+                        assume=None, why=None):
 	"""The single position `register`'s value was decided at, or None.
 
 	A wrapper on `reaching_definitions`, which answers with the SET of
@@ -4926,16 +4977,23 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 	always had. `stale_upper_reads` wants the set, because its question is
 	"is ANY of them a site this rewrite touched". Finding 194.
 	"""
-	found = reaching_definitions(instructions, index, register, blocked,
-	                             limit, sources, depth, visiting, assume)
+	try:
+		found = reaching_definitions(instructions, index, register, blocked,
+		                             limit, sources, depth, visiting, assume,
+		                             why)
+	except JoinCycle:
+		# **A cycle nobody anchored is a refusal, never a crash.** Letting
+		# one escape would abort the caller mid-run, which is how Finding
+		# 188 lost `verify`'s last two checks. Finding 197.
+		return refuse(why, "join cycle escaped")
 	if found is None or len(found) != 1:
 		return None
 	return next(iter(found))
 
 
 def reaching_definitions(instructions, index, register, blocked, limit=640,
-                         sources=None, depth=4, visiting=frozenset(),
-                         assume=None):
+                          sources=None, depth=4, visiting=frozenset(),
+                          assume=None, why=None):
 	"""Where `register`'s value at `index` was decided, or None.
 
 	Returns the position of the nearest instruction that writes it. Sound
@@ -5004,28 +5062,45 @@ def reaching_definitions(instructions, index, register, blocked, limit=640,
 		                           sources):
 			ways = predecessors_of(instructions, index, sources)
 			if ways is None:
-				return None
-			answers = set()
+				return refuse(why, "reader entry unknowable",
+				              instructions[index][0])
+			answers, cycles = set(), False
 			for way, inclusive in ways:
 				if way >= index or way in visiting:
-					return None
-				answer = reaching_definitions(
-					instructions, way + 1 if inclusive else way, register,
-					blocked, limit, sources, depth - 1, visiting | {index})
+					# The reader's own entry has a back edge into it, which
+					# is a loop like any other and was refused here only
+					# because the fixpoint was not reachable from this
+					# branch. Finding 197.
+					cycles = True
+					continue
+				try:
+					answer = reaching_definitions(
+						instructions, way + 1 if inclusive else way,
+						register, blocked, limit, sources, depth - 1,
+						visiting | {index}, assume, why)
+				except JoinCycle as cycle:
+					if cycle.position != index:
+						raise
+					cycles, answer = True, set()
 				if answer is None:
 					return None
 				answers |= answer
-			return answers or None
+			if cycles:
+				return loop_fixpoint(instructions, index, register, blocked,
+				                     limit, sources, depth, visiting, assume,
+				                     ways, why)
+			return answers or refuse(why, "reader entry decided nothing",
+			                         instructions[index][0])
 	narrow = "%xmm" + register[len("%ymm"):]
 	for step in range(1, limit + 1):
 		position = index - step
 		if position < 0:
-			return None
+			return refuse(why, "start of listing")
 		address, _encoding, mnemonic, operands, _comment = \
 			instructions[position]
 		if mnemonic.startswith(CONTROL_PREFIXES) \
 				and not conditional_branch(mnemonic):
-			return None
+			return refuse(why, f"control transfer: {mnemonic}", address)
 		if mnemonic in UPPER_HALF_KILLERS:
 			# It decides the upper half and names nothing, so the operand
 			# test below cannot see it. Returning its position refuses both
@@ -5067,7 +5142,7 @@ def reaching_definitions(instructions, index, register, blocked, limit=640,
 			# Exhausting the bound is a refusal, so an unresolved answer
 			# stays "no definition", which is the safe direction.
 			if depth <= 0:
-				return None
+				return refuse(why, "join depth exhausted", address)
 			# **Every predecessor, not just the fall-through.** Recursing
 			# here re-enters at the target and the `blocked` test at the
 			# top refuses it, so this resolved almost nothing: 605 of the
@@ -5085,7 +5160,7 @@ def reaching_definitions(instructions, index, register, blocked, limit=640,
 			# stay refused.
 			ways = predecessors_of(instructions, position, sources)
 			if ways is None:
-				return None
+				return refuse(why, "join entry unknowable", address)
 			# **An assumed join answers from the assumption.** This is the
 			# only way a loop can be walked at all: the fixpoint below
 			# anchors on a join, assumes a value for it, and walks the back
@@ -5096,54 +5171,76 @@ def reaching_definitions(instructions, index, register, blocked, limit=640,
 			if assume is not None and position in assume:
 				return set(assume[position])
 			if position in visiting:
-				return None
-			answers, deferred = set(), []
-			for way, inclusive in ways:
-				if way > position or way in visiting:
-					# **A back edge, and `value_survives_loop` already
-					# answers it.** Findings 83 and 84 built that rule for
-					# exactly this shape -- a loop head whose zero the body
-					# cannot disturb -- and `check-pe`'s `zerochain` is its
-					# positive control. Refusing every back edge instead
-					# discards it: the fixture stopped returning 33,
-					# because the body store could no longer prove the head
-					# was zero. An edge the loop cannot disturb contributes
-					# nothing and is skipped; one that might, refuses.
-					if value_survives_loop(instructions, position, register,
-					                       blocked, sources):
-						continue
-					# **And where it cannot, iterate rather than refuse.**
-					# The induction above is one shape -- a memset head whose
-					# body writes nothing -- and every other loop was a
-					# refusal. Finding 195.
-					deferred.append((way, inclusive))
-					continue
-				answer = reaching_definitions(
-					instructions, way + 1 if inclusive else way, register,
-					blocked, limit, sources, depth - 1,
-					visiting | {position}, assume)
-				if answer is None:
-					return None
-				answers |= answer
-			# **The set, not one of it.** The ways into a join may reach
-			# different definitions and that is an answer, not a refusal:
-			# `stale_upper_reads` asks whether ANY of them is a site this
-			# rewrite touched, and refusing on disagreement hid 128 of the
-			# 248 unresolved sources. A caller needing one answer gets None
-			# from the `reaching_definition` wrapper. Finding 194.
-			#
-			# **And an empty set is not an answer.** A chain of joins can
-			# each contribute nothing and leave this empty, which reads to
-			# `stale_upper_reads` as "resolved, and no producer was
-			# rewritten" -- a silent clean for a register nothing was
-			# established about. Refuse it. Finding 195.
-			if not deferred:
-				return answers or None
-			return loop_fixpoint(instructions, position, register, blocked,
-			                     limit, sources, depth, visiting, assume,
-			                     ways)
+				raise JoinCycle(position)
+			try:
+				return join_answer(instructions, position, register, blocked,
+				                   limit, sources, depth, visiting, assume,
+				                   ways, address, why)
+			except JoinCycle as cycle:
+				if cycle.position != position:
+					raise
+				# This join is the one the cycle returns to, so it is the
+				# one that must be assumed. Finding 197.
+				return loop_fixpoint(instructions, position, register,
+				                     blocked, limit, sources, depth,
+				                     visiting, assume, ways, why)
 		# A pure source, or no mention at all: the value is unchanged.
-	return None
+	return refuse(why, "budget exhausted")
+
+
+def join_answer(instructions, position, register, blocked, limit, sources,
+                depth, visiting, assume, ways, address, why):
+	"""Union the ways into a join, or None. Raises `JoinCycle`.
+
+	Split out of `reaching_definitions` so the join's own body can be run
+	under one `try`: a cycle detected anywhere below has to abandon this
+	whole union, not just the way it was found on. Finding 197.
+	"""
+	answers, deferred = set(), []
+	for way, inclusive in ways:
+		if way > position or way in visiting:
+			# **A back edge, and `value_survives_loop` already
+			# answers it.** Findings 83 and 84 built that rule for
+			# exactly this shape -- a loop head whose zero the body
+			# cannot disturb -- and `check-pe`'s `zerochain` is its
+			# positive control. Refusing every back edge instead
+			# discards it: the fixture stopped returning 33,
+			# because the body store could no longer prove the head
+			# was zero. An edge the loop cannot disturb contributes
+			# nothing and is skipped; one that might, refuses.
+			if value_survives_loop(instructions, position, register,
+			                       blocked, sources):
+				continue
+			# **And where it cannot, iterate rather than refuse.**
+			# The induction above is one shape -- a memset head whose
+			# body writes nothing -- and every other loop was a
+			# refusal. Finding 195.
+			deferred.append((way, inclusive))
+			continue
+		answer = reaching_definitions(
+			instructions, way + 1 if inclusive else way, register,
+			blocked, limit, sources, depth - 1,
+			visiting | {position}, assume, why)
+		if answer is None:
+			return None
+		answers |= answer
+	# **The set, not one of it.** The ways into a join may reach
+	# different definitions and that is an answer, not a refusal:
+	# `stale_upper_reads` asks whether ANY of them is a site this
+	# rewrite touched, and refusing on disagreement hid 128 of the
+	# 248 unresolved sources. A caller needing one answer gets None
+	# from the `reaching_definition` wrapper. Finding 194.
+	#
+	# **And an empty set is not an answer.** A chain of joins can
+	# each contribute nothing and leave this empty, which reads to
+	# `stale_upper_reads` as "resolved, and no producer was
+	# rewritten" -- a silent clean for a register nothing was
+	# established about. Refuse it. Finding 195.
+	if not deferred:
+		return answers or refuse(why, "join decided nothing", address)
+	return loop_fixpoint(instructions, position, register, blocked,
+	                     limit, sources, depth, visiting, assume,
+	                     ways, why)
 
 
 def zeroed_ymm(instructions, index, register, blocked, limit=640,
@@ -6415,7 +6512,8 @@ def switch_targets(instructions, binary, starts):
 	return found, tables, dispatches
 
 
-def stale_upper_reads(instructions, blocked, sources, placed, patched):
+def stale_upper_reads(instructions, blocked, sources, placed, patched,
+                      reasons=None):
 	"""[(reader, register, producer)] -- reads of an upper half left stale.
 
 	Asked from the READER's end, because the lowering's end cannot see the
@@ -6452,10 +6550,22 @@ def stale_upper_reads(instructions, blocked, sources, placed, patched):
 			# reader takes whatever that path left. Asking for a single
 			# definition and refusing on disagreement filed 128 of the 248
 			# sources as "cannot speak for". Finding 194.
-			where = reaching_definitions(instructions, position, field,
-			                             blocked, sources=sources)
+			why = [] if reasons is not None else None
+			try:
+				where = reaching_definitions(instructions, position, field,
+				                             blocked, sources=sources,
+				                             depth=JOIN_DEPTH, why=why)
+			except JoinCycle:
+				where = refuse(why, "join cycle escaped")
 			if where is None:
 				unknown += 1
+				if reasons is not None:
+					# The FIRST entry is the deepest refusal. Later ones are
+					# the same refusal propagating out through the joins
+					# above it, and counting those would report the shape of
+					# the recursion rather than the shape of the gap.
+					reasons.append((why[0] if why else ("unrecorded", None),
+					                address, field))
 				continue
 			# **Every rewritten producer, not the first one.** A join
 			# reaching two definitions has two ways to be stale, and
@@ -9306,9 +9416,54 @@ def loop_selftest():
 			print(f"selftest: {what}: reaching_definitions gave {got}, want "
 			      f"{expected}", file=sys.stderr)
 			failures += 1
+	# **A cycle visible only as recursion.** Join B is reached from the
+	# reader; walking B's ways reaches join A, whose own back edge walks
+	# forward again through B -- so B is re-entered while it is being
+	# evaluated, which is not a back edge in listing order and was refused
+	# outright. B catches the signal and re-runs itself as a fixpoint. 27 of
+	# the 230 unresolved sources at depth 16 were this. Finding 197.
+	spec = [
+		(vpxor, "vpxor", "%xmm0,%xmm0,%xmm0"),
+		(b"\x90", "nop", ""),
+		(bytes.fromhex("7401"), "je", "0x1008"),
+		(b"\x90", "nop", ""),
+		(b"\x90", "nop", ""),
+		(store, "vmovups", "%ymm0,(%rdi)"),
+		(bytes.fromhex("ebf4"), "jmp", "0x1004"),
+	]
+	rows, at = [], 0x1000
+	for encoding, mnemonic, operands in spec:
+		rows.append((at, encoding, mnemonic, operands, None))
+		at += len(encoding)
+	head, second = rows[1][0], rows[4][0]
+	sources = {head: [rows[6][0]], second: [rows[2][0]]}
+	fired = []
+	born = JoinCycle.__init__
+
+	def watch(self, position):
+		fired.append(position)
+		born(self, position)
+
+	JoinCycle.__init__ = watch
+	try:
+		got = reaching_definitions(rows, 5, "%ymm0", {head, second},
+		                           sources=sources)
+	finally:
+		JoinCycle.__init__ = born
+	if not fired:
+		# Without this the case passes for the wrong reason: any future
+		# shape that resolves without a cycle would satisfy the assertion
+		# below and the path would go untested.
+		print("selftest: the recursion-only cycle never raised JoinCycle, so "
+		      "this case does not reach the path it is for", file=sys.stderr)
+		failures += 1
+	elif got != {0}:
+		print(f"selftest: a cycle visible only as recursion: "
+		      f"reaching_definitions gave {got}, want {{0}}", file=sys.stderr)
+		failures += 1
 	if not failures:
-		print(f"selftest: {len(LOOP_CASES)} loops, and the body's own write "
-		      f"is not lost to the back edge")
+		print(f"selftest: {len(LOOP_CASES) + 1} loops, and the body's own "
+		      f"write is not lost to the back edge")
 	return failures
 
 
@@ -10159,6 +10314,9 @@ def main(argv):
 	if mode == "sabotage":
 		return sabotage(argv[1], argv[2], argv[3])
 
+	if mode == "sources":
+		return source_census(argv[1], argv[2])
+
 	print(f"detour.py: unknown mode {mode!r}", file=sys.stderr)
 	return 2
 
@@ -10219,6 +10377,92 @@ def sabotage(patched, output, kind):
 	with open(output, "wb") as image:
 		image.write(bytes(data))
 	print(f"sabotage: {kind} -- {SABOTAGE[kind]} must now be false")
+	return 0
+
+
+def repaired_placement(instructions, blocked, sources, candidates, patched,
+                       stub_base, spill_base, stub_reasons, home, tls):
+	"""Place the stubs, withholding the windows that would ship wrong bytes.
+
+	Returns `(placed, blob, overlapped, refused, dropped, swallowed)`.
+
+	**A window that swallows a VEX.128 write loses its upper-half zeroing,
+	and reverting cannot reach it.** The passenger is re-emitted inside the
+	stub as legacy SSE, so there is nothing on disk to put back and Finding
+	187's repair has no purchase. The only fix is not to place that window:
+	it costs the site and keeps the bytes right, which is 187's trade one
+	layer out.
+
+	It iterates because dropping a window un-swallows everything it
+	covered, which can make a reader that was inside it survive and expose
+	a producer of its own. Bounded by `REPAIR_ROUNDS`, and the candidate
+	list only shrinks.
+
+	**This is one function because the first version was not.** `apply`
+	grew the repair and `verify` did not, so `verify` went on placing the
+	eight windows `apply` withheld and reported 15 stale reads the image
+	does not have -- against a comment on its own `place_stubs` call saying
+	"the same call apply makes, so the two cannot drift apart". A promise
+	in a comment is not a mechanism. Finding 197.
+	"""
+	dropped = set()
+	for _round in range(REPAIR_ROUNDS):
+		keep = [item for item in candidates if item[0] not in dropped]
+		placed, _blob, _swallowed, _over, _refused = place_stubs(
+			keep, stub_base, spill_base, Counter(), home=home, tls=tls)
+		stale, _unresolved = stale_upper_reads(instructions, blocked,
+		                                       sources, placed, patched)
+		covers = {}
+		for site, window, _stub, _size, _prologue in placed:
+			for address in range(site, site + window):
+				covers[address] = site
+		# **Inside a window outranks being an in-place patch.** This said
+		# `and producer not in patched`, on the assumption that a patched
+		# producer would be repaired by Finding 187's revert. It is not:
+		# `apply` reverts into `data` and THEN writes the jump and its
+		# padding over the window, so a revert inside a window is
+		# overwritten seconds later and nothing says so. Three readers of
+		# %ymm7 shipped that way, all from one `vmovss` that was both
+		# patched and swallowed. A producer inside a window is guilty
+		# whatever else is true of it. Finding 197.
+		guilty = {covers[producer] for _reader, _field, producer in stale
+		          if producer in covers}
+		if not guilty - dropped:
+			break
+		dropped |= guilty
+	placed, blob, swallowed, overlapped, refused = place_stubs(
+		[item for item in candidates if item[0] not in dropped], stub_base,
+		spill_base, stub_reasons, home=home, tls=tls)
+	return placed, blob, overlapped, refused, dropped, swallowed
+
+
+def source_census(binary, listing):
+	"""Break the unresolved upper-half sources down by why. Always 0.
+
+	**A residue is not a floor until somebody asks what is in it.** The
+	193 indirect entries and 23 call/ret this project quotes were measured
+	when the total was 603; Findings 194 and 195 closed 346 of those, and
+	nothing re-derives a scope number by itself. This is the method beside
+	the fact. Finding 197.
+	"""
+	context = analysis_context(binary, listing)
+	_patches, candidates, _stats, _skipped, _declined, home = collect(
+		binary, listing, context)
+	placed, _blob, _swallowed, _over, _refused = place_stubs(
+		candidates, stub_base_of(open(binary, "rb").read()), home=home,
+		tls=tls_pair_of(tls_for(binary)))
+	instructions, _plain, blocked, sources, _tables, _seen = context
+	reasons = []
+	stale, unknown = stale_upper_reads(instructions, blocked, sources, placed,
+	                                   set(row[0] for row in _patches),
+	                                   reasons)
+	readers = len({reader for reader, _f, _p in stale})
+	print(f"sources: {readers:,} stale reader(s), {unknown:,} unresolved")
+	counted = Counter(reason for (reason, _at), _reader, _field in reasons)
+	width = max((len(name) for name in counted), default=0)
+	for name, count in counted.most_common():
+		print(f"  {name:<{width}}  {count:>5,}")
+	print(f"  {'total':<{width}}  {sum(counted.values()):>5,}")
 	return 0
 
 
@@ -10696,9 +10940,28 @@ def apply_all(binary, listing, output):
 	# steps by hand to find out that a swallowed instruction wanted a scratch.
 	# Every failure path names itself now. Finding 88.
 	stub_reasons = Counter()
-	placed, blob, _swallowed, overlapped, refused = place_stubs(
-		candidates, stub_base, spill_base, stub_reasons, home=home,
-		tls=tls_pair_of(tls_here))
+	instructions, _plain, blocked, sources, _tables, _seen = context
+
+	# **A window that swallows a VEX.128 write loses its upper-half
+	# zeroing, and reverting cannot reach it.** The passenger is re-emitted
+	# inside the stub as legacy SSE, so there is nothing on disk to put
+	# back -- the only repair is to not place that window, which costs the
+	# site and keeps the bytes right. Same trade as Finding 187's revert,
+	# one layer out.
+	#
+	# It iterates because dropping a window un-swallows everything it
+	# covered, which can make a reader that was inside it survive and
+	# expose a producer of its own. Bounded: each round drops at least one
+	# candidate or stops, and the list only shrinks. Finding 197.
+	placed, blob, overlapped, refused, dropped, swallowed = \
+		repaired_placement(instructions, blocked, sources, candidates,
+		                   set(undo), stub_base, spill_base, stub_reasons,
+		                   home, tls_pair_of(tls_here))
+	del swallowed
+	if dropped:
+		print(f"apply: {len(dropped):,} window(s) not placed, each having "
+		      f"swallowed a VEX.128 write whose zeroing a surviving "
+		      f"256-bit instruction still reads")
 
 	# **A VEX.128 write that stops zeroing, where somebody still looks.**
 	# Patching one in place turns it into legacy SSE, which leaves bits
@@ -10707,24 +10970,29 @@ def apply_all(binary, listing, output):
 	# only repair is to leave the VEX form standing: it costs the site and
 	# keeps the bytes right. Reverting cannot cascade, because a 128-bit
 	# write reads no upper half of its own. Finding 187.
-	instructions, _plain, blocked, sources, _tables, _seen = context
 	stale, unresolved = stale_upper_reads(instructions, blocked, sources,
 	                                      placed, set(undo))
+	covered = set()
+	for site, window, _stub, _size, _prologue in placed:
+		covered.update(range(site, site + window))
 	reverted, stuck = set(), []
 	for reader, field, producer in stale:
-		if producer in undo:
+		if producer in undo and producer not in covered:
 			if producer not in reverted:
 				offset, original = undo[producer]
 				data[offset:offset + len(original)] = original
 				reverted.add(producer)
 			continue
-		# **A stale read whose producer is not an in-place patch cannot be
-		# repaired by reverting one.** The producer is inside a window a
-		# detour swallowed, so its zeroing was re-emitted as legacy SSE in
-		# the stub and there is nothing on disk to put back. Silence here
-		# shipped 5 wrong readers: `apply` counted them among the 52 it
-		# reported and reverted only the 45 it could, and the difference
-		# was visible nowhere until `verify` read the image. Finding 194.
+		# **A stale read a revert cannot repair.** Either the producer is
+		# not an in-place patch at all, or it is one inside a window --
+		# and a revert inside a window is overwritten by the jump written
+		# over that window a moment later, which is worse, because it
+		# looks repaired. `repaired_placement` withholds those windows, so
+		# anything still here is a producer neither mechanism reaches.
+		# Silence shipped 5 wrong readers once already: `apply` counted
+		# them among the 52 it reported and repaired only the 45 it could,
+		# and the difference was visible nowhere until `verify` read the
+		# image. Findings 194 and 197.
 		stuck.append((reader, field, producer))
 	if stuck:
 		print(f"apply: {len(stuck):,} stale read(s) whose producer is not an "
@@ -10971,10 +11239,18 @@ def verify(original, patched, listing=None):
 	context = analysis_context(original, listing)
 	_patches, candidates, _stats, _skipped, _declined, home = collect(
 		original, listing, context)
-	# The same call apply makes, so the two cannot drift apart.
-	placed, _blob, swallowed, _overlapped, _refused = place_stubs(
-		candidates, stub_base_of(open(original, "rb").read()), home=home,
-		tls=tls_pair_of(tls_for(original)))
+	instructions, _plain, blocked, sources, _tables, _seen = context
+	# **The same call apply makes -- through the same function, now.** This
+	# said so in a comment while `apply` grew a repair pass this did not,
+	# and the drift cost 15 reported stale reads the image did not have.
+	# The repair takes the FULL patch set, as apply does when it decides,
+	# because the question is which windows apply withheld; the stale check
+	# below then reads the image. Finding 197.
+	placed, _blob, _over, _refused, _dropped, swallowed = repaired_placement(
+		instructions, blocked, sources, candidates,
+		set(row[0] for row in _patches),
+		stub_base_of(open(original, "rb").read()), 0, Counter(), home,
+		tls_pair_of(tls_for(original)))
 	groups = target_set.collect(original)
 	reachable = set()
 	for values in groups.values():
@@ -11084,7 +11360,6 @@ def verify(original, patched, listing=None):
 	# window that lowered it, or a VEX.128 write patched to legacy SSE,
 	# which stops zeroing [255:128] -- then the reader takes bytes the
 	# original would not have given it. Finding 186.
-	instructions, _plain, blocked, sources, _tables, _seen = context
 	# **From the IMAGE, not from the plan.** `_patches` is what `collect`
 	# intended; `apply` then reverts any patch whose zeroing a surviving
 	# reader still observes (Finding 187), so the planned list names sites

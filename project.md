@@ -12328,6 +12328,85 @@ That is now the third instance of a rebound name in this file -- `entries` in Fi
 `patched` in 188, `section_named` here -- and the third was written while reading the second.
 
 
+### Finding 197 -- the residue was mostly a knob, and repairing it found two ways to ship wrong bytes
+
+The last item on the list read "the residual 257 unresolved sources: ~2 known stale, rest a
+floor -- 193 indirect entry + 23 call/ret are unanswerable". **Every number in that sentence
+was wrong**, and the first act of the work was to measure it rather than attack it.
+
+`detour.py sources <binary> <listing>` breaks the residue down by the walk's OWN first refusal,
+recorded at the point of refusal rather than inferred:
+
+```
+                              at 4     at 16    after the cycle fix
+join entry unknowable           118       119        119   indirect entry: a floor
+join depth exhausted             77         0          0   a constant in this file
+control transfer: call           37        57         57   opaque: a floor
+reader entry is a back edge      10        11          0
+join revisited                    8        27          0
+join decided nothing              2         9         24   honest: nothing reaches
+control transfer: ret             5         5          5   a floor
+loop decided nothing              -         2          3
+total                           257       230        208
+stale readers found              61        78         78
+```
+
+**The quoted floor was 193 and 23; it is 119 and 62.** And the largest attackable class was
+never a property of the binary: `depth=4`, chosen in Finding 84 because four sufficed for the
+memset shape it was built for, sitting inside a number everyone read as architectural. Swept
+4/8/16/32/64 over one setup, the class empties at 16 and neither 32 nor 64 finds more -- so 16
+is where it CONVERGES rather than where a budget stopped -- and it costs nothing measurable,
+9 seconds against 8 in a step whose setup is 514.
+
+**A cycle visible only as recursion is a loop too.** `loop_fixpoint` handled the back edge it
+could see in listing order and refused the ones it could only meet as re-entry. The ancestor
+that owns the cycle now catches a signal and re-runs itself as a fixpoint with itself assumed;
+a cycle naming a different ancestor propagates to it, and one nobody anchors becomes a refusal
+at every boundary rather than an escaped exception -- which is how Finding 188 lost `verify`'s
+last two checks.
+
+#### And then it shipped 15 wrong readers, twice, for two different reasons
+
+**A window that swallows a VEX.128 write loses its upper-half zeroing, and Finding 187's
+revert cannot reach it.** The passenger is re-emitted inside the stub as legacy SSE; there is
+nothing on disk to put back. The repair is to withhold the window -- 187's trade one layer
+out, costing the site and keeping the bytes right -- and it iterates, because dropping a window
+un-swallows what it covered.
+
+That is what the "cannot be reverted" line added in Finding 194 was for. **It reported zero
+when it was written and existed only so that the next one would speak**, and it did: 24 rows,
+every one named.
+
+**Then `verify` reported 15 stale reads the image did not have.** `apply` had grown the repair
+and `verify` had not, so `verify` re-placed the nine windows `apply` withheld and read their
+contents as swallowed. Its `place_stubs` call carried the comment *"the same call apply makes,
+so the two cannot drift apart"* -- **a promise in a comment is not a mechanism**, and one edit
+to one side walked through it. It is one function called by both now.
+
+**And three were real, from a defect older than any of today's work.** `apply` reverts an
+in-place patch into the buffer and THEN writes the jump and its padding over the window, so a
+revert of a producer that is also swallowed is overwritten seconds later. The `guilty` set
+excluded patched producers on the assumption the revert would handle them -- the same
+assumption, one layer up. **That is worse than an unrepaired site, because it looks repaired**:
+a revert is counted, nothing is printed, and the bytes go out wrong. Three readers of `%ymm7`
+shipped that way, all from one `vmovss` that was both patched and swallowed. A producer inside
+a window is guilty whatever else is true of it.
+
+```
+                                    before    after
+unresolved upper-half sources          257      208     -49
+surviving VEX in .text               5,771    5,782     +11
+windows withheld                         0        9
+in-place patches reverted               51       53
+stale reads left in the IMAGE            0        0
+```
+
+**What is left is a floor with a method attached rather than a remembered number.** 181 of the
+208 are architectural -- indirect entry, calls, returns -- and 27 are the fixpoint honestly
+converging on "no definition reaches this point". `detour.py sources` re-derives all of it, so
+the next reader is not obliged to believe this paragraph.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12345,7 +12424,7 @@ a binary that computes the wrong answer.
 | - | ~~F2 and F3~~ **DONE** | 118 sources resolved, 20 more stale readers, 19 reverts | wrong bytes | Finding 194: and the set-valued walk exposed a repair loop that closed one path of a join and left the other |
 | - | ~~The loop-aware back-edge rule~~ **DONE** | 228 resolved, 9 more stale readers | wrong bytes | Finding 195: the fixpoint it wanted, and the skip is now a sabotage case |
 | - | ~~The 164 branch-target regions~~ **CLOSED at 0** | 0 emitted, 0 sites | sites | Finding 192: 21 representable of an estimated 74, none emitted, and the rule could not have been sound |
-| 1 | The residual 257 unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable; 346 of the old 603 were closed by Findings 194 and 195 |
+| - | ~~The residual unresolved sources~~ **AT THE FLOOR** | 257 -> 208; 181 architectural, 27 honest | wrong bytes | Finding 197: the quoted floor was wrong on both halves, and 77 of it was `depth=4`. Re-derive with `detour.py sources` |
 | - | ~~A gate that runs `detour.py verify`~~ **DONE** | 35 fixtures, 2 controls | robustness | Finding 196: and two of its checks only worked on the one image it had been pointed at |
 
 **The head is still in the currency that outranks.** Item 3 is the
@@ -12365,13 +12444,13 @@ Ordered by what was measured. **Rewritten after Findings 179-187**, which closed
 previous list and replaced its subject: the remaining work is no longer about lowering more
 sites but about the ones already lowered being right.
 
-The frontier is **5,771 surviving VEX of 805,131, 99.3% removed**. It has RISEN six times
+The frontier is **5,782 surviving VEX of 805,131, 99.3% removed**. It has RISEN seven times
 today and every rise was a correctness fix -- 467 region lowerings, 24 long-pair stores, 78
 stale reads across four strategies, the in-place patches of Finding 187, and the 11 and 2 sites
 Findings 194 and 195 keep in their VEX form. A count that only falls is a count nobody is
 checking.
 
-  1. **The 257 unresolved upper-half sources, which is the honest gap.** `verify`'s stale-read
+  1. **The 208 unresolved upper-half sources, which is the honest gap.** `verify`'s stale-read
      check reports them rather than counting them clean, and cannot speak for them:
      `reaching_definition` refuses when a branch target intervenes, and 699 surviving readers
      have a source it will not resolve. Three of the four readers Finding 185 found by hand
