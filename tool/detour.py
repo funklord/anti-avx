@@ -4854,8 +4854,68 @@ def address_position(instructions, address):
 	return None
 
 
+# How many times the loop fixpoint may grow its assumption before giving
+# up. The lattice is finite -- subsets of the definitions in one function --
+# so it terminates on its own; the bound is a cost ceiling, and exhausting
+# it is a refusal like every other budget here.
+LOOP_ROUNDS = 6
+
+
+def loop_fixpoint(instructions, position, register, blocked, limit, sources,
+                  depth, visiting, assume, ways):
+	"""The definitions reaching a join with a back edge, or None.
+
+	**Assume the back edge contributes nothing, then check the assumption
+	rather than keeping it.** That distinction is the whole of this
+	function. A prototype simply skipped back edges and reported 508
+	resolutions against 61 stale reads, and Finding 193 recorded it as
+	unsound and not to be gated -- rightly, because a loop that rewrites
+	the register on its second iteration is exactly what the skip cannot
+	see, and skipping says the value is whatever the first iteration left.
+
+	Iterating repairs it. Start the assumption at the empty set, evaluate
+	every way in under it, and union what comes back; stop when a round
+	adds nothing, which makes the assumption a fixpoint of the equation it
+	stands in. Reaching definitions is a union analysis over a finite
+	lattice, so the ascent from the empty set terminates and lands on the
+	LEAST fixpoint -- the one that assumes nothing it has not derived.
+
+	The difference from the skip is visible in one round: the skip stops
+	after evaluating the forward ways, this one then walks the back edge
+	with what it has and asks whether the loop body can add a definition.
+	Where the body writes the register, that write comes back and the
+	assumption grows to include it; the skip never asked. Where the body
+	does not, the second round adds nothing and the two agree -- which is
+	why the skip looked right on the cases anybody checked.
+
+	`value_survives_loop` still answers first, because it is cheap and
+	proven and covers the memset shape this project met earliest. This runs
+	only where that says no, so it adds resolutions and removes none.
+	Finding 195.
+	"""
+	current = frozenset()
+	for _ in range(LOOP_ROUNDS):
+		seen = dict(assume) if assume else {}
+		seen[position] = current
+		answers = set()
+		for way, inclusive in ways:
+			answer = reaching_definitions(
+				instructions, way + 1 if inclusive else way, register,
+				blocked, limit, sources, depth - 1, visiting | {position},
+				seen)
+			if answer is None:
+				return None
+			answers |= answer
+		if answers <= current:
+			# The assumption reproduced itself: a fixpoint, and sound.
+			return set(current) or None
+		current = frozenset(current | answers)
+	return None
+
+
 def reaching_definition(instructions, index, register, blocked, limit=640,
-                        sources=None, depth=4, visiting=frozenset()):
+                        sources=None, depth=4, visiting=frozenset(),
+                        assume=None):
 	"""The single position `register`'s value was decided at, or None.
 
 	A wrapper on `reaching_definitions`, which answers with the SET of
@@ -4867,14 +4927,15 @@ def reaching_definition(instructions, index, register, blocked, limit=640,
 	"is ANY of them a site this rewrite touched". Finding 194.
 	"""
 	found = reaching_definitions(instructions, index, register, blocked,
-	                             limit, sources, depth, visiting)
+	                             limit, sources, depth, visiting, assume)
 	if found is None or len(found) != 1:
 		return None
 	return next(iter(found))
 
 
 def reaching_definitions(instructions, index, register, blocked, limit=640,
-                         sources=None, depth=4, visiting=frozenset()):
+                         sources=None, depth=4, visiting=frozenset(),
+                         assume=None):
 	"""Where `register`'s value at `index` was decided, or None.
 
 	Returns the position of the nearest instruction that writes it. Sound
@@ -5023,9 +5084,20 @@ def reaching_definitions(instructions, index, register, blocked, limit=640,
 			# reachable by an indirect call nothing here enumerates, and
 			# stay refused.
 			ways = predecessors_of(instructions, position, sources)
-			if ways is None or position in visiting:
+			if ways is None:
 				return None
-			answers = set()
+			# **An assumed join answers from the assumption.** This is the
+			# only way a loop can be walked at all: the fixpoint below
+			# anchors on a join, assumes a value for it, and walks the back
+			# edge -- which comes back down to this same join. Without the
+			# assumption the walk re-enters and refuses, which is what made
+			# every loop unanswerable except through the narrow induction.
+			# Finding 195.
+			if assume is not None and position in assume:
+				return set(assume[position])
+			if position in visiting:
+				return None
+			answers, deferred = set(), []
 			for way, inclusive in ways:
 				if way > position or way in visiting:
 					# **A back edge, and `value_survives_loop` already
@@ -5040,11 +5112,16 @@ def reaching_definitions(instructions, index, register, blocked, limit=640,
 					if value_survives_loop(instructions, position, register,
 					                       blocked, sources):
 						continue
-					return None
+					# **And where it cannot, iterate rather than refuse.**
+					# The induction above is one shape -- a memset head whose
+					# body writes nothing -- and every other loop was a
+					# refusal. Finding 195.
+					deferred.append((way, inclusive))
+					continue
 				answer = reaching_definitions(
 					instructions, way + 1 if inclusive else way, register,
 					blocked, limit, sources, depth - 1,
-					visiting | {position})
+					visiting | {position}, assume)
 				if answer is None:
 					return None
 				answers |= answer
@@ -5054,7 +5131,17 @@ def reaching_definitions(instructions, index, register, blocked, limit=640,
 			# rewrite touched, and refusing on disagreement hid 128 of the
 			# 248 unresolved sources. A caller needing one answer gets None
 			# from the `reaching_definition` wrapper. Finding 194.
-			return answers
+			#
+			# **And an empty set is not an answer.** A chain of joins can
+			# each contribute nothing and leave this empty, which reads to
+			# `stale_upper_reads` as "resolved, and no producer was
+			# rewritten" -- a silent clean for a register nothing was
+			# established about. Refuse it. Finding 195.
+			if not deferred:
+				return answers or None
+			return loop_fixpoint(instructions, position, register, blocked,
+			                     limit, sources, depth, visiting, assume,
+			                     ways)
 		# A pure source, or no mention at all: the value is unchanged.
 	return None
 
@@ -7823,6 +7910,7 @@ def selftest():
 	failures += rescue_selftest()
 	failures += upper_source_selftest()
 	failures += join_selftest()
+	failures += loop_selftest()
 	failures += isa_bound_selftest()
 	failures += gpr_selftest()
 	failures += xmm_selftest()
@@ -9130,6 +9218,64 @@ def join_selftest():
 	if not failures:
 		print(f"selftest: {len(JOIN_CASES) + 4} joins, resolved only where "
 		      f"every way in agrees")
+	return failures
+
+
+LOOP_CASES = [
+	("a loop the body cannot disturb resolves to the write above it",
+	 False, {0}),
+	("a loop whose body rewrites the register names that write too",
+	 True, {0, 8}),
+]
+
+
+def loop_selftest():
+	"""Prove the loop fixpoint, and that it is not the skip. 0 or n.
+
+	The body is 40 instructions so `value_survives_loop` refuses both cases
+	on its 32-step budget -- otherwise the narrow induction would answer
+	first and neither case would reach the fixpoint at all.
+
+	**The second case is the whole point.** An implementation that skips a
+	back edge instead of iterating answers `{0}` for it: the pre-loop zero,
+	which is what the register holds on the first iteration and not on any
+	later one. The fixpoint walks the back edge with what it has and the
+	body's write comes back, so the answer names both. Finding 195.
+	"""
+	vpxor = bytes.fromhex("c5f9efc0")
+	store = bytes.fromhex("c5fc1107")
+	load = bytes.fromhex("c5fc1006")
+	failures = 0
+	for what, body_writes, expected in LOOP_CASES:
+		spec = [(vpxor, "vpxor", "%xmm0,%xmm0,%xmm0"),
+		        (b"\x90", "nop", ""),
+		        (store, "vmovups", "%ymm0,(%rdi)")]
+		for i in range(40):
+			if body_writes and i == 5:
+				spec.append((load, "vmovups", "(%rsi),%ymm0"))
+			else:
+				spec.append((b"\x90", "nop", ""))
+		spec.append((bytes.fromhex("0f8500000000"), "jne", "0x1004"))
+		rows, at = [], 0x1000
+		for encoding, mnemonic, operands in spec:
+			rows.append((at, encoding, mnemonic, operands, None))
+			at += len(encoding)
+		head, back = rows[1][0], rows[-1][0]
+		if value_survives_loop(rows, 1, "%ymm0", {head}, {head: [back]}):
+			print(f"selftest: {what}: the narrow induction answered first, "
+			      f"so this case does not reach the fixpoint",
+			      file=sys.stderr)
+			failures += 1
+			continue
+		got = reaching_definitions(rows, 2, "%ymm0", {head},
+		                           sources={head: [back]})
+		if got != expected:
+			print(f"selftest: {what}: reaching_definitions gave {got}, want "
+			      f"{expected}", file=sys.stderr)
+			failures += 1
+	if not failures:
+		print(f"selftest: {len(LOOP_CASES)} loops, and the body's own write "
+		      f"is not lost to the back edge")
 	return failures
 
 

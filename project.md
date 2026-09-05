@@ -12220,6 +12220,67 @@ would pass by answering every blocked reader from its fall-through alone, which 
 unsoundness pointed at a different address.
 
 
+### Finding 195 -- the back edge is iterated, not skipped, and the difference is one round
+
+The last item in the currency that outranks. `value_survives_loop` answered one loop shape --
+a memset head whose body writes the register nowhere -- and every other back edge was a
+refusal. A prototype simply skipped back edges and reported 508 resolutions against 61 stale
+reads; Finding 193 recorded that as unsound and not to be gated.
+
+**Iterating repairs it, and the repair is small.** Assume the back edge contributes nothing,
+evaluate every way in under that assumption, union what comes back, and stop when a round adds
+nothing -- which makes the assumption a fixpoint of the equation it stands in. Reaching
+definitions is a union analysis over a finite lattice, so the ascent from the empty set
+terminates and lands on the LEAST fixpoint: the one that assumes nothing it has not derived.
+`LOOP_ROUNDS = 6` is a cost ceiling, not a correctness one.
+
+```
+                                    before    after
+unresolved upper-half sources          485      257    -228
+in-place patches reverted               49       51      +2
+stale readers found at apply time       52       61      +9
+surviving VEX in .text               5,769    5,771      +2
+stale reads left in the IMAGE            0        0
+```
+
+228 against the 185 this was listed at, and 9 more readers taking bytes the original would not
+have given them. It costs 6 seconds in a step whose setup is 514.
+
+**The skip and the fixpoint differ by exactly one round, which is why the skip looked right.**
+The skip stops after the forward ways; this one then walks the back edge with what it has and
+asks whether the body can add a definition. Where the body writes the register that write comes
+back and the assumption grows; where it does not, the second round adds nothing and the two
+agree. **Every case anybody checked by hand was a body that writes nothing**, because those are
+the loops whose shape is easy to see.
+
+That is a test now rather than a caveat in a document:
+
+```
+sabotage: skip the back edge, do not iterate
+    a loop whose body rewrites the register -> gave {0}, want {0, 8}
+sabotage: accept round one without checking it converged
+    a loop the body cannot disturb          -> gave None, want {0}
+```
+
+The first is the prototype's rule failing on the case Finding 193 predicted it would fail on.
+The second proves the convergence check is load-bearing rather than decoration. **The body of
+the fixture is 40 instructions so that `value_survives_loop` refuses on its 32-step budget** --
+without that the narrow induction answers first and neither case reaches the fixpoint at all,
+which is Finding 111 met again in a test written to close something.
+
+**`value_survives_loop` still answers first**, being cheap and proven, so this adds resolutions
+and removes none. Two rules for one question is not duplication here: the induction is exact
+where it applies and the fixpoint is general, and keeping both is what made the change provably
+additive.
+
+**And an empty set is not an answer.** Finding 194 made the walk set-valued and left a hole a
+chain of joins could fall through: each contributing nothing leaves the union empty, which
+reads to `stale_upper_reads` as "resolved, and no producer was rewritten" -- a silent clean for
+a register nothing was established about. It refuses now. Nothing was measured to have been
+wrong because of it, which is the point: it was found by asking what the new return type could
+mean and not by anything going red.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12235,10 +12296,10 @@ a binary that computes the wrong answer.
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
 | - | ~~F2 and F3~~ **DONE** | 118 sources resolved, 20 more stale readers, 19 reverts | wrong bytes | Finding 194: and the set-valued walk exposed a repair loop that closed one path of a join and left the other |
-| 1 | The loop-aware back-edge rule | 10 more stale reads, 185 more resolved | wrong bytes | measured, but wants a fixpoint before it may gate |
+| - | ~~The loop-aware back-edge rule~~ **DONE** | 228 resolved, 9 more stale readers | wrong bytes | Finding 195: the fixpoint it wanted, and the skip is now a sabotage case |
 | - | ~~The 164 branch-target regions~~ **CLOSED at 0** | 0 emitted, 0 sites | sites | Finding 192: 21 representable of an estimated 74, none emitted, and the rule could not have been sound |
-| 2 | The residual 485 unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable; 118 of the old 603 were closed by Finding 194 |
-| 3 | A gate that runs `detour.py verify` | 0 today | robustness | structural: a crash there shipped green, and Finding 194 shipped 5 wrong readers that only `verify` could see |
+| 2 | The residual 257 unresolved sources | ~2 known stale, rest a floor | wrong bytes | 193 indirect entry + 23 call/ret are unanswerable; 346 of the old 603 were closed by Findings 194 and 195 |
+| 1 | A gate that runs `detour.py verify` | 0 today | robustness | structural: a crash there shipped green, and Finding 194 shipped 5 wrong readers that only `verify` could see |
 
 **The head is still in the currency that outranks.** Item 3 is the
 largest number on the page and sits third because its currency is weaker AND its figure is a
@@ -12257,13 +12318,13 @@ Ordered by what was measured. **Rewritten after Findings 179-187**, which closed
 previous list and replaced its subject: the remaining work is no longer about lowering more
 sites but about the ones already lowered being right.
 
-The frontier is **5,769 surviving VEX of 805,131, 99.3% removed**. It has RISEN five times
+The frontier is **5,771 surviving VEX of 805,131, 99.3% removed**. It has RISEN six times
 today and every rise was a correctness fix -- 467 region lowerings, 24 long-pair stores, 78
-stale reads across four strategies, the in-place patches of Finding 187, and the 11 sites
-Finding 194's sharper walk keeps in their VEX form. A count that only falls is a count nobody
-is checking.
+stale reads across four strategies, the in-place patches of Finding 187, and the 11 and 2 sites
+Findings 194 and 195 keep in their VEX form. A count that only falls is a count nobody is
+checking.
 
-  1. **The 485 unresolved upper-half sources, which is the honest gap.** `verify`'s stale-read
+  1. **The 257 unresolved upper-half sources, which is the honest gap.** `verify`'s stale-read
      check reports them rather than counting them clean, and cannot speak for them:
      `reaching_definition` refuses when a branch target intervenes, and 699 surviving readers
      have a source it will not resolve. Three of the four readers Finding 185 found by hand
