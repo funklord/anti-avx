@@ -13072,6 +13072,61 @@ new check catches it before it ships**, and all three were caught inside the hou
 written.
 
 
+### Finding 210 -- the flags, which 31,479 patches write and nothing observed
+
+Classifying the still-uncovered mnemonics by WHAT THEY WRITE, because that decides whether the
+harness can reach them at all:
+
+```
+71,074 patches in 81 uncovered mnemonic(s)
+  31,479  writes FLAGS only         5 mnemonics   vcomiss 23,168, vucomiss 6,450
+  19,253  writes nothing            1             vzeroupper
+  12,794  writes an xmm register   54
+   5,937  writes a general register 10
+   1,611  writes memory            11
+```
+
+**A case for a flag mnemonic in `lowering_test` would have passed while comparing bytes neither
+side touched.** That harness loads sixteen xmm registers and compares sixteen xmm registers
+against a reference returning `__m128i`; `vcomiss` writes none of them. The gap was not a
+missing case but a missing OBSERVATION, and adding the case without the observation would have
+turned a known gap into a green tick.
+
+`vex_oracle` captures the flags now -- masked to the six arithmetic bits, since the ambient
+ones differ between qemu and silicon and are nobody's result, and preceded by a deterministic
+`xor` so an instruction that writes no flags leaves the same value on both sides. The five
+mnemonics live in `build_flags()`, which `lowering_test` does not consume and which shares
+`finish()` with `build()` so both go through one assembling path rather than two.
+
+**Sabotaged, every flag lowering comparing the wrong register: 58 unexplained differences, all
+in those mnemonics.** The channel is live.
+
+#### Building it in three steps is what found the defect
+
+The observation went in ALONE first, and the existing 248 cases failed. One `span` was serving
+as the output size, the printed length AND the input stride, so growing it for the flags slot
+moved the input pointer 272 bytes per pattern instead of 256 and every case after the first
+read misaligned bytes. **Isolated, that is one variable.** Added together with new cases it
+would have been new and old failures at once, with nothing to say which was which.
+
+`span` was not a bug while input and output were the same size. It became one when they
+diverged, and nothing in the code said the two were equal by definition rather than by
+coincidence.
+
+#### And the hazard named in the design was one this instrument cannot see
+
+The justification written for this work said a prefix strip landing on `ucomiss` instead of
+`comiss` would be caught here. **It would not.** That pair differs only in whether a QNaN
+raises the invalid-operation flag in MXCSR; their EFLAGS results are identical, and this
+harness compares EFLAGS.
+
+What it catches is any lowering whose FLAGS differ -- a wrong register, a wrong operand order,
+a wrong instruction -- which is real and covers 31,479 patches. It is not the NaN-signalling
+case. **A probe checked against the mechanism its author had in mind rather than against the
+failure it must catch** is this file's own recurring finding, and it was written here into the
+justification rather than the code. MXCSR is a different slot and a separate piece of work.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13086,7 +13141,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | An executed case for `vcomiss` and family | 30,760 patches | wrong bytes | Finding 209: they write flags, which this harness cannot observe -- it needs a new one |
+| 1 | MXCSR observation, for the `comiss`/`ucomiss` distinction | unknown | wrong bytes | Finding 210: EFLAGS cannot see it; the two differ only in the invalid-operation flag |
+| - | ~~An executed case for `vcomiss` and family~~ **DONE** | 31,479 patches | wrong bytes | Finding 210: the oracle captures flags now; sabotage gives 58 differences |
 | - | ~~47% of in-place patches have no executed case~~ **PART DONE** | 185,000 patches covered | wrong bytes | Finding 209: five two-operand moves; the expansion could not express them |
 | - | ~~The span oracle never executes a plain passenger~~ **DONE** | 402 of 592 shipped members | wrong bytes | Finding 208: and each fault now has exactly one witness |
 | - | ~~The refusal reasons no fixture produces~~ **CLOSED at ~30** | 15 reasons, 1,822 refusals; the largest prices at 30 | sites | Finding 207: and the 638/3,644/28,814 that ranked it were doubled -- 319/1,822/14,407 |

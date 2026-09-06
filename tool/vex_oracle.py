@@ -162,7 +162,12 @@ def collect():
 
 	detour.lower_vex = recording
 	try:
-		cases = lowering_cases.build()
+		# **The flag-only cases come here and nowhere else.** They write no
+		# register, so `lowering_test` -- which compares sixteen xmm
+		# registers against an `__m128i` reference -- cannot express them
+		# and must not be given them. This harness captures the flags, so
+		# it can. Finding 210.
+		cases = lowering_cases.build() + lowering_cases.build_flags()
 	finally:
 		detour.lower_vex = real
 	if len(recorded) != len(cases):
@@ -188,7 +193,23 @@ def program(pairs, which):
 		          f"{which}_{i}:"]
 		for r in range(REGISTERS):
 			lines.append(f"\tmovaps {r * SLOT}(%rdi), %xmm{r}")
+		# **A deterministic flag state before the instruction**, so that
+		# an instruction which writes no flags leaves the same value on
+		# both sides rather than whatever the caller happened to have.
+		# `xor` sets ZF and PF and clears CF, OF, SF.
+		lines.append("\txor %eax, %eax")
 		lines.append("\t.byte " + ", ".join(f"0x{b:02x}" for b in body))
+		# **The flags, which 31,479 patches write and nothing observed.**
+		# `vcomiss` and its family are 44% of the in-place patches with no
+		# executed case, and their whole effect lands here: a harness that
+		# compares sixteen xmm registers would pass a case for one while
+		# comparing bytes neither side touched. Masked to the arithmetic
+		# flags, because the ambient bits differ between qemu and silicon
+		# and are nobody's result. Finding 210.
+		lines.append("\tpushfq")
+		lines.append("\tpopq %rax")
+		lines.append("\tandl $0x8d5, %eax")
+		lines.append(f"\tmovl %eax, {REGISTERS * SLOT}(%rsi)")
 		for r in range(REGISTERS):
 			lines.append(f"\tmovaps %xmm{r}, {r * SLOT}(%rsi)")
 		lines += ["\tret", ""]
@@ -226,11 +247,19 @@ int main(void) {
 
 
 def main_source(prefix, count):
-	span = REGISTERS * SLOT
+	# **The input stride and the output size are two numbers now.** They
+	# were one, and adding a flags slot to the output moved the input
+	# pointer 272 bytes per pattern instead of 256 -- every case after the
+	# first read misaligned bytes, and the existing 248 cases failed. A
+	# pattern is still sixteen registers; only what comes back grew.
+	# Finding 210.
+	stride = REGISTERS * SLOT
+	span = stride + SLOT
 	decls = "\n".join(f"void {prefix}_{i}(const void *, void *);"
 	                  for i in range(count))
 	table = ", ".join(f"{prefix}_{i}" for i in range(count))
-	return decls + "\n" + MAIN % (table, span, count, len(PATTERNS), span, span)
+	return decls + "\n" + MAIN % (table, span, count, len(PATTERNS),
+	                              stride, span)
 
 
 def build(name, prefix, pairs, which):

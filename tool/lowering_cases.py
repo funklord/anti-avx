@@ -143,6 +143,46 @@ MEMORY_EXEMPT = frozenset(("vmovss", "vmovsd", "vinsertps"))
 # this harness observes sixteen xmm registers, so a case for one would
 # compare the wrong thing and pass. That wants a different observation and
 # is recorded rather than bodged. Finding 209.
+# **The mnemonics whose whole effect is FLAGS.** 31,479 in-place patches --
+# 44% of everything still uncovered -- and `build()` must NOT return them:
+# `lowering_test` compares sixteen xmm registers against a reference that
+# returns `__m128i`, so a case for one would compare bytes neither side
+# touched and pass. That is the vacuous pass this tree is full of, and
+# writing it knowingly would be worse than the gap.
+#
+# `vex_oracle` can observe them, because it captures the flags after the
+# instruction and compares those too. So they live here, apart, and only
+# that harness consumes them.
+#
+# **The hazard is concrete rather than notional.** The lowering is a prefix
+# strip, `vcomiss` -> `comiss`. That pair and `ucomiss` differ ONLY in how
+# they signal a QNaN, and their encodings are adjacent: a strip landing on
+# the wrong one computes identically on every non-NaN input, sets identical
+# flags, passes every structural check, and diverges only on a NaN. The
+# all-NaN pattern in `vex_oracle` is exactly where that shows. Finding 210.
+FLAG_ONLY = [
+	"vcomiss", "vucomiss", "vcomisd", "vucomisd", "vptest",
+]
+# (name, src2, src1) -- these write no register, so the destination is a
+# source like any other.
+FLAG_SHAPES = [("distinct", 1, 0), ("same", 0, 0)]
+
+
+def build_flags():
+	"""[(mnemonic, shape, src1, src2, text, ...)] for the flag-only forms.
+
+	Kept out of `build()` so that a harness which cannot see flags does not
+	silently acquire cases it will pass for the wrong reason.
+	"""
+	wanted = []
+	for mnemonic in FLAG_ONLY:
+		for shape, source2, source1 in FLAG_SHAPES:
+			text = f"{mnemonic} %xmm{source2},%xmm{source1}"
+			wanted.append((mnemonic, shape, source1, source2, text,
+			               -1, source1, 0))
+	return finish(wanted)
+
+
 TWO_OPERAND = [
 	"vmovaps", "vmovups", "vmovdqu", "vmovdqa", "vmovupd",
 ]
@@ -317,6 +357,17 @@ def build():
 			wanted.append((mnemonic, shape, source1, source2, text,
 			               mask, destination, 0))
 
+	return finish(wanted)
+
+
+def finish(wanted):
+	"""Assemble the case text and lower each one. Shared by both lists.
+
+	Split out when `build_flags` arrived, so the flag-only cases go through
+	exactly the same assembling and lowering as every other case rather
+	than a second copy of it. A second copy would be a second thing to be
+	wrong. Finding 210.
+	"""
 	assembled = assemble([case[4] for case in wanted])
 	if len(assembled) != len(wanted):
 		raise SystemExit(f"assembled {len(assembled)} of {len(wanted)} cases")
