@@ -72,6 +72,20 @@ WORK = Path("build") / "vexoracle"
 # Class F: two roundings replace one, so these are allowed to differ and
 # `lowering_cases.FMAS` is the list rather than a second copy of it.
 CLASS_F = frozenset(lowering_cases.FMAS)
+# **Instructions whose result the ISA does not pin down.** `RCPPS` and
+# `RSQRTPS` are specified only to a relative error of about 1.5 * 2^-12,
+# with the low mantissa bits implementation-defined: Westmere returns a
+# coarse 12-bit approximation and qemu computes a finer one, so
+# `vex 0000803f` against `low 00f07f3f` is 1.0 against 0.99976 and neither
+# is wrong.
+#
+# The lowering is a prefix strip, so the two sides run the SAME
+# instruction and the difference is hardware against emulator. Dropping
+# them would lose the coverage; comparing them against the emulated
+# lowering keeps it, and asks the question that is actually answerable --
+# is the strip faithful -- rather than one the ISA declines to answer.
+# Finding 212.
+APPROXIMATE = frozenset(("vrcpps", "vrcpss", "vrsqrtps", "vrsqrtss"))
 
 
 def patterns():
@@ -167,7 +181,8 @@ def collect():
 		# registers against an `__m128i` reference -- cannot express them
 		# and must not be given them. This harness captures the flags, so
 		# it can. Finding 210.
-		cases = lowering_cases.build() + lowering_cases.build_flags()
+		cases = (lowering_cases.build() + lowering_cases.build_flags()
+		         + lowering_cases.build_oracle())
 	finally:
 		detour.lower_vex = real
 	if len(recorded) != len(cases):
@@ -399,7 +414,10 @@ def main():
 			emulated = low_emulated[(c, p)]
 			emulated = emulated[:scratch * SLOT] \
 				+ emulated[(scratch + 1) * SLOT:]
-			b = b[:status] + emulated[status:]
+			# An approximate instruction is compared entirely against the
+			# emulated lowering; everything else only in its status slot.
+			b = emulated if mnemonic in APPROXIMATE \
+				else b[:status] + emulated[status:]
 			if a == b:
 				agree += 1
 			elif mnemonic in CLASS_F:

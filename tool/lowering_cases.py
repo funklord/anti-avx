@@ -183,6 +183,139 @@ def build_flags():
 	return finish(wanted)
 
 
+# **Mnemonics that ship and had no executed case, for the oracle only.**
+# 59 of them, part of the 14,098 in-place patches Finding 209 left. They
+# need no GCC reference because `vex_oracle` compares against the ORIGINAL
+# INSTRUCTION -- the reference burden belongs to `lowering_test` alone,
+# which is why this list was first mispriced at "54 references, the largest
+# work for the smallest gain". Building `build_flags` is what showed the
+# route.
+#
+# **Written in the harness's convention, not the binary's.** The shipped
+# operands name `%rax`, `0xb0(%rbx)`, `0x8(%r8)` -- registers this harness
+# does not control, so a case copied verbatim would read uninitialised
+# state and could agree or differ for reasons having nothing to do with the
+# lowering. Only mnemonics whose every source is an xmm or an immediate are
+# here; the GPR- and memory-sourced ones want a deterministic input first
+# and are a separate piece of work.
+#
+# The FMA family is excluded: `FMAS` has its own list and its own Class F
+# rules, and a second entry would be a second thing to be wrong.
+# Finding 212.
+ORACLE_ONLY = [
+	("vaddsubps", None, 3),
+	("vandpd", None, 3),
+	("vblendps", '$0xc', 3),
+	("vcmpeqsd", None, 3),
+	("vcmpeqss", None, 3),
+	("vcmpltsd", None, 3),
+	("vcmpneqss", None, 3),
+	("vcmpordps", None, 3),
+	("vcvtdq2ps", None, 2),
+	("vcvtpd2ps", None, 2),
+	("vcvtps2dq", None, 2),
+	("vcvtps2pd", None, 2),
+	("vcvttps2dq", None, 2),
+	("vdivsd", None, 3),
+	("vhaddps", None, 3),
+	("vhsubps", None, 3),
+	("vmaxsd", None, 3),
+	("vminsd", None, 3),
+	("vmovddup", None, 2),
+	("vmovhlps", None, 3),
+	("vmovlhps", None, 3),
+	("vmovq", None, 2),
+	("vmovshdup", None, 2),
+	("vmulpd", None, 3),
+	("vpacksswb", None, 3),
+	("vpaddq", None, 3),
+	("vpclmulhqhqdq", None, 3),
+	("vpclmullqlqdq", None, 3),
+	("vpcmpeqq", None, 3),
+	("vpcmpgtb", None, 3),
+	("vpcmpgtq", None, 3),
+	("vpermilps", None, 3),
+	("vphsubd", None, 3),
+	("vpmaxud", None, 3),
+	("vpmovsxbd", None, 2),
+	("vpmovsxwd", None, 2),
+	("vpmovzxbd", None, 2),
+	("vpmovzxdq", None, 2),
+	("vpmovzxwd", None, 2),
+	("vpmovzxwq", None, 2),
+	("vpmulld", None, 3),
+	("vpmuludq", None, 3),
+	("vpshufd", '$0xee', 2),
+	("vpshufhw", '$0x27', 2),
+	("vpshuflw", '$0x27', 2),
+	("vpsubw", None, 3),
+	("vpunpckhqdq", None, 3),
+	("vpunpcklqdq", None, 3),
+	("vpunpcklwd", None, 3),
+	("vrcpps", None, 2),
+	("vroundps", '$0x8', 2),
+	("vroundsd", '$0x1', 3),
+	("vroundss", '$0x1', 3),
+	("vrsqrtps", None, 2),
+	("vshufpd", '$0x1', 3),
+	("vsqrtps", None, 2),
+	("vsqrtsd", None, 3),
+	("vunpckhpd", None, 3),
+	("vxorpd", None, 3),
+]
+
+
+def build_oracle():
+	"""Cases for  alone: no reference exists or is needed."""
+	wanted = []
+	for mnemonic, immediate, arity in ORACLE_ONLY:
+		lead = f"{immediate}," if immediate else ""
+		if arity == 3:
+			operands = f"%xmm2,%xmm1,%xmm{DESTINATION}"
+			source1, source2 = 1, 2
+		else:
+			operands = f"%xmm1,%xmm{DESTINATION}"
+			source1, source2 = DESTINATION, 1
+		wanted.append((mnemonic, "distinct", source1, source2,
+		               f"{mnemonic} {lead}{operands}", -1, DESTINATION, 0))
+	return finish([case for case in wanted if not needs_pool(case)])
+
+
+LOWER_VEX = detour.lower_vex
+
+
+def needs_pool(case):
+	"""Does this lowering load a constant from the pool?
+
+	**The harness emits no pool**, so a lowering that reaches for one gets
+	a rip-relative displacement pointing at whatever follows the bytes --
+	`vpermilps` came out as `pand -13(%rip),%xmm15` and the oracle died of
+	SIGSEGV. Stdout is block-buffered into a file, so the last case PRINTED
+	was two before the one that crashed; the index was misleading and the
+	bytes were not.
+
+	Detected by lowering twice at different pool addresses and seeing
+	whether the bytes move, rather than by listing mnemonics: a name list
+	would go stale the moment a lowering learns to use the pool.
+	Finding 212.
+	"""
+	site = assemble([case[4]])
+	if not site:
+		return True
+	address, encoding, printed, operands = site[0]
+	# **The UNWRAPPED lowering, bound at import.** `vex_oracle` replaces
+	# `detour.lower_vex` with a recorder while it builds the case list, and
+	# requires one recorded original per case -- a guard that caught this
+	# probe's two extra calls immediately, reporting 434 originals for 316
+	# cases. The probe is not a case and must not be recorded as one.
+	# Finding 212.
+	one = LOWER_VEX(address, encoding, operands, printed, 0x1000,
+	                scratch=SCRATCH)
+	two = LOWER_VEX(address, encoding, operands, printed, 0x2000,
+	                scratch=SCRATCH)
+	return one is None or two is None or one != two
+
+
 TWO_OPERAND = [
 	"vmovaps", "vmovups", "vmovdqu", "vmovdqa", "vmovupd",
 ]

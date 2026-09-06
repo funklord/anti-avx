@@ -13201,6 +13201,72 @@ byte-for-byte identical to the previous run. **A changed comparison that produce
 result has not been changed.**
 
 
+### Finding 212 -- the item I priced last was nearly free, and four instruments failed proving it
+
+Finding 209 ranked the 54 xmm-writing mnemonics below the flags group: "the largest amount of
+work for the smallest gain", because each needed a hand-written GCC reference. **That was
+wrong.** The reference burden belongs to `lowering_test` alone; `vex_oracle` compares against
+the ORIGINAL INSTRUCTION and needs none. Building `build_flags` for Finding 210 is what showed
+the route, and re-measuring turned 54 references into 58 mnemonics with zero.
+
+```
+xmm-writing mnemonics with no case   53      14,098 patches
+can be lowered                       53      no refusals
+usable as cases in the harness's convention  58 entries, 1 excluded
+oracle cases                        248  ->  316
+```
+
+**Written in the harness's convention, not the binary's.** The shipped operands name `%rax`,
+`0xb0(%rbx)`, `0x8(%r8)` -- registers this harness does not control, so a case copied verbatim
+would read uninitialised state and could agree OR differ for reasons unrelated to the lowering.
+Only mnemonics whose every source is an xmm or an immediate are here. The GPR- and
+memory-sourced ones need a deterministic input first and remain open.
+
+#### Four instruments failed, and none of them was the rewriter
+
+**A rip-relative lowering with no pool.** `vpermilps` lowers to `pand -13(%rip),%xmm15`, and
+the harness emits no constant pool, so the displacement pointed at whatever followed and the
+oracle died of SIGSEGV. It is excluded by a BEHAVIOURAL detector -- lower twice at different
+pool addresses and see whether the bytes move -- rather than by name, because a name list would
+be correct today and silently wrong the moment another lowering learns to use the pool.
+
+**A misleading crash index.** The last case PRINTED was `vpcmpgtq`, which disassembles to
+`movaps` plus `pcmpgtq` and cannot fault. stdout is block-buffered into a file, so the buffered
+tail was lost when the process died: the last printed index is a lower bound on progress, not
+the crash site. The bytes were right and the index was an artefact of how the output was
+captured.
+
+**A probe polluting the harness's bookkeeping.** `vex_oracle` wraps `lower_vex` to record one
+original per case and asserts the counts match. The pool detector's two extra calls per case
+made it 434 for 316, and the gate refused. Without that assertion the probe's calls would have
+been interleaved into the recorded originals and every case compared against the WRONG one --
+differences that look like lowering defects and are nothing of the kind. `LOWER_VEX` is bound
+at import now: **the probe is not a case and must not be counted as one.**
+
+**And twelve real differences that were not defects.** `vrcpps` and `vrsqrtps` are specified
+only to a relative error of about 1.5 * 2^-12 with the low mantissa implementation-defined:
+`vex 0000803f` against `low 00f07f3f` is 1.0 against 0.99976 and neither is wrong. The lowering
+is a prefix strip, so both sides run the same instruction and the difference is hardware
+against emulator. They are compared against the EMULATED lowering now, which asks the
+answerable question -- is the strip faithful -- rather than one the ISA declines to answer.
+
+#### Three comparison modes, each with its reason written down
+
+```
+registers, normally        qemu-VEX  vs  native-SSE   must be right on real silicon
+status slot                qemu-VEX  vs  qemu-SSE     qemu does not model DE
+approximate instructions   qemu-VEX  vs  qemu-SSE     the ISA pins no exact result
+```
+
+**An exemption whose justification is recorded can be re-examined when the reason changes; one
+added to make a run go green cannot, because nobody knows what it was for.** That is the
+difference between these three and an ignore list.
+
+**And the first sabotage was invalid.** Flipping a bit in the opcode produced SIGILL rather
+than a wrong answer -- a crash is not a comparison. Flipping the modrm's low bit, so the
+lowering reads the wrong register, gives 312 differences.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13215,6 +13281,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| 1 | Deterministic GPR and memory inputs, for the remaining mnemonics | ~11,000 patches | wrong bytes | Finding 212: their sources are `%rax` and `0xb0(%rbx)`, which the harness does not control |
+| - | ~~The xmm-writing mnemonics with no case~~ **DONE** | 58 mnemonics, oracle cases 248 -> 316 | wrong bytes | Finding 212: no references needed, and I had priced it last for needing 54 |
 | - | ~~MXCSR observation~~ **DONE** | the `comiss`/`ucomiss` distinction is now compared | wrong bytes | Finding 211: and the status slot is compared with the translator held constant, because qemu does not model DE |
 | - | ~~An executed case for `vcomiss` and family~~ **DONE** | 31,479 patches | wrong bytes | Finding 210: the oracle captures flags now; sabotage gives 58 differences |
 | - | ~~47% of in-place patches have no executed case~~ **PART DONE** | 185,000 patches covered | wrong bytes | Finding 209: five two-operand moves; the expansion could not express them |
