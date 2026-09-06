@@ -7235,6 +7235,13 @@ reads can be wrong indefinitely**, which is the argument for retiring it rather 
 correcting it in place: a corrected number nothing reads is a number that will drift
 again.
 
+**And the cost model was itself such a number, which Finding 221 found.** It is cited above as the reassuring case -- rebuilt from measured operand
+shapes, unlike the figure this entry retires -- and it was rebuilt on one axis only,
+pricing the lowering and never the detour. Nothing read it either. The lesson holds
+with the example inverted: being derived from a measurement is not the same as having
+been re-taken, and *Estimated cost of a translated binary* now carries a `make cost`
+target so that the next reader can re-take it rather than trust the derivation.
+
 ### Finding 121 -- seven dispatchers, not one, and now a check that says so
 
 Finding 5 found a CPUID/XGETBV-dispatched AVX-512 kernel and left two questions open:
@@ -13642,6 +13649,62 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 221 -- the cost model prices the lowering and not the detour that delivers it
+
+The headline figure was +1.34%, being 221,335 added instructions summed from operand
+shapes. Every one of its ten terms is a lowering expansion -- Class C movs, C-alias,
+splitting, shadow traffic, blendv, splat, FMA, `vzeroupper` elided. There is no term for
+the detour, and a detour costs two control transfers at every site plus whatever `nop`
+padding the replaced window leaves behind.
+
+Both binaries exist, so the estimate did not have to stay one. Counted from them:
+
+```
+lowering expansion                  +332,378   +2.01%    model says +221,335
+detour mechanism (2 jmp/site)       +405,676   +2.45%    model says 0
+nop padding (never executes)        +342,840   +2.07%    model says 0
+executed code                       +738,054   +4.46%    comparable to the model's +1.34%
+static total                      +1,080,894   +6.53%
+```
+
+The three terms reconcile to the whole-image delta exactly, which is the check that makes
+them a decomposition rather than three numbers printed together. **The omitted term is
+larger than the counted one**, and the model is low by 1.5x on the half it does price.
+
+**The static and executed totals answer different questions and the section says so.**
+Padding occupies cache and never runs; the two transfers run every time their site does.
+Averaging them would produce a number belonging to no question.
+
+Three things about how this was measured are worth more than the figure.
+
+**The count that could not fire returned a plausible zero.** Asking objdump for `.text`
+jmps into the stub section with a pattern matching `148...` when objdump renders targets
+as `0x148...` gave `detours 0` -- indistinguishable in the output from a binary with no
+detours, and quotable. It was caught only because zero was absurd. `image_cost.py` now
+refuses when it matched no jmp at all, and again when no jmp targets `.avxsse`.
+
+**A build log is not a fact about the artifact.** The detour count was first taken from
+`g5.log`, which described a build ninety minutes older than the image being measured,
+with fixture builds in between. The tool counts detours out of the binary it is given.
+That the two agree at 202,838 is a cross-check, not a licence to have used the log.
+
+**Two disassemblers agree, and that is genuine corroboration.** objdump and the project's
+own `inplace.disassemble` return 16,542,323 and 16,778,828 for the two `.text` sections,
+identical. The hand decomposition mixed the two instruments -- totals from one, `nop` and
+`jmp` counts from the other -- so agreement was load-bearing and unverified until the
+tool took every count with one instrument.
+
+The model also prices 2,197 split 256-bit arithmetic sites that Finding 200 measured at a
+ceiling of 75. That is ~2,100 instructions of work the rewriter refuses to do, running
+the other way and small. Both halves of the ratio were stale; only the direction differed.
+
+**What is measured is instructions, not time**, and "2-5% slower than native" rested on
+the smaller number. How much the 405,676 transfers cost depends on how often detoured
+sites execute, which nothing in the tree measures -- `cost_bench.py` times strategies
+against each other and states plainly that it cannot compare against the original,
+this host having no AVX. Re-take the count with `make cost` after any build that moves
+the frontier.
+
 ### Finding 220 -- the passenger question closes, and 1,881 of it never had a failure mode
 
 After Findings 218 and 219 the uncovered passengers were about 1,900 in 58 mnemonics --
@@ -13697,6 +13760,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.46% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |
 | - | ~~The remaining uncovered passengers~~ **CLOSED at 0** | 23 rip-relative, all covered | wrong bytes | Finding 220: 1,881 of ~1,900 move unchanged and have no failure mode |
 | - | ~~Fixtures for the swallowed conditional branches~~ **DONE** | ja, jae, jb, jbe -- 506 sites | wrong bytes | Finding 219: and two earlier versions swallowed the right thing while proving nothing |
 | - | ~~A fixture that swallows a call~~ **DONE** | 440 swallowed, 384 shipped | wrong bytes | Finding 218: executed for the first time; bending it four bytes answers 3 rather than 30 |
@@ -14045,11 +14109,45 @@ need two movs rather than one — partly offset by the commutative C-alias sites
 cost **nothing**, a fact milestone 0 also did not have. The second is Class D, which
 milestone 0 omitted from the model entirely and undercounted 12-fold (Finding 9).
 
-**+1.34%, not +0.9%.** The conclusion is unchanged: call it **2–5% slower than native**
-allowing for scratch spills and helper calls. Native class, comfortably. The point of
-recording the correction is that the cost model is now derived from measured operand
-shapes rather than from a mnemonic histogram, so the next person can see what it
-assumes.
+**+1.34%, not +0.9%** -- and both figures price only half the change. Superseded by
+the measurement below; kept because what the model omits is more instructive than what
+it got wrong.
+
+Every term in the table is a LOWERING expansion. None of them is the detour that
+delivers the lowering, which costs two control transfers per site -- the `jmp` out of
+`.text` and the `jmp` home at the end of the stub -- and leaves `nop` padding wherever
+the window it replaced was longer than five bytes. Counted from the two binaries by
+`make cost` rather than summed from operand shapes:
+
+```
+                                        instructions   of the original
+lowering expansion                          +332,378            +2.01%
+detour mechanism (2 jmp/site)               +405,676            +2.45%
+nop padding (never executes)                +342,840            +2.07%
+                                        ------------
+executed code                               +738,054            +4.46%
+static total                              +1,080,894            +6.53%
+
+the model above                             +221,335            +1.34%
+```
+
+Read the two totals for different questions and do not average them. The padding
+occupies cache and never runs, because the `jmp` steps over it, so **+4.46% is the
+figure comparable to the model** and +6.53% is what an icache budget would want. The
+model is low by 1.5x on the one term it prices and counts the larger term as zero.
+
+So **"2-5% slower than native" was drawn from a number that prices half the change**,
+and the honest restatement is that the static instruction count is what has been
+measured, not the time. Two transfers per detour is a real per-execution cost the model
+carried at zero; whether it lands as 4% or less depends on how often detoured sites run,
+which nothing here measures and `cost_bench.py` cannot, this host having no AVX to
+compare against.
+
+The model also prices work the rewriter does not do: `splitting 256-bit arithmetic
+(2,197 x 1)`. Finding 200 measured that class at a ceiling of **75** -- they are refused
+and survive as VEX -- so ~2,100 of its total is for a lowering that never happens. That
+error runs the other way and is small, which is the point: neither half of the ratio had
+been re-taken since it was written.
 
 ---
 

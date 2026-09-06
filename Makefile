@@ -74,7 +74,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs shapes cost-bench probe why check-spill check-tls check-unwind check-vex \
+        census spans gprs shapes cost-bench cost probe why check-spill check-tls check-unwind check-vex \
         check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -468,6 +468,13 @@ why: $(LISTING)
 # the same cost. A measurement, not a gate.
 cost-bench: | $(BUILD_DIR)
 	$(PYTHON) tool/cost_bench.py $(BUILD_DIR)
+
+# What the rewrite costs the whole image, counted from the two binaries
+# rather than summed from operand shapes. The estimate in project.md prices
+# the lowering and not the detour that delivers it; this prices all three
+# terms and checks they reconcile. A measurement, not a gate.
+cost: $(DETOURED)
+	$(PYTHON) tool/image_cost.py $(TARGET) $(DETOURED)
 
 # Every VEX shape the binary contains, and whether the plain lowering path
 # takes it. A measurement, not a gate: the point is the shapes nobody wrote
