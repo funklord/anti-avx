@@ -1132,7 +1132,7 @@ hundred:	.float 100.0
 # unwind codes claim a frame of zero has its `jmp` refused at -40 and the
 # borrow it exists to test never happens.
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
-          "regioncarry": 72, "swallowcall": 40,
+          "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
@@ -1872,6 +1872,71 @@ helper:
 	.p2align 4
 nine:	.float 9.0
 three:	.float 3.0
+""")
+
+
+# 46. Four conditional branches, each swallowed and each TAKEN.
+#
+# **The suite swallowed `jmp` and `je` and nothing else.** Starfield
+# swallows `jbe` 182 times, `ja` 132, `jb` 126 and `jae` 66, and a
+# re-emitted branch whose displacement was not recomputed goes to the wrong
+# place -- the program does not compute a wrong value, it transfers control
+# wrongly. `verify` proves every target still BEGINS an instruction, which
+# a wrong displacement satisfies by landing on a different valid one.
+#
+# **Each branch is TAKEN, and the first version's were not.** With all four
+# arranged to fall through, the fixture passed a sabotage that moved every
+# re-emitted target by two bytes: a branch nobody takes does not care where
+# it points. That is a fixture naming the hazard in its title and
+# exercising only the safe path.
+#
+# **And each branch targets the label after its own site**, which is what
+# gets it swallowed rather than the instruction after. The version before
+# that put a `cmp` there and every window widened FORWARD over it instead,
+# swallowing four `cmp`s and no branch at all -- a window takes the
+# cheapest widening available, and only a branch target blocks the forward
+# one.
+#
+# So the site each branch skips is a POISON: taken, `%xmm5` keeps the 3 it
+# was given and the answer is 3; a branch re-emitted to the wrong place
+# either runs the poison, making it 9999, or lands somewhere that faults.
+# Finding 219.
+PROGRAMS["condswallow"] = (3, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	nine(%rip), %xmm1
+	vmovss	three(%rip), %xmm3
+	vmovss	huge(%rip), %xmm4
+	vdivss	%xmm3, %xmm1, %xmm5	/* 9/3 = 3, the value under test */
+	movl	$2, %ecx
+	cmpl	$1, %ecx		/* 2 is above 1 */
+	ja	b1			/* TAKEN, and swallowed */
+	vdivss	%xmm3, %xmm4, %xmm5	/* poison, skipped */
+b1:
+	cmpl	$1, %ecx
+	jae	b2			/* TAKEN, and swallowed */
+	vdivss	%xmm3, %xmm4, %xmm5	/* poison, skipped */
+b2:
+	xorl	%ecx, %ecx
+	cmpl	$1, %ecx		/* 0 is below 1 */
+	jb	b3			/* TAKEN, and swallowed */
+	vdivss	%xmm3, %xmm4, %xmm5	/* poison, skipped */
+b3:
+	cmpl	$1, %ecx
+	jbe	b4			/* TAKEN, and swallowed */
+	vdivss	%xmm3, %xmm4, %xmm5	/* poison, skipped */
+b4:
+	vcvttss2si %xmm5, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+nine:	.float 9.0
+three:	.float 3.0
+huge:	.float 29997.0
 """)
 
 

@@ -13592,6 +13592,56 @@ number that exposed that was not a check but a fixture suite containing `swallow
 `crossblock` appearing to swallow two instructions in total.
 
 
+### Finding 219 -- the swallowed conditional branches, and two fixtures that proved nothing
+
+The suite swallowed `jmp` and `je`. Starfield swallows `jbe` 182 times, `ja` 132, `jb` 126 and
+`jae` 66, and a re-emitted branch whose displacement was not recomputed transfers control
+somewhere else. **`verify` cannot catch that**: it proves every target still BEGINS an
+instruction, which a wrong displacement satisfies by landing on a different valid one.
+
+`condswallow` swallows all four, and took three versions to be worth anything.
+
+```
+v1  a `cmp` after each site      windows widened FORWARD; four cmps swallowed, no branch
+v2  branches not taken           all four swallowed, green, and passed the sabotage
+v3  branches taken               clean 3, sabotaged 5
+```
+
+**v1 would have passed `check-pe`.** The arithmetic was right and the rewrite was right; the
+fixture simply tested nothing it was written for. A window takes the cheapest widening
+available and only a branch target blocks the forward one -- which is why `condbefore` gets its
+`je` swallowed, a fixture I had read and modelled on without seeing the part that made it work.
+Running `collect` before wine caught it in seconds.
+
+**v2 is the one worth keeping.** It swallowed exactly the four branches it named, ran green,
+and was provably useless: with every branch arranged to fall through, moving each re-emitted
+target by two bytes changed nothing, because **a branch nobody takes does not care where it
+points.** Every structural property of that fixture was correct. Only the sabotage could show
+it. It is *a test can name the hazard exactly and cover only the safe path*, written after
+reading that entry.
+
+v3 makes each branch taken and skipping a poison: taken correctly, `%xmm5` keeps its 3; a
+branch re-emitted two bytes out lands mid-instruction and the answer becomes 5.
+
+#### And aiming the sabotage took four attempts
+
+```
+close_stub's displaced loop        stub bytes identical
+build_stub's displaced loop        stub bytes identical
+short-branch opcodes 0x77 etc.     stub bytes identical
+build_stub's PRECEDING loop, 0f 8x  bytes differ, answer 3 -> 5
+```
+
+The branches here PRECEDE their sites and are in `preceding`; the swallowed `call` of Finding
+218 FOLLOWED its site and was in `displaced`. Same mechanism, opposite list. And a branch
+re-emitted into a stub is far from its target, so the two-byte form is widened to `0f 8x
+rel32` -- a sabotage keyed on `0x77` matches nothing.
+
+**Every wrong attempt returned a plausible number.** What separated them was diffing the
+sabotaged stub against the real one: three said IDENTICAL, and identical bytes cannot be a
+result.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13606,7 +13656,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | Fixtures for the swallowed conditional branches | jbe 182, ja 132, jb 126, jae 66 | wrong bytes | Finding 218: the fixtures cover `jmp` and `je` only, and a mis-emitted branch transfers control wrongly |
+| - | ~~Fixtures for the swallowed conditional branches~~ **DONE** | ja, jae, jb, jbe -- 506 sites | wrong bytes | Finding 219: and two earlier versions swallowed the right thing while proving nothing |
 | - | ~~A fixture that swallows a call~~ **DONE** | 440 swallowed, 384 shipped | wrong bytes | Finding 218: executed for the first time; bending it four bytes answers 3 rather than 30 |
 | - | ~~An observation of written memory~~ **DONE** | 124 of 126 mnemonics executed | wrong bytes | Finding 217: the in-place path is closed; `vzeroupper` and `vldmxcsr` are recorded exclusions |
 | - | ~~The 576 memory-sourced patches~~ **DONE** | coverage 95.2% -> 96.5% | wrong bytes | Finding 216: the same opcodes under a different name and a different lowering path |
