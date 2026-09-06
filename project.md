@@ -13642,6 +13642,47 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 220 -- the passenger question closes, and 1,881 of it never had a failure mode
+
+After Findings 218 and 219 the uncovered passengers were about 1,900 in 58 mnemonics --
+`testl` 468, `add` 226, `test` 218, `xor` 190. Asking what would be WRONG rather than what was
+untested:
+
+```
+     23  RIP-RELATIVE -- displacement must be recomputed   (4 mnemonics)
+    762  base-register memory -- moves unchanged           (23 mnemonics)
+  1,119  register only -- moves unchanged                  (40 mnemonics)
+```
+
+**A register-only instruction re-emitted at a new address is the same bytes in a new place.**
+There is no way for the rewriter to get it wrong, so a fixture exercising one is a green tick
+with no failure mode behind it. Base-register memory is the same: `mov 0x8(%rcx),%eax`
+addresses relative to a register the move does not touch.
+
+Only a rip-relative operand can be silently wrong, because its displacement is measured from
+the END of the instruction -- moving the instruction changes what it reads unless the
+displacement absorbs the move. That is the correction `narrow_piece` documents and Finding 43
+priced at 649 sites on the span path.
+
+**And three fixtures already swallow one:**
+
+```
+aliasing      vmovss 0x21(%rip),%xmm2
+rspcopy       lea    0x2(%rip),%rcx
+shadowspill   lea    0x2(%rip),%rax
+```
+
+All three run under wine and all three depend on it: `aliasing` would load the wrong bytes, and
+the two `lea`s feed an indirect jump, so a wrong address goes nowhere valid. `riprel` covers a
+rip-relative SITE, which is `lower_vex`; these cover a rip-relative PASSENGER, which is
+`emit_swallowed` and `offset_operand` -- a different path, and the one the 23 use.
+
+**So the class closes at 0, and "1,881 passengers with no test" was never the right count.** It
+reads as alarming and means nothing, which is the same shape as 1,925 arithmetic sites worth
+75 and 638 refusals that were 319. The question that priced it was not how many are untested
+but how many could be wrong.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13656,6 +13697,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| - | ~~The remaining uncovered passengers~~ **CLOSED at 0** | 23 rip-relative, all covered | wrong bytes | Finding 220: 1,881 of ~1,900 move unchanged and have no failure mode |
 | - | ~~Fixtures for the swallowed conditional branches~~ **DONE** | ja, jae, jb, jbe -- 506 sites | wrong bytes | Finding 219: and two earlier versions swallowed the right thing while proving nothing |
 | - | ~~A fixture that swallows a call~~ **DONE** | 440 swallowed, 384 shipped | wrong bytes | Finding 218: executed for the first time; bending it four bytes answers 3 rather than 30 |
 | - | ~~An observation of written memory~~ **DONE** | 124 of 126 mnemonics executed | wrong bytes | Finding 217: the in-place path is closed; `vzeroupper` and `vldmxcsr` are recorded exclusions |
