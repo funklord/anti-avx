@@ -12880,6 +12880,41 @@ edit never applied, and the unmodified binary returned 66, which reads exactly l
 that cannot fail. Only checking that the substitution landed told the two apart.
 
 
+### Finding 206 -- every byte the rewriter emits must decode, and nothing said so
+
+**11 of this file's 73 refusal reasons are produced by any fixture.** Measured by running
+every fixture under both `--region=` modes and all five `--spill=` modes and reading the
+collector's own `skipped` and `declined` dictionaries; twelve more are demonstrably live in
+Starfield with no fixture producing them.
+
+That number decides what kind of gate is worth building, and the answer is not more fixtures.
+**A refusal path fails safe** -- it costs sites. **An emission path fails wrong** -- it writes
+bytes. Fixture coverage catches an emission fault only where somebody wrote the fixture that
+reaches it, and at 11 of 73 that is thin.
+
+So `verify` now asserts that every instruction in the stub section decodes. It already ran
+`objdump` over `.avxsse` to count VEX; the same pass counts `(bad)`.
+
+**The check above it could not do this, and the difference is exact.** Its rule is that the
+stub holds zero VEX instructions -- and an invalid encoding is not VEX either. `66 0f 38 18`
+satisfied it, satisfied the header check, the sorted function table, the boundary
+reconciliation and the swallowed-instruction count. Every property anybody had thought to
+assert was true of a stub that decodes to nothing and dies at its entry.
+
+**The control is the historical defect rather than a synthetic one.** Disable `NO_LEGACY_FORM`
+and point a region at a `vbroadcastss` -- the exact shape Finding 205 found -- and the gate
+reports `2 byte sequence(s) in the stub section decode to nothing` and exits 1. A control taken
+from a real failure cannot be wrong about the shape the failure takes, which is the one thing a
+synthetic control cannot promise.
+
+**It catches a class rather than a path.** Every stub of every strategy passes through it on
+every build, including the fifteen strategies whose emission paths no fixture reaches. That is
+the difference between this and writing fourteen more fixtures: the fixtures would each cover
+one path chosen in advance, and this covers the property that matters for all of them.
+
+The real binary passes it: 0 undecodable sequences in 3.8 MB of stubs.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12894,6 +12929,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| 1 | The 12 refusal reasons live in Starfield that no fixture produces | unknown | sites | Finding 206: only 11 of 73 are exercised; a wrong refusal condition costs sites, not bytes |
+| - | ~~Nothing asserts a stub's bytes decode~~ **DONE** | catches the whole emission class | wrong bytes | Finding 206: controlled with the real defect from Finding 205 |
 | - | ~~The `region` strategy has no fixture~~ **DONE** | 93 sites now covered, one defect found | wrong bytes | Finding 205: `regioncarry`, modelled on a real region, and `NO_LEGACY_FORM` |
 | - | ~~A per-site `stack` fallback~~ **DONE** | 376 sites off the frontier | sites | Finding 204: 6,049 -> 5,673, and it retired two `check-spill` controls that now run with `--fallback=off` |
 | - | ~~What the 64 worst functions share~~ **CLOSED at ~0** | 3,079 sites, two thirds architectural | sites | Finding 203: they share being full of 256-bit arithmetic, already ceilinged at 75 |

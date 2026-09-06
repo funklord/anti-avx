@@ -11917,6 +11917,37 @@ def verify(original, patched, listing=None):
 	               if len(line.split("\t")) >= 3
 	               and line.split("\t")[1].split()[:1] in (["c4"], ["c5"]))
 	jumps = done.stdout.count("\tjmp ")
+	# **Every byte the rewriter emits must decode to an instruction, and
+	# until now nothing said so.** The check above asks whether the stub
+	# holds VEX; an invalid encoding is not VEX either, so a stub full of
+	# bytes that decode to nothing passed both it and every structural
+	# check in this file -- the image is well formed, the function table
+	# sorts, the boundaries reconcile, and the program dies at a stub
+	# entry.
+	#
+	# It is not hypothetical. `narrow_piece` lowers a span or region member
+	# by clearing `VEX.L` and re-encoding as legacy, which is right for
+	# `vaddps` and meaningless for an opcode the ISA only ever encoded
+	# under VEX: `vbroadcastss` came out as `66 0f 38 18`. The first
+	# fixture ever written for the region strategy produced it on its first
+	# run, and nothing had shipped wrong only because Starfield's 93 region
+	# sites happen to contain no such member.
+	#
+	# **This catches the whole class rather than one path.** Fixture
+	# coverage catches an emission fault only where somebody wrote the
+	# fixture that reaches it, and 11 of this file's 73 refusal reasons are
+	# produced by any fixture at all. Every stub of every strategy goes
+	# through this on every build. Finding 206.
+	undecodable = [line for line in done.stdout.splitlines()
+	               if "(bad)" in line]
+	if undecodable:
+		print(f"verify: FAILED -- {len(undecodable):,} byte sequence(s) in "
+		      f"the stub section decode to nothing", file=sys.stderr)
+		for line in undecodable[:8]:
+			print(f"    {line.strip()}", file=sys.stderr)
+		problems += 1
+	else:
+		print("verify: every instruction in the stub section decodes")
 	# **Every call in the stub section is a swallowed one, and this counts
 	# them rather than forbidding them.** The first version of this check
 	# asserted that no stub contains a call at all, which is a stronger
