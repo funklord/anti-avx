@@ -13525,6 +13525,73 @@ the cases were never the scarce thing. The two that stay shut are shut because t
 cannot hold the state, which is a different sentence from "nobody has written it yet".
 
 
+### Finding 218 -- 440 swallowed calls, and nothing had ever executed one
+
+The detour path measured the way the in-place path was:
+
+```
+detour candidates   242,927 across 129 site mnemonic(s)
+site coverage       242,790  (99.9%)   137 sites in 7 mnemonics uncovered
+swallowed           92,683 across 183 mnemonic(s)
+  executed by an oracle case            83,601
+  covered by a fixture rather than one    6,052   mov, jmp, lea, je, nop
+  executed by NOTHING                     3,030   in 62 mnemonics
+```
+
+The sites were nearly all covered already, because the in-place case list names the same
+mnemonics. The passengers were not, and the largest of them is `call` at 440 -- with `verify`
+reporting 384 in the shipped stub section, "every one an instruction a window covered and
+re-emitted". **The path has run in production since Finding 86 built it and nothing had
+executed one.**
+
+Structural checking cannot close it. `verify` proves a re-emitted call's target still begins an
+instruction; it cannot prove the DISPLACEMENT was recomputed for the stub's address, nor that
+the RETURN ADDRESS -- which now points into the stub -- leads somewhere execution continues.
+
+`swallowcall` does: a four-byte site that cannot hold a jump, a `jne` blocking backward
+widening, and a five-byte `call` the window must therefore swallow.
+
+#### The first version failed on a mechanism it was not testing
+
+It returned 5. The helper sat inside `func_end`, so both halves were ONE `.pdata` function, and
+the rewriter believed `rsp` stayed at `_start`'s frame throughout -- so the helper's stub
+borrowed the callee home space at `(%rsp)`, which inside a function entered by `call` is the
+RETURN ADDRESS. It saved `%xmm1` over it and restored `%xmm1` from it.
+
+**The rewriter reasoned correctly from what the binary told it.** Real binaries do not put a
+call target inside its caller's `.pdata` range: a called helper is its own function, a leaf,
+and a leaf lends nothing -- which is exactly what `no home space to borrow` refuses. The
+fixture had arranged for that refusal never to be asked.
+
+The helper is after `func_end` and in pure SSE now. Both halves matter: outside the range it is
+not rewritten, which isolates the test to the call's re-emission; pure SSE means an AVX-less
+CPU runs it unmodified.
+
+#### Three sabotages, and the first two edited code the path never reaches
+
+```
+close_stub's displaced loop, twice     stub bytes IDENTICAL -- the pass meant nothing
+build_stub's displaced loop            call 0x14000103d -> 0x140001041, answer 30 -> 3
+```
+
+There are three `emit_swallowed` call sites and the plain path uses the third. Both failed
+attempts asserted that the anchor LINE matched -- it did -- and neither checked that the output
+changed. What settled it was diffing the sabotaged stub against the real one and finding them
+byte-identical.
+
+**Asserting on the source proves you edited something; only the artifact proves you edited the
+thing that runs.** That is the fourth time today the two were confused, and the corrupted call
+is worth seeing: it still returns, and answers 3 instead of 30. Silent, not a crash.
+
+#### And two measurements of the passengers were wrong before this one
+
+`entry[2]` gave addresses rather than mnemonics -- caught because a column of instruction names
+held `5446595600`. Then counting only `preceding` and not `displaced` gave 2,251 passengers of
+the real 92,683: **2.4% of the population**, with a coverage percentage computed over it. The
+number that exposed that was not a check but a fixture suite containing `swallowjmp` and
+`crossblock` appearing to swallow two instructions in total.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13539,6 +13606,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| 1 | Fixtures for the swallowed conditional branches | jbe 182, ja 132, jb 126, jae 66 | wrong bytes | Finding 218: the fixtures cover `jmp` and `je` only, and a mis-emitted branch transfers control wrongly |
+| - | ~~A fixture that swallows a call~~ **DONE** | 440 swallowed, 384 shipped | wrong bytes | Finding 218: executed for the first time; bending it four bytes answers 3 rather than 30 |
 | - | ~~An observation of written memory~~ **DONE** | 124 of 126 mnemonics executed | wrong bytes | Finding 217: the in-place path is closed; `vzeroupper` and `vldmxcsr` are recorded exclusions |
 | - | ~~The 576 memory-sourced patches~~ **DONE** | coverage 95.2% -> 96.5% | wrong bytes | Finding 216: the same opcodes under a different name and a different lowering path |
 | - | ~~GPR-destination mnemonics~~ **DONE** | 6,244 patches, coverage 95.2% | wrong bytes | Finding 215: the observation was the gap, not the cases |

@@ -1132,7 +1132,7 @@ hundred:	.float 100.0
 # unwind codes claim a frame of zero has its `jmp` refused at -40 and the
 # borrow it exists to test never happens.
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
-          "regioncarry": 72,
+          "regioncarry": 72, "swallowcall": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
@@ -1809,6 +1809,69 @@ tls_callbacks:
 tls_directory:
 	.quad	0, 0, 0, 0
 	.long	0, 0
+""")
+
+
+# 45. A window that swallows a CALL, and the call must still return.
+#
+# **440 calls are swallowed in Starfield and no fixture swallowed one.**
+# `verify` reports 384 in the shipped stub section -- "every one an
+# instruction a window covered and re-emitted" -- so the path runs in
+# production and nothing had ever executed it. Finding 86 built it; the
+# evidence was structural only, and structural cannot see whether the
+# DISPLACEMENT was recomputed for the stub's address or whether the RETURN
+# ADDRESS leads somewhere execution continues.
+#
+# **The helper is after `func_end` and is pure SSE**, and both halves of
+# that matter. `func_end` bounds the `.pdata` function, so the helper is
+# outside it and is not rewritten -- which isolates this to the call's
+# re-emission rather than testing the helper's lowering as well. And pure
+# SSE means an AVX-less CPU can execute it unmodified.
+#
+# The first version put the helper INSIDE the function and it returned 5
+# rather than faulting. The rewriter had believed `rsp` sat at `_start`'s
+# frame throughout, so the helper's stub borrowed the callee home space at
+# `(%rsp)` -- which, inside a function entered by `call`, is the RETURN
+# ADDRESS. It saved `%xmm1` over it and restored `%xmm1` from it, and the
+# return address was gone. That is a fixture that puts a call target inside
+# its caller's `.pdata` range, which a real binary does not do: a called
+# helper is its own function, a leaf, and a leaf lends nothing -- which is
+# the `no home space to borrow` refusal doing its job.
+#
+# The `jne` blocks widening backwards; a four-byte site cannot hold a jump,
+# so the window widens forward over the five-byte call and becomes nine.
+#
+# 9/3 = 3 in %xmm5, the helper cubes it to 27, and 27 + 3 = 30.
+PROGRAMS["swallowcall"] = (30, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	nine(%rip), %xmm1
+	vmovss	three(%rip), %xmm3
+	xorl	%ecx, %ecx
+	testl	%ecx, %ecx
+	jne	wrong			/* not taken, and blocks widening backwards */
+	vdivss	%xmm3, %xmm1, %xmm5	/* four bytes: 9/3 = 3, the site */
+	call	helper			/* five bytes, swallowed into the stub */
+	vaddss	%xmm5, %xmm0, %xmm0	/* 27 + 3 = 30 */
+	vcvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+wrong:
+	movl	$1, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+helper:
+	movaps	%xmm5, %xmm0		/* pure SSE: outside .pdata, not rewritten */
+	mulss	%xmm5, %xmm0		/* 3 * 3 = 9 */
+	mulss	%xmm3, %xmm0		/* 9 * 3 = 27 */
+	ret
+	.p2align 4
+nine:	.float 9.0
+three:	.float 3.0
 """)
 
 
