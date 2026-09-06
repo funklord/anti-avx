@@ -13660,10 +13660,10 @@ padding the replaced window leaves behind.
 Both binaries exist, so the estimate did not have to stay one. Counted from them:
 
 ```
-lowering expansion                  +332,378   +2.01%    model says +221,335
+lowering expansion                  +328,688   +1.99%    model says +221,335
 detour mechanism (2 jmp/site)       +405,676   +2.45%    model says 0
-nop padding (never executes)        +342,840   +2.07%    model says 0
-executed code                       +738,054   +4.46%    comparable to the model's +1.34%
+padding (never executes)            +346,530   +2.09%    model says 0
+executed code                       +734,364   +4.44%    comparable to the model's +1.34%
 static total                      +1,080,894   +6.53%
 ```
 
@@ -13697,6 +13697,24 @@ tool took every count with one instrument.
 The model also prices 2,197 split 256-bit arithmetic sites that Finding 200 measured at a
 ceiling of 75. That is ~2,100 instructions of work the rewriter refuses to do, running
 the other way and small. Both halves of the ratio were stale; only the direction differed.
+
+**And the tool shipped with a fourth instance of its own lesson, found by asking a
+question it was not built for.** Sizing the padding to see whether it was compressible
+produced a histogram reading `1-byte 210,690, 3-byte 72,955, ... ` and **zero at two
+bytes**. `NOPS[2]` is `66 90`, which objdump renders as `xchg %ax,%ax`, so a filter
+asking for a mnemonic starting with "nop" sees every size but that one. 3,690 instructions
+were charged to the lowering expansion instead of to the padding: expansion is +328,688
+and padding +346,530, the mechanism term and both totals unchanged, because every
+instruction was always counted and only its attribution was wrong. The hole was in the
+output before anything was read into it. A histogram with a gap exactly where a canonical
+encoding belongs is the same shape as a count that cannot fire, and it was caught for the
+same reason -- the value was absurd rather than merely low.
+
+**The padding question that found it closes at zero.** `patch.nop_padding` composes
+longest-first from a table running to eight bytes, so a seven-byte gap is one instruction
+and not seven `0x90`s; the 210,690 added single-byte nops are in-place patch slack, where
+the VEX form is one byte longer than the SSE form replacing it and exactly one byte must
+be filled. That is a floor, not waste, and there is nothing to compress.
 
 **What is measured is instructions, not time**, and "2-5% slower than native" rested on
 the smaller number. How much the 405,676 transfers cost depends on how often detoured
@@ -13760,7 +13778,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.46% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |
+| - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |
+| - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.44% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |
 | - | ~~The remaining uncovered passengers~~ **CLOSED at 0** | 23 rip-relative, all covered | wrong bytes | Finding 220: 1,881 of ~1,900 move unchanged and have no failure mode |
 | - | ~~Fixtures for the swallowed conditional branches~~ **DONE** | ja, jae, jb, jbe -- 506 sites | wrong bytes | Finding 219: and two earlier versions swallowed the right thing while proving nothing |
 | - | ~~A fixture that swallows a call~~ **DONE** | 440 swallowed, 384 shipped | wrong bytes | Finding 218: executed for the first time; bending it four bytes answers 3 rather than 30 |
@@ -14121,18 +14140,18 @@ the window it replaced was longer than five bytes. Counted from the two binaries
 
 ```
                                         instructions   of the original
-lowering expansion                          +332,378            +2.01%
+lowering expansion                          +328,688            +1.99%
 detour mechanism (2 jmp/site)               +405,676            +2.45%
-nop padding (never executes)                +342,840            +2.07%
+padding (never executes)                    +346,530            +2.09%
                                         ------------
-executed code                               +738,054            +4.46%
+executed code                               +734,364            +4.44%
 static total                              +1,080,894            +6.53%
 
 the model above                             +221,335            +1.34%
 ```
 
 Read the two totals for different questions and do not average them. The padding
-occupies cache and never runs, because the `jmp` steps over it, so **+4.46% is the
+occupies cache and never runs, because the `jmp` steps over it, so **+4.44% is the
 figure comparable to the model** and +6.53% is what an icache budget would want. The
 model is low by 1.5x on the one term it prices and counts the larger term as zero.
 

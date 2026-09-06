@@ -42,6 +42,20 @@ import sys
 ADDRESS = re.compile(r"^\s*[0-9a-f]+:$")
 
 
+def is_padding(mnemonic, operand):
+	"""True for any of the fills `patch.nop_padding` composes.
+
+	**The two-byte one is not spelled `nop`.** `NOPS[2]` is `66 90`, which
+	objdump renders as `xchg %ax,%ax`, so a filter asking for a mnemonic
+	starting with "nop" sees every other size and silently misses that one.
+	It cost this tool 3,690 instructions on its first run, charged to the
+	lowering expansion instead of to the padding, and the tell was a size
+	histogram reading zero at exactly two bytes.
+	"""
+	return mnemonic.startswith("nop") or (mnemonic == "xchg"
+	                                      and operand == "%ax,%ax")
+
+
 def instructions(binary, section):
 	"""Every instruction in one section, as (address, mnemonic, operand).
 
@@ -112,8 +126,8 @@ def main():
 		raise SystemExit("control failed: no .text jmp targets .avxsse, "
 		                 "so either the parse is wrong or nothing was detoured")
 
-	nop_before = sum(1 for _a, m, _o in before if m.startswith("nop"))
-	nop_after = sum(1 for _a, m, _o in after if m.startswith("nop"))
+	nop_before = sum(1 for _a, m, o in before if is_padding(m, o))
+	nop_after = sum(1 for _a, m, o in after if is_padding(m, o))
 	stub_jmp = sum(1 for _a, m, _o in stub if m.startswith("jmp"))
 
 	padding = nop_after - nop_before
@@ -125,7 +139,7 @@ def main():
 	print(f"{'':32} {'instructions':>12}  {'of the original':>15}")
 	for name, value in (("lowering expansion", expansion),
 	                    ("detour mechanism (2 jmp/site)", mechanism),
-	                    ("nop padding (never executes)", padding)):
+	                    ("padding (never executes)", padding)):
 		print(f"{name:32} {value:>+12,}  {100.0 * value / len(before):>+14.2f}%")
 	executed = expansion + mechanism
 	print(f"{'':32} {'-' * 12}")
