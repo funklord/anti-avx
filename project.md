@@ -13468,6 +13468,63 @@ observation of written memory, which is the sixth such addition and the last one
 path has left.
 
 
+### Finding 217 -- the stores, and the end of the in-place path at 124 of 126 mnemonics
+
+The last class whose effect the harness could not see: 89 patches whose whole result is the
+memory they write. `vex_oracle` gained a sixteen-byte scratch region INSIDE its compared
+buffer, so the two sides differ exactly when the stored bytes differ and a case that writes
+nothing there costs nothing -- the driver memsets the whole buffer before each call.
+
+```
+in-place patches   547,716 across 126 mnemonic(s)
+executed coverage  528,459  (96.5%)  in 124 mnemonic(s)
+remaining           19,257  in 2 mnemonic(s)
+```
+
+**Both survivors are recorded exclusions, not gaps.**
+
+`vzeroupper` is 19,253 of them, patched to NOPs. A case would compare xmm registers neither
+side touches -- the low 128 bits are unchanged by `vzeroupper` and by `nop` alike -- while the
+entire semantic difference lives in upper halves this machine does not have. **The harness
+cannot ask the question**, and a case would be a green tick for nothing.
+
+`vldmxcsr` is 4, and it crashed the run before it was excluded. `LDMXCSR` raises #GP if any
+reserved bit of its operand is set, and every buffer here holds arbitrary bytes: the input is
+pattern data and the scratch is `0x5a5a5a5a`. Both are invalid MXCSR values. A valid operand
+means a buffer existing for one instruction with four patches, which is more machinery than the
+coverage buys. The diagnosis was confirmed by removing it and watching 341 cases pass, not
+inferred from the fault.
+
+#### Three invalid sabotages in one day, each of which produced output
+
+```
+the anchor matched but the edit never applied     assertion checked containment, not replacement
+the capture was removed from BOTH sides           applied, symmetric, agreed on the absence
+the displacement was flipped out of bounds        crashed instead of differing
+```
+
+**Each ran to completion and printed something that looked like a verdict.** The third is the
+sharpest: a blanket modrm flip would have been worse still, since `stmxcsr` is `/3` and
+`ldmxcsr` is `/2` -- one bit apart -- so the sabotage would have silently turned the store into
+the load that had just crashed the run, and the crash would have been read as the sabotage
+working.
+
+Replacing the lowered store with NOPs is asymmetric, in bounds, and cannot fault: 28
+differences across all four stores.
+
+#### What the day did to this harness
+
+```
+233 cases  ->  341        53% of in-place patches  ->  96.5%
+observations added: EFLAGS, MXCSR, %rax in, %rax out, a store region
+```
+
+Five observations and six case lists, and **not one of the five was "more cases of the kind
+already there"**. Every class that opened needed the harness to be able to SEE something new;
+the cases were never the scarce thing. The two that stay shut are shut because the machine
+cannot hold the state, which is a different sentence from "nobody has written it yet".
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13482,7 +13539,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | An observation of written memory, for the 89 store patches | 5 mnemonics | wrong bytes | Finding 216: the last class; `vzeroupper`'s 19,253 are not askable here |
+| - | ~~An observation of written memory~~ **DONE** | 124 of 126 mnemonics executed | wrong bytes | Finding 217: the in-place path is closed; `vzeroupper` and `vldmxcsr` are recorded exclusions |
 | - | ~~The 576 memory-sourced patches~~ **DONE** | coverage 95.2% -> 96.5% | wrong bytes | Finding 216: the same opcodes under a different name and a different lowering path |
 | - | ~~GPR-destination mnemonics~~ **DONE** | 6,244 patches, coverage 95.2% | wrong bytes | Finding 215: the observation was the gap, not the cases |
 | - | ~~A 256-bit input for the `%ymm`-source mnemonics~~ **CLOSED at 0** | 0 in-place patches | wrong bytes | Finding 214: 256-bit sites are never patched in place; the row came from misreading `vextractps` as `vextractf128` |

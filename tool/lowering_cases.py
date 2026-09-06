@@ -332,6 +332,44 @@ MEMORY_SOURCE = [
 ]
 
 
+# **Mnemonics whose whole effect is the memory they write.** 89 patches in
+# five, and a case for one was impossible until `vex_oracle` gained a
+# scratch region in its compared buffer: comparing sixteen registers, it
+# would have passed while touching nothing either side reads.
+#
+# They store into the OUTPUT buffer at `STORE_AT`, which is part of what is
+# compared -- so the two sides differ exactly when the stored bytes differ,
+# and a case that writes nothing there costs nothing.
+#
+# `vstmxcsr` is here for a second reason: it is the only instruction whose
+# subject is MXCSR, which Finding 211 made observable.
+#
+# **`vldmxcsr` is deliberately absent, and it crashed before it was.**
+# `LDMXCSR` raises #GP if any reserved bit of its operand is set, and every
+# buffer this harness owns holds arbitrary bytes -- the input is pattern
+# data (floats, NaNs, `0x7fffffff` edges) and the output scratch is memset
+# to `0x5a5a5a5a`. Both are invalid MXCSR values, so the lowered side died
+# of SIGSEGV. Giving it a valid operand means a buffer that exists for one
+# instruction with four patches, which is more machinery than the coverage
+# is worth. Finding 217.
+STORE_AT = 272
+STORE_DEST = [
+	f"vmovlps %xmm1,{STORE_AT}(%rsi)",
+	f"vmovhpd %xmm1,{STORE_AT}(%rsi)",
+	f"vmovntps %xmm1,{STORE_AT}(%rsi)",
+	f"vstmxcsr {STORE_AT}(%rsi)",
+]
+
+
+def build_store():
+	"""Cases whose result is the memory they write."""
+	wanted = []
+	for text in STORE_DEST:
+		mnemonic = text.split(" ", 1)[0]
+		wanted.append((mnemonic, "to_memory", 1, 1, text, -1, DESTINATION, 0))
+	return finish([case for case in wanted if not needs_pool(case)])
+
+
 def build_memory():
 	"""Cases whose source is memory the harness owns."""
 	wanted = []

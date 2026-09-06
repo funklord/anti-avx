@@ -185,7 +185,8 @@ def collect():
 		         + lowering_cases.build_oracle()
 		         + lowering_cases.build_gpr()
 		         + lowering_cases.build_gpr_dest()
-		         + lowering_cases.build_memory())
+		         + lowering_cases.build_memory()
+		         + lowering_cases.build_store())
 	finally:
 		detour.lower_vex = real
 	if len(recorded) != len(cases):
@@ -312,7 +313,15 @@ def main_source(prefix, count):
 	# pattern is still sixteen registers; only what comes back grew.
 	# Finding 210.
 	stride = REGISTERS * SLOT
-	span = stride + SLOT
+	# **A third region: sixteen bytes for a store to land in.** 89 patches
+	# are `vmovlps %xmm0,(%rcx)` and friends, whose whole effect is the
+	# memory they write -- invisible to a harness comparing registers, and
+	# a case for one would pass while touching nothing either side reads.
+	#
+	# It is part of the compared buffer, so an unwritten scratch is
+	# identical on both sides: the driver memsets the whole thing to 0x5a
+	# before each call. Finding 217.
+	span = stride + SLOT + SLOT
 	decls = "\n".join(f"void {prefix}_{i}(const void *, void *);"
 	                  for i in range(count))
 	table = ", ".join(f"{prefix}_{i}" for i in range(count))
