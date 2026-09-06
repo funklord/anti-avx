@@ -311,6 +311,37 @@ GPR_DEST = [
 ]
 
 
+# **The memory-sourced forms, the last uncovered class of the in-place
+# path.** 576 patches in six mnemonics, and every one is an instruction
+# already covered in its register form -- `objdump` prints the size suffix
+# (`vcvtsi2ssl`, `vcvtpd2psx`) precisely because a memory operand leaves
+# the width ambiguous, so these are separate mnemonics to the case list
+# even though they are the same instruction.
+#
+# The shipped operands read `0x8(%r8)`, `(%rbx)`, `0x48(%rsp)` and a
+# rip-relative displacement -- none of which this harness controls.
+# Written against `%rdi`, which is the input buffer, at an offset inside
+# the 256 bytes each pattern provides. Finding 216.
+MEMORY_SOURCE = [
+	"vcvtsi2ssl 32(%rdi),%xmm1,%xmm0",
+	"vcvtsi2ssq 32(%rdi),%xmm1,%xmm0",
+	"vcvtsi2sdl 32(%rdi),%xmm1,%xmm0",
+	"vcvtsi2sdq 32(%rdi),%xmm1,%xmm0",
+	"vcvtpd2psx 32(%rdi),%xmm0",
+	"vpaddb 32(%rdi),%xmm1,%xmm0",
+]
+
+
+def build_memory():
+	"""Cases whose source is memory the harness owns."""
+	wanted = []
+	for text in MEMORY_SOURCE:
+		mnemonic = text.split(" ", 1)[0]
+		wanted.append((mnemonic, "from_memory", 1, 2, text,
+		               -1, DESTINATION, 0))
+	return finish([case for case in wanted if not needs_pool(case)])
+
+
 def build_gpr_dest():
 	"""Cases whose result lands in a general register the oracle dumps."""
 	wanted = []

@@ -184,7 +184,8 @@ def collect():
 		cases = (lowering_cases.build() + lowering_cases.build_flags()
 		         + lowering_cases.build_oracle()
 		         + lowering_cases.build_gpr()
-		         + lowering_cases.build_gpr_dest())
+		         + lowering_cases.build_gpr_dest()
+		         + lowering_cases.build_memory())
 	finally:
 		detour.lower_vex = real
 	if len(recorded) != len(cases):

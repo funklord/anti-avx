@@ -13425,6 +13425,49 @@ MXCSR           Finding 211           the comiss/ucomiss distinction
 Every one unlocked a CLASS. The cases were never the scarce thing.
 
 
+### Finding 216 -- the memory-sourced forms, and 96.5% of the in-place path executed
+
+The last uncovered class with a source the harness could reach: 576 patches in six mnemonics.
+
+**They are not new instructions.** `vcvtsi2ssl`, `vcvtpd2psx` and the rest are the same opcodes
+already covered in register form -- `objdump` prints the size suffix precisely because a memory
+operand leaves the width ambiguous, so they arrive at the case list as distinct mnemonic
+strings. The gap was therefore not in the lowering's coverage of an instruction but in the
+case list's NAMING: the register form was tested, and the memory form goes through a different
+path in `lower_vex`, the one that adjusts a displacement rather than rewriting a modrm, which
+nothing had executed.
+
+Written against `%rdi`, the input buffer, because the shipped operands read `0x8(%r8)`,
+`(%rbx)`, `0x48(%rsp)` and a rip-relative displacement -- none of which the harness controls.
+`%rsp` would be the worst of them: reading it is harmless, and a lowering that adjusted the
+displacement would address into the harness's own frame.
+
+**The sabotage was chosen for what these cases test.** Flipping the last byte's low bit -- the
+trick used for the register cases -- changes a register field in some encodings and a
+displacement in others, so a pass would be ambiguous. Flipping bit 4 moves the DISPLACEMENT,
+which is the code path these exist for: 39 differences, in all six mnemonics.
+
+```
+in-place patches   547,716 across 126 mnemonic(s)
+executed coverage  528,374  (96.5%)  in 120 mnemonic(s)
+remaining           19,342  in 6 mnemonic(s)
+  19,253  vzeroupper
+      89  vmovlps, vmovhpd, vmovntps, vstmxcsr, vldmxcsr
+```
+
+**`vzeroupper` is not an item and should not become one.** It is patched to NOPs, and the
+argument is that an SSE-only CPU has no upper half to zero. A case would compare xmm registers
+neither side touches -- the low 128 bits are unchanged by `vzeroupper` and by `nop` alike -- so
+it would pass while the entire semantic difference lives in bits the test machine does not
+have. That is a question this harness cannot ask, and saying so is worth more than a green
+tick.
+
+**The 89 that remain are stores**, and the bucket label misfired again for the same reason as
+Finding 215: the classifier reads sources, and these have a memory DESTINATION. They want an
+observation of written memory, which is the sixth such addition and the last one the in-place
+path has left.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13439,7 +13482,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | The 576 memory-sourced patches | 6 mnemonics | wrong bytes | Finding 215: the last uncovered class of the in-place path |
+| 1 | An observation of written memory, for the 89 store patches | 5 mnemonics | wrong bytes | Finding 216: the last class; `vzeroupper`'s 19,253 are not askable here |
+| - | ~~The 576 memory-sourced patches~~ **DONE** | coverage 95.2% -> 96.5% | wrong bytes | Finding 216: the same opcodes under a different name and a different lowering path |
 | - | ~~GPR-destination mnemonics~~ **DONE** | 6,244 patches, coverage 95.2% | wrong bytes | Finding 215: the observation was the gap, not the cases |
 | - | ~~A 256-bit input for the `%ymm`-source mnemonics~~ **CLOSED at 0** | 0 in-place patches | wrong bytes | Finding 214: 256-bit sites are never patched in place; the row came from misreading `vextractps` as `vextractf128` |
 | - | ~~Deterministic GPR inputs~~ **DONE** | 6 mnemonics, ~9,000 patches | wrong bytes | Finding 213: and the filter that picked them misread `%ymm` as a general register |
