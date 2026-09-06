@@ -182,7 +182,8 @@ def collect():
 		# and must not be given them. This harness captures the flags, so
 		# it can. Finding 210.
 		cases = (lowering_cases.build() + lowering_cases.build_flags()
-		         + lowering_cases.build_oracle())
+		         + lowering_cases.build_oracle()
+		         + lowering_cases.build_gpr())
 	finally:
 		detour.lower_vex = real
 	if len(recorded) != len(cases):
@@ -219,6 +220,18 @@ def program(pairs, which):
 		lines.append("\tldmxcsr (%rsp)")
 		lines.append("\taddq $8, %rsp")
 		lines.append("\txor %eax, %eax")
+		# **Deterministic general registers**, so a mnemonic whose source
+		# is one can be a case at all. 11,000 in-place patches are
+		# `vcvtsi2ss %rax,...` and `vmovd %eax,...` shapes, and a case
+		# reading an uninitialised register could agree or differ for
+		# reasons having nothing to do with the lowering.
+		#
+		# Caller-saved only, and never %rdi or %rsi: %rbx and the rest are
+		# the CALLER's to keep, and this is a function the harness calls.
+		# `mov` does not write flags, so the `xor` above still stands when
+		# the instruction runs. Finding 213.
+		for slot, name in enumerate(("%rax", "%rcx", "%rdx")):
+			lines.append(f"\tmovq {slot * 8}(%rdi), {name}")
 		lines.append("\t.byte " + ", ".join(f"0x{b:02x}" for b in body))
 		# **The flags, which 31,479 patches write and nothing observed.**
 		# `vcomiss` and its family are 44% of the in-place patches with no

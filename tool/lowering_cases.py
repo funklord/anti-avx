@@ -265,6 +265,40 @@ ORACLE_ONLY = [
 ]
 
 
+# **Mnemonics whose source is a general register.** ~9,000 in-place
+# patches, and they could not be cases until `vex_oracle` set the GPRs to
+# known values -- a case reading an uninitialised register could agree or
+# differ for reasons unrelated to the lowering.
+#
+# The operand text is written out per mnemonic rather than generated,
+# because the shapes genuinely differ: two operands for `vmovd`, three for
+# the converts, four for the inserts with their immediate. Only `%rax`,
+# `%rcx` and `%rdx` appear, which are the three the harness loads.
+#
+# **Deliberately absent: `vcvtps2ph`, `vextractf128` and `vextracti128`.**
+# Their source is a `%ymm`, and this harness loads only the low halves --
+# a case would read an upper half nothing defined. They want a 256-bit
+# input and are a separate piece of work. Finding 213.
+GPR_SOURCE = [
+	"vcvtsi2ss %rax,%xmm1,%xmm0",
+	"vcvtsi2sd %rax,%xmm1,%xmm0",
+	"vmovd %eax,%xmm0",
+	"vpinsrd $0x0,%ecx,%xmm1,%xmm0",
+	"vpinsrq $0x1,%rdx,%xmm1,%xmm0",
+	"vpinsrw $0x1,%eax,%xmm1,%xmm0",
+]
+
+
+def build_gpr():
+	"""Cases whose source is a general register the harness sets."""
+	wanted = []
+	for text in GPR_SOURCE:
+		mnemonic = text.split(" ", 1)[0]
+		wanted.append((mnemonic, "gpr_source", DESTINATION, 1, text,
+		               -1, DESTINATION, 0))
+	return finish([case for case in wanted if not needs_pool(case)])
+
+
 def build_oracle():
 	"""Cases for  alone: no reference exists or is needed."""
 	wanted = []

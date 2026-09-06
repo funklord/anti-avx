@@ -13267,6 +13267,62 @@ than a wrong answer -- a crash is not a comparison. Flipping the modrm's low bit
 lowering reads the wrong register, gives 312 differences.
 
 
+### Finding 213 -- deterministic general registers, and a filter that misread three of nine
+
+A mnemonic whose source is a general register could not be a case: the harness controls `%rdi`
+and `%rsi` and nothing else, so `vcvtsi2ss %rax,...` would read whatever the C driver left.
+That is not a missing case but a case that could agree OR differ for reasons unrelated to the
+lowering -- the failure this file records more than any other, arriving as an input rather than
+as an observation.
+
+`vex_oracle` loads `%rax`, `%rcx` and `%rdx` from the input buffer now, so their values vary
+across all seven patterns rather than being one constant. Three constraints, and each would
+produce a harness that LIES rather than one that fails:
+
+  * **caller-saved only.** `%rbx` and `%r12`-`%r15` belong to the caller, and these are
+    functions the harness calls in a loop -- clobbering one corrupts the driver, and the
+    corruption appears as comparison differences that diverge as the loop proceeds.
+  * **never `%rdi` or `%rsi`**, which carry the pointers.
+  * **after the `xor`**, because `mov` writes no flags and the deterministic flag state of
+    Finding 210 has to survive to the instruction.
+
+The control ran first: 316 existing cases, GPR setup in place, 0 unexplained. Then the six new
+mnemonics, and 322 cases still agree.
+
+#### The filter misread three of nine, and adding them would have been the bug it fixes
+
+Selecting GPR-source mnemonics by "starts with `%` and not `%xmm`" also matches `%ymm`. So
+`vcvtps2ph`, `vextractf128` and `vextracti128` came back labelled GPR-source when their source
+is a 256-bit register.
+
+**Adding them would have been worse than leaving them out.** The harness loads only the low 128
+bits, so a `%ymm` source reads an upper half NOTHING DEFINED -- the same uninitialised-input
+defect this item exists to remove, reintroduced by the fix for it. They are recorded as
+deliberately absent, needing a 256-bit input, rather than silently dropped.
+
+#### The sabotage tests the machinery, not the cases
+
+Corrupting the lowered bytes would show the cases can fail and say nothing about whether the
+GPR setup is load-bearing. Feeding the two sides DIFFERENT values from the input buffer tests
+exactly that: 29 differences of a possible 42, the rest coinciding because some patterns give
+the same answer either way.
+
+#### Where the oracle now stands
+
+```
+233  this morning
+248  + two-operand moves       185,000 patches   a shape the expansion could not express
+258  + flag-only mnemonics      31,479           a new observation
+316  + xmm-source mnemonics     14,098           no reference was ever needed
+322  + GPR-source mnemonics      ~9,000          deterministic register inputs
+```
+
+Each step needed a different thing, and none of them was "write more cases of the kind already
+there". **What remains uncovered is recorded with its prerequisite** -- memory-sourced
+mnemonics, and the `%ymm`-source ones -- which is the difference between a gap somebody can
+pick up and a gap nobody knows about.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13281,7 +13337,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | Deterministic GPR and memory inputs, for the remaining mnemonics | ~11,000 patches | wrong bytes | Finding 212: their sources are `%rax` and `0xb0(%rbx)`, which the harness does not control |
+| 1 | A 256-bit input, for the `%ymm`-source mnemonics | `vextractf128` 1,624 and others | wrong bytes | Finding 213: the harness loads only low halves, so a case would read an undefined upper half |
+| - | ~~Deterministic GPR inputs~~ **DONE** | 6 mnemonics, ~9,000 patches | wrong bytes | Finding 213: and the filter that picked them misread `%ymm` as a general register |
 | - | ~~The xmm-writing mnemonics with no case~~ **DONE** | 58 mnemonics, oracle cases 248 -> 316 | wrong bytes | Finding 212: no references needed, and I had priced it last for needing 54 |
 | - | ~~MXCSR observation~~ **DONE** | the `comiss`/`ucomiss` distinction is now compared | wrong bytes | Finding 211: and the status slot is compared with the translator held constant, because qemu does not model DE |
 | - | ~~An executed case for `vcomiss` and family~~ **DONE** | 31,479 patches | wrong bytes | Finding 210: the oracle captures flags now; sabotage gives 58 differences |
