@@ -583,6 +583,19 @@ ESCAPE_RULE = ESCAPE_ALLOW
 # that with `shadowspill`, whose site is refused outright when this is off.
 SHADOW_OFF, SHADOW_ON = "off", "on"
 SHADOW_RULE = SHADOW_ON
+# `--fallback=off` takes the per-site stack borrow away, leaving `--spill=tls`
+# to decline a site where the home space cannot lend and fewer than two GPRs
+# are free -- which is what it did before Finding 204.
+#
+# **It exists because the fallback broke a control, not for symmetry.**
+# `check-spill` proves the caller's shadow is load-bearing by turning it off
+# and requiring the site to FAIL; with a stack fallback available the site
+# succeeds anyway, so `--shadow=off` stopped isolating the shadow and the
+# gate said so. A new mechanism that can rescue a site needs its own switch,
+# or every control that isolates a rescue below it quietly stops
+# discriminating. Finding 204.
+FALLBACK_OFF, FALLBACK_ON = "off", "on"
+FALLBACK_RULE = FALLBACK_ON
 
 
 def encode_rip(prefix, opcode, reg, target, at):
@@ -6036,17 +6049,40 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				# fewest other things this tool might later want.
 				ordered = sorted(available, key=lambda n: -n)
 				tls_pair = (ordered[0], ordered[1])
-		if base is None and tls_pair is None:
+		# **The stack, where neither the home space nor a TLS pair is
+		# available.** `--spill=tls` declines 386 sites for exactly this:
+		# the home space cannot lend and TLS addressing wants two free
+		# GPRs that are not live here. A stack slot needs no register to
+		# address, and `--spill=stack` already emits one -- this reuses
+		# that emission rather than inventing a second, so the unwind
+		# offset below is the same measured `prologue` that mode has been
+		# tested with.
+		#
+		# **A fallback is not a different default.** Measured: switching
+		# wholesale to `stack` closes all 386 and ends with 194 FEWER
+		# candidates, because it loses sites `tls` handles -- 333 of them
+		# to `no register free across the ymm run` alone. Falling back only
+		# where `tls` refused takes 349 of the 386 and loses none of that,
+		# since those sites keep the store that works for them.
+		# Finding 204.
+		stack_borrow = base is None and tls_pair is None \
+			and SPILL == SPILL_TLS and FALLBACK_RULE == FALLBACK_ON
+		if base is None and tls_pair is None and not stack_borrow:
 			if reasons is not None:
 				reasons["the site will not hold one borrow displacement"] += 1
 			return None, 0
-		if SPILL == SPILL_STACK:
+		if SPILL == SPILL_STACK or stack_borrow:
 			body += STACK_OPEN
 			# Where the allocation is complete, which is what the unwind
 			# code's offset means and why it is measured rather than assumed
 			# to be zero: a backward-widened window emits its swallowed
 			# instructions first.
 			prologue = len(body)
+		if stack_borrow:
+			# The freshly allocated sixteen bytes, at `(%rsp)`: the same
+			# place the callee home space is addressed from, which is why
+			# `encode_spill` needs nothing new to reach it.
+			base = 0
 		if tls_pair is not None:
 			index_va, slot_offset = tls
 			block, scratch_gpr = tls_pair
@@ -6084,7 +6120,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the borrowed register could not be restored"] += 1
 			return None, 0
 		body += restored
-		if SPILL == SPILL_STACK:
+		if SPILL == SPILL_STACK or stack_borrow:
 			body += STACK_CLOSE
 		lowered = b""
 	elif kind in ("span", "region"):
@@ -7470,8 +7506,16 @@ def collect(binary, listing, context=None):
 					# `--spill=tls` differs from `--spill=home` only where
 					# the home space said no. Two registers, because the
 					# addressing needs two and one is worth nothing to it.
-					if SPILL != SPILL_TLS or tls_slot_offset is None \
-							or len(gpr_free_at(home, address)) < 2:
+					# **Under `tls` the stack is the fallback, so this no
+					# longer declines.** `build_stub` allocates sixteen
+					# bytes and spills there when neither the home space nor
+					# a TLS pair is available, which is the same emission
+					# `--spill=stack` uses. A site the emitter still cannot
+					# take is refused there with its own reason, as every
+					# other stub failure is -- the decline here existed to
+					# save the attempt, and the attempt is now worth making.
+					# Finding 204.
+					if SPILL != SPILL_TLS or FALLBACK_RULE == FALLBACK_OFF:
 						skipped["no home space to borrow"] += 1
 						declined[address] = "no home space to borrow"
 						continue
@@ -10360,7 +10404,7 @@ def main(argv):
 	# site, as it always has, and the other two exist so that all three can
 	# be built and compared. See Finding 46.
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
-	global REGION_PLACE
+	global REGION_PLACE, FALLBACK_RULE
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -10376,6 +10420,15 @@ def main(argv):
 			REGION_RULE = item.split("=", 1)[1]
 			if REGION_RULE not in (REGION_WHOLE, REGION_LIVE):
 				print(f"detour.py: unknown region rule {REGION_RULE!r}",
+				      file=sys.stderr)
+				return 2
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--fallback="):
+			FALLBACK_RULE = item.split("=", 1)[1]
+			if FALLBACK_RULE not in (FALLBACK_OFF, FALLBACK_ON):
+				print(f"detour.py: unknown fallback rule {FALLBACK_RULE!r}",
 				      file=sys.stderr)
 				return 2
 			del argv[i]

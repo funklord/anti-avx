@@ -12749,6 +12749,62 @@ without the profile it differs from** -- *corroboration has to be independent*, 
 shape of a population rather than a claim.
 
 
+### Finding 204 -- a per-site stack fallback, and the two controls it silently retired
+
+`--spill=tls` declined 386 sites `no home space to borrow`: the home space cannot lend and TLS
+addressing wants two free GPRs that are not live. A stack slot needs no register to address,
+and `--spill=stack` already emits one.
+
+**A fallback is not a different default, and only the comparison separates them.** Switching
+wholesale to `stack` closes all 386 and ends with 194 FEWER candidates, losing sites `tls`
+handles -- 333 of them to `no register free across the ymm run` alone. Falling back only where
+`tls` refused keeps those, and takes 349 of the 386 (90%).
+
+```
+surviving VEX in .text  6,049 -> 5,673   -376
+detours               202,504 -> 202,838  +334
+removed                 99.2% -> 99.3%
+stale reads in the IMAGE:   0
+```
+
+376 against a ceiling of 349, because a placed window also swallows neighbouring VEX. It is the
+largest single gain of the session and it reuses `--spill=stack`'s emission verbatim --
+including the measured `prologue` the unwind data derives from -- so it inherits a path
+`check-unwind` already tests rather than needing new unwind reasoning.
+
+#### The part worth keeping: a new rescue retires every control beneath it
+
+`check-spill` carries controls of the form **turn off mechanism X and this site must FAIL**.
+That failure is the whole proof X is load-bearing. A rescue that can carry those sites breaks
+all of them at once:
+
+```
+shadowspill --shadow=off   want a failure, got 107 -- the correct answer
+regionlive  --region=whole want a failure, got 121 -- the correct answer
+```
+
+Neither mechanism changed. The stack fallback simply carried both sites, correctly -- it uses a
+fresh slot rather than the region's memory, so `--region=whole` stopped being able to
+demonstrate that borrowing from a live region is unsafe.
+
+**This is not the vacuous pass this file keeps recording, and the difference matters.** A
+vacuous check inspected nothing. These inspected the right thing, got the right answer, and
+stopped ISOLATING what they were built to isolate, while still running and still printing.
+Had `check-spill` merely asserted "the site works", the change would have gone green and
+quietly retired two proofs -- and the next person to touch the shadow or the region rule would
+have inherited a gate that could not fail.
+
+So: **a mechanism that can rescue a site needs its own off switch, or every control below it
+stops discriminating.** `--fallback=on|off` exists for that reason and its comment says so
+rather than presenting it as symmetry with `--shadow`. Both pairs run with `--fallback=off`
+now and both discriminate again -- `shadowspill` 29/107, `regionlive` 29/121.
+
+**And the wine gates could not run at all at first**, the prefix under `build/` being owned by
+another account. The canary caught it and said so, which is what it was added for after
+`check-tls` and `check-unwind` once reported a startup failure as a verdict on the work. Run
+against a prefix this session owns, all three pass.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12763,7 +12819,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | A per-site `stack` fallback where TLS lacks two free GPRs | up to 386 sites | sites | Finding 202: a wholesale switch is -194, so only a fallback pays; `pool` is refused for its race |
+| - | ~~A per-site `stack` fallback~~ **DONE** | 376 sites off the frontier | sites | Finding 204: 6,049 -> 5,673, and it retired two `check-spill` controls that now run with `--fallback=off` |
 | - | ~~What the 64 worst functions share~~ **CLOSED at ~0** | 3,079 sites, two thirds architectural | sites | Finding 203: they share being full of 256-bit arithmetic, already ceilinged at 75 |
 | - | ~~The 208 readers the gate cannot speak for~~ **CARRIED** | 131 conservative reverts, 132 more windows withheld, +267 frontier | wrong bytes | Finding 198: still unresolved, but every site that could have decided them keeps its VEX form |
 | - | ~~256-bit arithmetic, which no strategy handles~~ **CLOSED at 75** | 1,925 sites, ceiling 75 | sites | Finding 200: the class is a graph and its exits bound it; 482 of it is `vextractf128`/`vinsertf128`, unlowerable by construction |

@@ -740,10 +740,13 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 		fi; \
 	done; \
 	echo "check-spill: and the callee home space lends a register with no rsp"; \
+	echo "check-spill: the shadow pair runs with --fallback=off, because the"; \
+	echo "             stack fallback rescues the site on its own and the"; \
+	echo "             control stops isolating the shadow"; \
 	want=`$(PYTHON) tool/pe_build.py names | \
 	      awk '$$1 == "shadowspill" { print $$2 }'`; \
 	for mode in off on; do \
-		$(PYTHON) tool/detour.py --shadow=$$mode apply \
+		$(PYTHON) tool/detour.py --shadow=$$mode --fallback=off apply \
 			$(BUILD_DIR)/pe-shadowspill.exe \
 			$(BUILD_DIR)/pe-shadowspill.asm \
 			$(BUILD_DIR)/sse-shadowspill-$$mode.exe >/dev/null; \
@@ -768,7 +771,8 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 	      awk '$$1 == "regionlive" { print $$2 }'`; \
 	for name in regionlive regionread; do \
 		for mode in whole live; do \
-			$(PYTHON) tool/detour.py --region=$$mode apply \
+			$(PYTHON) tool/detour.py --region=$$mode --fallback=off \
+				apply \
 				$(BUILD_DIR)/pe-$$name.exe $(BUILD_DIR)/pe-$$name.asm \
 				$(BUILD_DIR)/sse-$$name-$$mode.exe >/dev/null; \
 			$(WINE_ENV) timeout 120 wine \
@@ -789,6 +793,10 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 		done; \
 	done; \
 	echo "check-spill: a region dead from the site is lent and a live one is not"; \
+	echo "check-spill: the region pair runs with --fallback=off for the same"; \
+	echo "             reason the shadow pair does -- the stack fallback"; \
+	echo "             rescues the site correctly and the control then has"; \
+	echo "             nothing left to demonstrate"; \
 	want=`$(PYTHON) tool/pe_build.py names | \
 	      awk '$$1 == "tlsspill" { print $$2 }'`; \
 	for mode in home tls; do \
