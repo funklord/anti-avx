@@ -13021,6 +13021,57 @@ control from an unapplied one was checking that the substitution itself had land
 harness does not remove the need to verify the sabotage.
 
 
+### Finding 209 -- a third of every in-place patch had no executed case, for a structural reason
+
+The same audit Finding 54 ran once, re-run against the patch list rather than from memory:
+
+```
+in-place patches   547,716 across 126 mnemonic(s)
+executed by an oracle             72 mnemonic(s)
+NO EXECUTED CASE                  77 mnemonic(s)  ->  256,186 patches   47%
+
+  92,897 vmovaps    24,789 vmovdqu    19,253 vzeroupper
+  65,770 vmovups    23,168 vcomiss     6,450 vucomiss
+```
+
+**Two ways this could have been a false alarm, and it survives both.** In-place patches are
+made by `sse_encoding`, a mechanical prefix strip, not by `lower.py`'s sequence rules -- so
+absence from `lowering_cases` might have meant coverage elsewhere. It does not: `vex_oracle`
+imports `lowering_cases.build()` rather than keeping its own list, so **both executed harnesses
+draw from the same 72 mnemonics.** The other 77 were covered only statically -- assembled, and
+checked that no VEX prefix survives, which says nothing about what the result computes.
+
+**The gap was structural.** `build()` writes every case as `%xmmA,%xmmB,%xmm0`, and
+`vmovaps %xmm1,%xmm0` has no middle operand, so the largest mnemonics in the binary could not
+be expressed. Nothing pointed at it because the figure everyone quotes -- "233 cases from 49
+mnemonics" -- counts `len(CASES)`, the case SPECS, and calls them mnemonics. The real count
+was 72.
+
+Five two-operand moves in three shapes each closes **185,000 patches, a third of the total**,
+from fifteen cases, and both oracles pick them up automatically.
+
+**`vcomiss` and its family are deliberately absent.** 30,760 patches that write FLAGS, and this
+harness observes sixteen xmm registers -- a case for one would compare the wrong thing and
+pass. That is the vacuous pass this file is full of, and writing it knowingly would be worse
+than the gap. It wants a different observation and is recorded rather than bodged.
+
+#### The first version of the cases could not fail, and only the sabotage said so
+
+The reference for a whole-register move is `return b`. Sabotaged to `return a`, the suite
+passed 1,984 lowerings.
+
+The cases passed `source` as BOTH `src1` and `src2`, so the harness loaded one register twice:
+`a` and `b` held the same bytes, `return a` and `return b` were the same answer, and the
+reference could not be wrong. **A case whose operands cannot disagree cannot test which one the
+lowering keeps.** With `src1` set to the destination's prior contents the sabotage fails on
+every pattern.
+
+That is the third control this session that could not fail, after two sabotages that never
+applied. **The discipline is not that the mistake gets avoided -- it is that sabotaging every
+new check catches it before it ships**, and all three were caught inside the hour they were
+written.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13035,6 +13086,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| 1 | An executed case for `vcomiss` and family | 30,760 patches | wrong bytes | Finding 209: they write flags, which this harness cannot observe -- it needs a new one |
+| - | ~~47% of in-place patches have no executed case~~ **PART DONE** | 185,000 patches covered | wrong bytes | Finding 209: five two-operand moves; the expansion could not express them |
 | - | ~~The span oracle never executes a plain passenger~~ **DONE** | 402 of 592 shipped members | wrong bytes | Finding 208: and each fault now has exactly one witness |
 | - | ~~The refusal reasons no fixture produces~~ **CLOSED at ~30** | 15 reasons, 1,822 refusals; the largest prices at 30 | sites | Finding 207: and the 638/3,644/28,814 that ranked it were doubled -- 319/1,822/14,407 |
 | - | ~~Nothing asserts a stub's bytes decode~~ **DONE** | catches the whole emission class | wrong bytes | Finding 206: controlled with the real defect from Finding 205 |

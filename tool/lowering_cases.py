@@ -123,6 +123,32 @@ MEMORY_SHAPE = ("src2_in_memory", 2, 1)
 # reference cannot describe both.
 MEMORY_EXEMPT = frozenset(("vmovss", "vmovsd", "vinsertps"))
 
+# **The two-operand moves, which the three-operand expansion cannot say.**
+# Every case above is written `%xmmA,%xmmB,%xmm0`, and `vmovaps %xmm1,%xmm0`
+# has no middle operand -- so the largest mnemonics in the binary were
+# absent for a structural reason rather than by anybody's choice.
+#
+# Measured over Starfield's own patch list: 126 mnemonics are patched in
+# place and 72 have an executed case. `vmovaps` alone is 92,897 patches and
+# `vmovups` 65,770; the five moves here are 185,000, a third of every
+# in-place patch in the binary.
+#
+# **Their lowering is a prefix strip**, which is correct for a 1:1 VEX/SSE
+# pair and is an argument rather than a measurement until something runs
+# it. `sse_encoding` will strip a prefix from an opcode with no legacy form
+# just as willingly -- that is Finding 205, in the span path, where it
+# emitted bytes that decoded to nothing.
+#
+# `vcomiss` and friends are deliberately NOT here: they write FLAGS, and
+# this harness observes sixteen xmm registers, so a case for one would
+# compare the wrong thing and pass. That wants a different observation and
+# is recorded rather than bodged. Finding 209.
+TWO_OPERAND = [
+	"vmovaps", "vmovups", "vmovdqu", "vmovdqa", "vmovupd",
+]
+# (name, source) for a register form; the memory form follows separately.
+TWO_OPERAND_SHAPES = [("distinct", 1), ("same", DESTINATION)]
+
 # **The blend, which had only ever been checked for shape.** 3,054 sites in
 # Starfield, and `lower_blendv` has four branches because SSE takes the mask
 # in an implicit %xmm0 and VEX names four registers where three fit. Each
@@ -244,6 +270,23 @@ def build():
 		wanted.append((mnemonic, shape, source1, source2, text,
 		               -1, DESTINATION, 0))
 
+	for mnemonic in TWO_OPERAND:
+		for shape, source in TWO_OPERAND_SHAPES:
+			text = f"{mnemonic} %xmm{source},%xmm{DESTINATION}"
+			# **src1 is the DESTINATION's prior contents, src2 the thing
+			# moved in**, so the reference's two arguments differ and
+			# returning the wrong one is a failure. The first version
+			# passed `source` for both: `a` and `b` were then the same
+			# register, `return a` and `return b` were the same answer,
+			# and a deliberately wrong reference passed 1,984 lowerings.
+			# A case whose operands cannot disagree cannot test which one
+			# the lowering keeps. Finding 209.
+			wanted.append((mnemonic, shape, DESTINATION, source, text,
+			               -1, DESTINATION, 0))
+		# The memory form, which is how most of them appear in the binary.
+		text = f"{mnemonic} 32(%rdi),%xmm{DESTINATION}"
+		wanted.append((mnemonic, "from_memory", DESTINATION, 2, text,
+		               -1, DESTINATION, 0))
 	for mnemonic, immediate in SHIFTS:
 		for shape, source in SHIFT_SHAPES:
 			text = f"{mnemonic} {immediate},%xmm{source},%xmm{DESTINATION}"

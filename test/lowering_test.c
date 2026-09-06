@@ -188,6 +188,23 @@ static __m128i ref_movss(__m128i a, __m128i b)
 	                             _mm_castsi128_ps(b)));
 }
 
+/* The two-operand moves: the destination becomes the source entirely, so
+ * one reference serves all five. They are named separately in the table
+ * below rather than aliased there, because a table that says which
+ * mnemonics share a reference is readable and a comment claiming it is not.
+ *
+ * These are 185,000 of Starfield's 547,716 in-place patches -- a third of
+ * them -- and they had no executed case at all: `build()` writes every case
+ * as three operands, and `vmovaps %xmm1,%xmm0` has no middle one, so the
+ * largest mnemonics in the binary were absent for a structural reason
+ * rather than by a decision. Finding 209.
+ */
+static __m128i ref_move_whole(__m128i a, __m128i b)
+{
+	(void)a;
+	return b;
+}
+
 static __m128i ref_cmpltps(__m128i a, __m128i b)
 {
 	return _mm_castps_si128(_mm_cmplt_ps(_mm_castsi128_ps(a),
@@ -665,6 +682,9 @@ static const struct {
 	{ "vpcmpeqd", ref_pcmpeqd }, { "vpcmpgtd", ref_pcmpgtd },
 	{ "vpunpckldq", ref_punpckldq },
 	{ "vmovss", ref_movss }, { "vmovsd", ref_movsd },
+	{ "vmovaps", ref_move_whole }, { "vmovups", ref_move_whole },
+	{ "vmovdqu", ref_move_whole }, { "vmovdqa", ref_move_whole },
+	{ "vmovupd", ref_move_whole },
 	{ "vshufps", ref_shufps },
 	{ "vsqrtss", ref_sqrtss }, { "vcvtss2sd", ref_cvtss2sd },
 	{ "vcvtsd2ss", ref_cvtsd2ss }, { "vmulsd", ref_mulsd },
