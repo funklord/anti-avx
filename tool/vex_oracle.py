@@ -197,6 +197,12 @@ def program(pairs, which):
 		# an instruction which writes no flags leaves the same value on
 		# both sides rather than whatever the caller happened to have.
 		# `xor` sets ZF and PF and clears CF, OF, SF.
+		# A known MXCSR before the instruction, for the same reason the
+		# flags are zeroed: the exception flags are STICKY, so without
+		# this each case would inherit whatever the previous one raised.
+		lines.append("\tpushq $0x1f80")
+		lines.append("\tldmxcsr (%rsp)")
+		lines.append("\taddq $8, %rsp")
 		lines.append("\txor %eax, %eax")
 		lines.append("\t.byte " + ", ".join(f"0x{b:02x}" for b in body))
 		# **The flags, which 31,479 patches write and nothing observed.**
@@ -210,6 +216,17 @@ def program(pairs, which):
 		lines.append("\tpopq %rax")
 		lines.append("\tandl $0x8d5, %eax")
 		lines.append(f"\tmovl %eax, {REGISTERS * SLOT}(%rsi)")
+		# **MXCSR, which EFLAGS cannot see.** `comiss` and `ucomiss` set
+		# identical EFLAGS and differ ONLY in whether a QNaN raises the
+		# invalid-operation flag here -- so a prefix strip landing on the
+		# wrong one of that adjacent pair is invisible to every other
+		# check in this tree. Masked to the six exception flags; the
+		# rounding mode and the masks are the state we set, not a result.
+		# Finding 211.
+		lines.append(f"\tstmxcsr {REGISTERS * SLOT + 4}(%rsi)")
+		lines.append(f"\tmovl {REGISTERS * SLOT + 4}(%rsi), %eax")
+		lines.append("\tandl $0x3f, %eax")
+		lines.append(f"\tmovl %eax, {REGISTERS * SLOT + 4}(%rsi)")
 		for r in range(REGISTERS):
 			lines.append(f"\tmovaps %xmm{r}, {r * SLOT}(%rsi)")
 		lines += ["\tret", ""]
@@ -345,6 +362,18 @@ def main():
 	print(f"   the VEX binary on this CPU: exit {native.returncode}{verdict}")
 
 	vex, low = run("vexside", True), run("sseside", False)
+	# **A third run: the lowered side under qemu as well.** The register
+	# comparison is qemu-VEX against native-SSE, which is the question that
+	# matters -- the lowering has to be right on the silicon it will run
+	# on. MXCSR cannot be asked that way: qemu does not model the DENORMAL
+	# flag, so a native run raises `PE|DE` where qemu raises `PE`, and 22
+	# cases differed on the `edges` pattern for no reason but that. Masking
+	# DE out would be an exemption wider than its reason.
+	#
+	# Running the lowered bytes under qemu too removes the emulator as a
+	# variable: both sides are then translated by the same translator, and
+	# a difference is the lowering's. Finding 211.
+	low_emulated = run("sseside", True)
 
 	agree, classf, oracle, bad = 0, [], [], []
 	scratch = lowering_cases.SCRATCH
@@ -352,9 +381,25 @@ def main():
 		shape, lane = case[1], case[6]
 		for p, (pname, _blob) in enumerate(PATTERNS):
 			a, b = vex[(c, p)], low[(c, p)]
-			# The scratch register is the one a lowering may destroy.
+			# **The status slot is compared against the EMULATED lowering,
+			# the registers against the native one.** Two questions, two
+			# comparisons: does the lowering compute the right values on
+			# real silicon, and does it raise what the original raised
+			# with the translator held constant. Finding 211.
+			# BYTES here, not hex: `run` returns `bytes.fromhex`, so a
+			# register is SLOT and not 32. The printer below works on
+			# `.hex()` and does use 32 -- two units in one function, and
+			# the first version of this splice took the printer's. It sliced
+			# past the end, `emulated[480:]` was empty, and the comparison
+			# was unchanged: a no-op that produced the same 22 differences
+			# and read exactly like a real result. Finding 211.
+			status = (REGISTERS - 1) * SLOT
 			a = a[:scratch * SLOT] + a[(scratch + 1) * SLOT:]
 			b = b[:scratch * SLOT] + b[(scratch + 1) * SLOT:]
+			emulated = low_emulated[(c, p)]
+			emulated = emulated[:scratch * SLOT] \
+				+ emulated[(scratch + 1) * SLOT:]
+			b = b[:status] + emulated[status:]
 			if a == b:
 				agree += 1
 			elif mnemonic in CLASS_F:
@@ -402,6 +447,15 @@ def main():
 			if x != y:
 				reg = r if r < scratch else r + 1
 				print(f"      xmm{reg:<2} vex {x}\n           low {y}")
+		# **The status slot, which the register loop cannot reach.** With
+		# the flags and MXCSR observed, a row can differ in neither of the
+		# fifteen registers -- and this printed nothing at all for it, so
+		# the difference was unreadable. A difference nobody can display
+		# is a difference nobody can diagnose. Finding 211.
+		at = (REGISTERS - 1) * 32
+		x, y = row[3][at:], row[4][at:]
+		if x != y:
+			print(f"      status vex {x}\n             low {y}")
 	return 1 if bad else 0
 
 

@@ -13127,6 +13127,80 @@ failure it must catch** is this file's own recurring finding, and it was written
 justification rather than the code. MXCSR is a different slot and a separate piece of work.
 
 
+### Finding 211 -- MXCSR, and the five sabotages it took to prove one channel works
+
+Finding 210 closed the flag mnemonics against EFLAGS and recorded that the `comiss`/`ucomiss`
+distinction was still invisible: that pair sets identical EFLAGS and differs only in whether a
+QNaN raises the invalid-operation flag in MXCSR. This adds that observation.
+
+The exception flags are STICKY, so each case resets MXCSR to `0x1f80` first; without it a case
+would inherit whatever the previous one raised and the verdict would depend on case ordering --
+reproducible, wrong, and stable enough to look deliberate.
+
+#### The comparison had to be split, and the measurement forced it
+
+With MXCSR observed, 22 existing cases differed -- all on the `edges` pattern, all in
+`dst_is_src1` and `dst_is_src2`, never `distinct`. The bytes said why:
+
+```
+vex (under qemu)   0x20   = PE
+low (native)       0x22   = PE | DE
+```
+
+**qemu does not model the denormal flag.** The `edges` pattern puts a denormal in `%xmm0`, and
+only the aliased shapes read `%xmm0` -- `distinct` reads `%xmm1` and `%xmm2`, whose values are
+XOR-shifted and not denormal. So the aliasing was a coincidence of which registers each shape
+happens to read, not a property of aliased lowerings.
+
+Masking DE out would have been an exemption wider than its reason, excusing the class the
+channel exists to catch. Instead the lowered side is run under qemu as well, and the STATUS
+slot is compared against that while the REGISTERS are still compared against the native run:
+
+```
+registers   qemu-VEX  vs  native-SSE    the lowering must be right on real silicon
+status      qemu-VEX  vs  qemu-SSE      one translator on both sides, so a difference is ours
+```
+
+**The claim is narrower and the narrowing is the point.** The status comparison no longer says
+"raises what the original raises on this hardware"; it says "raises what the original raises
+with the translator held constant". A qemu error affecting both forms equally is invisible to
+it. The register comparison does not share that limit, and saying so is cheaper than
+discovering it later.
+
+#### Five sabotages, and only the fifth was a control
+
+```
+1  string anchor matched two lines           assertion caught it
+2  shell escaping mangled the pattern         assertion caught it
+3  replace() silently did not match           assertion PASSED, edit did not apply
+4  capture removed from BOTH sides            applied, symmetric, 0 differences
+5  lowered side reports a masked-off MXCSR    312 differences
+```
+
+**Number 3 is the one to remember: the assertion checked that the line CONTAINED the anchor,
+not that the replacement happened.** Verifying the anchor is not verifying the edit. The fix
+was to replace the line by index and then grep the modified file -- check the artifact, not the
+operation.
+
+**Number 4 applied perfectly and still proved nothing.** Removing the capture from both
+programs made them agree on its absence. **A sabotage has to break the two sides
+DIFFERENTLY**, or it tests only that the harness is self-consistent, which it always is. That
+is Finding 209's undiscriminating operands in another costume, and the second time in two hours.
+
+#### And a no-op edit that read as a result
+
+The first attempt at the split spliced at `(REGISTERS - 1) * 32`. `run()` returns BYTES at
+`SLOT` each; the printer works on `.hex()` at 32 each. Two units in one function, no name
+distinguishing them, and the wrong constant silently in range: `b[:480]` was the whole buffer,
+`emulated[480:]` was empty, and the comparison never changed.
+
+The run then produced the same 22 differences with the same `0x20` against `0x22` -- and the
+obvious reading was available and wrong: *holding the translator constant did not help, so the
+lowering really does raise a different flag.* What refused it was that the output was
+byte-for-byte identical to the previous run. **A changed comparison that produces an unchanged
+result has not been changed.**
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13141,7 +13215,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | MXCSR observation, for the `comiss`/`ucomiss` distinction | unknown | wrong bytes | Finding 210: EFLAGS cannot see it; the two differ only in the invalid-operation flag |
+| - | ~~MXCSR observation~~ **DONE** | the `comiss`/`ucomiss` distinction is now compared | wrong bytes | Finding 211: and the status slot is compared with the translator held constant, because qemu does not model DE |
 | - | ~~An executed case for `vcomiss` and family~~ **DONE** | 31,479 patches | wrong bytes | Finding 210: the oracle captures flags now; sabotage gives 58 differences |
 | - | ~~47% of in-place patches have no executed case~~ **PART DONE** | 185,000 patches covered | wrong bytes | Finding 209: five two-operand moves; the expansion could not express them |
 | - | ~~The span oracle never executes a plain passenger~~ **DONE** | 402 of 592 shipped members | wrong bytes | Finding 208: and each fault now has exactly one witness |
