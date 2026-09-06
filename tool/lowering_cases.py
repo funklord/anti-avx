@@ -289,6 +289,37 @@ GPR_SOURCE = [
 ]
 
 
+# **Mnemonics whose DESTINATION is a general register.** 6,244 in-place
+# patches, and a case for one was impossible until `vex_oracle` observed
+# `%rax`: the harness compares sixteen xmm registers, so `vcvttss2si
+# %xmm1,%eax` would have compared bytes neither side touched and passed.
+# The mirror of `GPR_SOURCE`, which needed the register as an INPUT.
+#
+# `%eax` throughout except `vpextrq`, which moves 64 bits and needs the
+# full `%rax` -- writing it as `%eax` assembles to a different instruction
+# and would test the wrong one. Finding 215.
+GPR_DEST = [
+	"vcvttsd2si %xmm1,%eax",
+	"vcvttss2si %xmm1,%eax",
+	"vextractps $0x0,%xmm1,%eax",
+	"vmovmskps %xmm1,%eax",
+	"vpextrb $0x8,%xmm1,%eax",
+	"vpextrd $0x2,%xmm1,%eax",
+	"vpextrq $0x1,%xmm1,%rax",
+	"vpextrw $0x2,%xmm1,%eax",
+	"vpmovmskb %xmm1,%eax",
+]
+
+
+def build_gpr_dest():
+	"""Cases whose result lands in a general register the oracle dumps."""
+	wanted = []
+	for text in GPR_DEST:
+		mnemonic = text.split(" ", 1)[0]
+		wanted.append((mnemonic, "gpr_dest", 1, 1, text, -1, DESTINATION, 0))
+	return finish([case for case in wanted if not needs_pool(case)])
+
+
 def build_gpr():
 	"""Cases whose source is a general register the harness sets."""
 	wanted = []

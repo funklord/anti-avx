@@ -13364,6 +13364,67 @@ been priced -- it was carried straight from the sentence that excluded the mnemo
 exactly the shape of the four stale scope numbers already recorded today.
 
 
+### Finding 215 -- the general register as a RESULT, and 95.2% re-derived rather than added up
+
+Re-measured from the patch list rather than summed from the day's commits, which is the check
+the four stale scope numbers here all failed:
+
+```
+in-place patches   547,716 across 126 mnemonic(s)
+executed coverage  521,643  (95.2%)  in 106 mnemonic(s)
+remaining           26,073  in 20 mnemonic(s)
+  19,253  vzeroupper -- writes nothing, correctly excluded
+   6,244  13 mnemonics whose DESTINATION is a general register
+     576   6 mnemonics with a memory source
+```
+
+`vcvttss2si %xmm1,%eax`, `vmovmskps`, `vextractps`, the `vpextr*` family: their whole result
+lands in a GPR, and the harness compares sixteen xmm registers. A case for one would have
+compared bytes neither side touched and passed -- the same shape as the flags before Finding
+210, and the mirror of Finding 213, which needed the register as an INPUT.
+
+`vex_oracle` dumps `%rax` now. **The order is the correctness argument**: it goes before the
+flags capture, because `pushfq`/`popq %rax` destroys it, and it can go there only because
+`movq` writes no flags so the deterministic flag state still reaches the `pushfq`. Reversed,
+the GPR result would become the low bits of EFLAGS on both sides equally -- a self-consistent
+harness measuring nothing.
+
+Control first: 322 existing cases with the slot in place, 0 unexplained. Then nine mnemonics,
+and 331 cases still agree.
+
+#### Two sabotages, and the pair is what says anything
+
+```
+blank the slot on the lowered side       2,236 differences -- nearly every comparison
+flip the modrm of the gpr_dest cases        41 differences -- exactly the nine mnemonics
+```
+
+The first proves the slot is compared and cannot distinguish that from the cases working: every
+case loads `%rax` since Finding 213, so blanking it moves everything. The second proves each of
+the nine depends on its own lowering, and all nine appear. **A control that fails everywhere
+shows the channel exists; one that fails precisely where it should shows the cases use it.**
+
+#### A generator error no test would have caught
+
+It emitted `vpextrq $0x1,%xmm1,%eax`, taking the destination width from the template rather
+than from the mnemonic. `vpextrq` moves 64 bits: written with `%eax` it assembles to a
+DIFFERENT INSTRUCTION, and the case would have tested that one -- passing, because both sides
+run the same wrong thing. Operand width is a property of the mnemonic and the pattern could not
+know it.
+
+#### What moved the coverage was observations, not cases
+
+```
+xmm registers   the original          53% of patches
+EFLAGS          Finding 210           +31,479
+MXCSR           Finding 211           the comiss/ucomiss distinction
+%rax as input   Finding 213            +9,000
+%rax as result  Finding 215            +6,244        95.2%
+```
+
+Every one unlocked a CLASS. The cases were never the scarce thing.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13378,6 +13439,8 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| 1 | The 576 memory-sourced patches | 6 mnemonics | wrong bytes | Finding 215: the last uncovered class of the in-place path |
+| - | ~~GPR-destination mnemonics~~ **DONE** | 6,244 patches, coverage 95.2% | wrong bytes | Finding 215: the observation was the gap, not the cases |
 | - | ~~A 256-bit input for the `%ymm`-source mnemonics~~ **CLOSED at 0** | 0 in-place patches | wrong bytes | Finding 214: 256-bit sites are never patched in place; the row came from misreading `vextractps` as `vextractf128` |
 | - | ~~Deterministic GPR inputs~~ **DONE** | 6 mnemonics, ~9,000 patches | wrong bytes | Finding 213: and the filter that picked them misread `%ymm` as a general register |
 | - | ~~The xmm-writing mnemonics with no case~~ **DONE** | 58 mnemonics, oracle cases 248 -> 316 | wrong bytes | Finding 212: no references needed, and I had priced it last for needing 54 |

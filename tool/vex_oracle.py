@@ -183,7 +183,8 @@ def collect():
 		# it can. Finding 210.
 		cases = (lowering_cases.build() + lowering_cases.build_flags()
 		         + lowering_cases.build_oracle()
-		         + lowering_cases.build_gpr())
+		         + lowering_cases.build_gpr()
+		         + lowering_cases.build_gpr_dest())
 	finally:
 		detour.lower_vex = real
 	if len(recorded) != len(cases):
@@ -240,6 +241,17 @@ def program(pairs, which):
 		# comparing bytes neither side touched. Masked to the arithmetic
 		# flags, because the ambient bits differ between qemu and silicon
 		# and are nobody's result. Finding 210.
+		# **The general register, which 6,244 patches write and nothing
+		# observed.** `vcvttss2si`, `vmovmskps`, `vextractps` and friends
+		# put their whole result in a GPR, and a harness comparing sixteen
+		# xmm registers would pass a case for one while comparing bytes
+		# neither side touched -- the same shape as the flags before
+		# Finding 210.
+		#
+		# It goes FIRST because `pushfq`/`popq` below clobbers %rax, and
+		# `movq` writes no flags so the capture that follows is unharmed.
+		# Finding 215.
+		lines.append(f"\tmovq %rax, {REGISTERS * SLOT + 8}(%rsi)")
 		lines.append("\tpushfq")
 		lines.append("\tpopq %rax")
 		lines.append("\tandl $0x8d5, %eax")
