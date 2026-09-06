@@ -13649,6 +13649,54 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 224 -- guarding the decision does not guard the outcome, so verify now watches the data
+
+Findings 222 and 223 both guard a DECISION: refuse a row whose mnemonic is `(bad)`.
+Neither can see the case that would actually corrupt. A run of constant-pool bytes that
+decodes CLEANLY as VEX carries a real mnemonic, satisfies `classify`, and is patched or
+detoured like any site -- `.pdata` is consulted for function extent, not for whether a
+given byte is an instruction.
+
+That question is answered at the other end: whatever the collector decided, no byte
+inside a known data island may have moved. `verify` now clusters the bytes objdump
+refused, at `ISLAND_GAP = 256` -- `vex_scan`'s own figure, so the two agree about what an
+island IS rather than each carrying a private definition -- and compares only those bytes
+between the two images. About 48,000 of them, not 61 million, so it costs nothing on a
+run that already takes half an hour.
+
+```
+Starfield   VEX in .text 805,131 -> 5,673   (799,458 removed, 99.3%)
+            none of 747 data island(s) (48,399 bytes) was modified
+```
+
+**Seen to fail before it was believed.** A third sabotage kind, `island`, flips an
+undecodable byte; `check-verify` runs it against `dataisland` rather than in the existing
+loop, because that loop uses `ymm` and `ymm` has no island to break. The control asserts
+the failure arrived THROUGH the data-island check, the way the `stubvex` and `section`
+controls do, which is Finding 196's rule: a `verify` that dies early must not be able to
+pass a control. Clean fixture 0, sabotaged 1, message
+`1 data island(s) modified by the rewrite, first at 0x140001033-0x14000103b`.
+
+**Its limit is in the code rather than left to be discovered.** It can only see data
+holding at least one undecodable byte. A jump table of plausible addresses, or a string
+blob that decodes end to end, is in no population here -- which is exactly the case the
+finding is about, so this narrows the exposure rather than closing it.
+
+**Two instruments, two counts, and the difference is recorded rather than smoothed.**
+An ad-hoc probe written to ask the same question reported 742 islands and 47,500 bytes,
+having parsed the listing by its own tab-splitting; the check reports 747 and 48,399
+through `parse_with_comments`, the stream the collector itself reads. The safety answer
+was identical and the tally was not. Three parsers have now produced three counts of
+`(bad)` lines in this listing -- 11,783, 11,892 and 12,021 -- and none has been
+reconciled; the figure that belongs in the tree is the one the running check emits,
+because that is the one the next reader will quote.
+
+**The empty sweep is the finding.** Nothing was corrupted, and the value is in the lens
+being recorded with its population: 747 islands, 48,399 bytes, zero touched, and the
+`blocked` switch-target regions plus `.pdata` extents are evidently what keeps the
+rewrite out. The next fault in this family needs a detector for data that decodes
+cleanly, which neither this check nor the two guards before it can supply.
+
 ### Finding 223 -- the same defect in the in-place path, found by pointing the last lens at the last fix
 
 Finding 222's lens is **the guard is incidental rather than structural**, and the first
@@ -13886,6 +13934,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| - | ~~The rewrite writing into data~~ **GUARDED at 0** | 747 islands, 48,399 bytes, none modified | wrong bytes | Finding 224: a standing `verify` check with an `island` sabotage control; blind to data that decodes cleanly |
 | - | ~~Data reaching the in-place path~~ **FIXED** | 518,990 patches guarded, output byte-identical | wrong bytes | Finding 223: the same defect one call site over; `vex sites` was inflated by data |
 | - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
 | - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |

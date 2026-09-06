@@ -10590,10 +10590,16 @@ def main(argv):
 	return 2
 
 
+# How far apart two undecodable bytes may be and still be called one data
+# island. 256 is `vex_scan`'s figure, kept so the two agree about what an
+# island is rather than each having its own idea. Finding 224.
+ISLAND_GAP = 256
+
 SABOTAGE = {
 	# name: (which check must reject it, what is broken)
 	"stubvex": "the stub section holds no VEX",
 	"section": "every section after .text is byte-identical",
+	"island": "no byte inside a data island was modified",
 }
 
 
@@ -10643,6 +10649,35 @@ def sabotage(patched, output, kind):
 			return 2
 		raddr, _rsize = after[0]
 		data[raddr] ^= 0xFF
+	if kind == "island":
+		# Flip a byte objdump could not decode. Those are Finding 8's data
+		# islands, and the rewrite must never touch one. The address is
+		# read out of the PATCHED image, which is sound because an
+		# untouched island holds the same bytes at the same addresses in
+		# both -- and if that were false the check would already be
+		# failing for real.
+		done = subprocess.run(["objdump", "-d", "-j", ".text", patched],
+		                      capture_output=True, text=True,
+		                      errors="replace")
+		spot = None
+		for line in done.stdout.splitlines():
+			field = line.split("\t")
+			if len(field) < 3 or not field[2].startswith("(bad)"):
+				continue
+			head = field[0].strip()
+			if not head.endswith(":"):
+				continue
+			try:
+				spot = int(head[:-1], 16)
+			except ValueError:
+				continue
+			break
+		if spot is None:
+			print("detour.py: no undecodable byte to sabotage",
+			      file=sys.stderr)
+			return 2
+		vaddr, raddr, _size = inplace.text_mapping(patched)
+		data[raddr + (spot - vaddr)] ^= 0xFF
 	with open(output, "wb") as image:
 		image.write(bytes(data))
 	print(f"sabotage: {kind} -- {SABOTAGE[kind]} must now be false")
@@ -11734,6 +11769,57 @@ def verify(original, patched, listing=None):
 		print(f"verify: {len(intruders):,} (bad) row(s) reached the candidate "
 		      f"loop, first at 0x{intruders[0]:x}", file=sys.stderr)
 		problems += 1
+
+	# **And the rewrite must never modify a byte inside a data island.**
+	# The two guards above refuse data that FAILS to decode. Neither can
+	# see data that decodes CLEANLY, which is the case that would actually
+	# corrupt: such a run carries a real mnemonic, satisfies `classify`,
+	# and is patched like any site. So this asks the outcome rather than
+	# the decision -- cluster the bytes objdump refused, and require that
+	# none of them changed.
+	#
+	# It over-covers on purpose, sweeping in real code that lies between
+	# two data runs, so a hit is a question to be read and a zero is the
+	# strong answer. Its limit is worth knowing rather than discovering: it
+	# can only see data holding at least one undecodable byte, so a jump
+	# table that decodes end to end is in no population here. Measured on
+	# Starfield BY THIS CHECK: 747 islands spanning 48,399 bytes, none
+	# touched.
+	#
+	# **An ad-hoc probe of the same question said 742 and 47,500**, having
+	# parsed the listing with its own tab-splitting rather than through
+	# `parse_with_comments`. The safety answer was the same either way, and
+	# the count was not; the figure quoted here is the one this check
+	# produces, because that is the one anybody will read. Three parsers
+	# have now given three tallies of `(bad)` lines -- 11,783, 11,892 and
+	# 12,021 -- and none of them has been reconciled. Finding 224.
+	tv, tr, ts = inplace.text_mapping(original)
+	before_text = open(original, "rb").read()[tr:tr + ts]
+	after_text = open(patched, "rb").read()[tr:tr + ts]
+	islands = []
+	for row in instructions:
+		if row[2] != "(bad)" or not row[1]:
+			continue
+		low = row[0] - tv
+		high = low + len(row[1])
+		if low < 0 or high > ts:
+			continue
+		if islands and low - islands[-1][1] <= ISLAND_GAP:
+			islands[-1][1] = max(islands[-1][1], high)
+		else:
+			islands.append([low, high])
+	touched = [(low, high) for low, high in islands
+	           if before_text[low:high] != after_text[low:high]]
+	span = sum(high - low for low, high in islands)
+	if touched:
+		low, high = touched[0]
+		print(f"verify: {len(touched):,} data island(s) modified by the "
+		      f"rewrite, first at 0x{low + tv:x}-0x{high + tv:x}",
+		      file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: none of {len(islands):,} data island(s) "
+		      f"({span:,} bytes) was modified")
 	# **The same call apply makes -- through the same function, now.** This
 	# said so in a comment while `apply` grew a repair pass this did not,
 	# and the drift cost 15 reported stale reads the image did not have.

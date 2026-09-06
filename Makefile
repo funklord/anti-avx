@@ -632,7 +632,24 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 		$(BUILD_DIR)/verify-bad-section.log || \
 		{ echo "check-verify: the section control failed, but not through"; \
 		  echo "              the section-identity check"; exit 1; }
-	@echo "check-verify: both controls rejected, each by its own check"
+# The island control needs a fixture that HAS an island, which ymm does not,
+# so it runs against dataisland rather than in the loop above.
+	@set -e; \
+	$(PYTHON) tool/detour.py sabotage $(BUILD_DIR)/sse-dataisland.exe \
+		$(BUILD_DIR)/bad-island.exe island; \
+	if timeout 300 $(PYTHON) tool/detour.py verify \
+		$(BUILD_DIR)/pe-dataisland.exe $(BUILD_DIR)/bad-island.exe \
+		$(BUILD_DIR)/pe-dataisland.asm \
+		> $(BUILD_DIR)/verify-bad-island.log 2>&1; then \
+		echo "check-verify: the island control PASSED verify, so nothing"; \
+		echo "              is watching the rewrite stay out of data"; \
+		exit 1; \
+	fi; \
+	grep -q "data island(s) modified by the rewrite" \
+		$(BUILD_DIR)/verify-bad-island.log || \
+		{ echo "check-verify: the island control failed, but not through"; \
+		  echo "              the data-island check"; exit 1; }
+	@echo "check-verify: all three controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
@@ -949,9 +966,11 @@ clean:
 	      $(BUILD_DIR)/isa-disasm.txt $(BUILD_DIR)/region-refused.txt \
 	      $(BUILD_DIR)/regioncarry.log \
 	      $(BUILD_DIR)/bad-stubvex.exe $(BUILD_DIR)/bad-section.exe \
+	      $(BUILD_DIR)/bad-island.exe \
 	      $(PE_NAMES:%=$(BUILD_DIR)/verify-%.log) \
 	      $(BUILD_DIR)/verify-bad-stubvex.log \
 	      $(BUILD_DIR)/verify-bad-section.log \
+	      $(BUILD_DIR)/verify-bad-island.log \
 	      $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@# The wine prefix is a directory this build created, so it goes
