@@ -12884,8 +12884,12 @@ that cannot fail. Only checking that the substitution landed told the two apart.
 
 **11 of this file's 73 refusal reasons are produced by any fixture.** Measured by running
 every fixture under both `--region=` modes and all five `--spill=` modes and reading the
-collector's own `skipped` and `declined` dictionaries; twelve more are demonstrably live in
+collector's own `skipped` and `declined` dictionaries; fifteen more are demonstrably live in
 Starfield with no fixture producing them.
+
+**The site counts first published beside this were doubled** -- `skipped` and `declined` are
+filled on the same event and were summed. See Finding 207: it is 1,822 untested refusals of
+14,407, not 3,644 of 28,814.
 
 That number decides what kind of gate is worth building, and the answer is not more fixtures.
 **A refusal path fails safe** -- it costs sites. **An emission path fails wrong** -- it writes
@@ -12915,6 +12919,56 @@ one path chosen in advance, and this covers the property that matters for all of
 The real binary passes it: 0 undecodable sequences in 3.8 MB of stubs.
 
 
+### Finding 207 -- the untested refusals close at ~30, and the number that ranked them was doubled
+
+`outside .pdata` was the largest of the fifteen refusal reasons no fixture produces, and it is
+a BLOCKING decision rather than a lowering one -- the rewriter refuses a site it cannot prove
+is code. Finding 199 had shown `.pdata` coverage is incomplete, so the question was whether
+some of those sites are genuine code in leaf functions the table omits.
+
+**The asymmetry sets the bar and it is the opposite of every other pricing here.** Over-blocking
+costs a site; under-blocking lets a window swallow a place control arrives at, and the program
+jumps into the middle of a stub. So this looked for POSITIVE evidence that a refused address is
+code, with three witnesses chosen so they could disagree: a direct branch naming it, a position
+in a gap BETWEEN two functions rather than past the last, and preceding alignment padding.
+
+```
+319 refused 'outside .pdata'
+    289   1 witness
+     29   2 witnesses     -- 29 of these named by a direct branch
+      1   3 witnesses
+past the last .pdata function entirely:  0
+```
+
+**One witness turned out to carry no information, and the measurement is what showed it.** Every
+one of the 319 sits in a gap between functions -- none is past the last entry -- so that
+witness is true by construction. Only the branch and the padding discriminate, which leaves
+**30 sites at a ceiling**, and a ceiling is not a gain.
+
+**Closed at ~0.** Thirty sites in the weaker currency do not buy a weakening of a blocking rule
+whose over-conservatism is deliberate and whose under-conservatism is a crash. This project has
+already refused to reopen `.pdata` chained fragments on the same reasoning, with two
+counterexamples recorded, and the same answer holds here for the same reason.
+
+#### The number that ranked it was twice the truth
+
+Finding 206's table said `outside .pdata` refused **638** sites and that the fifteen untested
+reasons accounted for **3,644** of **28,814**. Every figure was doubled. The pricing summed
+`Counter(skipped)` and `Counter(declined.values())`, and the collector fills both on the same
+event -- `skipped[reason] += 1` beside `declined[address] = reason`, at all twelve sites that
+refuse anything. The true figures are **319**, **1,822** and **14,407**.
+
+**The tell was in this file already.** Finding 199's frontier census printed
+`declined: outside .pdata 319`, and the doubled figure was published an hour later without
+anyone reconciling the two. The proportions and the ranking survive; the magnitudes did not.
+
+**Two counters that always fire together are one measurement**, and summing them is not a
+mistake a re-run would catch -- both runs agree, because the loop is closed and the world is
+not in it. What caught it was a THIRD measurement of the same quantity arriving with a
+different number, which is the only thing that ever catches this class. It is the fourth figure
+today taken from the wrong artifact, and the first published before being re-derived.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12929,7 +12983,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | The 12 refusal reasons live in Starfield that no fixture produces | unknown | sites | Finding 206: only 11 of 73 are exercised; a wrong refusal condition costs sites, not bytes |
+| - | ~~The refusal reasons no fixture produces~~ **CLOSED at ~30** | 15 reasons, 1,822 refusals; the largest prices at 30 | sites | Finding 207: and the 638/3,644/28,814 that ranked it were doubled -- 319/1,822/14,407 |
 | - | ~~Nothing asserts a stub's bytes decode~~ **DONE** | catches the whole emission class | wrong bytes | Finding 206: controlled with the real defect from Finding 205 |
 | - | ~~The `region` strategy has no fixture~~ **DONE** | 93 sites now covered, one defect found | wrong bytes | Finding 205: `regioncarry`, modelled on a real region, and `NO_LEGACY_FORM` |
 | - | ~~A per-site `stack` fallback~~ **DONE** | 376 sites off the frontier | sites | Finding 204: 6,049 -> 5,673, and it retired two `check-spill` controls that now run with `--fallback=off` |
