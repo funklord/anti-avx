@@ -324,11 +324,38 @@ def in_git_repo(root: Path) -> bool:
 	built for and the only one it is right for.
 	"""
 	try:
+		# --show-toplevel, not --is-inside-work-tree. The question is
+		# whether THIS directory is a project git can enumerate, and
+		# "am I somewhere inside a work tree" answers a different one:
+		# a copy of a project placed inside another repository -- an
+		# extracted archive under build/, a release staging tree --
+		# gets `true`, and then `ls-files --exclude-standard` returns
+		# NOTHING, because the parent's .gitignore covers the
+		# directory it was put in.
+		#
+		# Found and fixed by ossacli 2026-09-05, who checked that their
+		# project builds from what a fresh clone holds and found `make
+		# style` the one target that refused. Reproduced here before it
+		# was taken: `git archive HEAD | tar -x` into a directory this
+		# repository ignores, and git lists 0 files while
+		# --is-inside-work-tree says true. The refusal is the guard
+		# below working correctly, and the reason it had to fire is
+		# this line. The docstring above already says the fallback is
+		# for "a tree with no `.git` to skip", which is exactly that
+		# tree; the code tested something else.
 		out = subprocess.run(["git", "-C", str(root), "rev-parse",
-		                      "--is-inside-work-tree"],
+		                      "--show-toplevel"],
 		                     capture_output=True, text=True, check=False)
 		if out.returncode == 0:
-			return out.stdout.strip() == "true"
+			top = out.stdout.strip()
+			try:
+				same = top and Path(top).resolve() == root.resolve()
+			except OSError:
+				same = False
+			# A directory that IS the top of a work tree, or that
+			# carries its own .git, is git's to enumerate. Anything
+			# else walks.
+			return bool(same) or (root / ".git").exists()
 		detail = out.stderr.strip().splitlines() or [
 			f"git rev-parse exited {out.returncode} and said nothing."]
 	except OSError as exc:
