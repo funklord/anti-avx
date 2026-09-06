@@ -12969,6 +12969,58 @@ different number, which is the only thing that ever catches this class. It is th
 today taken from the wrong artifact, and the first published before being re-derived.
 
 
+### Finding 208 -- the oracle tested the shape that ships once and not the one that ships 402 times
+
+`span_oracle` is the strongest evidence in this tree: it runs the 256-bit original under
+`qemu-x86_64` on a host with no AVX, runs the lowering natively on silicon that can execute
+pure SSE, and requires the 32 bytes to agree. It does not read the code, it executes it. It
+carried five cases.
+
+What ships, measured over Starfield's span and region candidates:
+
+```
+windows   16 region + 27 span
+members   592
+    402   plain      68%      cases in the oracle: 0
+     97   load                                     8
+     92   store                                    6
+      1   lane                                     6
+```
+
+**The commonest member by far had no executed case, and the rarest had six.** `lane` occurs
+ONCE in the whole binary. Nobody decided that: cases get written for the shapes that are
+interesting to reason about, and what a tool emits is a different list. It is the same drift
+that left the region strategy without a fixture until Finding 205.
+
+**What was missing is not that an instruction can be moved.** `swallowed`, `gapped` and
+`interleaved` cover that, and `passenger cannot be moved` is a refusal that exists. What
+nothing asked is whether the REPRESENTATION survives a passenger: across one, a helper xmm
+holds an upper half and a slot holds another, and a passenger emitted in the wrong place -- or
+not at all -- returns the wrong 32 bytes while every structural check passes.
+
+The new case puts an ordinary `movaps` between the load and the lane operation, and sends the
+passenger's own value to the output at `0x20(%rdi)`. That is deliberate: a passenger whose
+result went nowhere would agree byte for byte however badly it was moved, and the case would
+pass for the wrong reason.
+
+#### Each fault has exactly one witness, which a green run cannot show
+
+```
+drop the slot restore     ->  only "two values in two slots"       DIFFER
+drop the passenger emit   ->  only "a plain passenger between..."  DIFFER
+```
+
+So the new case is not redundant with the five, and the five do not cover it. **Neither half of
+that is visible from a passing suite** -- it took breaking the lowering twice, in two different
+places, and reading which case noticed.
+
+**And the first sabotage did not apply.** The anchor matched two lines, the assertion failed,
+the edit never landed, and all six cases agreed -- which reads exactly like a case that cannot
+fail. That is the second time in one session; both times the only thing separating a working
+control from an unapplied one was checking that the substitution itself had landed. A sabotage
+harness does not remove the need to verify the sabotage.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12983,6 +13035,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| - | ~~The span oracle never executes a plain passenger~~ **DONE** | 402 of 592 shipped members | wrong bytes | Finding 208: and each fault now has exactly one witness |
 | - | ~~The refusal reasons no fixture produces~~ **CLOSED at ~30** | 15 reasons, 1,822 refusals; the largest prices at 30 | sites | Finding 207: and the 638/3,644/28,814 that ranked it were doubled -- 319/1,822/14,407 |
 | - | ~~Nothing asserts a stub's bytes decode~~ **DONE** | catches the whole emission class | wrong bytes | Finding 206: controlled with the real defect from Finding 205 |
 | - | ~~The `region` strategy has no fixture~~ **DONE** | 93 sites now covered, one defect found | wrong bytes | Finding 205: `regioncarry`, modelled on a real region, and `NO_LEGACY_FORM` |

@@ -89,6 +89,31 @@ CASES = [
 	 [("load", 0, "%ymm0"), ("load", 1, "%ymm1"), ("lane", 2, "%ymm2"),
 	  ("store", 3, "%ymm2")],
 	 {"%ymm0": 0, "%ymm1": 1, "%ymm2": 2}),
+	# **A plain passenger between the members**, which is 402 of the 592
+	# span and region members Starfield emits -- 68% of them, and the kind
+	# no case here executed. The other four are pure 256-bit sequences with
+	# nothing interleaved, while `lane` ships exactly once in the whole
+	# binary and had six of this file's twenty members. The suite was
+	# weighted toward the shape that was interesting to write.
+	#
+	# What is at stake is not whether an instruction can be moved -- other
+	# fixtures cover that -- but whether the REPRESENTATION survives one.
+	# Across a passenger the helper xmm holds an upper half and a slot
+	# holds another, and a passenger that disturbed either would return the
+	# wrong 32 bytes. Only running it asks that.
+	#
+	# The passenger's own value reaches the output at `0x20(%rdi)`, so a
+	# passenger moved to the wrong place, or emitted before the slot save
+	# rather than after, shows up as bytes rather than as a refusal.
+	("a plain passenger between the members",
+	 [("c5fc1006", "vmovups", "(%rsi),%ymm0"),
+	  ("0f28be80000000", "movaps", "0x80(%rsi),%xmm7"),
+	  ("c5fc584640", "vaddps", "0x40(%rsi),%ymm0,%ymm0"),
+	  ("c5fc1107", "vmovups", "%ymm0,(%rdi)"),
+	  ("0f297f20", "movaps", "%xmm7,0x20(%rdi)")],
+	 [("load", 0, "%ymm0"), ("plain", 1, None), ("lane", 2, "%ymm0"),
+	  ("store", 3, "%ymm0"), ("plain", 4, None)],
+	 {"%ymm0": 0}),
 	# A multiply rather than an add, so the answer depends on the opcode
 	# surviving the split rather than on the operands alone.
 	("a multiply, whose result differs from an add's",
@@ -100,7 +125,7 @@ CASES = [
 ]
 
 # How many bytes each case writes, and how much input it reads.
-OUT_BYTES = {0: 32, 1: 64, 2: 32, 3: 32, 4: 32}
+OUT_BYTES = {0: 32, 1: 64, 2: 32, 3: 32, 4: 48, 5: 32}
 IN_BYTES = 256
 
 
