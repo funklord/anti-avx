@@ -1133,7 +1133,8 @@ hundred:	.float 100.0
 # borrow it exists to test never happens.
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
-          "regionread": 40, "tlsspill": 40, "spanblock": 72}
+          "regionread": 40, "tlsspill": 40, "spanblock": 72,
+          "dataisland": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -1937,6 +1938,56 @@ func_end:
 nine:	.float 9.0
 three:	.float 3.0
 huge:	.float 29997.0
+""")
+
+
+# A data island inside `.text` whose bytes carry a VEX prefix. `c5 32 00`
+# and `c4 4f 00 cb` are taken from Starfield, where 180 such sequences sit
+# in the constant pools a linear sweep walks into (Finding 8), and 99 of
+# them reach the candidate loop: `decode_vex` rejects on LENGTH alone --
+# under three bytes, or a `c4` under four -- and never checks that the map
+# field is one of the three that exist. `c5 32 00` has map 1 and opcode
+# 00, which is not an instruction, and `c4 4f 00 cb` has map 0x0f, which
+# does not exist.
+#
+# **Nothing was ever corrupted by this and a behavioural fixture would
+# therefore pass without the guard.** What turned those 99 away was the
+# mnemonic: objdump writes `(bad)`, every strategy is keyed on a mnemonic,
+# and no table has an entry for it. That is the far wall of the room, not
+# the door -- and the 256-bit strategies already branch on `vex["L"]`,
+# read straight out of the unvalidated prefix. So the assertion in
+# `verify` is structural rather than behavioural: no `(bad)` row may reach
+# the candidate loop at all. Measured on this fixture: 1 without the guard,
+# at 0x140001037, and 0 with it. One rather than four because the sweep
+# aligns its own way -- `40 c5 32 00` is read as a REX byte and rejected on
+# the first test, and the lone `c4` is rejected on length -- which is the
+# reason to read the count off a run instead of predicting it from the
+# bytes written here.
+#
+# The island is read as data as well, so that a rewriter which did patch
+# it is caught by the answer and not only by the assertion.
+PROGRAMS["dataisland"] = (7, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	three(%rip), %xmm1
+	vaddss	%xmm1, %xmm1, %xmm2
+	vcvttss2si %xmm2, %eax		/* 6 */
+	movzbl	island(%rip), %ecx	/* 0xc5 = 197 */
+	subl	$196, %ecx		/* 1, and 0 if the byte moved */
+	addl	%ecx, %eax		/* 7 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+island:
+	.byte 0xc5, 0x32, 0x00
+	.byte 0xc5, 0x32, 0x00
+	.byte 0xc4, 0x4f, 0x00, 0xcb
+	.byte 0xc5, 0x2a, 0x00
 """)
 
 

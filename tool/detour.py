@@ -6906,6 +6906,19 @@ def collect(binary, listing, context=None):
 	            _comment) in enumerate(instructions):
 		if not encoding or encoding[0] not in (0xC4, 0xC5):
 			continue
+		# **A byte objdump could not decode is not an instruction.** The
+		# test below rejects on LENGTH alone and never checks that the map
+		# field is one of the three that exist, so a constant pool's
+		# `c5 32 00` -- map 1, opcode 00 -- decodes as a VEX prefix and is
+		# offered to every strategy. Nothing was ever lowered from one,
+		# because each strategy is keyed on a mnemonic and none has an
+		# entry for `(bad)`; that is the far wall of the room rather than
+		# the door, and the 256-bit strategies already branch on `vex["L"]`
+		# taken straight from the unvalidated prefix. Starfield carries 180
+		# such sequences in the data islands of Finding 8, and 99 of them
+		# reached this loop. Finding 222.
+		if mnemonic == "(bad)":
+			continue
 		if address in already:
 			continue
 		vex = inplace.decode_vex(encoding)
@@ -11690,9 +11703,26 @@ def verify(original, patched, listing=None):
 		return 1 if problems else 0
 
 	context = analysis_context(original, listing)
-	_patches, candidates, _stats, _skipped, _declined, home = collect(
+	_patches, candidates, _stats, _skipped, declined_rows, home = collect(
 		original, listing, context)
 	instructions, _plain, blocked, sources, _tables, _seen = context
+	# **A data island must not reach the candidate loop.** `decode_vex`
+	# rejects on LENGTH alone -- under three bytes, or a `c4` under four --
+	# and never checks the map field, so a constant pool's `c5 32 00`
+	# decodes as a VEX prefix and is offered to every strategy. What turned
+	# those sites away was the mnemonic: objdump writes `(bad)` and no
+	# strategy's table has an entry for one. That is the far wall of the
+	# room rather than the door, and the 256-bit strategies already branch
+	# on `vex["L"]` read straight out of the unvalidated prefix. Starfield
+	# carries 180 such sequences in the islands of Finding 8 and 99 of them
+	# reached the loop. Finding 222.
+	offered = {item[0] for item in candidates} | set(declined_rows)
+	intruders = sorted(row[0] for row in instructions
+	                   if row[2] == "(bad)" and row[0] in offered)
+	if intruders:
+		print(f"verify: {len(intruders):,} (bad) row(s) reached the candidate "
+		      f"loop, first at 0x{intruders[0]:x}", file=sys.stderr)
+		problems += 1
 	# **The same call apply makes -- through the same function, now.** This
 	# said so in a comment while `apply` grew a repair pass this did not,
 	# and the drift cost 15 reported stale reads the image did not have.

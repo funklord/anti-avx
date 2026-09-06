@@ -13649,6 +13649,71 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 222 -- 99 sequences of data enter the candidate loop, and the mnemonic is what turns them away
+
+`collect` tests a site's first byte for `C4`/`C5` and then calls
+`inplace.decode_vex`, which is the guard. It rejects on LENGTH alone -- under three
+bytes, or a `c4` under four -- and never checks that the map field is one of the three
+that exist. So a constant pool's `c5 32 00`, map 1 and opcode `00`, decodes as a VEX
+prefix and is offered to every strategy, as does `c4 4f 00 cb`, whose map is `0x0f`.
+
+Starfield carries 180 such sequences, the VEX-prefixed subset of the data islands
+Finding 8 mapped. Split by what `decode_vex` does with them:
+
+```
+c4, 1 byte      81   rejected on length      -> never a candidate
+c4, 4 bytes     16   accepted                -> enters the loop
+c5, 3 bytes     83   accepted                -> enters the loop
+                99 reach the candidate loop
+```
+
+**Nothing has ever been lowered from one, and that is the problem.** What turns them
+away is that objdump wrote `(bad)` as the mnemonic and every strategy is keyed on a
+mnemonic, so no table has an entry. That is the far wall of the room rather than the
+door -- and the 256-bit strategies already branch on `vex["L"]`, read straight out of
+the unvalidated prefix. A window widened over a jump table is how a rewriter corrupts
+data silently, and "no strategy matched" is a thin thing to be resting on.
+
+The fix is one line in the candidate loop, before the decode: skip a row whose mnemonic
+is `(bad)`. `decode_vex` is left alone deliberately -- it is a prefix decoder and its
+length checks are right for what it does. Whether a byte is an instruction at all is the
+caller's question, and the caller had objdump's verdict in hand and was discarding it.
+
+**Proved in the order that makes it a test.** The assertion went into `verify` FIRST and
+was watched failing -- `1 (bad) row(s) reached the candidate loop, first at
+0x140001037`, rc=1 -- through the check under test rather than through anything else.
+Then the guard went in and the same command returned 0. The new `dataisland` fixture
+carries the island, and reads a byte of it back as its answer, so a rewriter that ever
+does patch one fails on the number as well as on the assertion.
+
+**A behavioural fixture alone would have proved nothing**, which is the reason the
+assertion is structural. The 99 were already declined, so the island was never corrupted
+and a fixture checking only its own answer passes with the guard reverted. That is the
+test-that-passes-against-the-old-code trap, and it was nearly built.
+
+**And the whole binary is the control.** Those 99 were declined either way, so the guard
+must change the output not at all: rebuilt, Starfield's 111,601,152-byte image is
+BYTE-IDENTICAL to the one built without it, at 518,990 in-place patches and 202,838
+detours. A single differing byte would have meant the guard was suppressing something
+that had been reaching a strategy, which is a worse finding than the one being fixed.
+
+**Two things this got wrong on the way, both predictions of counts.** The census reports
+180 `(bad)` and 86 "never a candidate", and the gap was read as 94 sites; it is 99, and
+the 86 is 81 of these plus 5 addresses that decode as valid VEX and still reached no
+strategy. On the fixture the comment claimed 4 intruders before measuring; it is 1,
+because the sweep aligns its own way -- `40 c5 32 00` is read as a REX byte and rejected
+on the first test. Both are the same error: predicting a count from bytes rather than
+reading it off a run.
+
+**A correction, because it was stated as a defect first.** The 180 also appear in the
+frontier of 5,673 and in the VEX total of 805,131, and that is DELIBERATE:
+`vex_scan.py` says so in as many words, on the ground that the bytes really do carry a
+VEX prefix, with Finding 8 for what they are. They sit in both halves of the ratio, so
+removed-work is exact and the percentage is consistent. "The frontier is 5,493" was a
+change of definition dressed as a correction. What survives is only that 180 of the
+frontier can never be lowered, so the actionable figure is 5,493 -- a framing for
+ranking work, not a fix to anybody's number.
+
 ### Finding 221 -- the cost model prices the lowering and not the detour that delivers it
 
 The headline figure was +1.34%, being 221,335 added instructions summed from operand
@@ -13778,6 +13843,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
 | - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |
 | - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.44% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |
 | - | ~~The remaining uncovered passengers~~ **CLOSED at 0** | 23 rip-relative, all covered | wrong bytes | Finding 220: 1,881 of ~1,900 move unchanged and have no failure mode |
