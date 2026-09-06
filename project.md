@@ -13649,6 +13649,49 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 223 -- the same defect in the in-place path, found by pointing the last lens at the last fix
+
+Finding 222's lens is **the guard is incidental rather than structural**, and the first
+place to point it was at that finding's own fix. It changed one call site. It did not
+change the class.
+
+`build_patches` has the identical shape: `decode_vex` is the only gate, and what turns a
+data byte away is `classify(mnemonic, ...)` finding no table entry for `(bad)`. That is
+the **in-place** path -- 518,990 patches that rewrite bytes where they lie, against the
+candidate loop's stubs -- so it is the more consequential of the two, and it was the one
+left unguarded. Measured on the `dataisland` fixture:
+
+```
+                (bad) in blocked   vex sites   refused   patches
+before                         1           5         0         3
+after                          0           4         3         3
+```
+
+**`vex sites` was inflated by data**, so this was a wrong statistic as well as a thin
+guard. `patches` is unchanged, and Starfield rebuilds BYTE-IDENTICAL at 518,990 in-place
+patches and 202,838 detours -- the control that says the guard suppressed nothing that
+had been reaching a table.
+
+`verify`'s assertion now covers in-place patch addresses as well as candidates and
+declines, so a `(bad)` row reaching **either** path fails it.
+
+**And the belief this contradicts was written down.** A comment in `why`'s census said
+"the collector never sees these: decode_vex refuses the encoding", with the set beneath
+it selected on `decode_vex(e) is None` -- which captures the 81 rows rejected on length
+and misses the 99 that pass. The sentence was false for exactly those 99 until the guard
+existed, and the bucket under-reported 180 as 81. Both now select on the mnemonic, which
+is the thing that decides.
+
+**The lesson is about scope rather than about VEX.** A fix applied where the defect was
+found is not a fix of the defect's class, and the cheapest way to discover that is to
+re-run the lens that found it against the code you have just written. `decode_vex` has
+some fifty callers; the two that decide what gets rewritten are `collect` and
+`build_patches`, and having repaired one it was easy to feel finished.
+
+A rename during the work missed a use of `_patches` 180 lines below the edit and raised
+`NameError` rather than passing quietly -- the substring-anchor hazard, caught by luck of
+the interface rather than by care, and worth the same suspicion next time.
+
 ### Finding 222 -- 99 sequences of data enter the candidate loop, and the mnemonic is what turns them away
 
 `collect` tests a site's first byte for `C4`/`C5` and then calls
@@ -13843,6 +13886,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| - | ~~Data reaching the in-place path~~ **FIXED** | 518,990 patches guarded, output byte-identical | wrong bytes | Finding 223: the same defect one call site over; `vex sites` was inflated by data |
 | - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
 | - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |
 | - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.44% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |

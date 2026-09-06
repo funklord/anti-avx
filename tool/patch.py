@@ -418,6 +418,18 @@ def build_patches(listing, ranges=None):
 	blocked = Counter()
 
 	for address, encoding, mnemonic, operands in parse_listing(listing):
+		# **A byte objdump could not decode is not an instruction**, and
+		# this is the in-place path, which rewrites bytes where they lie.
+		# `decode_vex` below rejects on LENGTH alone and never checks the
+		# map field, so a constant pool's `c5 32 00` reaches here and is
+		# turned away only by `classify` finding no table entry for the
+		# mnemonic -- the same incidental guard the detour candidate loop
+		# had, at the site where a wrong answer edits the image rather than
+		# building a stub. It also counted them: `vex sites` was inflated
+		# by every data byte carrying a VEX prefix. Finding 223.
+		if mnemonic == "(bad)":
+			stats["(bad) rows refused"] += 1
+			continue
 		vex = decode_vex(encoding)
 		if vex is None:
 			continue

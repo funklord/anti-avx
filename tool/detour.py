@@ -10389,12 +10389,18 @@ def census(binary, listing, patched):
 				out.update(range(start, start + window))
 		return out
 
-	# The collector never sees these: decode_vex refuses the encoding, so
-	# there is nothing to classify. They are objdump's `(bad)` lines, which
-	# are bytes it could not decode rather than instructions.
-	undecodable = {a for a, e, _m, _o in inplace.parse_listing(listing)
-	               if e[:1] in (b"\xc4", b"\xc5")
-	               and inplace.decode_vex(e) is None}
+	# The collector never sees these -- and since Finding 223 that is a rule
+	# rather than an accident. They are objdump's `(bad)` lines, bytes it
+	# could not decode rather than instructions, and both the candidate loop
+	# and the in-place path now refuse them on the mnemonic.
+	#
+	# **Selecting them by `decode_vex` found 81 of Starfield's 180.** That
+	# test rejects on LENGTH alone -- under three bytes, or a `c4` under
+	# four -- so the 99 longer sequences passed it, and the claim above was
+	# false for exactly those until the guard existed. Select on the thing
+	# that decides.
+	undecodable = {a for a, e, m, _o in inplace.parse_listing(listing)
+	               if m == "(bad)" and e[:1] in (b"\xc4", b"\xc5")}
 
 	buckets = (("declined by the collector", set(declined)),
 	           ("refused, stub not buildable", spread(refused)),
@@ -11703,7 +11709,7 @@ def verify(original, patched, listing=None):
 		return 1 if problems else 0
 
 	context = analysis_context(original, listing)
-	_patches, candidates, _stats, _skipped, declined_rows, home = collect(
+	patch_rows, candidates, _stats, _skipped, declined_rows, home = collect(
 		original, listing, context)
 	instructions, _plain, blocked, sources, _tables, _seen = context
 	# **A data island must not reach the candidate loop.** `decode_vex`
@@ -11716,7 +11722,12 @@ def verify(original, patched, listing=None):
 	# on `vex["L"]` read straight out of the unvalidated prefix. Starfield
 	# carries 180 such sequences in the islands of Finding 8 and 99 of them
 	# reached the loop. Finding 222.
-	offered = {item[0] for item in candidates} | set(declined_rows)
+	# The in-place path is included because it is the one that rewrites
+	# bytes where they lie: `build_patches` had the same incidental guard,
+	# a mnemonic lookup in `classify`, at the site where a wrong answer
+	# edits the image rather than building a stub. Finding 223.
+	offered = ({item[0] for item in candidates} | set(declined_rows)
+	           | {row[0] for row in patch_rows})
 	intruders = sorted(row[0] for row in instructions
 	                   if row[2] == "(bad)" and row[0] in offered)
 	if intruders:
@@ -11731,7 +11742,7 @@ def verify(original, patched, listing=None):
 	# below then reads the image. Finding 197.
 	placed, _blob, _over, _refused, _dropped, swallowed = repaired_placement(
 		instructions, blocked, sources, candidates,
-		set(row[0] for row in _patches),
+		set(row[0] for row in patch_rows),
 		stub_base_of(open(original, "rb").read()), 0, Counter(), home,
 		tls_pair_of(tls_for(original)))
 	groups = target_set.collect(original)
@@ -11843,7 +11854,7 @@ def verify(original, patched, listing=None):
 	# window that lowered it, or a VEX.128 write patched to legacy SSE,
 	# which stops zeroing [255:128] -- then the reader takes bytes the
 	# original would not have given it. Finding 186.
-	# **From the IMAGE, not from the plan.** `_patches` is what `collect`
+	# **From the IMAGE, not from the plan.** `patch_rows` is what `collect`
 	# intended; `apply` then reverts any patch whose zeroing a surviving
 	# reader still observes (Finding 187), so the planned list names sites
 	# whose bytes never moved. Asking it reports defects the binary does
@@ -11859,7 +11870,7 @@ def verify(original, patched, listing=None):
 	# section's zero-VEX property. The same rebound-name defect as Finding
 	# 175, written by the hand that recorded it. Finding 188.
 	narrowed_sites = set()
-	for row in _patches:
+	for row in patch_rows:
 		where = raddr + (row[0] - vaddr)
 		if bytes(b[where:where + len(row[1])]) != row[1]:
 			narrowed_sites.add(row[0])
