@@ -508,7 +508,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
              mxcsr splatrun splatop extract shadowspill regionlive \
-             tlsspill spanblock
+             tlsspill spanblock regioncarry
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
@@ -672,6 +672,25 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 		fi; \
 	done; \
 	echo "check-pe: AVX in, SSE out, and the answers survived the trip"
+	@# **A fixture that returns the right answer by another route is not
+	@# coverage.** `regioncarry` exists to exercise the region lowering,
+	@# and four earlier shapes of it silently became spans -- the span is
+	@# tried first, so anything it can carry it does. `regionlive` is the
+	@# standing example: it reads as region coverage and places a `spill`.
+	@# So assert the strategy row, not just the exit code. Finding 205.
+	@set -e; \
+	$(PYTHON) tool/detour.py apply $(BUILD_DIR)/pe-regioncarry.exe \
+		$(BUILD_DIR)/pe-regioncarry.asm \
+		$(BUILD_DIR)/sse-regioncarry.exe > $(BUILD_DIR)/regioncarry.log; \
+	if grep -qE '^apply:   region +[0-9]' $(BUILD_DIR)/regioncarry.log; then \
+		echo "check-pe: regioncarry places a region, so the region lowering"; \
+		echo "          is the thing its answer came from"; \
+	else \
+		echo "check-pe: regioncarry placed NO region -- it is being carried"; \
+		echo "          by another strategy and covers nothing"; \
+		grep -E '^apply:   [a-z]+ +[0-9]' $(BUILD_DIR)/regioncarry.log; \
+		exit 1; \
+	fi
 
 # The three ways a stub can get a scratch register when none is dead, all
 # built and all run. `none` is the default and must REFUSE the site, so the
@@ -921,6 +940,7 @@ clean:
 	      $(BUILD_DIR)/icache_bench \
 	      $(BUILD_DIR)/after.asm $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm \
 	      $(BUILD_DIR)/isa-disasm.txt $(BUILD_DIR)/region-refused.txt \
+	      $(BUILD_DIR)/regioncarry.log \
 	      $(BUILD_DIR)/bad-stubvex.exe $(BUILD_DIR)/bad-section.exe \
 	      $(PE_NAMES:%=$(BUILD_DIR)/verify-%.log) \
 	      $(BUILD_DIR)/verify-bad-stubvex.log \

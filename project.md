@@ -12805,6 +12805,81 @@ another account. The canary caught it and said so, which is what it was added fo
 against a prefix this session owns, all three pass.
 
 
+### Finding 205 -- the one strategy with no fixture, and the defect it was hiding
+
+A new lens, and the last one this session had left: **which lowering strategies does the
+fixture suite never exercise?** Not how well a check tests something, but whether anything
+tests it at all. Run every fixture, collect the strategy rows, compare against the strategies
+Starfield actually uses:
+
+```
+strategies shipped in Starfield        16
+exercised by a PE fixture              15
+SHIPPED WITH NO FIXTURE             region     16 windows, 93 sites
+```
+
+**`regionlive` and `regionread` read as region coverage and are not.** They place a `spill`;
+`--region=` decides whether a region may be BORROWED FROM, which is a different mechanism from
+the region lowering. The names collide and the coverage does not -- and that is why the gap
+survived: anyone checking would have found two fixtures with the right word in them.
+
+It matters because of what a wrong lowering does here. It does not crash the rewriter or fail a
+structural check: the image is well formed, the function table sorts, the boundaries reconcile,
+and the program computes the wrong answer. Only a fixture that RUNS the lowered code catches
+it. The region strategy has shipped such a defect before -- 467 wrong lowerings, found by
+reading bytes in the image.
+
+#### It found one on its first run
+
+```
+stub bytes for vbroadcastss:   66 0f 38 18   ->  (bad)
+```
+
+`narrow_piece` lowers a member by clearing `VEX.L` and re-encoding as legacy. That is right for
+`vaddps` -> `addps` and meaningless for an opcode the ISA only ever encoded under VEX:
+`vbroadcastss` has no legacy form, and `lower.py` knows it -- `movss` plus `shufps $0` -- but
+the span and region path narrows the instruction directly and never consults those tables.
+
+**`verify` could not have caught it.** Its rule is that the stub section holds zero VEX
+instructions, and an invalid instruction is not VEX either. `check-isa` counts VEX. Nothing in
+the tree asserts that the bytes in a stub decode to anything at all.
+
+**Nothing shipped wrong, by luck.** The real stub section holds 0 `(bad)` instructions, because
+Starfield's 93 region sites happen to contain no such member. `NO_LEGACY_FORM` names the
+mnemonics that must never be narrowed and the member walk refuses them now.
+
+#### Nine invented shapes, and the one that was read rather than guessed
+
+The fixture took ten attempts. Seven became SPANS -- the span is tried first, so anything it
+can carry it carries -- and two were refused for member shapes. The mistake was reasoning about
+what a REGION needs instead of about what a SPAN refuses.
+
+Dumping the members of Starfield's own regions settled it in one look. All sixteen have this
+shape:
+
+```
+vmovups 0x70(%rsp),%ymm0     a 256-bit load
+vcomiss %xmm6,%xmm0          a 128-bit use of the same register
+```
+
+A span walks from a load and must CLOSE on a 256-bit store; a 128-bit use stops it, and the
+region is bounded by the ABI instead. **An hour of guessing was one dump away from being
+avoided**, which is *read the input before theorising about the mechanism* met one level up:
+the input here was the tree's own output, and nothing prevented reading it first.
+
+#### The gate asserts the strategy, not the answer
+
+A fixture that returns the right answer by another route is not coverage, and `regionlive` is
+the standing proof. So `check-pe` greps for the `region` row and fails if it is absent, naming
+what carried it instead.
+
+**And the fixture was watched failing.** With the region's upper-half save removed it returns
+**61** rather than 66 -- lane 4 comes back as the addend's own upper half. The FIRST sabotage
+attempt was a false negative and nearly reported as one: the anchor matched three lines, the
+edit never applied, and the unmodified binary returned 66, which reads exactly like a fixture
+that cannot fail. Only checking that the substitution landed told the two apart.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -12819,6 +12894,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| - | ~~The `region` strategy has no fixture~~ **DONE** | 93 sites now covered, one defect found | wrong bytes | Finding 205: `regioncarry`, modelled on a real region, and `NO_LEGACY_FORM` |
 | - | ~~A per-site `stack` fallback~~ **DONE** | 376 sites off the frontier | sites | Finding 204: 6,049 -> 5,673, and it retired two `check-spill` controls that now run with `--fallback=off` |
 | - | ~~What the 64 worst functions share~~ **CLOSED at ~0** | 3,079 sites, two thirds architectural | sites | Finding 203: they share being full of 256-bit arithmetic, already ceilinged at 75 |
 | - | ~~The 208 readers the gate cannot speak for~~ **CARRIED** | 131 conservative reverts, 132 more windows withheld, +267 frontier | wrong bytes | Finding 198: still unresolved, but every site that could have decided them keeps its VEX form |

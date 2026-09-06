@@ -1132,6 +1132,7 @@ hundred:	.float 100.0
 # unwind codes claim a frame of zero has its `jmp` refused at -40 and the
 # borrow it exists to test never happens.
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
+          "regioncarry": 72,
           "regionread": 40, "tlsspill": 40, "spanblock": 72}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
@@ -1715,6 +1716,78 @@ _start:
 	cvttss2si 36(%rsp), %eax	/* element 7, from the upper half */
 	addl	80(%rsp), %eax		/* read AFTER the span: shadow is live */
 	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+values:
+	.float	1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0
+addend:
+	.float	10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# 44. A REGION: a 256-bit load whose value is then used 128 bits at a time,
+# so the span cannot close and the region carries the stretch instead.
+#
+# **The region strategy shipped with no fixture behind it.** Measured by
+# running every fixture and collecting the strategy rows: 15 of the 16
+# strategies Starfield uses are exercised by one and `region` was not -- 16
+# windows and 93 sites lowered by code nothing had ever executed, in a
+# strategy that has already shipped a defect (467 wrong lowerings, found by
+# reading the bytes in the image rather than by any test).
+#
+# `regionlive` and `regionread` sound like they cover it and do not: they
+# place a `spill`, and `--region=` controls whether a region may be BORROWED
+# FROM, which is a different mechanism from the region lowering.
+#
+# **The shape is copied from a real region rather than guessed.** Nine
+# invented shapes became spans -- the span is tried first and carries almost
+# everything -- so the members of Starfield's own regions were dumped and
+# one was copied. Every one of them looks like this:
+#
+#     vmovups 0x70(%rsp),%ymm0     a 256-bit load
+#     vcomiss %xmm6,%xmm0          a 128-bit use of the same register
+#
+# A span walks from a load and must CLOSE on a 256-bit store; a 128-bit use
+# stops it, and the region is bounded by the ABI instead -- at the call
+# above, every ymm upper half is dead.
+#
+# 1..8 plus 10..80 is 11,22,33,44,55,66,77,88. Lane 4 is in the UPPER half,
+# so 55 comes back only if bits 255:128 survived; lane 0 adds 11. A region
+# that dropped the upper half returns 11, and one that never formed keeps
+# its VEX and dies of an illegal instruction -- three distinguishable
+# outcomes.
+PROGRAMS["regioncarry"] = (66, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	call	helper			/* the region's start, and home space */
+	vmovups	values(%rip), %ymm0
+	vcomiss	%xmm0, %xmm0		/* 128 bits of it: no span can close */
+	vaddps	addend(%rip), %ymm0, %ymm0
+	vmovups	%ymm0, 8(%rsp)
+	cvttss2si 24(%rsp), %eax	/* lane 4 = 55, from the upper half */
+	cvttss2si 8(%rsp), %ecx		/* lane 0 = 11 */
+	addl	%ecx, %eax		/* 66 */
+	addq	$72, %rsp
+	ret
+helper:
 	ret
 func_end:
 	.p2align 5

@@ -2627,6 +2627,35 @@ def rip_target(tail, address, length):
 	return address + length + struct.unpack_from("<i", tail, 2)[0]
 
 
+# Mnemonics with NO legacy encoding, which therefore must never be narrowed
+# by clearing `VEX.L` and re-emitting. `sse_encoding` will do it anyway and
+# produce bytes that decode to nothing: `vbroadcastss` came out as
+# `66 0f 38 18`, which objdump calls `(bad)`, in a stub that `verify` passed
+# because its rule is "no VEX in the stub" and an invalid instruction is not
+# VEX either.
+#
+# **The plain path never had this problem**, because it goes through
+# `lower.py`, which carries an explicit rule per shape -- a broadcast is
+# `movss` plus `shufps $0`, not a prefix strip -- and refuses what it has no
+# rule for. The span and region path narrows the instruction directly, which
+# is right for `vaddps` and wrong for anything the ISA only ever encoded
+# under VEX.
+#
+# Starfield's 93 region sites happen to contain none of these, so nothing
+# has shipped wrong; the defect was found by the first fixture ever written
+# for the region strategy, on its first run. Finding 205.
+NO_LEGACY_FORM = frozenset((
+	"vbroadcastss", "vbroadcastsd", "vbroadcastf128", "vbroadcasti128",
+	"vpbroadcastb", "vpbroadcastw", "vpbroadcastd", "vpbroadcastq",
+	"vextractf128", "vextracti128", "vinsertf128", "vinserti128",
+	"vperm2f128", "vperm2i128", "vpermd", "vpermq", "vpermps", "vpermpd",
+	"vpermilps", "vpermilpd", "vmaskmovps", "vmaskmovpd", "vpmaskmovd",
+	"vpmaskmovq", "vzeroupper", "vzeroall", "vgatherdps", "vgatherqps",
+	"vgatherdpd", "vgatherqpd", "vpgatherdd", "vpgatherqd", "vpgatherdq",
+	"vpgatherqq", "vtestps", "vtestpd", "vcvtph2ps", "vcvtps2ph",
+))
+
+
 def narrow_piece(vex, tail, delta, address, length, at):
 	"""One 128-bit half of a 256-bit memory operand, `delta` bytes along.
 
@@ -4184,6 +4213,10 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		vex = inplace.decode_vex(encoding)
 		if vex is None or not vex["L"]:
 			return refuse("member is not a 256-bit VEX")
+		if mnemonic in NO_LEGACY_FORM:
+			# Narrowing this would emit bytes that decode to nothing. See
+			# NO_LEGACY_FORM. Finding 205.
+			return refuse(f"member {mnemonic} has no legacy encoding")
 		tail = encoding[vex["length"]:]
 		shape = span_operand_shape(vex, tail, operands, None)
 		if shape is None:
