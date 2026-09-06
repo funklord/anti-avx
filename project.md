@@ -13323,6 +13323,47 @@ mnemonics, and the `%ymm`-source ones -- which is the difference between a gap s
 pick up and a gap nobody knows about.
 
 
+### Finding 214 -- an item created by misreading three characters, closed at 0
+
+Finding 213 recorded `vcvtps2ph`, `vextractf128` and `vextracti128` as needing a 256-bit input
+before they could be oracle cases, and put that on the list. It is worth nothing, and the row
+existed because of a misclassification followed by a misreading.
+
+**The misclassification:** selecting GPR-source mnemonics by "starts with `%` and not `%xmm`"
+also matches `%ymm`, so three lane instructions were labelled GPR-source. Excluding them was
+right; recording them as a future item assumed they were patched at all.
+
+**The misreading:** the destination table showed `vextractps` with 1,221 memory and 403
+general-register patches, and it was read as `vextractf128`. Three characters apart, and
+completely different instructions -- `vextractps` extracts a float element and has a legacy
+form; `vextractf128` moves a 128-bit lane and does not.
+
+That misreading raised a real alarm, and it was worth checking rather than dismissing.
+`lower.py` says a lane-1 extract needs "the Y2 shadow slot for this register", which only a
+region provides -- so an IN-PLACE patch of one would read a half that does not exist on an
+SSE-only CPU, and nothing in the tree would catch it: the bytes decode, no VEX survives, the
+boundaries reconcile.
+
+```
+in-place patches of vextractf128, vextracti128, vinsertf128,
+vinserti128 and vcvtps2ph:                                       0
+```
+
+**None, and by construction rather than by luck.** 256-bit sites are never patched in place --
+the rule `stale_upper_reads` relies on to decide which readers survive. So `vex_oracle`, which
+tests the in-place path, can never need a 256-bit input.
+
+**The coverage question for 256-bit work belongs to `span_oracle`**, which executes spans and
+regions and gained its missing passenger case in Finding 208. That is where a lane extract's
+correctness is tested when a region carries one -- and where Finding 205's `NO_LEGACY_FORM`
+defect was found.
+
+**The cost of checking was one pass; the cost of building would have been a 256-bit input
+channel for zero patches.** A row on the list is a claim like any other, and this one had never
+been priced -- it was carried straight from the sentence that excluded the mnemonics, which is
+exactly the shape of the four stale scope numbers already recorded today.
+
+
 ### The ranked list, and how it is kept
 
 **Sorted by measured impact, re-sorted after every measurement.** The rule this session earned:
@@ -13337,7 +13378,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
-| 1 | A 256-bit input, for the `%ymm`-source mnemonics | `vextractf128` 1,624 and others | wrong bytes | Finding 213: the harness loads only low halves, so a case would read an undefined upper half |
+| - | ~~A 256-bit input for the `%ymm`-source mnemonics~~ **CLOSED at 0** | 0 in-place patches | wrong bytes | Finding 214: 256-bit sites are never patched in place; the row came from misreading `vextractps` as `vextractf128` |
 | - | ~~Deterministic GPR inputs~~ **DONE** | 6 mnemonics, ~9,000 patches | wrong bytes | Finding 213: and the filter that picked them misread `%ymm` as a general register |
 | - | ~~The xmm-writing mnemonics with no case~~ **DONE** | 58 mnemonics, oracle cases 248 -> 316 | wrong bytes | Finding 212: no references needed, and I had priced it last for needing 54 |
 | - | ~~MXCSR observation~~ **DONE** | the `comiss`/`ucomiss` distinction is now compared | wrong bytes | Finding 211: and the status slot is compared with the translator held constant, because qemu does not model DE |
