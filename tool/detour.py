@@ -11032,6 +11032,7 @@ def frontier_census(original, patched, listing):
 	# sites in it ARE, which is what decides whether a bucket is one
 	# strategy's worth of work or a thousand unrelated shapes.
 	by_reason = defaultdict(Counter)
+	reason_of = {}
 	by_address = {row[0]: row for row in instructions}
 	for address in surviving:
 		row = by_address.get(address)
@@ -11050,6 +11051,7 @@ def frontier_census(original, patched, listing):
 		else:
 			reason = "never a candidate"
 		counted[reason] += 1
+		reason_of[address] = reason
 		if row is not None:
 			by_reason[reason][row[2]] += 1
 	print(f"frontier: {len(surviving):,} surviving VEX instruction(s)")
@@ -11057,6 +11059,23 @@ def frontier_census(original, patched, listing):
 	for name, count in counted.most_common():
 		print(f"  {name:<{width}}  {count:>6,}")
 	print(f"  {'total':<{width}}  {sum(counted.values()):>6,}")
+	# **And the sites themselves, because a count cannot be read.** The
+	# bucket totals say which reason is biggest and the shapes say what is
+	# in it; neither lets anybody go and LOOK at a site. Written the way
+	# `apply` writes its refused regions, and for the same reason: an item
+	# is picked from this census, and picking one on a number whose members
+	# nobody has seen is how a bucket gets characterised wrongly.
+	# Finding 228.
+	from pathlib import Path		# imported here as elsewhere in this file
+	roll = Path("build") / "frontier-sites.txt"
+	if roll.parent.is_dir():
+		with roll.open("w", encoding="utf-8") as out:
+			for address in sorted(surviving):
+				row = by_address.get(address)
+				out.write(f"{address:#x}\t{reason_of.get(address, '?')}\t"
+				          f"{row[2] if row else '?'}\t"
+				          f"{(row[3] if row else '') or ''}\n")
+		print(f"frontier: every surviving site written to {roll}")
 	print("frontier: the commonest mnemonics in each reason")
 	for reason, _n in counted.most_common():
 		shown = by_reason[reason]

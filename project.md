@@ -13649,6 +13649,47 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 228 -- the largest bucket is a symptom, and its label points at the wrong end
+
+`frontier_census` counted buckets and never named their members, so a bucket could only
+be characterised by guessing -- which this file did twice in one night, calling seven
+reasons one question and pricing the 132 as provenance when it is placement. It now
+writes every surviving site with its reason, mnemonic and operands to
+`build/frontier-sites.txt`, the way `apply` already writes its refused regions.
+
+With the members readable, the top bucket answers in two passes:
+
+```
+declined: ymm value has no known upper half           1,046
+  defined by a vmovups LOAD                             736   70%
+  defined by arithmetic (vmulps 46, vaddps 27, ...)    ~200
+  no definition within 64 instructions                   49
+
+of the 736 defining loads:  729 survive in the frontier,  7 do not
+  declined: ymm upper half read later                    130
+  declined: 256-bit: no store before 256-bit arithmetic  123
+  declined: no store before a branch target in the run    99
+  declined: no store before a control transfer            98
+```
+
+**So the 1,046 is downstream of a load that could not commit.** Finding 180 made a load
+ask `long_partner_lowers` before reserving a shadow, so a store that cannot lower keeps
+its load from committing and the store then declines for want of the upper half the load
+never carried. The reasons on the LOAD side are the blockers; `ymm value has no known
+upper half` is the echo, and it has been top of the ranked list describing the wrong end.
+
+**The counts are store-sites grouped by their definer's reason, not distinct loads.**
+Several stores can share one load, so `130` is 130 stores.
+
+**The seven exceptions are the probe's error, not the tree's, and the example is worth
+keeping.** A load lowered while a store reading its register survives would be wrong
+bytes. At `0x142919ba9` the load pairs with the store at `0x142919baf` and both were
+detoured together; the survivor at `0x142919bc7` is a DIFFERENT store, sitting after a
+`jmp` and a branch target, and the backward walk crossed both. **A linear backward scan
+is not a reaching definition**, which is the whole reason `reaching_definitions` exists,
+and seven in 736 is the size a heuristic's error should be expected to have. The
+rewriter is right to decline that store: at a merge the upper half is unknown.
+
 ### Finding 227 -- provenance now survives a merge, and Starfield has no site that needs it
 
 `constant_ymm` asked `reaching_definition` -- **singular** -- which is a wrapper
@@ -13675,13 +13716,12 @@ one only because the control exists -- without it, byte-identical is indistingui
 from a change that can never fire.
 
 So **the 1,046 are not single-position pessimism about constants**, which is what this
-was built to test. The hypothesis that remains, untested and recorded as such:
-`constant_load` requires a `wide_move` LOAD, and a ymm that was COMPUTED -- the output of
-`vaddps`, `vmulps` and their kin -- has no constant to point at. Its upper half exists
-only at runtime, and with no 256-bit instruction on the host it cannot be relocated at
-all; the only route left is the shadow register, which needs the load to have committed.
-If that is right the bucket is a hard limit rather than a backlog, and Finding 226's
-"waiting on the walk" is wrong for it too.
+was built to test.
+
+**~~The hypothesis that remains: the values are COMPUTED, so the bucket is a hard
+limit.~~ Measured by Finding 228 and false.** 736 of the 1,046 are defined by a
+`vmovups` LOAD, usually one instruction earlier; the arithmetic definers total about
+200. The value is in memory, not only in a register.
 
 The change is kept: strictly more permissive, byte-identical here, carrying its own
 control, and it will pay on a binary that has the shape.
@@ -14089,6 +14129,7 @@ a binary that computes the wrong answer.
 | - | ~~Data reaching the in-place path~~ **FIXED** | 518,990 patches guarded, output byte-identical | wrong bytes | Finding 223: the same defect one call site over; `vex sites` was inflated by data |
 | - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
 | - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |
+| 1 | The load-side reasons behind the 1,046 | 729 stores freed if their loads commit | sites lowered | Finding 228: `ymm upper half read later` 130, run-walk limits ~376; the store bucket is an echo |
 | - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.44% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |
 | - | ~~The remaining uncovered passengers~~ **CLOSED at 0** | 23 rip-relative, all covered | wrong bytes | Finding 220: 1,881 of ~1,900 move unchanged and have no failure mode |
 | - | ~~Fixtures for the swallowed conditional branches~~ **DONE** | ja, jae, jb, jbe -- 506 sites | wrong bytes | Finding 219: and two earlier versions swallowed the right thing while proving nothing |
