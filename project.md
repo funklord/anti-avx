@@ -13649,6 +13649,40 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 234 -- a catch-all `else` made every new sabotage do the section one too
+
+Asking which checks each control actually trips -- rather than assuming one each -- found
+a defect in the sabotage added earlier the same night. `island` flipped **two** bytes:
+
+```
+0x433   the (bad) byte in .text          what it was written to do
+0x600   the first section after .text    what the `else` branch did
+```
+
+`sabotage` was `if kind == "stubvex": ... else: <section sabotage>`, so every kind added
+after it fell into the catch-all and performed the section corruption as well as its own.
+`island` therefore failed the section check for a reason that had nothing to do with data
+islands. **A control that fails for two reasons is not a control for either**, and the
+`elif` that fixes it is one word.
+
+**The gate was not lying, which is why this survived.** `check-verify` greps each
+control's log for its intended message, so the island control really did prove the island
+check fires; the extra failure was invisible to an assertion looking for one line. Only
+enumerating what each control trips showed it.
+
+```
+before   island:  sections after .text changed | data island(s) modified | boundaries lost
+after    island:  data island(s) modified | boundaries lost
+```
+
+The remaining boundary failure is honest: flipping a byte in `.text` moves an instruction
+boundary, and the sweep is supposed to notice.
+
+**The five controls cover more than five checks**, which was also assumed rather than
+measured -- `staleupper` trips the boundary check as well as the stale-upper one. Real
+coverage is seven or eight of `verify`'s seventeen, not five, and the twelve still
+uncovered are the item that remains.
+
 ### Finding 233 -- a fixture for the repair, and why it can only ever be a verify fixture
 
 Finding 231 measured the repair pass at zero fixture coverage. `repairdrop` closes that,

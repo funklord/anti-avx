@@ -10776,7 +10776,16 @@ def sabotage(patched, output, kind):
 			      file=sys.stderr)
 			return 2
 		data[raddr:raddr + 4] = bytes.fromhex("c5fc1006")
-	else:
+	elif kind == "section":
+		# **`elif`, not `else`.** This was a catch-all, so every kind added
+		# after it -- `island` first -- silently performed the section
+		# sabotage as well as its own, and tripped the section check for a
+		# reason that had nothing to do with what it was testing. Measured
+		# by asking which checks each control actually fires: `island` flips
+		# two bytes, 0x433 in `.text` and 0x600 in the section after it.
+		# A control that fails for two reasons is not a control for either.
+		# Finding 234.
+		#
 		# Any section after `.text`: the check is about all of them, and the
 		# fixtures do not all carry the same ones. The stub section is
 		# skipped because it is APPENDED rather than carried over, so it is
