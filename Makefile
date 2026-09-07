@@ -515,7 +515,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
              mxcsr splatrun splatop extract shadowspill regionlive \
-             tlsspill spanblock regioncarry swallowcall condswallow dataisland
+             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
@@ -665,7 +665,26 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 		$(BUILD_DIR)/verify-bad-badrow.log || \
 		{ echo "check-verify: the badrow control failed, but not through"; \
 		  echo "              the candidate-loop check"; exit 1; }
-	@echo "check-verify: all four controls rejected, each by its own check"
+# The staleupper control needs an image built WITHOUT the repair, so it runs
+# apply under the environment variable and verifies the result normally.
+# repairdrop is the only fixture the repair pass reaches -- Finding 231
+# measured the other 39 as untouched by it.
+	@set -e; \
+	ANTI_AVX_SABOTAGE=staleupper $(PYTHON) tool/detour.py apply \
+		$(BUILD_DIR)/pe-repairdrop.exe $(BUILD_DIR)/pe-repairdrop.asm \
+		$(BUILD_DIR)/bad-staleupper.exe > /dev/null; \
+	if timeout 300 $(PYTHON) tool/detour.py verify \
+		$(BUILD_DIR)/pe-repairdrop.exe $(BUILD_DIR)/bad-staleupper.exe \
+		$(BUILD_DIR)/pe-repairdrop.asm \
+		> $(BUILD_DIR)/verify-bad-staleupper.log 2>&1; then \
+		echo "check-verify: the staleupper control PASSED verify, so nothing"; \
+		echo "              watches the repair keep a stale upper half out"; \
+		exit 1; \
+	fi; \
+	grep -q "left stale" $(BUILD_DIR)/verify-bad-staleupper.log || \
+		{ echo "check-verify: the staleupper control failed, but not"; \
+		  echo "              through the stale-upper-half check"; exit 1; }
+	@echo "check-verify: all five controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
@@ -988,6 +1007,8 @@ clean:
 	      $(BUILD_DIR)/verify-bad-section.log \
 	      $(BUILD_DIR)/verify-bad-island.log \
 	      $(BUILD_DIR)/verify-bad-badrow.log \
+	      $(BUILD_DIR)/verify-bad-staleupper.log \
+	      $(BUILD_DIR)/bad-staleupper.exe \
 	      $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@# The wine prefix is a directory this build created, so it goes

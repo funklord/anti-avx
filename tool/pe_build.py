@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40}
+          "dataisland": 40, "repairdrop": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -1988,6 +1988,63 @@ island:
 	.byte 0xc5, 0x32, 0x00
 	.byte 0xc4, 0x4f, 0x00, 0xcb
 	.byte 0xc5, 0x2a, 0x00
+""")
+
+
+# The repair pass, which nothing else reaches. `repaired_placement` drops a
+# window whose swallowed VEX.128 write a surviving 256-bit instruction still
+# needs the zeroing of -- 184 reverts and 141 withheld windows on Starfield,
+# the mechanism Findings 185, 187, 194, 197 and 198 all turn on, and
+# Finding 231 measured its fixture coverage at zero: disabling the repair
+# changed none of the 39 images.
+#
+# **The shape is forced by what cannot run here.** The repair only matters
+# where a 256-bit instruction SURVIVES, and a surviving 256-bit instruction
+# faults on this host, so a fixture that executes one returns 29 and proves
+# nothing. The reader therefore sits on a path that is never taken: present
+# for the analysis, absent from the run. The answer is 77 whether or not the
+# repair happens, which is the point -- this is a fixture for `verify` and
+# for the `staleupper` control, not a behavioural test, and the behaviour is
+# here only so that a rewrite which corrupts the live path is still caught.
+#
+# `vaddss` is three-operand, so it wants a stub, and at four bytes its window
+# must widen by one to fit a five-byte jump -- which swallows the `vxorps`
+# after it. That `vxorps` is a VEX.128 write, so it zeroes ymm0[255:128] in
+# the original and does not once re-emitted as legacy SSE inside the stub.
+#
+# **The whole cluster sits on the dead path, and the first version did not.**
+# The repair works by WITHHOLDING that window, which leaves the `vaddss`
+# un-lowered -- and a surviving VEX instruction faults on this host, so the
+# fixture returned 29 with the mechanism working perfectly. Anything the
+# repair may refuse to lower has to be somewhere the program never reaches.
+PROGRAMS["repairdrop"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* the live path: a pair, lowered */
+	vmovups	%ymm0, (%rdi)
+	movl	$1, %eax
+	testl	%eax, %eax
+	jne	after			/* always taken */
+	vmovss	one(%rip), %xmm1
+	vmovss	two(%rip), %xmm2
+	vaddss	%xmm1, %xmm2, %xmm3	/* three-operand: wants a stub, widens */
+	vxorps	%xmm0, %xmm0, %xmm0	/* swallowed, and it zeroes ymm0[255:128] */
+	vaddps	%ymm0, %ymm0, %ymm4	/* survives, and reads that zeroing */
+after:
+	movl	16(%rdi), %eax		/* 77 from the copy */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+one:	.float 1.0
+two:	.float 2.0
+source:	.long 1, 2, 3, 4
+	.long 77, 6, 7, 8
 """)
 
 

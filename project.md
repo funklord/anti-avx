@@ -13649,6 +13649,47 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 233 -- a fixture for the repair, and why it can only ever be a verify fixture
+
+Finding 231 measured the repair pass at zero fixture coverage. `repairdrop` closes that,
+and `verify`'s stale-upper-half check -- the property Findings 185, 187, 194, 197 and 198
+all turn on -- has a control that has been watched failing:
+
+```
+repairdrop, normal image      rc=0
+repairdrop, repair disabled   rc=1   1 surviving 256-bit read(s) take a stale upper half
+                                     0x14000103a reads %ymm0, decided at 0x14000102d
+wine                          rewritten 77, want 77
+check-verify                  all five controls rejected, each by its own check
+```
+
+The mechanism is visible in the image: at `0x14000102d` the `vxorps` is **kept in VEX
+form**, reverted rather than narrowed, because the surviving `vaddps` at `0x14000103a`
+needs its upper-half zeroing. That is Starfield's 184 reverts at fixture scale.
+
+**The first version returned 29 BECAUSE the repair worked, and that is the design
+constraint.** The repair withholds the `vaddss` window to protect the zeroing, which
+leaves that instruction un-lowered -- and a surviving VEX instruction faults on this
+host. So **anything the repair may refuse to lower has to sit where the program never
+reaches it.** The repair's whole purpose is to leave sites un-lowered rather than ship
+wrong bytes, so a fixture exercising it contains surviving VEX by construction and can
+only ever be a `verify` fixture. The cluster sits behind an always-taken `jne`; the live
+path carries only the pair, which lowers cleanly and returns 77.
+
+**And the check I wrote to prove the live path was clean did not.** It counted VEX
+prefixes from `<.text>:` to the first `ret`, a range that spans the dead path it was meant
+to exclude, and reported 3 -- the three instructions that are supposed to survive. What
+establishes the property is the wine run: the program executes and returns 77, which is
+only possible if no surviving VEX is reached.
+
+**Four probes written this session were wrong and no tool in the tree was.** A linear
+backward walk invented seven anomalies (Finding 228), a `(bad)` filter missed the two-byte
+nop (Finding 221), three `ps` matchers read the wrong process, and this one counted what
+it was written to exclude. The tree's own instruments -- `outside.py report`,
+`frontier_census`, `verify` -- were right every time. **A check written to confirm
+something already believed tends to confirm it**, and the remedy that keeps working is
+the one this file already carries: make it fail first.
+
 ### Finding 232 -- ddisasm runs here, does not fit this input, and calls it unsupported
 
 Finding 8 named Ddisasm as milestone 3's instrument and the ground truth to audit the 744
@@ -13721,12 +13762,11 @@ Disabling the repair changes **no fixture's image**: all 39 rebuild byte-for-byt
 identical. Verified rather than assumed -- the loop produced 39 artifacts and `cmp` was
 shown detecting a one-byte change.
 
-**So the repair pass has no fixture coverage at all.** On Starfield it reverts 184
-in-place patches and withholds 141 windows; it is the mechanism Findings 185, 187, 194,
-197 and 198 all turn on, and the suite that runs on every commit does not exercise it
-once. The control cannot exist until a fixture does: a VEX.128 write swallowed by a
-window, whose zeroing a surviving 256-bit read still needs. That is a fixture to build,
-not a sabotage to write, and it is the next item.
+**~~So the repair pass has no fixture coverage at all.~~ Closed by Finding 233**, which
+built `repairdrop`. The measurement stood: on Starfield the pass reverts 184 in-place
+patches and withholds 141 windows, it is the mechanism Findings 185, 187, 194, 197 and
+198 all turn on, and until that fixture existed the suite running on every commit did not
+exercise it once.
 
 ### Finding 230 -- the 319 outside .pdata are data, and leaf recovery already takes 97.9%
 
@@ -14277,7 +14317,7 @@ a binary that computes the wrong answer.
 | - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
 | - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |
 | - | ~~Ddisasm as milestone 3's ground truth~~ **BLOCKED** | >20 GB address space; PGO unsupported | neither | Finding 232: obtainable without sudo, but it calls this input unsupported and does not fit |
-| 1 | A fixture that exercises the repair pass | 184 reverts and 141 withheld windows, all untested | wrong bytes | Finding 231: disabling the repair changes no fixture's image; `staleupper` has nothing to bite on |
+| - | ~~A fixture that exercises the repair pass~~ **DONE** | `repairdrop`; five controls, each rejected by its own check | wrong bytes | Finding 233: the repair only matters where VEX survives, so it can only be a verify fixture |
 | - | ~~The 319 outside .pdata~~ **PRICED at 52** | 315 of 367 refusals are data; leaf recovery takes 97.9% | sites lowered | Finding 230: 4 chunks of unproven extent, 3 with no findable caller |
 | - | ~~`ymm upper half read later`, 115 loads / 130 stores~~ **PRICED at 0** | raising the 40-instruction limit frees nothing | sites lowered | Finding 229: all 115 have a reader inside the window; the remaining lever needs the placer's answer at collect time |
 | - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.44% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |
