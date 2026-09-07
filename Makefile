@@ -649,7 +649,23 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 		$(BUILD_DIR)/verify-bad-island.log || \
 		{ echo "check-verify: the island control failed, but not through"; \
 		  echo "              the data-island check"; exit 1; }
-	@echo "check-verify: all three controls rejected, each by its own check"
+# The badrow control is a CODE sabotage: no corrupted image can make a (bad)
+# row reach the candidate loop, so the guard is disabled through the
+# environment and verify must reject the result. See CODE_SABOTAGE.
+	@set -e; \
+	if ANTI_AVX_SABOTAGE=badrow timeout 300 $(PYTHON) tool/detour.py verify \
+		$(BUILD_DIR)/pe-dataisland.exe $(BUILD_DIR)/sse-dataisland.exe \
+		$(BUILD_DIR)/pe-dataisland.asm \
+		> $(BUILD_DIR)/verify-bad-badrow.log 2>&1; then \
+		echo "check-verify: the badrow control PASSED verify, so nothing"; \
+		echo "              watches data stay out of the candidate loop"; \
+		exit 1; \
+	fi; \
+	grep -q "reached the candidate loop" \
+		$(BUILD_DIR)/verify-bad-badrow.log || \
+		{ echo "check-verify: the badrow control failed, but not through"; \
+		  echo "              the candidate-loop check"; exit 1; }
+	@echo "check-verify: all four controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
@@ -971,6 +987,7 @@ clean:
 	      $(BUILD_DIR)/verify-bad-stubvex.log \
 	      $(BUILD_DIR)/verify-bad-section.log \
 	      $(BUILD_DIR)/verify-bad-island.log \
+	      $(BUILD_DIR)/verify-bad-badrow.log \
 	      $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@# The wine prefix is a directory this build created, so it goes

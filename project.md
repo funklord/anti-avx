@@ -13649,6 +13649,38 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 231 -- fourteen of verify's seventeen checks had no control, and the repair has no fixture
+
+`verify` raises `problems` at **17** places. `sabotage` had **3** kinds, and its docstring
+is honest about why: `section` trips an early check and `stubvex` one of the last, so a
+`verify` that dies in the middle passes neither. That is POSITIONAL coverage. It says
+nothing about whether any individual check can fire, and by Finding 196's own rule a
+check nobody has watched fail is a green light.
+
+**The three image kinds cannot cover the rest, which is why there were only three.**
+`sabotage` corrupts an artifact; the other fourteen checks test the COLLECTOR's
+decisions, and no broken image can make a `(bad)` row reach the candidate loop or make a
+repair fail to happen. So `CODE_SABOTAGE` reads `ANTI_AVX_SABOTAGE` once at import and
+each value disables exactly one guard, letting the gate watch a check reject its own
+output.
+
+`badrow` is wired in and works: with the guard off, `verify` reports **2 (bad) row(s)
+reached the candidate loop** and exits 1, and `check-verify` asserts the failure arrived
+through that check rather than another. Tonight's Findings 222 and 223 rested on a proof
+run by hand -- reverting the guard in a scratch copy -- and now rest on the gate.
+
+**`staleupper` is named and cannot yet be demonstrated, which is the larger finding.**
+Disabling the repair changes **no fixture's image**: all 39 rebuild byte-for-byte
+identical. Verified rather than assumed -- the loop produced 39 artifacts and `cmp` was
+shown detecting a one-byte change.
+
+**So the repair pass has no fixture coverage at all.** On Starfield it reverts 184
+in-place patches and withholds 141 windows; it is the mechanism Findings 185, 187, 194,
+197 and 198 all turn on, and the suite that runs on every commit does not exercise it
+once. The control cannot exist until a fixture does: a VEX.128 write swallowed by a
+window, whose zeroing a surviving 256-bit read still needs. That is a fixture to build,
+not a sabotage to write, and it is the next item.
+
 ### Finding 230 -- the 319 outside .pdata are data, and leaf recovery already takes 97.9%
 
 `outside.py report` prices this without a new probe, which after three flawed probes in
@@ -14197,6 +14229,7 @@ a binary that computes the wrong answer.
 | - | ~~Data reaching the in-place path~~ **FIXED** | 518,990 patches guarded, output byte-identical | wrong bytes | Finding 223: the same defect one call site over; `vex sites` was inflated by data |
 | - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
 | - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |
+| 1 | A fixture that exercises the repair pass | 184 reverts and 141 withheld windows, all untested | wrong bytes | Finding 231: disabling the repair changes no fixture's image; `staleupper` has nothing to bite on |
 | - | ~~The 319 outside .pdata~~ **PRICED at 52** | 315 of 367 refusals are data; leaf recovery takes 97.9% | sites lowered | Finding 230: 4 chunks of unproven extent, 3 with no findable caller |
 | - | ~~`ymm upper half read later`, 115 loads / 130 stores~~ **PRICED at 0** | raising the 40-instruction limit frees nothing | sites lowered | Finding 229: all 115 have a reader inside the window; the remaining lever needs the placer's answer at collect time |
 | - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.44% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |

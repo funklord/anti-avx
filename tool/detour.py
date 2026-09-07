@@ -45,6 +45,7 @@ Two details are easy to get wrong and both are fatal.
 """
 
 import bisect
+import os
 import re
 import struct
 import subprocess
@@ -6993,7 +6994,7 @@ def collect(binary, listing, context=None):
 		# taken straight from the unvalidated prefix. Starfield carries 180
 		# such sequences in the data islands of Finding 8, and 99 of them
 		# reached this loop. Finding 222.
-		if mnemonic == "(bad)":
+		if mnemonic == "(bad)" and CODE_SABOTAGE != "badrow":
 			continue
 		# **And a byte that decodes CLEANLY can still be data.** The guard
 		# above refuses what objdump refused; it cannot see a constant pool
@@ -10717,11 +10718,29 @@ def main(argv):
 # island is rather than each having its own idea. Finding 224.
 ISLAND_GAP = 256
 
+# **Controls for the checks no broken IMAGE can express.** `sabotage`
+# corrupts an artifact, which is enough for a check that reads bytes: the
+# stub section, the sections after `.text`, the data islands. Those are
+# three of `verify`'s seventeen. The rest test the COLLECTOR's decisions,
+# and no image can make a `(bad)` row reach the candidate loop or make a
+# repair fail to happen -- so fourteen checks had never been watched
+# failing, which by Finding 196's rule is a green light.
+#
+# Each value here disables exactly one guard, so the gate can run `apply`
+# with it and watch `verify` reject the result. Read once, at import, so
+# no hot path pays for it, and named in `SABOTAGE` beside the image kinds
+# so the two are found together. Finding 231.
+CODE_SABOTAGE = os.environ.get("ANTI_AVX_SABOTAGE", "")
+
 SABOTAGE = {
 	# name: (which check must reject it, what is broken)
 	"stubvex": "the stub section holds no VEX",
 	"section": "every section after .text is byte-identical",
 	"island": "no byte inside a data island was modified",
+	# Code sabotages, set through ANTI_AVX_SABOTAGE rather than written
+	# into an image -- see CODE_SABOTAGE for why these cannot be artifacts.
+	"badrow": "no (bad) row reaches the candidate loop",
+	"staleupper": "the repair withholds what would ship a stale upper half",
 }
 
 
@@ -10855,6 +10874,8 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 		# whatever else is true of it. Finding 197.
 		guilty = {covers[producer] for _reader, _field, producer in stale
 		          if producer in covers}
+		if CODE_SABOTAGE == "staleupper":
+			guilty = set()		# the repair keeps nothing: see CODE_SABOTAGE
 		if not guilty - dropped:
 			break
 		dropped |= guilty
