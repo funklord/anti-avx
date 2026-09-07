@@ -74,7 +74,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs shapes cost-bench cost probe why check-spill check-tls check-unwind check-vex \
+        census spans gprs shapes cost-bench cost status probe why check-spill check-tls check-unwind check-vex \
         check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -386,6 +386,22 @@ detour: $(DETOURED)
 detour-verify: $(DETOURED) $(LISTING)
 	$(PYTHON) tool/detour.py $(SPILL_FLAGS) verify $(TARGET) $(DETOURED) \
 	          $(LISTING)
+
+# Do the documents still say what the rewriter does? Both status lines
+# quoted 797,907 / 202,115 / 7,224 while the tool measured 799,458 /
+# 202,838 / 5,673 -- stale by 1,551 sites in the most-read line of each,
+# and in two places, so correcting one would have left the other. The
+# remedy this workspace prescribes for a count quoted often is a target
+# comparing it against what the run reports. Finding 241.
+#
+# The log is cached because the Starfield verify takes half an hour and
+# this has to be cheap enough to run after editing a sentence.
+$(BUILD_DIR)/detour-verify.log: $(DETOURED) $(LISTING)
+	$(PYTHON) tool/detour.py $(SPILL_FLAGS) verify $(TARGET) $(DETOURED) \
+	          $(LISTING) > $@ 2>&1 || { cat $@; rm -f $@; exit 1; }
+
+status: $(BUILD_DIR)/detour-verify.log
+	$(PYTHON) tool/status_check.py $< project.md README.md
 
 # -- measuring the cost ------------------------------------------------------
 
@@ -1081,6 +1097,7 @@ clean:
 	      $(BUILD_DIR)/bad-conservative.exe \
 	      $(BUILD_DIR)/verify-bad-conservative.log \
 	      $(BUILD_DIR)/verify-bad-switchbase.log \
+	      $(BUILD_DIR)/detour-verify.log \
 	      $(BUILD_DIR)/verify-bad-stubbad.log \
 	      $(BUILD_DIR)/verify-bad-notable.log \
 	      $(BUILD_DIR)/verify-bad-unsorted.log \

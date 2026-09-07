@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **797,907 of 805,131 VEX
-sites -- 99.1%** -- through 202,115 detours, and every `make detour-verify` invariant
-holds on the result. 7,224 sites are left, and the rewritten binary loads 305 modules
+**Status:** the rewriter works. `tool/detour.py` rewrites **799,458 of 805,131 VEX
+sites -- 99.3%** -- through 202,838 detours, and every `make detour-verify` invariant
+holds on the result. 5,673 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
@@ -13685,6 +13685,44 @@ so: if the RVAs go stale the table stops resolving and `check-verify` goes red.
 showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and the `.asm`
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
+
+### Finding 241 -- the headline numbers were stale in both documents, and now a target says so
+
+The most-read line of each document, measured against what the tool reports:
+
+```
+                    said        measured
+rewritten        797,907         799,458
+percentage          99.1%           99.3%
+detours          202,115         202,838
+left               7,224           5,673
+```
+
+Stale by 1,551 sites, and **in two places** -- `project.md`'s status paragraph and
+`README.md`'s -- so correcting one would have left the other saying something else. That
+is the shape `working-practice.md` names: a claim lives in more than one place, and the
+correction has to go where a reader will next look.
+
+**The fix is a target, not a better sentence.** `make status` compares the documents
+against a `verify` log and fails with both. It checks what each document CLAIMS rather
+than demanding it claim everything -- README quotes the percentage and the remainder,
+`project.md` the removed count and the detours -- because requiring all four of both
+reported a false failure on the first run.
+
+Seen to fail three ways before being believed: a measurement that moved (four claims
+red), the actual stale text this finding started from (`says 797,907, measured 799,458`),
+and a truncated log, which is refused rather than passed. **A log with no measurement in
+it is not agreement**, which is this file's own rule one level down.
+
+**It is deliberately expensive.** `status` depends on `$(DETOURED)`, so a changed
+`detour.py` rebuilds the image and re-verifies before comparing -- fifty minutes. Reading
+documents against a stale artifact is precisely the error Finding 240 recorded, so the
+target refuses to do it, and the log is cached so that re-running after editing a sentence
+costs nothing.
+
+**What it does not check is written into the tool**: only the three counts and the
+percentage. The frontier address, the module count and "every invariant holds" have no
+measurement here to compare against, and a pass must not be read as covering them.
 
 ### Finding 240 -- a fixed path made a fixture's census look like Starfield's
 

@@ -15,11 +15,11 @@ measured instruction mix says a translated binary should cost about **+1.34%
 in instruction count** and run within a few percent of native -- the
 performance argument against this approach does not hold.
 
-**Status: it rewrites. 99.1% of 805,131 VEX sites, and that is not enough.**
+**Status: it rewrites. 99.3% of 805,131 VEX sites, and that is not enough.**
 
 A translated binary that is 99.99% correct is worthless: the remaining 0.01%
 is a crash at an unpredictable moment. So the number to watch is not how much
-is translated but how much is left, and 7,224 sites are left.
+is translated but how much is left, and 5,673 sites are left.
 
 **Starfield has now been run, under Proton, and each run names the next site
 to work on.** The original dies on the first AVX instruction it executes.
