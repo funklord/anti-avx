@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2043,6 +2043,54 @@ func_end:
 	.p2align 5
 one:	.float 1.0
 two:	.float 2.0
+source:	.long 1, 2, 3, 4
+	.long 77, 6, 7, 8
+""")
+
+
+# A conservative candidate, which nothing else produces. `apply` keeps a
+# reader the walk COULD NOT RULE OUT in its VEX form at the price of the
+# site (Finding 198), and `verify` fails if one was narrowed anyway. No
+# corrupted image can express "a repair that did not happen", so the check
+# needs a code control -- and a code control needs an input that makes one.
+# Swept across all 39 fixtures at zero before this existed.
+#
+# Three things have to line up. The `call` is the ABI bound: the upper half
+# of every ymm is volatile across one, so `conservative_producers` searches
+# back only that far. The `lea` puts `target` in `blocked` -- an address
+# something can reach -- while naming no branch that goes there, so the walk
+# arrives at a join whose predecessors it cannot enumerate and gives up.
+# And the `vxorps` is a VEX.128 write with a same-length SSE form, so it is
+# patched in place, which is what stops it zeroing [255:128].
+#
+# The reader sits on a never-taken path for Finding 233's reason: the repair
+# leaves sites un-lowered, and surviving VEX faults on this host.
+PROGRAMS["conservative"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* the live path: a pair, lowered */
+	vmovups	%ymm0, (%rdi)
+	call	helper			/* the ABI bound for the search back */
+	leaq	target(%rip), %rax	/* blocks `target`, naming no branch to it */
+	movl	$1, %ecx
+	testl	%ecx, %ecx
+	jne	after			/* always taken */
+	vxorps	%xmm0, %xmm0, %xmm0	/* patched in place; stops zeroing */
+target:
+	vaddps	%ymm0, %ymm0, %ymm1	/* survives; its source is unresolvable */
+after:
+	movl	16(%rdi), %eax		/* 77 from the copy */
+	addq	$40, %rsp
+	ret
+helper:
+	ret
+func_end:
+	.p2align 5
 source:	.long 1, 2, 3, 4
 	.long 77, 6, 7, 8
 """)

@@ -13649,6 +13649,42 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 237 -- a check with no possible input needs a fixture, not a sabotage
+
+The conservative-candidate check is the one `apply` obeys at the price of sites: a reader
+the walk COULD NOT RULE OUT is kept in its VEX form (Finding 198), and `verify` fails if
+one was narrowed anyway. It had no control, and the reason turned out to be stronger than
+"nobody wrote one": **swept across all 39 fixtures, not one produces a conservative
+candidate.** The check had no possible input.
+
+So the work was a fixture built to a specification, and each part earns its place:
+
+```
+call helper              the ABI bound -- the upper half of every ymm is volatile
+                         across a call, so conservative_producers searches back
+                         only that far
+leaq target(%rip), %rax  puts `target` in `blocked` while naming no branch to it,
+                         so the walk reaches a join whose predecessors it cannot
+                         enumerate and gives up -- UNRESOLVABLE, not merely stale
+vxorps %xmm0,...         a VEX.128 write with a same-length SSE form, so it is
+                         patched in place, which is what stops it zeroing 255:128
+```
+
+Only with all three does `apply` face a reader it cannot rule out. Sabotaged, `verify`
+reports **1 conservative candidate(s) were narrowed anyway**; unsabotaged it is clean, and
+wine returns 77.
+
+**The two remaining checks are not the same kind of gap, and the difference is worth
+keeping.** *Switch dispatch recognised and no table resolved* is genuinely uncovered. The
+branch-target check is uncoverable by construction and says so itself -- the swallowed set
+is compared against a superset of the data that produced it, kept because it would catch
+`targets.collect` disagreeing with itself between two calls. **Inventing a sabotage to
+make a count read 17 of 17 would have been worse than leaving it**, because the next
+reader would have believed the count.
+
+Twelve controls, about fourteen of seventeen checks watched failing, from three at the
+start of the pass.
+
 ### Finding 236 -- a sabotage that changed nothing said its property must now be false
 
 `stubbad` covers the stub decode gate, the check Finding 206 added after `vbroadcastss`

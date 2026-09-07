@@ -10720,7 +10720,7 @@ ISLAND_GAP = 256
 
 # Sabotage kinds that break the COLLECTOR rather than an image, so an
 # unchanged output is correct for them and an error for everything else.
-CODE_KINDS = ("badrow", "staleupper")
+CODE_KINDS = ("badrow", "staleupper", "conservative")
 
 # **Controls for the checks no broken IMAGE can express.** `sabotage`
 # corrupts an artifact, which is enough for a check that reads bytes: the
@@ -10751,6 +10751,7 @@ SABOTAGE = {
 	"stubbad": "every byte of stub decodes to an instruction",
 	"badrow": "no (bad) row reaches the candidate loop",
 	"staleupper": "the repair withholds what would ship a stale upper half",
+	"conservative": "a conservative candidate keeps its VEX form",
 }
 
 
@@ -11748,7 +11749,11 @@ def apply_all(binary, listing, output):
 	# the price of the site: `apply` cannot tell the two apart and must not
 	# try. Finding 198.
 	kept = len({producer for _r, _f, producer in unsure})
-	stale = stale + unsure
+	# The conservative half is dropped only under sabotage, which leaves
+	# those candidates narrowed in the image for `verify` to catch: no
+	# corrupted artifact can express "a repair that did not happen", so this
+	# check needs a code control like `badrow`'s. Finding 237.
+	stale = stale + ([] if CODE_SABOTAGE == "conservative" else unsure)
 	covered = set()
 	for site, window, _stub, _size, _prologue in placed:
 		covered.update(range(site, site + window))

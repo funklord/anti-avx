@@ -515,7 +515,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
              mxcsr splatrun splatop extract shadowspill regionlive \
-             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop
+             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
@@ -710,7 +710,27 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 			{ echo "check-verify: the $$kind control failed, but not"; \
 			  echo "              through its own check"; exit 1; }; \
 	done
-	@echo "check-verify: all eleven controls rejected, each by its own check"
+# A conservative candidate is one the walk could not rule out, kept in its
+# VEX form at the price of the site (Finding 198). No corrupted image can
+# express "a repair that did not happen", so this needs a code control, and
+# the `conservative` fixture is the only input that produces one.
+	@set -e; \
+	ANTI_AVX_SABOTAGE=conservative $(PYTHON) tool/detour.py apply \
+		$(BUILD_DIR)/pe-conservative.exe $(BUILD_DIR)/pe-conservative.asm \
+		$(BUILD_DIR)/bad-conservative.exe > /dev/null; \
+	if timeout 300 $(PYTHON) tool/detour.py verify \
+		$(BUILD_DIR)/pe-conservative.exe $(BUILD_DIR)/bad-conservative.exe \
+		$(BUILD_DIR)/pe-conservative.asm \
+		> $(BUILD_DIR)/verify-bad-conservative.log 2>&1; then \
+		echo "check-verify: the conservative control PASSED verify, so"; \
+		echo "              nothing watches a repair that did not happen"; \
+		exit 1; \
+	fi; \
+	grep -q "conservative candidate(s) were narrowed anyway" \
+		$(BUILD_DIR)/verify-bad-conservative.log || \
+		{ echo "check-verify: the conservative control failed, but not"; \
+		  echo "              through the conservative-candidate check"; exit 1; }
+	@echo "check-verify: all twelve controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
@@ -1039,6 +1059,8 @@ clean:
 	      $(BUILD_DIR)/bad-nostub.exe $(BUILD_DIR)/bad-stubgap.exe \
 	      $(BUILD_DIR)/bad-stubcall.exe \
 	      $(BUILD_DIR)/bad-stubbad.exe \
+	      $(BUILD_DIR)/bad-conservative.exe \
+	      $(BUILD_DIR)/verify-bad-conservative.log \
 	      $(BUILD_DIR)/verify-bad-stubbad.log \
 	      $(BUILD_DIR)/verify-bad-notable.log \
 	      $(BUILD_DIR)/verify-bad-unsorted.log \
