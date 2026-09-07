@@ -6832,6 +6832,50 @@ def analysis_context(binary, listing):
 	return instructions, plain, blocked, sources, switch_tables, len(switched)
 
 
+def data_islands(instructions, gap=None):
+	"""Address spans objdump could not decode, clustered. Finding 225.
+
+	**One authority for what an island is.** The collector refuses a
+	candidate standing in one, `verify` checks that none of their bytes
+	moved, and `vex_scan` names them with the same 256-byte gap -- so the
+	three agree by construction rather than by three people picking the
+	same number.
+
+	Clustering over-covers, sweeping in real code that lies between two
+	data runs. Measured on Starfield that costs exactly ONE site: 747
+	islands hold a single cleanly-decoding VEX instruction between them,
+	the `vphsubd` at 0x142c4079a, and that one is itself a constant pool's
+	bytes. So the over-coverage is free here, which is why the collector
+	can afford to refuse on it.
+	"""
+	if gap is None:
+		gap = ISLAND_GAP
+	islands = []
+	for row in instructions:
+		if row[2] != "(bad)" or not row[1]:
+			continue
+		low, high = row[0], row[0] + len(row[1])
+		if islands and low - islands[-1][1] <= gap:
+			islands[-1][1] = max(islands[-1][1], high)
+		else:
+			islands.append([low, high])
+	return islands
+
+
+def in_island(islands, address):
+	"""Whether `address` falls inside one of `islands`, which are sorted."""
+	low, high = 0, len(islands) - 1
+	while low <= high:
+		mid = (low + high) // 2
+		if islands[mid][1] <= address:
+			low = mid + 1
+		elif islands[mid][0] > address:
+			high = mid - 1
+		else:
+			return True
+	return False
+
+
 def collect(binary, listing, context=None):
 	"""(in-place patches, class C detour candidates, statistics).
 
@@ -6902,6 +6946,7 @@ def collect(binary, listing, context=None):
 	candidates = []
 	skipped = Counter()
 	declined = {}
+	islands = data_islands(instructions)
 	for index, (address, encoding, mnemonic, operands,
 	            _comment) in enumerate(instructions):
 		if not encoding or encoding[0] not in (0xC4, 0xC5):
@@ -6918,6 +6963,21 @@ def collect(binary, listing, context=None):
 		# such sequences in the data islands of Finding 8, and 99 of them
 		# reached this loop. Finding 222.
 		if mnemonic == "(bad)":
+			continue
+		# **And a byte that decodes CLEANLY can still be data.** The guard
+		# above refuses what objdump refused; it cannot see a constant pool
+		# whose bytes happen to form a real instruction. Starfield holds
+		# one: `c4 02 1a 05` at 0x142c4079a is a valid VEX.128 map-2
+		# `vphsubd`, and it sits in a 4-byte-stride table of them. The
+		# region strategy took it as a member and refused it for "lanereg3
+		# source from outside the region" -- a shape reason having nothing
+		# to do with standing in data, which is protection by luck.
+		#
+		# Refusing the island interior costs that one site and nothing
+		# else, because it is the only cleanly-decoding VEX instruction
+		# inside any of the 747. Finding 225.
+		if in_island(islands, address):
+			declined[address] = "standing in a data island"
 			continue
 		if address in already:
 			continue
@@ -11796,18 +11856,8 @@ def verify(original, patched, listing=None):
 	tv, tr, ts = inplace.text_mapping(original)
 	before_text = open(original, "rb").read()[tr:tr + ts]
 	after_text = open(patched, "rb").read()[tr:tr + ts]
-	islands = []
-	for row in instructions:
-		if row[2] != "(bad)" or not row[1]:
-			continue
-		low = row[0] - tv
-		high = low + len(row[1])
-		if low < 0 or high > ts:
-			continue
-		if islands and low - islands[-1][1] <= ISLAND_GAP:
-			islands[-1][1] = max(islands[-1][1], high)
-		else:
-			islands.append([low, high])
+	islands = [(low - tv, high - tv) for low, high in data_islands(instructions)
+	           if 0 <= low - tv and high - tv <= ts]
 	touched = [(low, high) for low, high in islands
 	           if before_text[low:high] != after_text[low:high]]
 	span = sum(high - low for low, high in islands)

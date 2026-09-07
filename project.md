@@ -13649,6 +13649,43 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 225 -- one instruction in a constant pool, refused for the wrong reason
+
+Findings 222 and 223 refuse what objdump refused. Neither can see a table whose bytes
+happen to form a real instruction, and Starfield has one:
+
+```
+0x142c40795   06 c4 02 1a 05  c4 02 5d 06  c4 02 22 06  c4 02 df 05  ...
+```
+
+A 4-byte-stride array, and every `c4 02 ...` is a VALID 3-byte VEX prefix -- map 2,
+unlike the illegal `0x0a` and `0x0f` maps of Finding 222's 180. `c4 02 1a 05` decodes as
+`vphsubd`. The region strategy took the one at `0x142c4079a` as a member and refused it
+for **"lanereg3 source from outside the region"**, a lowering-shape reason having nothing
+to do with standing in data. Protection by luck, which is 222's lesson one layer out and
+the case 224's outcome check exists to catch.
+
+**Why `.pdata` does not save it.** Of the 747 islands, only 109 lie wholly outside every
+function range; **638 are inside one**, so the function boundary is not what keeps the
+collector out of data. Finding 224 said it was, and this corrects it.
+
+**The guard is free, and that is a measurement rather than a hope.** Clustering
+over-covers on purpose -- it sweeps in real code lying between two data runs -- so
+refusing the island interior could have cost genuine lowerings. Across all 747 islands
+there is **exactly one** cleanly-decoding VEX instruction, and it is the `vphsubd` above.
+So the refusal costs one site that was never a site. Starfield rebuilds BYTE-IDENTICAL at
+518,990 in-place patches and 202,838 detours.
+
+`collect` now records it as `declined: standing in a data island`, so it appears in the
+frontier census rather than vanishing, and `data_islands()` / `in_island()` are shared:
+the collector refuses on them, `verify` checks them, and `vex_scan` names islands with
+the same 256-byte gap. One definition rather than three that can drift.
+
+**What this still cannot see.** Only data holding at least one undecodable byte becomes
+an island. A constant pool that decodes end to end is in no population here, and nothing
+in the tree can currently find one -- Finding 8 named Ddisasm as the instrument for that,
+and it remains milestone 3's job.
+
 ### Finding 224 -- guarding the decision does not guard the outcome, so verify now watches the data
 
 Findings 222 and 223 both guard a DECISION: refuse a row whose mnemonic is `(bad)`.
@@ -13692,10 +13729,17 @@ reconciled; the figure that belongs in the tree is the one the running check emi
 because that is the one the next reader will quote.
 
 **The empty sweep is the finding.** Nothing was corrupted, and the value is in the lens
-being recorded with its population: 747 islands, 48,399 bytes, zero touched, and the
-`blocked` switch-target regions plus `.pdata` extents are evidently what keeps the
-rewrite out. The next fault in this family needs a detector for data that decodes
-cleanly, which neither this check nor the two guards before it can supply.
+being recorded with its population: 747 islands, 48,399 bytes, zero touched.
+
+**~~The `blocked` switch-target regions plus `.pdata` extents are evidently what keeps
+the rewrite out.~~ Measured, and wrong.** `.pdata` accounts for **109 of 747**. The other
+**638 lie inside a declared function range**, where the collector is free to consider
+addresses -- MSVC embeds constant pools in its functions and `.pdata` covers them, the
+first example being `0x1402ad414-0x1402ad4f6` inside `0x1402aa850-0x1402ad559`, which is
+the table holding the `c4`/`c5` bytes read at `0x1402ad455`. "Evidently" was a
+comfortable cause attached to a clean result, and it made this check look ceremonial
+when it is the only thing watching 85% of the islands. Finding 225 has the split and the
+guard that follows from it.
 
 ### Finding 223 -- the same defect in the in-place path, found by pointing the last lens at the last fix
 
@@ -13934,6 +13978,7 @@ a binary that computes the wrong answer.
 
 | # | item | impact | currency | provenance |
 |---|---|---|---|---|
+| - | ~~A VEX site standing inside a constant pool~~ **FIXED at 1** | `vphsubd` at 0x142c4079a; costs one non-site | wrong bytes | Finding 225: refused for a shape reason, not for being data; `.pdata` covers only 109 of 747 islands |
 | - | ~~The rewrite writing into data~~ **GUARDED at 0** | 747 islands, 48,399 bytes, none modified | wrong bytes | Finding 224: a standing `verify` check with an `island` sabotage control; blind to data that decodes cleanly |
 | - | ~~Data reaching the in-place path~~ **FIXED** | 518,990 patches guarded, output byte-identical | wrong bytes | Finding 223: the same defect one call site over; `vex sites` was inflated by data |
 | - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
