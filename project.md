@@ -13649,6 +13649,39 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 235 -- the unwinder checks get controls, and an if/elif chain needs one each
+
+Finding 46 measured what the unwinder checks are worth: an exception raised in a stub
+that no function table entry covers is never dispatched at all. There are four of them --
+the exception directory must point at a table, the table must stay sorted because
+`RtlLookupFunctionEntry` binary-searches it, the stub section must exist, and every stub
+byte must lie inside an entry -- and **not one had ever been watched failing.**
+
+**They are an `if/elif` chain, which is why a single sabotage could never have covered
+them:** only the first failing condition is reported, so each needs its own kind. That is
+also why they had none.
+
+```
+notable    FAILED -- no function table
+unsorted   FAILED -- the function table is not sorted
+nostub     FAILED -- no stub section
+stubgap    FAILED -- 4 bytes of stub outside every function table entry
+stubcall   FAILED -- 1 call instruction(s) in the stub section
+```
+
+Each sabotage matches what its check reads: `notable` zeroes the directory's RVA and
+size, `unsorted` swaps the last two entries so a binary search lands wrong, `nostub`
+renames the section header, `stubgap` shrinks the final entry by four bytes, `stubcall`
+writes `e8 00000000` into the section past the pool. Each is pinned by a `grep` to its own
+message -- Finding 234's lesson, a control that fails for the wrong reason still looks
+green.
+
+**Coverage went from 5 controls to 10, and from six of `verify`'s seventeen checks to
+about eleven.** What is left uncovered are the collector-decision checks -- swallowed
+instructions that are branch targets, conservative candidates narrowed anyway, a switch
+dispatch with no table resolved -- and those need code sabotages of `badrow`'s and
+`staleupper`'s kind rather than a corrupted image, because no image can express them.
+
 ### Finding 234 -- a catch-all `else` made every new sabotage do the section one too
 
 Asking which checks each control actually trips -- rather than assuming one each -- found

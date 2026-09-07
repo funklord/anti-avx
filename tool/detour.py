@@ -10739,6 +10739,11 @@ SABOTAGE = {
 	"island": "no byte inside a data island was modified",
 	# Code sabotages, set through ANTI_AVX_SABOTAGE rather than written
 	# into an image -- see CODE_SABOTAGE for why these cannot be artifacts.
+	"notable": "the exception directory points at a function table",
+	"unsorted": "the function table is sorted",
+	"nostub": "the stub section is present",
+	"stubgap": "every stub byte lies inside a function table entry",
+	"stubcall": "the stub section holds no call",
 	"badrow": "no (bad) row reaches the candidate loop",
 	"staleupper": "the repair withholds what would ship a stale upper half",
 }
@@ -10828,6 +10833,54 @@ def sabotage(patched, output, kind):
 			return 2
 		vaddr, raddr, _size = inplace.text_mapping(patched)
 		data[raddr + (spot - vaddr)] ^= 0xFF
+	if kind in ("notable", "unsorted", "nostub", "stubgap", "stubcall"):
+		# **The unwinder checks, which are an if/elif chain**, so each needs
+		# its own kind: only the first failing condition is ever reported.
+		# Finding 46 measured what their absence costs -- an exception
+		# raised in a stub is never dispatched at all -- and until now
+		# nothing had watched any of them fail. Finding 235.
+		pe = struct.unpack_from("<I", bytes(data), 0x3C)[0]
+		where = pe + 24 + 112 + EXCEPTION_DIRECTORY * 8
+		rva, size = struct.unpack_from("<II", bytes(data), where)
+		if kind == "notable":
+			struct.pack_into("<II", data, where, 0, 0)
+		elif kind == "nostub":
+			found = section_named(bytes(data), SECTION_NAME)
+			if found is None:
+				print("detour.py: no stub section to hide", file=sys.stderr)
+				return 2
+			at = bytes(data).find(SECTION_NAME)
+			data[at:at + len(SECTION_NAME)] = b".gone\0\0\0"
+		else:
+			at = rva_to_offset(bytes(data), rva) if rva and size else None
+			if at is None or size < 24:
+				print("detour.py: no function table to sabotage",
+				      file=sys.stderr)
+				return 2
+			if kind == "unsorted":
+				# Swap the last two entries: a binary search over an
+				# unsorted table finds the wrong stub, or none.
+				last = at + (size // 12 - 1) * 12
+				before = at + (size // 12 - 2) * 12
+				one = bytes(data[before:before + 12])
+				data[before:before + 12] = data[last:last + 12]
+				data[last:last + 12] = one
+			elif kind == "stubgap":
+				# Shrink the last entry, leaving stub bytes no entry covers.
+				last = at + (size // 12 - 1) * 12
+				begin, end, unwind = struct.unpack_from("<III", bytes(data),
+				                                        last)
+				struct.pack_into("<III", data, last, begin,
+				                 max(begin, end - 4), unwind)
+			else:			# stubcall
+				found = section_named(bytes(data), SECTION_NAME)
+				if found is None or found[3] < len(PERMIL_POOL) + 5:
+					print("detour.py: stub section too small for a call",
+					      file=sys.stderr)
+					return 2
+				_v, _vs, raw, _rs = found
+				at = raw + len(PERMIL_POOL)
+				data[at:at + 5] = b"\xe8\x00\x00\x00\x00"
 	with open(output, "wb") as image:
 		image.write(bytes(data))
 	print(f"sabotage: {kind} -- {SABOTAGE[kind]} must now be false")

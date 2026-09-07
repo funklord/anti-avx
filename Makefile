@@ -684,7 +684,32 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 	grep -q "left stale" $(BUILD_DIR)/verify-bad-staleupper.log || \
 		{ echo "check-verify: the staleupper control failed, but not"; \
 		  echo "              through the stale-upper-half check"; exit 1; }
-	@echo "check-verify: all five controls rejected, each by its own check"
+# The five unwinder checks are an if/elif chain, so each needs its own kind:
+# only the first failing condition is ever reported. Finding 46 measured what
+# their absence costs -- an exception raised in a stub is never dispatched --
+# and until Finding 235 nothing had watched any of them fail.
+	@set -e; \
+	for pair in "notable:no function table" \
+	            "unsorted:the function table is not sorted" \
+	            "nostub:no stub section" \
+	            "stubgap:outside every function table entry" \
+	            "stubcall:call instruction(s) in the stub section"; do \
+		kind=$${pair%%:*}; want=$${pair#*:}; \
+		$(PYTHON) tool/detour.py sabotage $(BUILD_DIR)/sse-ymm.exe \
+			$(BUILD_DIR)/bad-$$kind.exe $$kind; \
+		if timeout 300 $(PYTHON) tool/detour.py verify \
+			$(BUILD_DIR)/pe-ymm.exe $(BUILD_DIR)/bad-$$kind.exe \
+			$(BUILD_DIR)/pe-ymm.asm \
+			> $(BUILD_DIR)/verify-bad-$$kind.log 2>&1; then \
+			echo "check-verify: the $$kind control PASSED verify, so the"; \
+			echo "              unwinder checks are watching nothing"; \
+			exit 1; \
+		fi; \
+		grep -q "$$want" $(BUILD_DIR)/verify-bad-$$kind.log || \
+			{ echo "check-verify: the $$kind control failed, but not"; \
+			  echo "              through its own check"; exit 1; }; \
+	done
+	@echo "check-verify: all ten controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
@@ -1009,6 +1034,14 @@ clean:
 	      $(BUILD_DIR)/verify-bad-badrow.log \
 	      $(BUILD_DIR)/verify-bad-staleupper.log \
 	      $(BUILD_DIR)/bad-staleupper.exe \
+	      $(BUILD_DIR)/bad-notable.exe $(BUILD_DIR)/bad-unsorted.exe \
+	      $(BUILD_DIR)/bad-nostub.exe $(BUILD_DIR)/bad-stubgap.exe \
+	      $(BUILD_DIR)/bad-stubcall.exe \
+	      $(BUILD_DIR)/verify-bad-notable.log \
+	      $(BUILD_DIR)/verify-bad-unsorted.log \
+	      $(BUILD_DIR)/verify-bad-nostub.log \
+	      $(BUILD_DIR)/verify-bad-stubgap.log \
+	      $(BUILD_DIR)/verify-bad-stubcall.log \
 	      $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@# The wine prefix is a directory this build created, so it goes
