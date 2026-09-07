@@ -387,9 +387,24 @@ def discover(root: Path, cfg: Config) -> tuple[list[Path], int]:
 	The fallback exists so the tool works in a tree that is not a repo yet.
 	"""
 	if in_git_repo(root):
+		# -z, and not for tidiness. Without it git QUOTES any path it
+		# considers unusual -- core.quotePath defaults to true -- so a
+		# file named caf\303\251.py arrives as the literal 12-character
+		# string `"caf\303\251.py"`, `root / name` names nothing on
+		# disk, and the is_file() filter below drops it without a word.
+		# The file is then exempt from every rule this gate enforces
+		# while the run reports a pass, and the collapse floor cannot
+		# see it either because the quoted name is still counted in the
+		# raw population. Measured: a tree whose only violation was in
+		# such a file printed "2 file(s) pass" and exited 0, where the
+		# same violation in an ASCII name exited 1.
+		#
+		# NUL separation rather than core.quotePath=false, which fixes
+		# the same case: a filename may contain a newline, and only -z
+		# survives that.
 		out = subprocess.run(
-			["git", "-C", str(root), "ls-files", "--cached", "--others",
-			 "--exclude-standard"],
+			["git", "-C", str(root), "ls-files", "-z", "--cached",
+			 "--others", "--exclude-standard"],
 			capture_output=True, text=True, check=False)
 		# A git that exits non-zero is a broken instrument, not an empty
 		# tree, and downstream the two are indistinguishable: both arrive
@@ -408,7 +423,7 @@ def discover(root: Path, cfg: Config) -> tuple[list[Path], int]:
 			reject(f"cannot list the files in {root}.", *detail,
 			       "discovery is the whole file set, so continuing "
 			       "would check nothing and pass.")
-		names = [line for line in out.stdout.splitlines() if line]
+		names = [name for name in out.stdout.split("\0") if name]
 		paths = [root / n for n in names]
 	else:
 		paths = [p for p in root.rglob("*") if p.is_file()]
@@ -1734,6 +1749,57 @@ def fix_file(path: Path, cfg: Config, write: bool) -> tuple[bool, str | None]:
 _DOC_TOKEN = re.compile(r"`([A-Za-z0-9._/-]+)`")
 
 
+def outside_fences(text: str):
+	"""(number, line) for every line not inside a CLOSED fenced block.
+
+	Both document checks read prose, and neither could tell prose from a
+	fenced example until this existed: a shell comment starts at column 0
+	exactly as a heading does, and an illustrated markdown table has rows
+	starting with `|` exactly as a real one does. A `# build the thing`
+	appearing twice in one block was reported as a repeated heading, and a
+	fenced table naming `tool/nope.py` as a missing file -- the second only
+	when the illustrated path's parent directory exists, which is why it
+	hid.
+
+	**Only a CLOSED fence hides anything, and the first version of this
+	got that wrong in the direction that matters.** It toggled on every
+	marker, so a lone one swallowed the rest of the file. fuzznet's
+	project.md carries a single `~~~~` at line 6474 as a horizontal rule,
+	with no partner anywhere: the heading count fell from 1086 to 99, and
+	993 headings and every path across the remaining 22,765 lines left the
+	gate without a word. That is the fault this whole function exists to
+	remove, reintroduced by the function -- and it was caught by comparing
+	the two gates across sixteen trees before spreading either, not by
+	review.
+
+	So pairing is required, and an unmatched marker is ordinary text. The
+	worst case is then a genuinely unterminated fence whose contents get
+	read as prose, which is the behaviour before any of this and cannot
+	hide anything. A closing run must be the same character and no shorter
+	than the opening one, and must hold nothing else -- an info string is
+	allowed only on the opener, which is what lets ```sh open and ``` close.
+	"""
+	lines = text.splitlines()
+	inside: set[int] = set()
+	opened_at = 0
+	opened_ch = ""
+	opened_len = 0
+	for number, line in enumerate(lines, start=1):
+		stripped = line.lstrip()
+		char = stripped[:1] if stripped[:1] in ("`", "~") else ""
+		run = len(stripped) - len(stripped.lstrip(char)) if char else 0
+		if not opened_at:
+			if char and run >= 3:
+				opened_at, opened_ch, opened_len = number, char, run
+		elif (char == opened_ch and run >= opened_len
+		      and not stripped.strip(opened_ch)):
+			inside.update(range(opened_at, number + 1))
+			opened_at = 0
+	for number, line in enumerate(lines, start=1):
+		if number not in inside:
+			yield number, line
+
+
 def doc_paths(text: str) -> list[tuple[int, str]]:
 	"""Backticked paths in table rows: the document's declared inventory.
 
@@ -1767,7 +1833,7 @@ def doc_paths(text: str) -> list[tuple[int, str]]:
 	literally greps for a table, finds 149, and concludes this function
 	is broken. One did, and wrote it into a commit message."""
 	found = []
-	for number, line in enumerate(text.splitlines(), start=1):
+	for number, line in outside_fences(text):
 		if not line.lstrip().startswith("|"):
 			continue
 		for token in _DOC_TOKEN.findall(line):
@@ -1811,7 +1877,7 @@ def check_docs(root: Path, cfg: Config,
 	text = doc.read_text(encoding="utf-8", errors="replace")
 
 	seen: dict[str, int] = {}
-	for number, line in enumerate(text.splitlines(), start=1):
+	for number, line in outside_fences(text):
 		if line.startswith("#"):
 			if line in seen:
 				problems.append(Problem(rel, number, 1,

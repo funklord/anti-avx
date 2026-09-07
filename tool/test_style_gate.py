@@ -1381,6 +1381,146 @@ class CommitMsgHook(unittest.TestCase):
 		self.assertEqual(out.returncode, 1, out.stderr)
 
 
+class NonAsciiFilenameIsChecked(unittest.TestCase):
+	"""A quoted path from `git ls-files` used to leave a file unchecked.
+
+	core.quotePath defaults to true, so git renders an unusual path as a
+	quoted C string: caf\303\251.py comes back as the literal 12-character
+	`"caf\303\251.py"`, root / name names nothing, and discover()'s
+	is_file() filter drops it silently. The file was then exempt from every
+	rule while the run reported a pass -- and the collapse floor could not
+	catch it either, because the quoted name is still counted in raw.
+
+	Both directions are held. The violation must be FOUND in the non-ASCII
+	name, or the fix proves nothing; and the control puts the identical
+	violation in an ASCII name, so a run that fails for some unrelated
+	reason cannot be read as this test passing.
+	"""
+
+	def gate(self, root: Path, mode: str = "check") -> tuple[int, str]:
+		gate = Path(__file__).resolve().parent / "style_gate.py"
+		r = subprocess.run([sys.executable, str(gate), mode], cwd=root,
+		                   capture_output=True, text=True, timeout=120)
+		return r.returncode, r.stdout + r.stderr
+
+	def repo(self, root: Path, bad: str, good: str) -> None:
+		env = dict(os.environ,
+		           GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+		run = lambda *a: subprocess.run(["git", "-C", str(root)] + list(a),
+		                                env=env, capture_output=True, check=True)
+		run("init", "-q")
+		(root / ".style-gate.toml").write_text("floor = 0.1\n")
+		(root / bad).write_text("x = 1   \n", encoding="utf-8")
+		(root / good).write_text("y = 2\n", encoding="utf-8")
+		run("add", "-A")
+
+	def test_a_violation_in_a_non_ascii_name_is_found(self):
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			self.repo(root, "caf\u00e9.py", "plain.py")
+			rc, out = self.gate(root)
+			self.assertEqual(rc, 1, f"the violation was not found:\n{out}")
+			self.assertIn("trailing whitespace", out)
+
+	def test_the_file_is_in_the_set_at_all(self):
+		"""The count, because exit 1 alone could come from the other file."""
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			self.repo(root, "caf\u00e9.py", "plain.py")
+			_, out = self.gate(root, "list")
+			self.assertIn("caf\u00e9.py", out, f"not enumerated:\n{out}")
+
+	def test_control_the_same_violation_in_an_ascii_name(self):
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			self.repo(root, "plain.py", "caf\u00e9.py")
+			rc, out = self.gate(root)
+			self.assertEqual(rc, 1, f"the control did not fire:\n{out}")
+
+
+class FencedBlocksAreNotProse(unittest.TestCase):
+	"""`docs` read fenced examples as claims about the tree.
+
+	A shell comment starts at column 0 exactly as a heading does, and an
+	illustrated markdown table has rows starting with `|` exactly as a
+	real one does, so both document checks reported findings against text
+	whose whole purpose was to be an example. Neither is a fault in the
+	tree, and false findings are how a gate acquires an ignore list and
+	stops being read.
+
+	The path case hid behind the "parent does not exist" guard: it fires
+	only when the illustrated path's parent directory is real, which is
+	the likely case for a realistic example and the reason it was not
+	noticed earlier. The fixture therefore creates that directory.
+	"""
+
+	def docs(self, files: dict[str, str]) -> tuple[int, str]:
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			for name, text in files.items():
+				(root / name).parent.mkdir(parents=True, exist_ok=True)
+				(root / name).write_text(text, encoding="utf-8")
+			gate = Path(__file__).resolve().parent / "style_gate.py"
+			r = subprocess.run([sys.executable, str(gate), "docs"], cwd=root,
+			                   capture_output=True, text=True, timeout=120)
+			return r.returncode, r.stdout + r.stderr
+
+	FENCED_COMMENTS = ("# Title\n\n```sh\n# build the thing\nmake all\n"
+	                   "# build the thing\nmake test\n```\n")
+
+	def test_a_repeated_comment_in_a_fence_is_not_a_repeated_heading(self):
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": self.FENCED_COMMENTS})
+		self.assertEqual(rc, 0, f"fenced comment read as a heading:\n{out}")
+		self.assertNotIn("heading repeats", out)
+
+	def test_a_real_repeated_heading_is_still_caught(self):
+		"""The control: the check must still be able to fire."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": "# Title\n\n# Title\n"})
+		self.assertEqual(rc, 1, f"the check cannot fire at all:\n{out}")
+		self.assertIn("heading repeats", out)
+
+	def test_a_path_in_a_fenced_table_is_not_an_inventory_entry(self):
+		doc = ("# Title\n\n```markdown\n| file | note |\n|---|---|\n"
+		       "| `tool/nope.py` | an illustration |\n```\n")
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": doc,
+		                     "tool/real.py": "x = 1\n"})
+		self.assertEqual(rc, 0, f"fenced example demanded on disk:\n{out}")
+		# "names a missing file", not "missing file": the SUCCESS line
+		# reads "names no missing file", so the loose pattern matches a
+		# pass. Caught by this test failing against a correct gate.
+		self.assertNotIn("names a missing file", out)
+
+	def test_a_lone_marker_does_not_swallow_the_rest_of_the_file(self):
+		"""fuzznet's `~~~~` is a horizontal rule, and the first fix ate 993
+		headings behind it. An unmatched marker must be ordinary text."""
+		doc = ("# Title\n\n~~~~\n\n## After the rule\n\n"
+		       "| file | note |\n|---|---|\n| `tool/nope.py` | real |\n")
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": doc,
+		                     "tool/real.py": "x = 1\n"})
+		self.assertEqual(rc, 1, f"everything after the rule was skipped:\n{out}")
+		self.assertIn("names a missing file", out)
+
+	def test_headings_after_a_lone_marker_are_still_counted(self):
+		"""The count, because the path half alone could hide a smaller loss."""
+		doc = "# One\n\n~~~~\n\n## Two\n\n### Three\n"
+		_, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                    "project.md": doc})
+		self.assertIn("3 heading(s)", out, f"headings lost behind a rule:\n{out}")
+
+	def test_a_real_missing_inventory_entry_is_still_caught(self):
+		"""The control, and it must fail through the path half."""
+		doc = "# Title\n\n| file | note |\n|---|---|\n| `tool/nope.py` | real |\n"
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": doc,
+		                     "tool/real.py": "x = 1\n"})
+		self.assertEqual(rc, 1, f"the path check cannot fire:\n{out}")
+		self.assertIn("names a missing file", out)
+
+
 class ReportsItsScope(unittest.TestCase):
 	"""The success line must not claim more or less than the gate checks.
 
