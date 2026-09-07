@@ -95,7 +95,7 @@ test: check-aliasing check-lowering check-f16c check-fmaddsub \
       check-permil check-permd
 
 check: style verify check-verify check-aliasing check-lowering check-isa \
-       check-f16c check-f16c-oracle check-fmaddsub check-permil check-permd
+       check-f16c check-f16c-oracle check-fmaddsub check-permil check-permd check-span
 
 style: style-source style-docs
 
@@ -426,6 +426,7 @@ placement: $(LISTING)
 # has said static TLS is "proven under wine" since Finding 69 with nothing
 # in the tree that proved it. This is that proof, and the sweep is what
 # makes it one: a smaller SizeOfZeroFill must NOT return 66.
+# Needs wine, and stays out of `check` for that reason. Finding 242.
 check-tls:
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-tls: wine is not installed"; exit 1; }
@@ -785,6 +786,8 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 # not own, and the message named `aliasing`. The canary asks whether wine
 # runs at all before any of that, so the cause is stated once instead of
 # being attributed to whichever fixture happens to be first.
+# Needs wine, so it is not a prerequisite of `check`: a commit gate
+# must not fail on a machine without it. Finding 242.
 check-pe: $(PE_FIXED) $(PE_SOURCES)
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-pe: wine is not installed"; exit 1; }
@@ -844,6 +847,7 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 # which no single-threaded test can reach.
 #
 # Termination: one wine invocation per mode, each under a timeout.
+# Needs wine, and stays out of `check` for that reason. Finding 242.
 check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
              $(BUILD_DIR)/pe-homespill.exe $(BUILD_DIR)/pe-homespill.asm \
              $(BUILD_DIR)/pe-shadowspill.exe $(BUILD_DIR)/pe-shadowspill.asm \
@@ -994,6 +998,7 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 # ever goes back to 5 something has stopped emitting `.avxpdat`.
 #
 # Termination: one wine invocation per program, each under a timeout.
+# Needs wine, and stays out of `check` for that reason. Finding 242.
 check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe \
               $(BUILD_DIR)/pe-unwindspill.exe $(BUILD_DIR)/pe-unwindspill.asm
 	@command -v wine >/dev/null 2>&1 || \

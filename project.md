@@ -13686,6 +13686,36 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 242 -- a five-second check that proves bit-exactness was not in the gate
+
+Eight `check-*` targets are not prerequisites of `check`. Four say why -- they need qemu,
+or take minutes. Four said nothing, and the reason mattered in only one of them:
+
+```
+check-pe       needs wine        reason real, unstated
+check-spill    needs wine        reason real, unstated
+check-tls      needs wine        reason real, unstated
+check-unwind   needs wine        reason real, unstated
+check-span     needs nothing     4.9 s, and it was not running
+```
+
+`check-span` runs `span_oracle.py`, which reports **6 span(s) lower to SSE that computes
+what the 256-bit original computes, bit for bit** -- and it carries two of its own
+controls, a capability control that the 256-bit side must not run on this host, and a
+sabotage requiring two values sharing one slot to be rejected, under the note that *a
+harness that agrees with itself proves nothing*. So it is a check that can fail, costs
+five seconds, and nobody ran it unless they remembered to.
+
+It is in `check` now, and the four wine gates carry the sentence saying why they are not:
+**a commit gate must not fail on a machine without wine.** That reason was true all along
+and written nowhere, which is the difference between a deliberate exclusion and an
+accident nobody can tell apart later.
+
+**The lens is `evidence.md`'s, moved indoors.** *A check that runs only in CI is a check
+you have stopped running* -- and a check that runs only when somebody types its name is
+the same thing with a shorter distance. What made it findable was asking which targets
+exist rather than which ones the gate names.
+
 ### Finding 241 -- the headline numbers were stale in both documents, and now a target says so
 
 The most-read line of each document, measured against what the tool reports:
