@@ -11195,6 +11195,14 @@ def frontier_census(original, patched, listing):
 	roll = Path("build") / "frontier-sites.txt"
 	if roll.parent.is_dir():
 		with roll.open("w", encoding="utf-8") as out:
+			# **Name the image, because the path is fixed.** Any `frontier`
+			# run overwrites this file, so a two-line census of a fixture
+			# replaces Starfield's 5,673 and nothing says so. Measured the
+			# hard way: a coverage count was computed against a fixture's
+			# leftovers and reported 304 lowered sites with no oracle case,
+			# where the real answer is 1. A reader -- or a script -- can now
+			# see which binary the rows describe. Finding 240.
+			out.write(f"# {original}\t{len(surviving)} surviving\n")
 			for address in sorted(surviving):
 				row = by_address.get(address)
 				out.write(f"{address:#x}\t{reason_of.get(address, '?')}\t"

@@ -13686,6 +13686,40 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 240 -- a fixed path made a fixture's census look like Starfield's
+
+Asking which lowered mnemonics no oracle names produced three answers, and only the last
+is true:
+
+```
+304 sites   searching one tool (lowering_cases.py) instead of eight
+ 22 sites   searching all eight, but against a census of a FIXTURE
+  1 site    against Starfield's own 5,673-row census
+```
+
+`build/frontier-sites.txt` is a fixed path, so the `frontier` run I did on the
+`switchtable` fixture had overwritten Starfield's 5,673 rows with **two**, and nothing in
+the file said which binary it described. Every mnemonic then looked `survive=0`, so
+everything looked lowered.
+
+**The result disagreed with something already known and that is what should have caught
+it.** `vcmple_oqps` on `%ymm` cannot be lowered -- the rewriter refuses 256-bit
+arithmetic, which is the largest bucket on the frontier -- yet the table said it was. A
+number that contradicts a rule you rely on is not a surprise to explain later.
+
+The file now opens with `# <image>\t<n> surviving`. It costs one line and makes the
+artifact self-describing, which is the property it needed to have when it was added
+earlier the same day.
+
+**And the coverage lens comes back empty, which is the honest headline.** Of 215 distinct
+VEX mnemonics in `.text`, 14 are named by no oracle or lowering tool and 13 of those are
+entirely survivors -- 256-bit and AVX-only shapes the rewriter refuses. The remaining one
+is `vfmsub213ss`, a single lowered site, and FMA is dispatched by regex rather than by
+name: `FMA_SAMPLES` picks one form per distinct arm of `lower_fma` deliberately, so a
+mnemonic absent from that list is not thereby uncovered. **A name test cannot answer a
+question about shapes**, which is the same error as searching one tool of eight, one level
+up.
+
 ### Finding 239 -- every check that can fail has been watched failing
 
 Thirteen controls, from three. Sixteen of `verify`'s seventeen checks have now been seen to
