@@ -74,7 +74,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs shapes cost-bench cost status probe why check-spill check-tls check-unwind check-vex \
+        census spans gprs shapes cost-bench cost status probe why check-shadow check-spill check-tls check-unwind check-vex \
         check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -151,6 +151,16 @@ check-lanes: | $(BUILD_DIR)
 # natively, because the span is pure SSE and that is the whole point.
 check-span: | $(BUILD_DIR)
 	$(PYTHON) tool/span_oracle.py $(BUILD_DIR)
+
+# The uniform shadow representation: every ymm has a PERMANENT slot, so a
+# 256-bit operation needs no proof of where its operands came from. This
+# asks whether the arithmetic is right under it, which span_oracle cannot
+# reach -- a span addresses the high half of a MEMORY operand, and the
+# largest refused bucket on the frontier is arithmetic whose source is a
+# register. Needs qemu for the 256-bit side, so it says SKIPPED rather than
+# passing where that is absent. Finding 243.
+check-shadow: | $(BUILD_DIR)
+	$(PYTHON) tool/shadow_oracle.py $(BUILD_DIR)
 
 # -- the software F16C conversions -------------------------------------------
 

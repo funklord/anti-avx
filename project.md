@@ -13686,6 +13686,65 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 243 -- the uniform shadow representation computes correctly, measured
+
+**Can this reach 100%?** Nothing measured says otherwise. No refusal in the census names
+an operation without an SSE equivalent; every one names a proof that failed or a window
+that would not fit. The ceiling is not 100% of the counted sites either -- 180 of the
+805,131 are `(bad)` data bytes, so **99.978%** is the arithmetic maximum on that
+denominator, and 99.295% is reached.
+
+**What blocks the rest is one circularity, and it is an artefact of rewriting
+partially.** To relocate a ymm's upper half needs a 256-bit instruction and the host has
+none, so the rewriter must PROVE where each value came from and refuses when it cannot.
+That is the two largest groups: 1,875 "arithmetic rather than a copy" and ~1,363
+provenance failures. It dissolves if every VEX site is lowered: nothing then writes a ymm
+upper half, ymm registers are effectively 128-bit, and a 256-bit value is a pair -- low
+half in xmm, high half in a permanent slot. No walk, no window, no proof.
+
+**The region strategy already says this in its refusals.** Of 5,580 regions not
+representable, **5,383 (96%) fail for one reason: a member reads a ymm defined outside the
+region** -- after a call, after a jump, at a branch target. A permanent slot answers all
+three, because the value's origin stops mattering.
+
+`shadow_oracle.py` asks whether the arithmetic is right under that representation, which
+`span_oracle` cannot reach: a span addresses the high half of a MEMORY operand, and the
+refused bucket is arithmetic whose source is a REGISTER.
+
+```
+vaddps %ymm1,%ymm2,%ymm3  ->  movaps %xmm2,%xmm3      low half
+                              addps  %xmm1,%xmm3
+                              movaps s2,%xmm15        high half
+                              addps  s1,%xmm15
+                              movaps %xmm15,s3
+
+9 register-source operations agree with the 256-bit original bit for bit
+control: a high half taken from the low one DIFFERS
+```
+
+Both sides run and in different places -- the original under qemu, the lowering natively,
+because it is pure SSE. The harness populates the slots on load and reads them on store,
+so what is tested is the representation end to end rather than one instruction.
+
+**The first run reported nine DIFFER with the lowering visibly correct**, because a
+function entered by `call` leaves `%rsp` at 8 mod 16 and both `movaps` to a slot and
+`addps` from one need an aligned operand. The harness was measuring itself. A real stub
+borrows the callee home space, which the ABI aligns.
+
+**The price, stated because it is the reason this is not simply better.** Five
+instructions and a scratch register for one. Sixteen ymm cannot be sixteen xmm pairs --
+there are only sixteen xmm -- so upper halves live in memory permanently. And it is
+all-or-nothing: every writer must maintain its slot and every reader consult it, so a
+partial adoption is incoherent, which is exactly why the current incremental design cannot
+converge on it.
+
+**What is proved here is the arithmetic, and nothing else yet.** Not the slot allocation,
+not the emission into stubs, not that every VEX.128 write can be made to clear its slot.
+That last one is the real question for adoption, and the tree already computes the set it
+would touch: `stale_upper_reads` finds the 128-bit writes a 256-bit read observes, a few
+hundred sites rather than the 518,990 in-place patches -- which is what makes the
+prerequisite bounded rather than hopeless.
+
 ### Finding 242 -- a five-second check that proves bit-exactness was not in the gate
 
 Eight `check-*` targets are not prerequisites of `check`. Four say why -- they need qemu,
