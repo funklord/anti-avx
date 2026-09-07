@@ -1800,6 +1800,24 @@ def outside_fences(text: str):
 			yield number, line
 
 
+def heading_number(line: str) -> str:
+	"""The section number a heading opens with, or "" if it opens with none.
+
+	`## 130. Title` gives "130", `### 26.223 Title` gives "26.223", and
+	`## 15d. Title` gives "15d" -- a letter suffix is how these documents
+	insert a section between two that are already numbered, so it is part
+	of the identifier rather than noise. A heading with no leading number
+	gives "", which is what keeps this silent in the documents that do not
+	number their sections at all.
+	"""
+	body = line.lstrip("#").strip()
+	token = body.split(" ", 1)[0].rstrip(".")
+	if not token or not token[0].isdigit():
+		return ""
+	return token if all(c.isdigit() or c == "." or c.islower()
+	                    for c in token) else ""
+
+
 def doc_paths(text: str) -> list[tuple[int, str]]:
 	"""Backticked paths in table rows: the document's declared inventory.
 
@@ -1877,6 +1895,21 @@ def check_docs(root: Path, cfg: Config,
 	text = doc.read_text(encoding="utf-8", errors="replace")
 
 	seen: dict[str, int] = {}
+	# A NUMBER is an identifier, and two sections may carry the same one
+	# while their headings differ -- so the repeat check above cannot see
+	# it. Two sessions appending to one document pick the next number by
+	# reading the file, and between the read and the write the other has
+	# already taken it. Measured 2026-09-06 across seven numbered
+	# documents: fuzznet carried two `## 130.` written the same day, and
+	# situ two `### 26.223`.
+	#
+	# Keyed by level AND parent, because a bare `### 1.` restarting under
+	# each `##` is how several of these documents are written and is not a
+	# collision. Only a number repeated among siblings is one. That is the
+	# whole of the rule: it needs no list of which trees number their
+	# sections, and stays silent in the three that do not.
+	numbers: dict[tuple[int, str, str], int] = {}
+	parents: dict[int, str] = {}
 	for number, line in outside_fences(text):
 		if line.startswith("#"):
 			if line in seen:
@@ -1884,6 +1917,19 @@ def check_docs(root: Path, cfg: Config,
 					f"heading repeats line {seen[line]}: {line.strip()}"))
 			else:
 				seen[line] = number
+			level = len(line) - len(line.lstrip("#"))
+			parents[level] = line.strip()
+			for deeper in [k for k in parents if k > level]:
+				del parents[deeper]
+			label = heading_number(line)
+			if label:
+				key = (level, parents.get(level - 1, ""), label)
+				if key in numbers:
+					problems.append(Problem(rel, number, 1,
+						f"section {label} repeats line {numbers[key]}: "
+						f"{line.strip()}"))
+				else:
+					numbers[key] = number
 
 	counts["headings"] = len(seen)
 	if not cfg["doc_check_paths"]:
