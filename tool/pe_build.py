@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2142,6 +2142,40 @@ table:	.long	0x103a			/* case0, as an RVA */
 	.long	0x103b			/* case1 */
 source:	.long 1, 2, 3, 4
 	.long 77, 6, 7, 8
+""")
+
+
+# Register-source 256-bit arithmetic, which is refused without permanent
+# slots and lowered with them. `vpaddd %ymm1,%ymm2,%ymm2` is the `lanereg`
+# shape: the second source is a REGISTER, so its upper half lives in a slot
+# of its own and the operation has to reach it there. A span's slot table is
+# local, so it answers None and the member is refused -- the single refusal
+# behind 1,875 "arithmetic rather than a copy" sites.
+#
+# The answer is deliberately in the UPPER half: element 4 sits at offset 16,
+# so 77 can only be right if the high halves were added and stored. A
+# lowering that operated on the low half twice returns 7.
+PROGRAMS["laneregadd"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm1
+	vmovups	0x20(%rsi), %ymm2
+	vpaddd	%ymm1, %ymm2, %ymm2	/* lanereg: second source is a register */
+	vmovups	%ymm2, (%rdi)
+	movl	16(%rdi), %eax		/* upper half: 70 + 7 = 77 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 70, 6, 7, 8
+	.long 0, 0, 0, 0
+	.long 7, 0, 0, 0
 """)
 
 

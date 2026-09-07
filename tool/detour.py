@@ -4091,12 +4091,12 @@ def span_entries(members, instructions, slots, scope, plain):
 			shape = span_operand_shape(vex, encoding[vex["length"]:],
 			                           operands, None)
 			if shape is not None and shape[0] in ("lanereg", "lanereg3"):
-				second = slots.get(shape[2])
+				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
 			# text to look either of them up with.
 			if shape is not None and shape[0] == "lanereg3":
-				third = slots.get(shape[3])
+				third = slot_for(slots, shape[3])
 		out.append((kind, address, encoding, mnemonic, operands,
 		            slots.get(register), moved, second, third))
 	return out
@@ -4116,6 +4116,56 @@ def span_entries(members, instructions, slots, scope, plain):
 # because a bigger `SizeOfZeroFill` for no sites is a cost with no return.
 # Finding 157.
 TLS_SLOTS = 4
+
+# **Sixteen permanent slots, one per ymm, which is the uniform
+# representation.** A span's slot table is LOCAL to the span, so a member
+# reading a register the span does not track gets `None` and the operation
+# is refused -- `lanereg second source is in no slot`. That single refusal
+# is what 1,875 "arithmetic rather than a copy" sites and 5,383 of 5,580
+# unrepresentable regions come down to: the value's upper half exists
+# nowhere the lowering can address.
+#
+# Give every register a slot that outlives every span and the question
+# stops being asked. Nothing has to be proved about where a value came
+# from, which is the whole purpose of the provenance walk.
+#
+# The price is real and is why this is a flag rather than the default:
+# sixteen ymm cannot be sixteen xmm pairs, so the upper halves live in
+# memory permanently, and the representation is only coherent if EVERY
+# writer maintains its slot. Finding 244.
+SHADOW_REGS = 16
+SHADOW_OFF, SHADOW_ALL = "off", "all"
+SHADOW_RULE = SHADOW_OFF
+
+
+def tls_block_slots():
+	"""How many slots the per-thread block must hold."""
+	return TLS_SLOTS + (SHADOW_REGS if SHADOW_RULE == SHADOW_ALL else 0)
+
+
+def shadow_index(register):
+	"""The permanent slot index for `%ymmN`, past the transient ones."""
+	name = canonical_ymm(register)
+	if name is None or not name.startswith("%ymm"):
+		return None
+	try:
+		number = int(name[len("%ymm"):])
+	except ValueError:
+		return None
+	return TLS_SLOTS + number if 0 <= number < SHADOW_REGS else None
+
+
+def slot_for(slots, register):
+	"""`slots`'s answer, or the register's permanent slot when shadows are on.
+
+	The one place the uniform representation differs from the span's own
+	bookkeeping, so that `lower_ymm_span` needs no change: it already knows
+	how to operate between a slot and a helper.
+	"""
+	found = slots.get(register)
+	if found is not None or SHADOW_RULE != SHADOW_ALL:
+		return found
+	return shadow_index(register)
 
 
 def span_slot_move(helper, save, base, slot, block, at):
@@ -6960,7 +7010,7 @@ def collect(binary, listing, context=None):
 	tls_slot_offset = None
 	if SPILL == SPILL_TLS:
 		with open(binary, "rb") as image:
-			found = tls_slot(image.read(), TLS_SLOTS * SLOT)
+			found = tls_slot(image.read(), tls_block_slots() * SLOT)
 		if found is not None:
 			tls_slot_offset = found
 	# Where a 256-bit load can be taken at its word. Only the headers are
@@ -10586,7 +10636,7 @@ def main(argv):
 	# site, as it always has, and the other two exist so that all three can
 	# be built and compared. See Finding 46.
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
-	global REGION_PLACE, FALLBACK_RULE
+	global REGION_PLACE, FALLBACK_RULE, SHADOW_RULE
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -10604,6 +10654,16 @@ def main(argv):
 				print(f"detour.py: unknown region rule {REGION_RULE!r}",
 				      file=sys.stderr)
 				return 2
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--shadow-regs="):
+			want = item.split("=", 1)[1]
+			if want not in (SHADOW_OFF, SHADOW_ALL):
+				print(f"detour.py: --shadow-regs wants off or all, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			SHADOW_RULE = want
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
@@ -11274,7 +11334,7 @@ def tls_for(binary):
 		# and a span wants its peak, and both address the same area --
 		# `SizeOfZeroFill` is one number for the image, so it is sized for
 		# the largest thing that will ever reach into it.
-		return tls_slot(image.read(), TLS_SLOTS * SLOT)
+		return tls_slot(image.read(), tls_block_slots() * SLOT)
 
 
 def report_cost(candidates, placed, home):

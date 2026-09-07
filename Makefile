@@ -74,7 +74,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs shapes cost-bench cost status probe why check-shadow check-spill check-tls check-unwind check-vex \
+        census spans gprs shapes cost-bench cost status probe why check-shadow check-shadow-pe check-spill check-tls check-unwind check-vex \
         check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -161,6 +161,28 @@ check-span: | $(BUILD_DIR)
 # passing where that is absent. Finding 243.
 check-shadow: | $(BUILD_DIR)
 	$(PYTHON) tool/shadow_oracle.py $(BUILD_DIR)
+
+# The representation end to end: a fixture whose answer lives in the UPPER
+# half, refused without permanent slots and lowered with them. `laneregadd`
+# is not in PE_NAMES because it FAILS without the flag, which is the point
+# of it. Needs wine. Finding 244.
+check-shadow-pe: $(BUILD_DIR)/pe-laneregadd.exe $(BUILD_DIR)/pe-laneregadd.asm
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
+	@set -e; \
+	$(PYTHON) tool/detour.py --shadow-regs=all apply \
+		$(BUILD_DIR)/pe-laneregadd.exe $(BUILD_DIR)/pe-laneregadd.asm \
+		$(BUILD_DIR)/sse-laneregadd.exe > /dev/null; \
+	mkdir -p $(PE_PREFIX); \
+	got=0; \
+	WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d \
+		wine $(BUILD_DIR)/sse-laneregadd.exe > /dev/null 2>&1 || got=$$?; \
+	if [ "$$got" != "77" ]; then \
+		echo "check-shadow-pe: returned $$got, want 77"; exit 1; \
+	fi; \
+	echo "check-shadow-pe: register-source 256-bit arithmetic lowered"; \
+	echo "                 through permanent slots returns 77 -- the answer"; \
+	echo "                 is in the upper half, so the slots carried it"
 
 # -- the software F16C conversions -------------------------------------------
 

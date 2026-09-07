@@ -13686,6 +13686,55 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 244 -- the representation is in the tool, and it unlocks nothing yet
+
+`--shadow-regs=all` gives every ymm a permanent slot instead of a span-local one.
+`lower_ymm_span` needed no change: it already knows how to operate between a slot and a
+helper, and what refused it was `second = slots.get(...)` answering None because the slot
+table is LOCAL to a span. `slot_for()` falls back to the register's permanent slot, and
+the refusal stops being reachable.
+
+**It works, end to end, and the fixture cannot be satisfied by accident.** `laneregadd`
+computes `vpaddd %ymm1,%ymm2,%ymm2` -- the `lanereg` shape, second source a register --
+and reads element 4, which sits at offset 16. 77 can only appear if the HIGH halves were
+added and stored; a lowering that operated on the low half twice returns 7.
+
+```
+fixture, no permanent slots   1 in-place, 0 detours, region REFUSED
+fixture, --shadow-regs=all    1 in-place, 1 detour
+original under wine           rc=29   faults, no AVX here
+rewritten under wine          rc=77
+```
+
+**And on Starfield it moves nothing: 5,673 -> 5,673.** Regions went from 5,580 not
+representable to 5,579 -- one site. **The dominant refusal is upstream of what this
+fixes.** `region_members` rejects a member that reads a ymm the region did not itself
+define, before any slot is resolved:
+
+```
+members: reads a ymm defined outside the region, after a call            3,378
+members: reads a ymm defined outside the region, after a jump            1,079
+members: reads a ymm defined outside the region, at a branch target        926
+```
+
+**That guard is soundness, not bookkeeping, and relaxing it now would ship wrong bytes.**
+A permanent slot carries the right value only if whatever defined the register OUTSIDE
+the region also maintained it -- and nothing does. Every 256-bit write would have to
+store its high half, and every VEX.128 write clear it, or a read gets a stale slot. That
+is the all-or-nothing property, and it is the unbuilt half.
+
+**So the honest position: the representation is proved and the plumbing reaches only the
+last refusal.** The measurement is worth more than a gain would have been, because it
+names exactly what adoption costs -- not a lowering, an invariant maintained by every
+writer in the binary.
+
+**What makes it tractable rather than hopeless is already computed.** `stale_upper_reads`
+finds the 128-bit writes a 256-bit read observes: on Starfield 184 reverted patches, 141
+withheld windows, 131 conservative candidates. Hundreds of sites, not the 518,990
+in-place patches -- because most 128-bit writes are to registers never read 256-bit
+again. Maintaining the invariant is a bounded change, and the set is the one the repair
+pass already walks.
+
 ### Finding 243 -- the uniform shadow representation computes correctly, measured
 
 **Can this reach 100%?** Nothing measured says otherwise. No refusal in the census names
