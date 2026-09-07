@@ -49,7 +49,7 @@ import re
 import struct
 import subprocess
 import sys
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 
 HERE = __import__("pathlib").Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -10965,28 +10965,45 @@ def frontier_census(original, patched, listing):
 	got = {site for site, _w, _s, _z, _p in placed}
 
 	counted, shapes = Counter(), Counter()
+	# **And the shape of each bucket, not only of the whole.** The
+	# totals say which reason is biggest; they cannot say what the
+	# sites in it ARE, which is what decides whether a bucket is one
+	# strategy's worth of work or a thousand unrelated shapes.
+	by_reason = defaultdict(Counter)
 	by_address = {row[0]: row for row in instructions}
 	for address in surviving:
 		row = by_address.get(address)
 		if row is not None:
 			shapes[row[2]] += 1
 		if address in reverted:
-			counted["kept: a repair left it in VEX form"] += 1
+			reason = "kept: a repair left it in VEX form"
 		elif address in inside_dropped:
-			counted["kept: its window was withheld"] += 1
+			reason = "kept: its window was withheld"
 		elif address in declined:
-			counted[f"declined: {declined[address]}"] += 1
+			reason = f"declined: {declined[address]}"
 		elif address in wanted and address not in got:
-			counted["lost to an overlap or a refused stub"] += 1
+			reason = "lost to an overlap or a refused stub"
 		elif address in wanted:
-			counted["a placed window covered it (should not happen)"] += 1
+			reason = "a placed window covered it (should not happen)"
 		else:
-			counted["never a candidate"] += 1
+			reason = "never a candidate"
+		counted[reason] += 1
+		if row is not None:
+			by_reason[reason][row[2]] += 1
 	print(f"frontier: {len(surviving):,} surviving VEX instruction(s)")
 	width = max((len(name) for name in counted), default=0)
 	for name, count in counted.most_common():
 		print(f"  {name:<{width}}  {count:>6,}")
 	print(f"  {'total':<{width}}  {sum(counted.values()):>6,}")
+	print("frontier: the commonest mnemonics in each reason")
+	for reason, _n in counted.most_common():
+		shown = by_reason[reason]
+		if not shown:
+			continue
+		top = "  ".join(f"{name} {n:,}"
+		                for name, n in shown.most_common(4))
+		print(f"  {reason}")
+		print(f"      {top}")
 	print("frontier: the ten commonest mnemonics among them")
 	for name, count in shapes.most_common(10):
 		print(f"  {name:<{width}}  {count:>6,}")

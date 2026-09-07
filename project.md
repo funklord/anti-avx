@@ -13649,6 +13649,56 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 226 -- the census reports each bucket's shape, and the buckets were carrying data
+
+`frontier_census` reported mnemonics in aggregate, so it could say which reason was
+biggest and not what the sites in it ARE -- which is the whole question, because a bucket
+that is 900 `vmovups` is one strategy's worth of work and a thousand unrelated shapes is
+not work at all. It now prints the commonest mnemonics per reason. The tally also
+computes its bucket ONCE into `reason` and increments both counters from it, where six
+branches previously incremented `counted` directly and a seventh could have disagreed.
+
+**The first run confirmed this session's two guards from the tool's own accounting**,
+which until now rested on probes I had written:
+
+```
+                                          before    after   delta
+declined: arithmetic rather than a copy    1,925    1,875     -50
+declined: no direct SSE form                  52        2     -50
+never a candidate                             86      185     +99
+declined: standing in a data island            -        1      +1
+                                                                0
+```
+
+99 is exactly Finding 222's count of `(bad)` rows reaching the candidate loop, and 1 is
+exactly Finding 225's cleanly-decoding site in a constant pool. Two instruments, same
+answers, and the arithmetic closes to zero.
+
+**`no direct SSE form` was 52 and is 2: fifty of the fifty-two were data.** That bucket
+had been in the ranked list as though it were work, and 96% of it was constant-pool
+bytes. `arithmetic rather than a copy` lost 50 the same way. **A decline reason is a
+claim about a site, and the sites were not all instructions.**
+
+**And the buckets are fewer problems than they look.** Seven reasons are 94-100%
+`vmovups` and sum to about 2,095 -- larger than the 1,875 at the top of the list:
+
+```
+ymm value has no known upper half                    vmovups 988  vmovdqu 45  vmovupd 13
+256-bit: no store before 256-bit arithmetic          vmovups 270  vmovdqu 21  vmovupd  6
+256-bit: the constant is read without a reload       vmovups 116  vmovdqu 68  vmovupd 18
+256-bit: no store before the value is touched        vmovups 165
+256-bit: no store before a control transfer          vmovups 158
+256-bit: no store before a branch target in the run  vmovups 132
+ymm upper half read later                            vmovups 112
+```
+
+They are one question in seven phrasings: **a 256-bit move whose value cannot be traced
+to memory or to a constant.** That is not waiting on a lowering, it is waiting on the
+walk. Relocating a ymm's upper half at runtime needs a 256-bit-aware instruction and the
+host has none, so provenance must be established statically -- which is why every
+strategy that succeeds (`pair`, `longload`/`longstore`, `region`) works by proving the
+value came from memory or read-only bytes and copying 32 bytes as two halves.
+
 ### Finding 225 -- one instruction in a constant pool, refused for the wrong reason
 
 Findings 222 and 223 refuse what objdump refused. Neither can see a table whose bytes
