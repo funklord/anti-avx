@@ -693,7 +693,8 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 	            "unsorted:the function table is not sorted" \
 	            "nostub:no stub section" \
 	            "stubgap:outside every function table entry" \
-	            "stubcall:call instruction(s) in the stub section"; do \
+	            "stubcall:call instruction(s) in the stub section" \
+	            "stubbad:decode to nothing"; do \
 		kind=$${pair%%:*}; want=$${pair#*:}; \
 		$(PYTHON) tool/detour.py sabotage $(BUILD_DIR)/sse-ymm.exe \
 			$(BUILD_DIR)/bad-$$kind.exe $$kind; \
@@ -709,7 +710,7 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 			{ echo "check-verify: the $$kind control failed, but not"; \
 			  echo "              through its own check"; exit 1; }; \
 	done
-	@echo "check-verify: all ten controls rejected, each by its own check"
+	@echo "check-verify: all eleven controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
@@ -1037,6 +1038,8 @@ clean:
 	      $(BUILD_DIR)/bad-notable.exe $(BUILD_DIR)/bad-unsorted.exe \
 	      $(BUILD_DIR)/bad-nostub.exe $(BUILD_DIR)/bad-stubgap.exe \
 	      $(BUILD_DIR)/bad-stubcall.exe \
+	      $(BUILD_DIR)/bad-stubbad.exe \
+	      $(BUILD_DIR)/verify-bad-stubbad.log \
 	      $(BUILD_DIR)/verify-bad-notable.log \
 	      $(BUILD_DIR)/verify-bad-unsorted.log \
 	      $(BUILD_DIR)/verify-bad-nostub.log \

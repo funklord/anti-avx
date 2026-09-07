@@ -10718,6 +10718,10 @@ def main(argv):
 # island is rather than each having its own idea. Finding 224.
 ISLAND_GAP = 256
 
+# Sabotage kinds that break the COLLECTOR rather than an image, so an
+# unchanged output is correct for them and an error for everything else.
+CODE_KINDS = ("badrow", "staleupper")
+
 # **Controls for the checks no broken IMAGE can express.** `sabotage`
 # corrupts an artifact, which is enough for a check that reads bytes: the
 # stub section, the sections after `.text`, the data islands. Those are
@@ -10744,6 +10748,7 @@ SABOTAGE = {
 	"nostub": "the stub section is present",
 	"stubgap": "every stub byte lies inside a function table entry",
 	"stubcall": "the stub section holds no call",
+	"stubbad": "every byte of stub decodes to an instruction",
 	"badrow": "no (bad) row reaches the candidate loop",
 	"staleupper": "the repair withholds what would ship a stale upper half",
 }
@@ -10767,7 +10772,8 @@ def sabotage(patched, output, kind):
 		print(f"detour.py: unknown sabotage {kind!r}, want one of "
 		      f"{', '.join(sorted(SABOTAGE))}", file=sys.stderr)
 		return 2
-	data = bytearray(open(patched, "rb").read())
+	original_bytes = open(patched, "rb").read()
+	data = bytearray(original_bytes)
 	if kind == "stubvex":
 		# `c5 fc 10 06` is `vmovups (%rsi),%ymm0` -- a VEX prefix in the one
 		# section this whole rewrite exists to keep free of them.
@@ -10833,7 +10839,8 @@ def sabotage(patched, output, kind):
 			return 2
 		vaddr, raddr, _size = inplace.text_mapping(patched)
 		data[raddr + (spot - vaddr)] ^= 0xFF
-	if kind in ("notable", "unsorted", "nostub", "stubgap", "stubcall"):
+	if kind in ("notable", "unsorted", "nostub", "stubgap", "stubcall",
+	            "stubbad"):
 		# **The unwinder checks, which are an if/elif chain**, so each needs
 		# its own kind: only the first failing condition is ever reported.
 		# Finding 46 measured what their absence costs -- an exception
@@ -10872,6 +10879,20 @@ def sabotage(patched, output, kind):
 				                                        last)
 				struct.pack_into("<III", data, last, begin,
 				                 max(begin, end - 4), unwind)
+			elif kind == "stubbad":
+				# `06` is `push es`, deleted in 64-bit mode, so objdump
+				# renders it `(bad)`. Chosen over a malformed VEX on
+				# purpose: a `c4` with an illegal map would also be counted
+				# by the stub-VEX check, and a control that fails two checks
+				# is a control for neither -- Finding 234.
+				found = section_named(bytes(data), SECTION_NAME)
+				if found is None or found[3] < len(PERMIL_POOL) + 4:
+					print("detour.py: stub section too small to corrupt",
+					      file=sys.stderr)
+					return 2
+				_v, _vs, raw, _rs = found
+				at = raw + len(PERMIL_POOL)
+				data[at:at + 4] = b"\x06\x06\x06\x06"
 			else:			# stubcall
 				found = section_named(bytes(data), SECTION_NAME)
 				if found is None or found[3] < len(PERMIL_POOL) + 5:
@@ -10881,6 +10902,18 @@ def sabotage(patched, output, kind):
 				_v, _vs, raw, _rs = found
 				at = raw + len(PERMIL_POOL)
 				data[at:at + 5] = b"\xe8\x00\x00\x00\x00"
+	# **A sabotage that did not apply and a check that cannot fail are
+	# indistinguishable from the output**, which is `evidence.md`'s rule and
+	# was met here rather than quoted: `stubbad` was added to the dispatch
+	# and not to the tuple guarding it, so it wrote an unmodified copy and
+	# announced that its property "must now be false". The gate would have
+	# caught it -- verify passes, the control fails -- but the sabotage had
+	# no way to know, and the next one might be added the same way. An image
+	# kind that changes nothing is now an error. Finding 236.
+	if kind not in CODE_KINDS and bytes(data) == original_bytes:
+		print(f"detour.py: the {kind} sabotage changed nothing",
+		      file=sys.stderr)
+		return 2
 	with open(output, "wb") as image:
 		image.write(bytes(data))
 	print(f"sabotage: {kind} -- {SABOTAGE[kind]} must now be false")

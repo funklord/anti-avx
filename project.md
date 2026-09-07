@@ -13649,6 +13649,37 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 236 -- a sabotage that changed nothing said its property must now be false
+
+`stubbad` covers the stub decode gate, the check Finding 206 added after `vbroadcastss`
+shipped undecodable bytes into `.avxsse`. It writes `06` -- `push es`, deleted in 64-bit
+mode -- rather than a malformed VEX, deliberately: a `c4` with an illegal map would also
+be counted by the stub-VEX check, and Finding 234 is that a control failing two checks is
+a control for neither.
+
+**The first attempt was a silent no-op.** The kind was added to the dispatch and not to
+the tuple guarding it, so `sabotage` wrote an unmodified copy and announced that its
+property "must now be false". Zero bytes changed, exit 0.
+
+The gate would have caught it -- verify passes, the control fails -- but **the sabotage
+had no way to know, and the next kind could be added the same way.** So `sabotage` now
+refuses to write an image it did not change. That is this workspace's own rule, *a
+sabotage that did not apply and a check that cannot fail are indistinguishable from the
+output*, which the tool had been quoting at other people while not obeying. `CODE_KINDS`
+exempts `badrow` and `staleupper` by name, an unchanged image being correct for them.
+
+**One remaining check cannot be controlled, and the code already says so.** The
+branch-target check carries "this one could never fail, and saying so is the point": the
+swallowed set is checked against a superset of the data that produced it, so the
+intersection is empty by construction. It is kept because it costs nothing and would
+catch `targets.collect` disagreeing with itself between two calls. **A check that cannot
+fail is not a gap when it is documented as one** -- what it needs is its status honoured,
+not a sabotage invented to satisfy a count.
+
+Eleven controls now, covering about twelve of `verify`'s seventeen. Two are genuinely
+open -- conservative candidates narrowed anyway, and a switch dispatch with no table
+resolved -- and both are collector decisions needing code sabotages.
+
 ### Finding 235 -- the unwinder checks get controls, and an if/elif chain needs one each
 
 Finding 46 measured what the unwinder checks are worth: an exception raised in a stub
