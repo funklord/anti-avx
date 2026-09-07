@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2091,6 +2091,55 @@ helper:
 	ret
 func_end:
 	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 77, 6, 7, 8
+""")
+
+
+# A switch dispatch, which no fixture had. `switch_targets` reads the
+# dispatch rather than guessing at the table -- Finding 174 measured the
+# guessing approach at chance, 3 of 14,574 targets real -- and `verify`
+# fails when dispatches are recognised and no table resolves, because that
+# is what a broken resolver looks like. Finding 196 built that floor after
+# an image base added twice returned zero tables for a whole build and the
+# totals read as neutral.
+#
+# The pattern it recognises is exact, so the fixture writes it exactly:
+# %r9 holds __ImageBase, the table entries are RVAs, and the dispatch is
+# mov/add/jmp. The table sits after `func_end` with its entries written as
+# `target - 0x140000000`, which is what an MSVC x64 table holds.
+#
+# Never executed: `jmp *%rcx` on the live path would leave the answer at the
+# mercy of the table, and the check is static -- a dispatch is recognised by
+# reading the listing, not by running it.
+PROGRAMS["switchtable"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm0		/* the live path: a pair, lowered */
+	vmovups	%ymm0, (%rdi)
+	movl	16(%rdi), %eax		/* 77 from the copy */
+	addq	$40, %rsp
+	ret
+dead:
+	movabsq	$0x140000000, %r9	/* __ImageBase */
+	xorl	%eax, %eax
+	movl	0x1040(%r9,%rax,4), %ecx
+	addq	%r9, %rcx
+	jmp	*%rcx
+case0:
+	nop
+case1:
+	nop
+	ret
+func_end:
+	.p2align 5
+table:	.long	0x103a			/* case0, as an RVA */
+	.long	0x103b			/* case1 */
 source:	.long 1, 2, 3, 4
 	.long 77, 6, 7, 8
 """)

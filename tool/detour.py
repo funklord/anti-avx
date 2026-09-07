@@ -6569,7 +6569,14 @@ def switch_targets(instructions, binary, starts):
 	# zero tables where the same logic found 1,795 standalone. Caught only
 	# because the count is printed: the build's totals were identical to
 	# the previous one, which reads exactly like "this changed nothing".
-	spans = [(v, r, rs) for v, _vs, r, rs in sections.values() if v and r]
+	# Under sabotage the base is added a second time, which is exactly the
+	# defect Finding 196's floor exists to catch: every span lands
+	# 0x140000000 too high, `at` resolves nothing, and the resolver reports
+	# zero tables while still recognising every dispatch. No corrupted image
+	# can express that, so the check needs a code control. Finding 238.
+	twice = base if CODE_SABOTAGE == "switchbase" else 0
+	spans = [(v + twice, r, rs)
+	         for v, _vs, r, rs in sections.values() if v and r]
 
 	def at(va):
 		for start, raw, size in spans:
@@ -10720,7 +10727,7 @@ ISLAND_GAP = 256
 
 # Sabotage kinds that break the COLLECTOR rather than an image, so an
 # unchanged output is correct for them and an error for everything else.
-CODE_KINDS = ("badrow", "staleupper", "conservative")
+CODE_KINDS = ("badrow", "staleupper", "conservative", "switchbase")
 
 # **Controls for the checks no broken IMAGE can express.** `sabotage`
 # corrupts an artifact, which is enough for a check that reads bytes: the
@@ -10752,6 +10759,7 @@ SABOTAGE = {
 	"badrow": "no (bad) row reaches the candidate loop",
 	"staleupper": "the repair withholds what would ship a stale upper half",
 	"conservative": "a conservative candidate keeps its VEX form",
+	"switchbase": "a recognised switch dispatch resolves its table",
 }
 
 

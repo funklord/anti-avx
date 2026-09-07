@@ -515,7 +515,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
              mxcsr splatrun splatop extract shadowspill regionlive \
-             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative
+             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
@@ -730,7 +730,26 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 		$(BUILD_DIR)/verify-bad-conservative.log || \
 		{ echo "check-verify: the conservative control failed, but not"; \
 		  echo "              through the conservative-candidate check"; exit 1; }
-	@echo "check-verify: all twelve controls rejected, each by its own check"
+# The switch floor: a resolver that has broken still recognises every
+# dispatch and reads noise, so "dispatches without tables" is the resolver
+# and "no dispatches" is an honest nothing (Finding 196). The sabotage adds
+# the image base twice, which is the defect that built the floor, and
+# switchtable is the only fixture holding a dispatch at all.
+	@set -e; \
+	if ANTI_AVX_SABOTAGE=switchbase timeout 300 $(PYTHON) tool/detour.py \
+		verify $(BUILD_DIR)/pe-switchtable.exe \
+		$(BUILD_DIR)/sse-switchtable.exe \
+		$(BUILD_DIR)/pe-switchtable.asm \
+		> $(BUILD_DIR)/verify-bad-switchbase.log 2>&1; then \
+		echo "check-verify: the switchbase control PASSED verify, so"; \
+		echo "              nothing watches the switch resolver"; \
+		exit 1; \
+	fi; \
+	grep -q "recognised and no table resolved" \
+		$(BUILD_DIR)/verify-bad-switchbase.log || \
+		{ echo "check-verify: the switchbase control failed, but not"; \
+		  echo "              through the switch-dispatch check"; exit 1; }
+	@echo "check-verify: all thirteen controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
@@ -1061,6 +1080,7 @@ clean:
 	      $(BUILD_DIR)/bad-stubbad.exe \
 	      $(BUILD_DIR)/bad-conservative.exe \
 	      $(BUILD_DIR)/verify-bad-conservative.log \
+	      $(BUILD_DIR)/verify-bad-switchbase.log \
 	      $(BUILD_DIR)/verify-bad-stubbad.log \
 	      $(BUILD_DIR)/verify-bad-notable.log \
 	      $(BUILD_DIR)/verify-bad-unsorted.log \

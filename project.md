@@ -13649,6 +13649,65 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 238 -- the switch floor gets a control, and an indirect jump poisons the walk
+
+The last coverable check. `verify` fails when dispatches are recognised and no table
+resolves, because that is what a broken resolver looks like -- Finding 196 built the floor
+after an image base added twice returned zero tables for a whole build and the totals read
+as neutral. It needed BOTH halves built: no fixture contained a dispatch, and no corrupted
+image can express "the resolver read nothing".
+
+The sabotage is not an invented breakage. It adds the base a second time, which is the
+defect the floor exists for: every span lands 0x140000000 too high, `at` resolves nothing,
+and every dispatch is still recognised.
+
+```
+switchtable, normal      rc=0   dispatches=1 tables=1 targets=2
+switchtable, sabotaged   rc=1   1 switch dispatch(es) recognised and no table resolved
+wine                     rewritten 77, want 77
+```
+
+**An indirect jump poisons `upper_half_read_later` for everything BEFORE it.** The first
+layout put the dispatch on a dead path inside the function and the fixture returned 29:
+the forward walk cannot resolve where `jmp *%rcx` goes, so it answers "read", which
+declined the live-path pair and left surviving VEX where the program runs. Moving the
+dispatch past the `ret` fixes it -- the walk stops at the return, and the dispatch is still
+in the listing for a static resolver. **A conservative answer at one site is a refusal at
+every site before it**, which is not obvious from reading either piece of code.
+
+**And the table entries must be literal RVAs.** The assembler cannot fold
+`symbol - 0x140000000` without a relocation, so the first version assembled the
+displacement and both entries as `0` -- which made the fixture trip the check with no
+sabotage at all. Hardcoding them makes the fixture brittle to layout changes, and loudly
+so: if the RVAs go stale the table stops resolving and `check-verify` goes red.
+
+**Twenty minutes went to a stale artifact.** `switch_dispatch` returned `0x0` while objdump
+showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and the `.asm`
+listing is a separate target. Reading a listing generated before the fix is this file's own
+artifact-not-plan rule, met from a direction nobody had listed.
+
+### Finding 239 -- every check that can fail has been watched failing
+
+Thirteen controls, from three. Sixteen of `verify`'s seventeen checks have now been seen to
+reject something, and the seventeenth cannot fail by construction.
+
+Three fixtures exist because three checks had **no possible input**, which is a stronger
+statement than "nobody wrote a control": `repairdrop`, `conservative` and `switchtable`.
+Each taught a constraint worth more than its control:
+
+- **the repair leaves sites un-lowered**, so anything it may refuse must sit off the live
+  path -- a repair fixture can only ever be a `verify` fixture (Finding 233);
+- **an unresolvable join** needs a `lea` that blocks an address while naming no branch to
+  it, plus a `call` for the ABI bound (Finding 237);
+- **an indirect jump poisons the forward walk for everything before it** (Finding 238).
+
+**The seventeenth is left uncovered on purpose.** The branch-target check says of itself
+"this one could never fail, and saying so is the point": the swallowed set is compared
+against a superset of the data that produced it. It is kept because it would catch
+`targets.collect` disagreeing with itself between two calls. **Manufacturing a sabotage so
+the count could read 17 of 17 would make the number a lie**, and the number is the thing a
+later reader will trust.
+
 ### Finding 237 -- a check with no possible input needs a fixture, not a sabotage
 
 The conservative-candidate check is the one `apply` obeys at the price of sites: a reader
