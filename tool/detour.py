@@ -5411,11 +5411,42 @@ def constant_ymm(instructions, index, register, blocked, readonly,
 	gets past `constant_load` at all.
 	"""
 	depth = VALUE_DEPTH if depth is None else depth
-	position = reaching_definition(instructions, index, register, blocked,
-	                              limit, sources, depth)
-	if position is None:
+	# **Ask the SET, because two ways into a join can carry one constant.**
+	# `reaching_definition` returns an answer only when the set holds
+	# exactly one position, so a value defined on both arms of a branch was
+	# refused even where both arms load the identical read-only bytes --
+	# `len(found) != 1` is agreement of POSITIONS, and what this needs is
+	# agreement of the VALUE. That refusal is the largest bucket on the
+	# frontier: 1,046 sites in `ymm value has no known upper half`, 988 of
+	# them `vmovups`.
+	#
+	# The comparison is on the resolved absolute target rather than on the
+	# tuple, which carries an unhashable dict and, more to the point,
+	# describes the INSTRUCTION: two loads at different addresses with
+	# different displacements can name one constant, and the stub only ever
+	# needs the address it reads thirty-two bytes from. Any of the tuples
+	# then serves, since each recomputes the same absolute target.
+	# Finding 227.
+	try:
+		found = reaching_definitions(instructions, index, register, blocked,
+		                             limit, sources, depth)
+	except JoinCycle:
 		return None
-	return constant_load(instructions[position], readonly)
+	if not found:
+		return None
+	answer, target = None, None
+	for position in found:
+		one = constant_load(instructions[position], readonly)
+		if one is None:
+			return None
+		here = rip_target(one[1], one[2], one[3])
+		if here is None:
+			return None
+		if target is None:
+			answer, target = one, here
+		elif here != target:
+			return None
+	return answer
 
 
 # How many instructions `upper_half_read_later` may examine across all the
@@ -8601,6 +8632,37 @@ def constant_selftest():
 	if constant_ymm([load, killer, store], 2, "%ymm3", set(),
 	                readonly) is not None:
 		print("selftest: a vzeroupper between the two was scanned past",
+		      file=sys.stderr)
+		failures += 1
+
+	# **Two arms, one constant: the case the singular wrapper refused.**
+	# `reaching_definition` answers only when the reaching SET holds one
+	# position, so a ymm defined on both sides of a branch was declined even
+	# where both sides load the identical read-only bytes. This pair is the
+	# control for that fix: the first must be accepted and the second must
+	# not, and without the second the first proves only that something was
+	# returned. Finding 227.
+	const, elsewhere = 0x140002000, 0x140002100
+	merge = [
+		(0x140001000, bytes.fromhex("750a"), "jne", "0x14000100c", None),
+		site(const, "c5fc1005", "0x0(%rip),%ymm3", at=0x140001002),
+		(0x14000100a, bytes.fromhex("eb08"), "jmp", "0x140001014", None),
+		site(const, "c5fc1005", "0x0(%rip),%ymm3", at=0x14000100c),
+		(0x140001014, bytes.fromhex("c5fc291f"), "vmovaps", "%ymm3,(%rdi)",
+		 None),
+	]
+	where = {0x14000100c: [0x140001000], 0x140001014: [0x14000100a]}
+	stops = {0x14000100c, 0x140001014}
+	if constant_ymm(merge, 4, "%ymm3", stops, readonly,
+	                sources=where) is None:
+		print("selftest: two arms loading ONE constant were refused",
+		      file=sys.stderr)
+		failures += 1
+	apart = list(merge)
+	apart[3] = site(elsewhere, "c5fc1005", "0x0(%rip),%ymm3", at=0x14000100c)
+	if constant_ymm(apart, 4, "%ymm3", stops, readonly,
+	                sources=where) is not None:
+		print("selftest: two arms loading DIFFERENT constants were accepted",
 		      file=sys.stderr)
 		failures += 1
 

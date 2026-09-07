@@ -13649,6 +13649,52 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 227 -- provenance now survives a merge, and Starfield has no site that needs it
+
+`constant_ymm` asked `reaching_definition` -- **singular** -- which is a wrapper
+returning an answer only when the reaching SET holds exactly one position. That is
+agreement of POSITIONS. What the lowering needs is agreement of the VALUE: a ymm defined
+on both arms of a branch where both arms load the identical read-only bytes can be stored
+by a stub that reloads those thirty-two bytes, whichever way control arrived. The old
+test refused it.
+
+It now walks the set, requires every definition to be a `constant_load`, and compares the
+**resolved absolute target** rather than the returned tuple -- which carries an unhashable
+dict and, more to the point, describes the INSTRUCTION: two loads at different addresses
+with different displacements can name one constant, and any of their tuples then serves.
+
+**Proven in both directions, and the negative half is what makes the positive half mean
+anything.** A control in `selftest` builds two arms loading one constant and requires
+acceptance; a second builds two arms loading DIFFERENT constants and requires refusal.
+Against a reverted copy of the tool the first fails -- `two arms loading ONE constant
+were refused` -- so the control tests the change rather than the code around it.
+
+**And on Starfield it buys nothing: the rebuild is byte-identical**, `conststore` still
+16 windows over 16 sites. That is a measurement rather than a disappointment, and it is
+one only because the control exists -- without it, byte-identical is indistinguishable
+from a change that can never fire.
+
+So **the 1,046 are not single-position pessimism about constants**, which is what this
+was built to test. The hypothesis that remains, untested and recorded as such:
+`constant_load` requires a `wide_move` LOAD, and a ymm that was COMPUTED -- the output of
+`vaddps`, `vmulps` and their kin -- has no constant to point at. Its upper half exists
+only at runtime, and with no 256-bit instruction on the host it cannot be relocated at
+all; the only route left is the shadow register, which needs the load to have committed.
+If that is right the bucket is a hard limit rather than a backlog, and Finding 226's
+"waiting on the walk" is wrong for it too.
+
+The change is kept: strictly more permissive, byte-identical here, carrying its own
+control, and it will pay on a binary that has the shape.
+
+**A note on the instrument, since it happened twice in one hour.** The reverted copy was
+first built by slicing between two string offsets, and `s.index("\treturn answer")`
+matched a different `return answers or refuse(...)` further down, truncating the file
+mid-statement -- caught only because Python refused to parse it. And the gate run that
+followed reported failure for a passing `make check`, because the compound command ended
+in `grep -c`, which exits 1 when it counts nothing. **Both are this project's own rules
+turned on the person applying them**: an anchor that is a substring of a longer one, and
+a pipeline's status belonging to its last process.
+
 ### Finding 226 -- the census reports each bucket's shape, and the buckets were carrying data
 
 `frontier_census` reported mnemonics in aggregate, so it could say which reason was
@@ -13692,9 +13738,19 @@ ymm value has no known upper half                    vmovups 988  vmovdqu 45  vm
 ymm upper half read later                            vmovups 112
 ```
 
-They are one question in seven phrasings: **a 256-bit move whose value cannot be traced
-to memory or to a constant.** That is not waiting on a lowering, it is waiting on the
-walk. Relocating a ymm's upper half at runtime needs a 256-bit-aware instruction and the
+~~They are one question in seven phrasings.~~ **Two questions, and reading the stop
+reasons separates them** -- corrected by Finding 227, which nearly built the wrong thing
+on this sentence. Five are `ymm_run`'s linear-scan limits, where the walk halts at a
+branch target, a control transfer or a touch of the value (~847 sites); three are
+provenance, where the value itself cannot be traced (~1,363). **Sharing a mnemonic is not
+sharing a question**, and `vmovups 988` in one bucket and `vmovups 132` in another
+licensed a characterisation the code does not support.
+
+The largest run-walk reason, `no store before a branch target inside the run`, is not
+provenance at all: `blocked` is "can anything reach this address", so a window may not
+swallow a branch target because that address stops being an instruction boundary.
+Fixing those 132 means retargeting branches into stubs, which is a different and much
+larger feature. Relocating a ymm's upper half at runtime needs a 256-bit-aware instruction and the
 host has none, so provenance must be established statically -- which is why every
 strategy that succeeds (`pair`, `longload`/`longstore`, `region`) works by proving the
 value came from memory or read-only bytes and copying 32 bytes as two halves.
