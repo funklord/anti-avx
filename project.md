@@ -13649,6 +13649,39 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 230 -- the 319 outside .pdata are data, and leaf recovery already takes 97.9%
+
+`outside.py report` prices this without a new probe, which after three flawed probes in
+one night is the point worth taking from it:
+
+```
+chunks outside .pdata                  89,747
+  of which contain a VEX site           3,006
+  VEX sites in them                    17,604
+
+verdict                               chunks  VEX sites
+  called, and ends in a transfer       2,979     17,237   accepted
+  contains (bad) -- not code              20        315   rejected
+  called, but runs off the end             4         35   rejected
+  uncalled, ends in a transfer             3         17   rejected
+```
+
+`leaf_ranges` already recovers **17,237 of 17,604** sites outside `.pdata`, 97.9%. Of the
+367 it refuses, **315 sit in 20 chunks holding undecodable bytes** -- data, correctly
+called not-code, and the same population Findings 222 to 225 kept meeting from other
+directions.
+
+**So the ceiling is 52 sites in 7 chunks**, and each needs real work: 4 are called but
+their extent is unproven, 3 are well-formed but nothing appears to call them, which for
+an indirect caller may be unprovable. Not worth opening in the weaker currency.
+
+**The pattern across tonight is worth more than the row.** The frontier's large buckets
+keep resolving into data or into echoes: 180 sites left the candidate loop as
+undecodable, 315 more are data here, the 1,046 is downstream of its loads, and the 130
+priced at zero. What remains is refused by design -- the 1,875 arithmetic against Finding
+200's ceiling of 75 -- or blocked by the collect-time circularity Finding 229 names.
+**The frontier is closer to its floor than its size suggests.**
+
 ### Finding 229 -- the limit is not what refuses them, so the obvious lever buys nothing
 
 Finding 228 put `ymm upper half read later` at the top of the list: 115 loads, freeing
@@ -14164,6 +14197,7 @@ a binary that computes the wrong answer.
 | - | ~~Data reaching the in-place path~~ **FIXED** | 518,990 patches guarded, output byte-identical | wrong bytes | Finding 223: the same defect one call site over; `vex sites` was inflated by data |
 | - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
 | - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |
+| - | ~~The 319 outside .pdata~~ **PRICED at 52** | 315 of 367 refusals are data; leaf recovery takes 97.9% | sites lowered | Finding 230: 4 chunks of unproven extent, 3 with no findable caller |
 | - | ~~`ymm upper half read later`, 115 loads / 130 stores~~ **PRICED at 0** | raising the 40-instruction limit frees nothing | sites lowered | Finding 229: all 115 have a reader inside the window; the remaining lever needs the placer's answer at collect time |
 | - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.44% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |
 | - | ~~The remaining uncovered passengers~~ **CLOSED at 0** | 23 rip-relative, all covered | wrong bytes | Finding 220: 1,881 of ~1,900 move unchanged and have no failure mode |
