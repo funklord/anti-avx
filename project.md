@@ -13649,6 +13649,41 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 229 -- the limit is not what refuses them, so the obvious lever buys nothing
+
+Finding 228 put `ymm upper half read later` at the top of the list: 115 loads, freeing
+130 stores with them. `upper_half_read_later` walks 40 instructions and returns True when
+it runs out -- conservative since Finding 185, where returning False there shipped 21
+wrong-byte sites with the use eight instructions past the limit. So a refusal is either
+"a reader was found" or "nothing was established in 40", and only the second can be
+bought with a larger budget.
+
+```
+loads refused for a later read      115
+  reader within 40 (the limit)      115
+  limit-bound                         0
+```
+
+**Not one is limit-bound**, so raising the limit frees nothing and the 245-site ceiling
+is not available at any price. Measured with a linear forward walk over
+`build/frontier-sites.txt`, which is weaker than the real one -- it matches any mention of
+the register where the function discriminates a full overwrite and a lowered reader, and
+it does not follow branch edges. That weakens what the mentions ARE and not the
+conclusion: the refusals are not caused by running out of room.
+
+**The remaining lever is precision, and the tree already names the obstacle.**
+`upper_half_read_later` takes a `covered` predicate that dismisses a reader which will
+itself be lowered, passed today only by `constant_ymm`. Extending it to the pair path is
+the right idea, and the comment at the walk's tail says why it is not built: the correct
+guard is "credit unless a SURVIVING reader follows", which needs the placer's answer at
+collect time. Deciding what to place requires knowing what will be placed. That is a real
+circularity rather than an unwritten function, and it is not worth opening for 245 sites
+in the weaker currency.
+
+**A negative price is a result.** The row closes with a measurement instead of staying at
+the top of the list looking actionable, which is what a plausible ceiling does to every
+later reader of it.
+
 ### Finding 228 -- the largest bucket is a symptom, and its label points at the wrong end
 
 `frontier_census` counted buckets and never named their members, so a bucket could only
@@ -14129,7 +14164,7 @@ a binary that computes the wrong answer.
 | - | ~~Data reaching the in-place path~~ **FIXED** | 518,990 patches guarded, output byte-identical | wrong bytes | Finding 223: the same defect one call site over; `vex sites` was inflated by data |
 | - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
 | - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |
-| 1 | The load-side reasons behind the 1,046 | 729 stores freed if their loads commit | sites lowered | Finding 228: `ymm upper half read later` 130, run-walk limits ~376; the store bucket is an echo |
+| - | ~~`ymm upper half read later`, 115 loads / 130 stores~~ **PRICED at 0** | raising the 40-instruction limit frees nothing | sites lowered | Finding 229: all 115 have a reader inside the window; the remaining lever needs the placer's answer at collect time |
 | - | ~~The headline cost figure~~ **CORRECTED** | +1.34% -> +4.44% executed, +6.53% static | neither | Finding 221: the model priced the lowering and not the detour; `make cost` re-takes it from the binaries |
 | - | ~~The remaining uncovered passengers~~ **CLOSED at 0** | 23 rip-relative, all covered | wrong bytes | Finding 220: 1,881 of ~1,900 move unchanged and have no failure mode |
 | - | ~~Fixtures for the swallowed conditional branches~~ **DONE** | ja, jae, jb, jbe -- 506 sites | wrong bytes | Finding 219: and two earlier versions swallowed the right thing while proving nothing |
