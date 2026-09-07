@@ -162,27 +162,66 @@ check-span: | $(BUILD_DIR)
 check-shadow: | $(BUILD_DIR)
 	$(PYTHON) tool/shadow_oracle.py $(BUILD_DIR)
 
-# The representation end to end: a fixture whose answer lives in the UPPER
-# half, refused without permanent slots and lowered with them. `laneregadd`
-# is not in PE_NAMES because it FAILS without the flag, which is the point
-# of it. Needs wine. Finding 244.
-check-shadow-pe: $(BUILD_DIR)/pe-laneregadd.exe $(BUILD_DIR)/pe-laneregadd.asm
+# The representation end to end, on `crossregion`: a ymm defined BEFORE a
+# branch target and read in the region after it, with the answer in the
+# upper half, so 77 is reachable only if the slot was maintained across the
+# boundary. Run both ways, because a control that passes either way is not
+# one.
+#
+# **It was aimed at `laneregadd` and that did not discriminate.** Two
+# reasons, and each is worth more than the target was. Its 77 comes from
+# the CALLER'S SHADOW, not from permanent slots -- measured, the span uses
+# slot 0 and slot 1, which are its own bookkeeping and never a register's
+# permanent one. And the flag appeared to matter only because
+# `--shadow-regs=` and `--shadow=` shared a variable, so asking for
+# permanent slots switched the caller's shadow on as a side effect: with
+# the collision fixed, `laneregadd` returns 77 with the flag and without
+# it. A control written in the same commit as the bug it was calibrated
+# against cannot see it. Finding 246.
+#
+# **The zero fill is a build argument.** A permanent slot lives in the
+# per-thread block, so the fixture needs a TLS directory asking for
+# `tls_block_slots() * 16` = 320 bytes; the stock 32 holds two slots and
+# the lowering refuses every site. Needs wine.
+check-shadow-pe:
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
-	$(PYTHON) tool/detour.py --shadow-regs=all apply \
-		$(BUILD_DIR)/pe-laneregadd.exe $(BUILD_DIR)/pe-laneregadd.asm \
-		$(BUILD_DIR)/sse-laneregadd.exe > /dev/null; \
 	mkdir -p $(PE_PREFIX); \
-	got=0; \
-	WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d \
-		wine $(BUILD_DIR)/sse-laneregadd.exe > /dev/null 2>&1 || got=$$?; \
-	if [ "$$got" != "77" ]; then \
-		echo "check-shadow-pe: returned $$got, want 77"; exit 1; \
-	fi; \
-	echo "check-shadow-pe: register-source 256-bit arithmetic lowered"; \
-	echo "                 through permanent slots returns 77 -- the answer"; \
-	echo "                 is in the upper half, so the slots carried it"
+	for name in crossregion laneswap; do \
+		$(PYTHON) tool/pe_build.py sample $$name \
+			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
+		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
+			> $(BUILD_DIR)/pe-$$name-320.asm; \
+		for mode in off all; do \
+			$(PYTHON) tool/detour.py --shadow-regs=$$mode apply \
+				$(BUILD_DIR)/pe-$$name-320.exe \
+				$(BUILD_DIR)/pe-$$name-320.asm \
+				$(BUILD_DIR)/sse-$$name-$$mode.exe > /dev/null; \
+			got=0; \
+			WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all \
+				WINEDLLOVERRIDES=winedbg.exe=d \
+				wine $(BUILD_DIR)/sse-$$name-$$mode.exe \
+				> /dev/null 2>&1 || got=$$?; \
+			echo "check-shadow-pe: $$name --shadow-regs=$$mode -> $$got"; \
+			if [ "$$mode" = "off" ]; then \
+				if [ "$$got" = "77" ]; then \
+					echo "check-shadow-pe: $$name answers 77 without"; \
+					echo "                 permanent slots, so it never"; \
+					echo "                 needed them and proves nothing"; \
+					exit 1; \
+				fi; \
+			elif [ "$$got" != "77" ]; then \
+				echo "check-shadow-pe: $$name wanted 77 with slots"; \
+				exit 1; \
+			fi; \
+		done; \
+	done; \
+	echo "check-shadow-pe: crossregion -- a ymm defined outside the region"; \
+	echo "                 reads 77 from its permanent slot, 29 without"; \
+	echo "check-shadow-pe: laneswap -- vextractf128 and vinsertf128 routed"; \
+	echo "                 to slot moves, and the extract zeroed the slot"; \
+	echo "                 its VEX.128 write implies"
 
 # -- the software F16C conversions -------------------------------------------
 

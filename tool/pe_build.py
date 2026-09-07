@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2215,6 +2215,89 @@ source:	.long 1, 2, 3, 4
 	.long 70, 6, 7, 8
 	.long 0, 0, 0, 0
 	.long 7, 0, 0, 0
+	/* A TLS directory, because a PERMANENT slot has nowhere else to
+	   live: the callee home space is two slots wide and a borrowed
+	   frame lasts one window, while a register's slot has to outlive
+	   every window in the image. Without this the unconditional
+	   lowering refuses every site here and the control cannot fire --
+	   which is what it did when it was first written. The zero fill
+	   this asks for is a build argument, so `check-shadow-pe` can run
+	   the A/B that makes the number mean something. Finding 246. */
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# The lane operations, routed to slot moves rather than refused.
+# `vextractf128 $1` reads the source's upper half -- a slot -- and
+# `vinsertf128 $1` writes the destination's, so each is a 16-byte move once
+# the halves are separately addressable. 510 sites in Starfield are these
+# four mnemonics, and every one was refused as "no legacy encoding" until
+# Finding 246 read that set correctly: it forbids PREFIX-STRIPPING them, not
+# emitting them.
+#
+# **Two answers, because the shape has two halves and only one is obvious.**
+# 77 comes back from the extracted upper half, which is the move. 0 comes
+# back from ymm2's upper half, which is the part a careless lowering drops:
+# `vextractf128` writes %xmm2 with a VEX.128 instruction, and a VEX.128
+# write ZEROES bits 255:128 -- so the destination's own slot has to be
+# zeroed, not left holding what it had. Summing them means either half
+# failing changes the answer.
+PROGRAMS["laneswap"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	0x20(%rsi), %ymm3	/* defined, so nothing reads a stale half */
+	vmovups	(%rsi), %ymm1
+	vextractf128 $0x1, %ymm1, %xmm2	/* xmm2 = ymm1 upper; ymm2 upper = 0 */
+	vinsertf128 $0x1, %xmm2, %ymm3, %ymm3	/* ymm3 upper = xmm2 */
+	vmovups	%ymm3, (%rdi)
+	vmovups	%ymm2, 0x20(%rdi)
+	movl	16(%rdi), %eax		/* 77, carried through both lane ops */
+	addl	48(%rdi), %eax		/* + 0, because the VEX.128 write zeroed */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 77, 6, 7, 8
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
 """)
 
 

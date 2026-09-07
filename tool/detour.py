@@ -3708,6 +3708,31 @@ def canonical_ymm(field):
 	return found.group(0) if found else field
 
 
+def ymm_alias(field):
+	"""`%ymm7` for `%xmm7` as well as for `%ymm7`, or None.
+
+	A lane operation names the same architectural register in both widths
+	-- `vextractf128 $1,%ymm1,%xmm2` writes the low half of ymm2 -- and
+	the slot belongs to the ymm. `canonical_ymm` hands back an %xmm
+	operand unchanged, which then has no slot; this is the conversion it
+	deliberately does not do.
+	"""
+	numbers = scratch_finder.xmm_numbers(field)
+	return f"%ymm{numbers[0]}" if numbers else None
+
+
+# The lane operations this can emit against slots. They are in
+# NO_LEGACY_FORM -- there is no one-width-down encoding and prefix-stripping
+# them produces bytes that decode to nothing -- but that set is about a
+# TECHNIQUE, not about the semantics, which `lower.py` has emitted on the
+# plain path since Finding 205 by carrying a rule per shape. Under the
+# uniform representation the rule is a 16-byte move, because an upper half
+# IS a slot: `lower.py` already writes `movaps shadow(%ymm1),%xmm0` and
+# calls that path Y2. Finding 246.
+SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
+                   "vinsertf128", "vinserti128")
+
+
 def lower_ymm_run(strategy, at, pool):
 	"""The run, with every 256-bit copy split and everything else moved."""
 	_helpers, entries = strategy[0], strategy[1]
@@ -3987,7 +4012,7 @@ def region_demand(instructions, first, last):
 	return peak, frozenset(live)
 
 
-def span_operand_shape(vex, tail, operands, tracked):
+def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 	"""`("load"|"store"|"lane", register)` if this member is one this can
 	emit, else None.
 
@@ -4005,6 +4030,37 @@ def span_operand_shape(vex, tail, operands, tracked):
 	"""
 	fields = inplace.split_operands(operands or "")
 	wide = [f for f in fields if f.startswith("%ymm")]
+	# **The lane operations, first, so they cannot fall through.** Left to
+	# the shapes below, `vbroadcastss (%rax),%ymm0` reads as a `load` and
+	# would be prefix-stripped into nothing -- which is why NO_LEGACY_FORM
+	# exists. These four are different: each is a pure 128-bit half move
+	# once the halves are separately addressable, which is exactly what a
+	# permanent slot makes them.
+	#
+	# **Only under `--shadow-regs=all`, and that is soundness rather than
+	# caution.** `extract` READS the source's upper half from its slot, and
+	# only the uniform representation promises that slot is maintained; a
+	# span-local table may not track the source at all.
+	#
+	# **Only `$0x1` and only registers**, because that is the population:
+	# in Starfield, 362 of 383 `vextractf128` and 141 of 157 `vinsertf128`
+	# are register forms with that immediate, and every `vextracti128` and
+	# `vinserti128` is. A memory form is refused rather than guessed at.
+	if SHADOW_REGS_RULE == SHADOW_REGS_ALL and mnemonic in SLOT_LANE_FORMS:
+		if mnemonic in ("vextractf128", "vextracti128"):
+			if (len(fields) == 3 and fields[0] == "$0x1"
+					and fields[1].startswith("%ymm")
+					and fields[2].startswith("%xmm")):
+				return ("extract", ymm_alias(fields[2]),
+				        canonical_ymm(fields[1]))
+			return None
+		if (len(fields) == 4 and fields[0] == "$0x1"
+				and fields[1].startswith("%xmm")
+				and fields[2].startswith("%ymm")
+				and fields[3].startswith("%ymm")):
+			return ("insert", canonical_ymm(fields[3]),
+			        ymm_alias(fields[1]), canonical_ymm(fields[2]))
+		return None
 	if len(fields) == 2 and len(wide) == 1:
 		if "(" in fields[0] and wide[0] == fields[1]:
 			return ("load", canonical_ymm(fields[1]))
@@ -4089,8 +4145,9 @@ def span_entries(members, instructions, slots, scope, plain):
 		vex = inplace.decode_vex(encoding)
 		if vex is not None and vex["L"]:
 			shape = span_operand_shape(vex, encoding[vex["length"]:],
-			                           operands, None)
-			if shape is not None and shape[0] in ("lanereg", "lanereg3"):
+			                           operands, None, mnemonic)
+			if shape is not None and shape[0] in ("lanereg", "lanereg3",
+			                                      "extract"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
@@ -4098,7 +4155,7 @@ def span_entries(members, instructions, slots, scope, plain):
 			if shape is not None and shape[0] == "lanereg3":
 				third = slot_for(slots, shape[3])
 		out.append((kind, address, encoding, mnemonic, operands,
-		            slots.get(register), moved, second, third))
+		            slot_for(slots, register), moved, second, third))
 	return out
 
 
@@ -4134,17 +4191,21 @@ TLS_SLOTS = 4
 # memory permanently, and the representation is only coherent if EVERY
 # writer maintains its slot. Finding 244.
 SHADOW_REGS = 16
-SHADOW_OFF, SHADOW_ALL = "off", "all"
-SHADOW_RULE = SHADOW_OFF
+SHADOW_REGS_OFF, SHADOW_REGS_ALL = "off", "all"
+SHADOW_REGS_RULE = SHADOW_REGS_OFF
 
 
 def tls_block_slots():
 	"""How many slots the per-thread block must hold."""
-	return TLS_SLOTS + (SHADOW_REGS if SHADOW_RULE == SHADOW_ALL else 0)
+	return TLS_SLOTS + (SHADOW_REGS if SHADOW_REGS_RULE == SHADOW_REGS_ALL else 0)
 
 
 def shadow_index(register):
 	"""The permanent slot index for `%ymmN`, past the transient ones."""
+	# A `plain` passenger names no register, and `slot_for` asks about
+	# every member. `slots.get(None)` answered None; this has to too.
+	if register is None:
+		return None
 	name = canonical_ymm(register)
 	if name is None or not name.startswith("%ymm"):
 		return None
@@ -4163,7 +4224,7 @@ def slot_for(slots, register):
 	how to operate between a slot and a helper.
 	"""
 	found = slots.get(register)
-	if found is not None or SHADOW_RULE != SHADOW_ALL:
+	if found is not None or SHADOW_REGS_RULE != SHADOW_REGS_ALL:
 		return found
 	return shadow_index(register)
 
@@ -4236,6 +4297,28 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			reasons.append(why)
 		return None
 
+	# **A permanent slot needs the per-thread block, and this is the one
+	# place that can enforce it for every caller.** A slot index below
+	# `TLS_SLOTS` is a span's own bookkeeping and the callee home space
+	# holds it; an index at or above is a REGISTER's permanent slot under
+	# `--shadow-regs=all`, and the home space is two slots wide. Addressing
+	# slot 4 off it writes `base + 64` into somebody's locals -- silently,
+	# because it does not fault. Checked here rather than in each of the
+	# three candidate builders, so a fourth cannot reintroduce it.
+	#
+	# **It has not been seen to fire, and that is stated rather than
+	# implied.** `region_candidate` routes to the block before reaching
+	# here, and on every fixture in this tree -- with the routing
+	# deliberately removed and `--spill` swept over home, none and stack --
+	# the region is refused earlier, by `more slots than a store holds`.
+	# So this is a floor for a builder that does not exist yet, not
+	# evidence that anything is protected today: the routing is what
+	# actually does the work. Finding 246.
+	if block is None:
+		for entry in entries:
+			if any(x is not None and x >= TLS_SLOTS
+			       for x in (entry[5], entry[7], entry[8])):
+				return refuse("permanent slot needs the per-thread block")
 	body = bytearray()
 	if block is not None:
 		# **Once, at the top.** The block pointer stays in its register for
@@ -4264,14 +4347,18 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		vex = inplace.decode_vex(encoding)
 		if vex is None or not vex["L"]:
 			return refuse("member is not a 256-bit VEX")
-		if mnemonic in NO_LEGACY_FORM:
-			# Narrowing this would emit bytes that decode to nothing. See
-			# NO_LEGACY_FORM. Finding 205.
-			return refuse(f"member {mnemonic} has no legacy encoding")
 		tail = encoding[vex["length"]:]
-		shape = span_operand_shape(vex, tail, operands, None)
+		shape = span_operand_shape(vex, tail, operands, None, mnemonic)
 		if shape is None:
 			return refuse("no span shape at emit time")
+		if mnemonic in NO_LEGACY_FORM and shape[0] not in ("extract",
+		                                                   "insert"):
+			# Narrowing this would emit bytes that decode to nothing. See
+			# NO_LEGACY_FORM. Finding 205. The two lane shapes are the
+			# exception and are not narrowed at all: they are emitted as
+			# 16-byte moves against slots, which is what `lower.py` does
+			# for them on the plain path. Finding 246.
+			return refuse(f"member {mnemonic} has no legacy encoding")
 		if slot is None:
 			return refuse("member has no slot")
 		what = shape[0]
@@ -4309,6 +4396,42 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if piece is None:
 				return refuse("store high half cannot be narrowed")
 			body += piece
+			continue
+		if what == "extract":
+			# **`vextractf128 $1,%ymmS,%xmmD` is two moves.** The low half
+			# of D becomes the upper half of S, which is a slot, so it is
+			# read straight into D with no helper. And D is written by a
+			# VEX.128 instruction, which ZEROES bits 255:128 -- under this
+			# representation that is D's own slot, so it is zeroed rather
+			# than left holding whatever D last had. Dropping that second
+			# half is the stale-upper-read bug pointed the other way.
+			if second is None:
+				return refuse("extract source is in no slot")
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			body += span_slot_move(low_dst, False, base, second, block,
+			                       at + len(body))
+			# xorps helper,helper -- the zero for D's upper half.
+			body += encode_rr(None, b"\x0f\x57", helper, helper)
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
+		if what == "insert":
+			# **`vinsertf128 $1,%xmmS,%ymmS1,%ymmD` reads no slot at all**:
+			# both its sources are 128-bit machine registers, and the only
+			# upper half in sight is the one it writes. So it is a store
+			# to D's slot, plus D's low half from S1 where those differ.
+			#
+			# **The store comes first.** With S1 and S in the same machine
+			# register as D -- which is what 141 of Starfield's 157 look
+			# like -- moving S1 into D first would overwrite the very
+			# value the store is meant to save.
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			low_src = scratch_finder.xmm_numbers(shape[2])[0]
+			low_s1 = scratch_finder.xmm_numbers(shape[3])[0]
+			body += span_slot_move(low_src, True, base, slot, block,
+			                       at + len(body))
+			if low_dst != low_s1:
+				body += encode_movaps(low_dst, low_s1)
 			continue
 		if what == "lanereg3":
 			# **A destination of its own, so both halves are a move and an
@@ -4532,13 +4655,13 @@ def region_members(instructions, first, last, reasons=None):
 
 	members, slots, defined = [], {}, set()
 	for position in range(first, last):
-		_a, encoding, _m, operands, _c = instructions[position]
+		_a, encoding, member_mnemonic, operands, _c = instructions[position]
 		vex = inplace.decode_vex(encoding)
 		if vex is None or not vex["L"]:
 			members.append(("plain", position, None))
 			continue
 		shape = span_operand_shape(vex, encoding[vex["length"]:], operands,
-		                           None)
+		                           None, member_mnemonic)
 		if shape is None:
 			# The lowering cannot emit this shape. Which one it is decides
 			# what to build next, so it is named and not just counted.
@@ -4553,7 +4676,27 @@ def region_members(instructions, first, last, reasons=None):
 				# what makes a region unable to read a ymm defined
 				# elsewhere. Finding 245.
 				slots[register] = (shadow_index(register)
-				                   if SHADOW_RULE == SHADOW_ALL
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
+			defined.add(register)
+		elif what == "insert":
+			# Reads no slot -- both sources are machine registers -- and
+			# DEFINES the destination's upper half, so it needs nothing
+			# proved about what came before it.
+			if register not in slots:
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
+			defined.add(register)
+		elif what == "extract":
+			# Reads the SOURCE's upper half and defines the destination's.
+			if shape[2] not in defined:
+				return refuse("extract source from outside the region")
+			if register not in slots:
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
 				                   and shadow_index(register) is not None
 				                   else len(slots))
 			defined.add(register)
@@ -4566,7 +4709,7 @@ def region_members(instructions, first, last, reasons=None):
 				return refuse("lanereg3 source from outside the region")
 			if register not in slots:
 				slots[register] = (shadow_index(register)
-				                   if SHADOW_RULE == SHADOW_ALL
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
 				                   and shadow_index(register) is not None
 				                   else len(slots))
 			defined.add(register)
@@ -4719,8 +4862,19 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 		REGION_REFUSED["window outside .pdata"] += 1
 		return None
 	base, block = window_borrow(home, address, window), None
+	# **A permanent slot is not a thing one window owns.** With
+	# `--shadow-regs=all` a slot index is the REGISTER's, running to
+	# `tls_block_slots()`, and addressing that off the callee home
+	# space -- two slots wide -- writes `base + 4*16` and up into
+	# somebody's locals. It does not fault and the fixture still
+	# answered 77, which is the whole hazard `--rsp=blanket` exists
+	# for. The block is the only backing store the representation
+	# admits. Finding 246.
+	if SHADOW_REGS_RULE == SHADOW_REGS_ALL:
+		base = None
+	need = (max(slots.values()) + 1) if slots else 0
 	if base is None or len(slots) > SLOTS_PER_REGION:
-		if tls is None or len(slots) > TLS_SLOTS:
+		if tls is None or need > tls_block_slots():
 			REGION_REFUSED[f"more slots than a store holds ({len(slots)})"] \
 				+= 1
 			return None
@@ -4762,6 +4916,291 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 	return (address, instructions[first][1], instructions[first][3],
 	        instructions[first][2], window, [], None, [],
 	        ("region", (entries, helpers[0], block, base, second)))
+
+
+# **Why a site the unconditional lowering was offered was not taken.**
+# The same shape as `REGION_REFUSED` and cleared beside it: this one is
+# the measurement Finding 246 exists to take, so its histogram IS the
+# result rather than a diagnostic beside it.
+# **The lowerings that maintain a slot**, which is what the uniform
+# representation needs of every 256-bit site. Everything else lowers a
+# site by other means and leaves its upper half to the machine register,
+# which under this representation is nobody maintaining it.
+SLOT_CARRYING = ("span", "region", "unit")
+UNIT_REFUSED = Counter()
+UNIT_EXAMPLES = {}
+WIDE_SITES = Counter()
+
+
+def unit_candidate(instructions, plain, index, blocked, home,
+                   ranges, scope, tls=None, limit=12):
+	"""A candidate lowering ONE 256-bit instruction, or None.
+
+	**The strategy none of the others is.** Every lowering above this one
+	is CONSUMER-DRIVEN: a pair wants a load and a store, a run a chain of
+	copies, a span a chain that closes, a region a stretch whose every
+	definition it can see. All four ask the same question in different
+	words -- *can I account for this value's upper half* -- and a site
+	whose answer is no is left as VEX. That is why the frontier is what it
+	is, and no amount of widening any one of them reaches a site whose
+	value simply arrives from somewhere the walk cannot see.
+
+	The uniform representation inverts the question. A 256-bit instruction
+	is lowered BECAUSE IT IS 256-BIT: the upper half goes to the
+	register's permanent slot, and nothing has to be proved about where
+	the value came from or who reads it next. Provenance stops being a
+	precondition, which is the whole purpose of `--shadow-regs=all`.
+
+	**Three properties, and the third is not this function's to hold.**
+
+	- It needs the per-thread block, never a home-space borrow. A borrowed
+	  frame lasts as long as its window; a permanent slot has to outlive
+	  every window in the image, so `--spill=tls` is not one backing store
+	  among three here but the only one the representation admits.
+	- It does not ask `upper_half_read_later`. Every other lowering must,
+	  because it leaves the machine ymm's upper half stale and a later
+	  256-bit read would see it. Here the slot IS the upper half, so a
+	  later reader is correct -- **provided that reader is lowered too.**
+	- Which is the third property, and it is a whole-image one: the
+	  representation is sound only if it is TOTAL. One 256-bit site left
+	  as VEX reads a machine upper half this has stopped maintaining, and
+	  one VEX.128 write left in place zeroes a machine upper half while
+	  the slot keeps the old value. So this function's refusals are not a
+	  list of missed opportunities; each one is a hole in the invariant,
+	  and `report_units` totals them as such. Finding 246.
+
+	`limit` bounds how far the window may widen over neighbours to reach
+	the five bytes a jump needs. Four rather than the region's twenty-four
+	because a passenger here buys nothing but length: the member is one
+	instruction and widening exists only to make it placeable.
+	"""
+	def refuse(why):
+		UNIT_REFUSED[why] += 1
+		seen = UNIT_EXAMPLES.setdefault(why, [])
+		seen.append(instructions[index][0])
+		return None
+
+	if SHADOW_REGS_RULE != SHADOW_REGS_ALL:
+		return None
+	address, encoding, mnemonic, operands, _comment = instructions[index]
+	vex = inplace.decode_vex(encoding)
+	if vex is None or not vex["L"]:
+		return None
+	# **Asked AFTER the shape, which is the correction.** This read as a
+	# property of the instruction set -- "no legacy encoding, so nothing
+	# reaches it" -- and NO_LEGACY_FORM says no such thing. It forbids one
+	# TECHNIQUE, clearing `VEX.L` and re-emitting, which for these
+	# mnemonics produces bytes that decode to nothing. The semantics are
+	# emitted on the plain path by `lower.py`, per shape, and four of them
+	# are 16-byte moves once an upper half is a slot. Finding 246.
+	shape = span_operand_shape(vex, encoding[vex["length"]:], operands, None,
+	                           mnemonic)
+	if shape is None:
+		if mnemonic in NO_LEGACY_FORM:
+			return refuse(f"{mnemonic} has no legacy encoding")
+		return refuse("shape " + (span_shape_name(encoding, operands) or "?"))
+	if mnemonic in NO_LEGACY_FORM and shape[0] not in ("extract", "insert"):
+		return refuse(f"{mnemonic} has no legacy encoding")
+	what, register = shape[0], shape[1]
+	if shadow_index(register) is None:
+		return refuse("destination is not one of the sixteen ymm")
+	members, slots = [], {}
+
+	def take(at, one):
+		"""Give every register `one` names its permanent slot."""
+		for named in one[1:]:
+			if named is None:
+				continue
+			found = shadow_index(named)
+			if found is None:
+				return "a register outside the sixteen ymm"
+			slots.setdefault(named, found)
+		members.append((one[0], at, one[1]))
+		return None
+
+	# Every register the shape names resolves to its own permanent slot,
+	# which is exactly what this representation is for: `region_members`
+	# refuses a source it did not itself define, and here there is nothing
+	# to refuse because every source already has one.
+	told = take(index, shape)
+	if told is not None:
+		return refuse(told)
+
+	# **Absorb the whole run of adjacent 256-bit sites, not just enough
+	# bytes to place a jump.** The first version widened only while the
+	# window was under five bytes, and on a cluster of lane operations
+	# that produced one window per site, each overlapping the next: three
+	# candidates built and one placed, because they were competing for the
+	# same bytes. A strategy offered at EVERY 256-bit site collides with
+	# itself in a way none of the consumer-driven ones can, since those
+	# are offered at a site only when a walk found something to do there.
+	#
+	# So a neighbour that is itself 256-bit is taken whether or not the
+	# window needs the length, and a plain one only while it does. The
+	# conditions for crossing into either are the ordinary ones --
+	# adjacent, not a branch target, not a control transfer -- because the
+	# hazard is the same: an address in the middle of a window is an
+	# address nothing may reach.
+	last = index + 1
+	window = len(encoding)
+	while last - index < limit and last < len(instructions):
+		nxt_address, nxt_encoding, nxt_mnemonic, nxt_operands, _nc = \
+			instructions[last]
+		nxt_vex = inplace.decode_vex(nxt_encoding)
+		wide_next = nxt_vex is not None and nxt_vex["L"]
+		if not wide_next and window >= 5:
+			break			# long enough, and nothing left to absorb
+		stop = None
+		if nxt_address != address + window:
+			stop = "next not adjacent"
+		elif nxt_address in blocked:
+			stop = "next is a branch target"
+		elif nxt_mnemonic.startswith(CONTROL_PREFIXES):
+			stop = "next transfers control"
+		if stop is None and wide_next:
+			# **A 256-bit neighbour is a MEMBER, never a passenger.** A
+			# passenger is emitted into the stub as it stands, and
+			# emitting VEX into a stub is the one thing this tool exists
+			# not to do -- `moved_instruction` refuses it, so carrying
+			# one turns a four-byte site into `passenger cannot be
+			# moved`. Taking it as a member lowers it instead, which is
+			# what the representation says to do with any 256-bit
+			# instruction whatever.
+			nxt_shape = span_operand_shape(
+				nxt_vex, nxt_encoding[nxt_vex["length"]:], nxt_operands,
+				None, nxt_mnemonic)
+			if nxt_shape is None:
+				stop = ("neighbour " + nxt_mnemonic + " has no legacy form"
+				        if nxt_mnemonic in NO_LEGACY_FORM
+				        else "neighbour shape "
+				             + (span_shape_name(nxt_encoding, nxt_operands)
+				                or "?"))
+			elif nxt_mnemonic in NO_LEGACY_FORM \
+					and nxt_shape[0] not in ("extract", "insert"):
+				stop = "neighbour " + nxt_mnemonic + " has no legacy form"
+			else:
+				told = take(last, nxt_shape)
+				if told is not None:
+					stop = "neighbour names " + told
+		if stop is not None:
+			# Past five bytes the run simply ends here; under it, there is
+			# no window to place and the reason is the refusal.
+			if window >= 5:
+				break
+			return refuse("too short to place, " + stop)
+		if not wide_next:
+			members.append(("plain", last, None))
+		window += len(nxt_encoding)
+		last += 1
+	if window < 5:
+		return refuse("too short to place, nothing follows")
+
+	if not inplace.covered_by(ranges, address, window):
+		return refuse("window outside .pdata")
+	# **The block, and only the block.** `window_borrow` is not consulted:
+	# a home-space displacement is valid for the length of one window and
+	# a permanent slot is not a thing one window owns.
+	if tls is None:
+		return refuse("no per-thread block, so no permanent slots")
+	free = sorted(window_gpr_free(home, address, window), reverse=True)
+	if len(free) < 2:
+		return refuse("fewer than two dead GPRs for the block")
+	base, block = tls[1], (free[0], free[1], tls[0])
+
+	entries = span_entries(members, instructions, slots, scope, plain)
+	helpers, _whole = region_helpers(plain, instructions, index, last,
+	                                 blocked, scope)
+	for entry in entries:
+		helpers -= set(scratch_finder.xmm_numbers(entry[4] or ""))
+	helpers = tuple(sorted(helpers))
+	if not helpers:
+		return refuse("no xmm helper free at the site")
+	second = helpers[1] if len(helpers) > 1 else None
+	told = []
+	if lower_ymm_span(entries, base, helpers[0], address, address, block,
+	                  second, told) is None:
+		return refuse(told[-1] if told else "lowering refused, no reason")
+	return (address, encoding, operands, mnemonic, window, [], None, [],
+	        ("unit", (entries, helpers[0], block, base, second)))
+
+
+def report_units(candidates, placed, home, wide=0, original=None):
+	"""What the unconditional lowering reached, and what the invariant needs.
+
+	**Two denominators, and reporting one of them was a defect.** The first
+	version printed the refusals against `wide` -- every 256-bit site in the
+	image -- and called them "holes in it". That is the wrong population in
+	the flattering direction, twice over.
+
+	`unit_candidate` is offered LAST, so it is only ASKED at a site every
+	other strategy declined: on Starfield that is 3,553 of 35,844, and a
+	deficit quoted against the larger number reads an order of magnitude
+	better than it is.
+
+	And the sites it was never asked about are not therefore safe. `pair`,
+	`run`, `zero`, `spill` and the ordinary path lower a 256-bit site
+	without maintaining any slot, because they were written before slots
+	existed and answer a different question. Under the uniform
+	representation each of those is a hole too -- a machine upper half
+	nobody maintains, read by whatever comes next.
+
+	So the honest figure is the one this prints last: how many 256-bit
+	sites are covered by a lowering that CARRIES a slot, against how many
+	there are. Finding 246.
+	"""
+	if SHADOW_REGS_RULE != SHADOW_REGS_ALL:
+		return
+	taken = sum(1 for c in candidates if c[8] and c[8][0] == "unit")
+	missed = sum(UNIT_REFUSED.values())
+	asked = taken + missed
+	print(f"apply: unconditional lowering: {taken:,} built, "
+	      f"{missed:,} refused, of {asked:,} sites it was asked about")
+	for why, count in sorted(UNIT_REFUSED.items(), key=lambda kv: -kv[1]):
+		print(f"apply:   {why:<52} {count:>7,}")
+		for site in UNIT_EXAMPLES.get(why, [])[:3]:
+			print(f"apply:       site {site:#x}")
+	from pathlib import Path		# imported here as elsewhere in this file
+	roll = Path("build") / "unit-refused.txt"
+	if roll.parent.is_dir():
+		with roll.open("w", encoding="utf-8") as out:
+			# **Name the image, because the path is fixed.** A fixture run
+			# overwrote Starfield's 3,216 rows with an empty file and
+			# nothing said so -- Finding 240's fault, met again by a roll
+			# written a day after that one was fixed.
+			out.write(f"# {original}\t{missed:,} refused\n")
+			for why, rows in sorted(UNIT_EXAMPLES.items()):
+				for site in rows:
+					out.write(f"{why}\t{site:#x}\n")
+		print(f"apply: every refused site written to {roll}")
+	# **The figure that answers whether the representation is whole.**
+	# Counted from the windows actually PLACED, not from candidates built:
+	# a candidate the placer dropped maintains nothing.
+	if home is None:
+		return
+	plain = home[3]["plain"]
+	starts = [row[0] for row in plain]
+	kind_of = {}
+	for entry in candidates:
+		strategy = entry[8]
+		kind_of[entry[0]] = strategy[0] if strategy is not None else "plain"
+	carried = 0
+	for address, window, _stub, _body, _prologue in placed:
+		if kind_of.get(address, "plain") not in SLOT_CARRYING:
+			continue
+		low = bisect.bisect_left(starts, address)
+		high = bisect.bisect_left(starts, address + window)
+		for position in range(low, high):
+			vex = inplace.decode_vex(plain[position][1])
+			if vex is not None and vex["L"]:
+				carried += 1
+	print(f"apply: 256-bit sites lowered through a slot: {carried:,} of "
+	      f"{wide:,}")
+	if carried < wide:
+		print(f"apply:   {wide - carried:,} are not, so the representation "
+		      f"is not whole: each is lowered by a")
+		print(f"apply:   strategy that maintains no slot, or not lowered "
+		      f"at all -- an upper half nobody keeps")
+
 
 
 def span_candidate(instructions, plain, positions, index, blocked, home,
@@ -6249,7 +6688,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		if SPILL == SPILL_STACK or stack_borrow:
 			body += STACK_CLOSE
 		lowered = b""
-	elif kind in ("span", "region"):
+	elif kind in ("span", "region", "unit"):
 		# **The upper halves live in the callee home space for the length
 		# of the window**, which is why the displacement has to be one
 		# number over all of it -- `window_borrow`'s argument, and the
@@ -6988,6 +7427,9 @@ def collect(binary, listing, context=None):
 	# A run reports its own numbers, not the previous one's.
 	REGION_REFUSED.clear()
 	REGION_EXAMPLES.clear()
+	UNIT_REFUSED.clear()
+	UNIT_EXAMPLES.clear()
+	WIDE_SITES.clear()
 	instructions, plain, blocked, sources, switch_tables, switch_seen = \
 		context if context is not None else analysis_context(binary, listing)
 	# The code oracle, in two parts. .pdata is the binary's own statement
@@ -7084,6 +7526,11 @@ def collect(binary, listing, context=None):
 		vex = inplace.decode_vex(encoding)
 		if vex is None:
 			continue
+		if vex["L"]:
+			# **The denominator for the uniform representation**, counted
+			# where the loop decodes so it cannot drift from what is
+			# offered. A deficit is only meaningful against the whole.
+			WIDE_SITES["256-bit"] += 1
 
 		strategy = None
 		y_reason = []
@@ -7637,6 +8084,20 @@ def collect(binary, listing, context=None):
 			                            scope, tls_slot_offset)
 			if regional is not None:
 				candidates.append(regional)
+				continue
+
+		# **The unconditional lowering, last of all.** Every strategy
+		# above is consumer-driven and has had its turn; what reaches
+		# here is a site whose upper half no walk could account for,
+		# which is exactly the population the uniform representation
+		# exists to take. Offered only under `--shadow-regs=all`, and
+		# refusing there is a hole in the invariant rather than a miss.
+		# Finding 246.
+		if vex["L"] and strategy is None:
+			lone = unit_candidate(instructions, plain, index, blocked,
+			                      home, ranges, scope, tls_slot_offset)
+			if lone is not None:
+				candidates.append(lone)
 				continue
 
 		if vex["L"] and strategy is None and not needs_sequence:
@@ -10647,7 +11108,7 @@ def main(argv):
 	# site, as it always has, and the other two exist so that all three can
 	# be built and compared. See Finding 46.
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
-	global REGION_PLACE, FALLBACK_RULE, SHADOW_RULE
+	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -10670,11 +11131,11 @@ def main(argv):
 	for i, item in enumerate(argv):
 		if item.startswith("--shadow-regs="):
 			want = item.split("=", 1)[1]
-			if want not in (SHADOW_OFF, SHADOW_ALL):
+			if want not in (SHADOW_REGS_OFF, SHADOW_REGS_ALL):
 				print(f"detour.py: --shadow-regs wants off or all, "
 				      f"not {want!r}", file=sys.stderr)
 				return 2
-			SHADOW_RULE = want
+			SHADOW_REGS_RULE = want
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
@@ -11401,7 +11862,7 @@ def report_cost(candidates, placed, home):
 		      f"{body:>10,} {per:>8.1f}")
 
 
-def report_regions(candidates):
+def report_regions(candidates, original=None):
 	"""Why regions the collector accepted were not emitted.
 
 	Every line below `members refused the region` is a disagreement between
@@ -11433,6 +11894,8 @@ def report_regions(candidates):
 	roll = Path("build") / "region-refused.txt"
 	if roll.parent.is_dir():
 		with roll.open("w", encoding="utf-8") as out:
+			out.write(f"# {original}\t{sum(walk.values()):,} not "
+			          f"representable\n")
 			for why, rows in sorted(REGION_EXAMPLES.items()):
 				for begin, site in rows:
 					out.write(f"{why}\t{begin:#x}\t{site:#x}\n")
@@ -11727,7 +12190,7 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			run_entries = strategy[1][1]
 			for one in run_entries[1:]:
 				swallowed.add(one[4])
-		if strategy is not None and strategy[0] in ("span", "region"):
+		if strategy is not None and strategy[0] in ("span", "region", "unit"):
 			# The window's first byte keeps its boundary because the jump is
 			# written there; every member after the first loses its own.
 			# Each entry's second field is its address.
@@ -11957,7 +12420,9 @@ def apply_all(binary, listing, output):
 	      f"{len(overlapped):,} skipped for overlap, {len(refused):,} refused")
 	for why, count in stub_reasons.most_common():
 		print(f"apply:   refused, {why:<38} {count:>8,}")
-	report_regions(candidates)
+	report_regions(candidates, binary)
+	report_units(candidates, placed, home, WIDE_SITES["256-bit"],
+	             binary)
 	report_placement(candidates, placed, overlapped, refused)
 	report_cost(candidates, placed, home)
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "

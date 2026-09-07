@@ -13686,6 +13686,134 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 246 -- the unconditional lowering, and a set read as an ISA bound
+
+Finding 245 named the missing piece and this builds it: `unit_candidate`, offered below every
+other strategy under `--shadow-regs=all`, lowering a 256-bit instruction **because it is
+256-bit** rather than because a walk found a consumer. Two fixtures prove it end to end --
+`crossregion` returns 77 where a region reads a ymm defined outside it, `laneswap` returns 77
+where the value travels through `vextractf128` and `vinsertf128` -- and 29 without the flag,
+so `check-shadow-pe` now carries four assertions that all discriminate.
+
+**A permanent slot needs the per-thread block.** A borrowed frame lasts one window; a
+register's slot has to outlive every window in the image. So `--spill=tls` is not one backing
+store among three here, it is the only one the representation admits, and the region path is
+routed to it rather than to a home space two slots wide. The fixtures needed a TLS directory
+of `tls_block_slots() * 16` = 320 bytes before any of this could be exercised at all.
+
+**`NO_LEGACY_FORM` is about a TECHNIQUE, and it was read as a claim about the instruction
+set.** 628 sites were refused as "no legacy encoding" and reported here as a hard floor --
+"100% is not reachable, and the proof is no longer an argument". That was wrong. The set
+forbids clearing `VEX.L` and re-emitting, which for these mnemonics produces bytes that decode
+to nothing; it says nothing about the semantics, which `lower.py` has emitted on the plain path
+since Finding 205 by carrying a rule per shape. The comment above the set says so in as many
+words, and nobody read it.
+
+Four of them are 16-byte moves once an upper half is a slot, which is what `lower.py` already
+writes and already calls the Y2 path:
+
+    vextractf128 $1,%ymmS,%xmmD   ->  movups slot(S),%xmmD    ; D.lo = S.hi
+                                      xorps  %h,%h            ; D.hi = 0
+                                      movups %h,slot(D)
+    vinsertf128 $1,%xmmS,%ymmS1,%ymmD -> movups %xmmS,slot(D) ; D.hi = S
+                                         movaps %xmmS1,%xmmD  ; only if S1 != D
+
+**The extract's second half is the part a careless lowering drops.** `vextractf128` writes
+`%xmmD` with a VEX.128 instruction, and a VEX.128 write zeroes bits 255:128 -- which under this
+representation is D's own slot. Leaving it holding what it had is the stale-upper-read bug
+pointed the other way. `laneswap` sums 77 from the moved half and 0 from the zeroed one, so
+either failing changes the answer.
+
+**And the insert's store must come first.** 141 of Starfield's 157 are
+`$1,%xmm4,%ymm4,%ymm4` -- one machine register for all three operands -- so moving S1 into D
+before the store would overwrite the value the store exists to save.
+
+Routing them took the ISA-bound refusals from **628 to 156**, and the accounting closes
+exactly: 472 removed, being 461 direct and 11 that had been refused as swallowed neighbours.
+The residue is what was declined rather than a surprise -- 21 `vextractf128` and 16
+`vinsertf128` memory forms, 12 `vperm2f128` not implemented, and 107 broadcasts, cross-lane
+permutes and F16C. Only `$0x1` register forms are emitted, because that is the whole
+population: 362 of 383 and 141 of 157 in Starfield, and every `vextracti128` and
+`vinserti128`.
+
+**A strategy offered at every site collides with itself.** `laneswap`'s first run returned 29:
+three candidates built, one placed, 1 of 6 sites through a slot. Every adjacent 256-bit
+instruction wanted its own window and they competed for the same bytes -- a failure no
+consumer-driven strategy can have, since those are offered at a site only where a walk found
+something to do. Absorbing the whole run of adjacent 256-bit sites into one window took the
+fixture to 6 of 6 and 19.0 B/site from 39.5.
+
+    Starfield, --shadow-regs=all      before lanes     after
+    ISA-bound refusals                        628        156
+    shape not emittable                       839        839
+    register pressure                       1,746      2,144
+    unit sites lowered                         25        192
+    unit windows                               17         58
+    unit cost                          40.2 B/site 25.7 B/site
+    256-bit sites through a slot              ~283        428
+
+**Register pressure rising is the refusal moving down the pipeline**, not a regression: a site
+that used to stop at "no legacy encoding" now reaches the point of wanting two dead GPRs.
+
+#### The denominator was wrong in the flattering direction
+
+`report_units` first printed its refusals against every 256-bit site -- "3,216 of 35,844 are
+holes" -- and both halves of that are wrong. `unit_candidate` is offered LAST, so it is only
+ASKED at a site every other strategy declined: 3,540 of 35,844. And the sites it was never
+asked about are not therefore safe, because `pair`, `run`, `zero`, `spill` and the ordinary
+path lower a 256-bit site while maintaining no slot at all -- they were written before slots
+existed and answer a different question.
+
+So the honest figure is counted from windows the placer KEPT, since a candidate it dropped
+maintains nothing: **428 of 35,844 sites are lowered through a slot** -- span 194, unit 192,
+region 152. The other 35,416 are holes in the invariant. `SLOT_CARRYING` names the three in one
+place so a fourth cannot join without somebody deciding that it should.
+
+The general shape is `evidence.md`'s and it is worth stating plainly: **the population a check
+was OFFERED is not the population it speaks for**, and quoting the larger one made a deficit
+read an order of magnitude better than it was.
+
+#### Two defects found on the way, one of them mine and two commits old
+
+**`SHADOW_RULE` was declared twice.** `--shadow=` and `--shadow-regs=` shared one module
+global, the second definition overwriting the first at import, so since `38492ab` **every
+default build has had the caller's shadow borrow silently off**. Renamed to `SHADOW_REGS_RULE`,
+with a match-count proof that refused the first attempt when the expected count was wrong.
+
+**Its blast radius on Starfield is zero, measured.** The default build after the fix is
+805,131 -> 5,673, 99.3%, 202,838 detours -- the documented numbers exactly, and `make status`
+agrees. The stack fallback rescues the same sites, which is precisely what `check-spill`'s own
+comment records and why that control has to pass `--fallback=off` to isolate the shadow at all.
+A real defect with no measurable cost is still a defect, and the reason it had none is worth
+more than the fix.
+
+**`check-shadow-pe` was calibrated against that bug, in the commit that introduced it.** It
+asserted `laneregadd` returns 77 with permanent slots, and the flag appeared to matter only
+because it switched the caller's shadow on as a side effect of the collision. With the
+collision fixed, `laneregadd` returns 77 either way. Probed on a copy of HEAD: the span uses
+slot 0 and slot 1 -- its own bookkeeping, never a register's permanent one -- so the target
+never touched the mechanism it named. It is re-aimed at `crossregion` and `laneswap`, both run
+in both arms.
+
+**A control written in the same commit as the bug it is calibrated against cannot see it**, and
+nothing in the ordinary course of work brings the two together: the control passes, so nobody
+looks. What exposed it was fixing the collision for an unrelated reason and watching a green
+target stop discriminating.
+
+#### Smaller, and recorded so they are not rediscovered
+
+- **`crossregion` was in no Makefile target.** It was committed in `8479238` as the invariant's
+  control and nothing ran it. Wired in now.
+- **`unit-refused.txt` and `region-refused.txt` did not name their image**, so a fixture run
+  overwrote Starfield's 3,216-row roll with an empty file and nothing said so. That is Finding
+  240's fault exactly, met again by a roll written a day after that one was given a header.
+  Both carry one now.
+- **The emitter guard refusing a permanent slot with no block has not been seen to fire.** With
+  the routing deliberately removed and `--spill` swept over home, none and stack, every fixture
+  is refused earlier. It is a floor for a candidate builder that does not exist yet, not
+  evidence that anything is protected today, and the source says so rather than implying
+  otherwise.
+
 ### Finding 245 -- the invariant needs an unconditional lowering, which no strategy is
 
 Building "every writer maintains its slot" turned out to need one thing nobody had named,
