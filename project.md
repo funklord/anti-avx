@@ -13649,6 +13649,53 @@ sabotaged stub against the real one: three said IDENTICAL, and identical bytes c
 result.
 
 
+### Finding 232 -- ddisasm runs here, does not fit this input, and calls it unsupported
+
+Finding 8 named Ddisasm as milestone 3's instrument and the ground truth to audit the 744
+data islands against. It is obtainable and it was run. Two facts came back, and the
+second matters more than the first.
+
+**It costs more than 20 GB of address space on this binary**, which nobody had measured:
+
+```
+threads   wall     peak RSS        outcome
+     4    370s   11,475,424 kB   std::bad_alloc at the 20 GB cap
+     1    268s   11,476,076 kB   std::bad_alloc at the 20 GB cap
+```
+
+Peak resident is identical to within 0.006%, so **`-j` changes nothing about the
+memory** -- the demand is Souffle's relations, not per-thread arenas. That was a
+hypothesis, tested, and refuted; single-threaded was merely faster, four threads having
+reached only 50% CPU. Both die in the same phase, `disassembly load`. Note the gap
+between 11.5 GB resident and 20 GB virtual: `prlimit --as` bounds address space, and
+Souffle maps far more than it touches, so RSS is the wrong number to size the cap from.
+
+**And it declares the input unsupported before running out of memory:**
+
+```
+WARNING: Input binary compiled with Profile Guided Optimization. (unsupported)
+```
+
+**Starfield is PGO-compiled and ddisasm does not support that.** So milestone 3's plan
+needs revisiting on its own terms: even a run that completed would produce a code/data
+separation of uncertain standing for exactly the audit it was wanted for. That is worth
+knowing before anybody buys a bigger machine for it.
+
+**Obtaining it, because it is not a package here.** Not in Debian; `sudo` needs a
+password; Docker would cost 1-2 GB on the 72%-full `/`. GrammaTech publish `.deb`s at
+`download.grammatech.com/gtirb/files/apt-repo` (components `stable`/`unstable`, dist
+`focal`), and `dpkg-deb -x` unpacks them into a prefix with no install at all -- which is
+what `run_ddisasm.sh`'s `DDISASM_PREFIX` was always for. ddisasm 1.9.5 needs `libgtirb`
+2.3.2, `libgtirb-pprinter` 2.2.5 and `libcapstone-dev` 1:5.0.1-gt from that repo, plus
+three focal sonames Debian does not carry -- `libboost_filesystem.so.1.71.0`,
+`libboost_program_options.so.1.71.0` and `libprotobuf.so.17` -- taken from Ubuntu's
+`main` pool into the same prefix. About 110 MB, and `ldd` then reports nothing missing.
+
+**The wrapper did its job and the default would not have.** `run_ddisasm.sh` defaults to
+a 28 GB cap; 29 GB was available, with swap already half used and another session working
+this machine. Capped at 20 GB the failure was a dead process in four minutes instead of a
+box in swap.
+
 ### Finding 231 -- fourteen of verify's seventeen checks had no control, and the repair has no fixture
 
 `verify` raises `problems` at **17** places. `sabotage` had **3** kinds, and its docstring
@@ -14229,6 +14276,7 @@ a binary that computes the wrong answer.
 | - | ~~Data reaching the in-place path~~ **FIXED** | 518,990 patches guarded, output byte-identical | wrong bytes | Finding 223: the same defect one call site over; `vex sites` was inflated by data |
 | - | ~~Data reaching the candidate loop~~ **FIXED** | 99 of 180 (bad) rows, output byte-identical | wrong bytes | Finding 222: `decode_vex` gates on length, never on the map field; the mnemonic was the only thing refusing them |
 | - | ~~Compressing the detour padding~~ **CLOSED at 0** | 346,530 fills, already longest-first | neither | Finding 221: `nop_padding` composes from NOPS[1..8]; the 210,690 single-byte fills are in-place slack, a floor |
+| - | ~~Ddisasm as milestone 3's ground truth~~ **BLOCKED** | >20 GB address space; PGO unsupported | neither | Finding 232: obtainable without sudo, but it calls this input unsupported and does not fit |
 | 1 | A fixture that exercises the repair pass | 184 reverts and 141 withheld windows, all untested | wrong bytes | Finding 231: disabling the repair changes no fixture's image; `staleupper` has nothing to bite on |
 | - | ~~The 319 outside .pdata~~ **PRICED at 52** | 315 of 367 refusals are data; leaf recovery takes 97.9% | sites lowered | Finding 230: 4 chunks of unproven extent, 3 with no findable caller |
 | - | ~~`ymm upper half read later`, 115 loads / 130 stores~~ **PRICED at 0** | raising the 40-instruction limit frees nothing | sites lowered | Finding 229: all 115 have a reader inside the window; the remaining lever needs the placer's answer at collect time |
