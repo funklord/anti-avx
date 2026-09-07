@@ -13686,6 +13686,46 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 245 -- the invariant needs an unconditional lowering, which no strategy is
+
+Building "every writer maintains its slot" turned out to need one thing nobody had named,
+and the control fixture is what named it.
+
+**Three classes of writer, and only two need anything.** Legacy SSE writes leave
+`[255:128]` alone, so the slot should be untouched -- no action. 256-bit writes must store
+their high half to the register's PERMANENT slot; they wrote a span-local index, which is
+invisible outside the span. VEX.128 writes zero `[255:128]` in the original, so they must
+zero the slot. **Calls need nothing**: the Win64 ABI makes every ymm upper half volatile
+across one, so a callee clobbering slots matches the hardware exactly, which is why
+`conservative_producers` already stops there.
+
+**Done: region-lowered 256-bit writes now take the permanent slot** when
+`--shadow-regs=all`, so a value one region defines is addressable by every later one.
+`laneregadd` still returns 77, `make check` and `check-pe` are clean.
+
+**The control that names the rest.** `crossregion` puts a `%ymm1` before a branch target
+and reads it in the region after -- the 3,378 + 1,079 + 926 shape. Its answer is
+unforgeable: **77 if the slot carried the high half, 7 if it read an unmaintained one.**
+
+And it reports `0 detours`. **The defining load is not lowered either**, because nothing
+consumes it inside its own region and every strategy here is consumer-driven: `pair` wants
+a load AND a store, `span` a closed chain, `region` a stretch whose definitions it can
+see. None fires on a lone load.
+
+**So the invariant is not a rule added to the strategies. It is a strategy none of them
+is:**
+
+> a 256-bit instruction must be lowered because it is 256-bit, not because an analysis
+> found a consumer for it.
+
+That is the unbuilt piece, and it is smaller than it sounds: `lower_ymm_span` already
+emits the shape for a load -- low half into the real xmm, high half into a helper, helper
+into the slot. What is missing is a candidate that offers EVERY 256-bit site as a
+one-member lowering, plus its placement and cost, across 35,845 sites.
+
+**Not built here rather than shipped unverified.** What is left behind is what makes it
+checkable: a fixture that fails the right way, and slots that are already permanent.
+
 ### Finding 244 -- the representation is in the tool, and it unlocks nothing yet
 
 `--shadow-regs=all` gives every ymm a permanent slot instead of a span-local one.

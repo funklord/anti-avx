@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2166,6 +2166,45 @@ _start:
 	vmovups	(%rsi), %ymm1
 	vmovups	0x20(%rsi), %ymm2
 	vpaddd	%ymm1, %ymm2, %ymm2	/* lanereg: second source is a register */
+	vmovups	%ymm2, (%rdi)
+	movl	16(%rdi), %eax		/* upper half: 70 + 7 = 77 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 70, 6, 7, 8
+	.long 0, 0, 0, 0
+	.long 7, 0, 0, 0
+""")
+
+
+# The invariant's control: a region that reads a ymm defined OUTSIDE it.
+# `region_members` refuses this today, and the refusal is soundness rather
+# than bookkeeping -- 3,378 sites after a call, 1,079 after a jump, 926 at a
+# branch target. A permanent slot only carries the right value if whatever
+# defined the register outside also maintained it.
+#
+# The branch is what splits the two regions: `here` is a branch target, so
+# the region below it did not define %ymm1. The answer is again in the upper
+# half -- 70 + 7 -- so a region that reads an unmaintained slot returns 7,
+# and one reading a maintained slot returns 77. That difference is the whole
+# invariant, expressed as a number.
+PROGRAMS["crossregion"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	(%rsi), %ymm1		/* defines %ymm1 */
+	movl	$1, %ecx
+	testl	%ecx, %ecx
+	jne	here			/* always taken; `here` is a branch target */
+here:
+	vmovups	0x20(%rsi), %ymm2	/* a new region starts here */
+	vpaddd	%ymm1, %ymm2, %ymm2	/* reads %ymm1, defined outside it */
 	vmovups	%ymm2, (%rdi)
 	movl	16(%rdi), %eax		/* upper half: 70 + 7 = 77 */
 	addq	$40, %rsp

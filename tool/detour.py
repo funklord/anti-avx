@@ -4547,7 +4547,15 @@ def region_members(instructions, first, last, reasons=None):
 		what, register = shape[0], shape[1]
 		if what == "load":
 			if register not in slots:
-				slots[register] = len(slots)
+				# **The permanent slot when shadows are on**, so a value
+				# this region defines is visible to every later one. A
+				# span-local index is invisible outside the span, which is
+				# what makes a region unable to read a ymm defined
+				# elsewhere. Finding 245.
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_RULE == SHADOW_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
 			defined.add(register)
 		elif what == "lanereg3":
 			# **Reads two and writes a third.** The destination is not a
@@ -4557,7 +4565,10 @@ def region_members(instructions, first, last, reasons=None):
 			if shape[2] not in defined or shape[3] not in defined:
 				return refuse("lanereg3 source from outside the region")
 			if register not in slots:
-				slots[register] = len(slots)
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_RULE == SHADOW_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
 			defined.add(register)
 		else:
 			# Everything else READS the register it names, so the region
