@@ -13686,6 +13686,86 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 249 -- the block register saved, and a cross-tab read at its margin
+
+Finding 248 ended saying the 937 sites with nothing free needed the BLOCK register saved across
+a whole stub rather than the index across three instructions. This builds that, and it works,
+and it buys four candidates and no sites at all.
+
+#### Finding 69's circularity is not the whole truth
+
+That finding says there is nowhere to save a general-purpose register that does not need a
+register to address it. **`(%rsp)` needs none.** What is actually scarce is not an addressing
+register but eight bytes of stack that are ours to write: below `rsp` is nothing, Win64 having
+no red zone, and above it is the caller's business. The callee home space is the one place, and
+`window_borrow` has been finding it since Finding 98.
+
+    mov  %block,  d+0(%rsp)        32 bytes is room for both
+    mov  %index,  d+8(%rsp)
+    mov  %gs:0x58,%block
+    mov  tls_index(%rip),%indexd
+    mov  (%block,%index,8),%block
+    mov  d+8(%rsp),%index          the index comes back at once
+    ... every member ...
+    mov  d+0(%rsp),%block          the block at the single exit
+
+**And what these registers must be is UNNAMED, not dead.** They are given back, so what the
+program does with them after the stub is no business of the borrow; all that matters is that
+nothing inside the window reads or writes them. `window_gpr_unnamed` asks that weaker question,
+and it is the whole reason a site with nothing dead is reachable at all.
+
+`nogpr` is the control: all seven volatile GPRs set above the site and read below it, with a
+`call` to make the home space real. The region strategy still refuses that same site for "fewer
+than two dead GPRs". Its sabotages land exactly where the arithmetic says -- index restore cut
+gives **57** (77 - 20), block save cut gives **37** (77 - 40), block restore cut gives **245**,
+r11 holding a pointer -- and since those three exist only on this path, they also prove it is
+the path taken.
+
+#### The number was in a table already printed, at the cell rather than the margin
+
+The probe that chose this design reported a CROSS-TAB, and the write-up quoted one edge of it:
+
+    no home space    no xmm       526
+    home space       no xmm       411
+    no home space    xmm free       8
+    home space       xmm free       4
+
+"415 sites have a home space" is the row margin and it is true. It is also not the reachable
+population, because a stub needs an xmm helper for the lowering **whatever** it does about the
+block pointer, and the cell where both are present says **4**.
+
+    no dead GPR for the block         949  ->  534    -415
+    no xmm helper free at the site  1,293  -> 1,704    +411
+    unit candidates built             437  ->    441      +4
+    256-bit sites through a slot      456  ->    456       0
+
+415 = 4 + 411, to the unit. **The result was predictable from data already on the page, and the
+prediction was declined on the grounds that the last three had been wrong** -- which was the
+right instinct pointed at the wrong thing. The lesson is not to predict less; it is that a
+margin is not a cell, which is *A passing check is not evidence on its own* in its other
+costume: a true figure over the wrong population.
+
+Same error as `report_units` in Finding 246, one document apart.
+
+#### Four levers, and the constraint was elsewhere for the last two
+
+    lever                          refusals removed   sites gained
+    ISA lowerings (three passes)                141             14
+    the block pointer, one register             577             21
+    liveness, sound portion              6% of 1,799      not built
+    the block register saved                    415              0
+
+**The binding constraint has been the xmm helper since the second row**, and two passes were
+spent on the GPR side of it. The refusal to look at is now `no xmm helper free at the site` at
+1,704 of 3,099 -- and the thing to do with it is what Finding 248 did for the GPRs: measure
+what is behind it before building anything, including whether a helper is needed at all for the
+shapes that dominate it.
+
+**The code stays.** It is correct, it is proved by a control that fails three distinct ways, and
+it establishes that the home space can hold a general-purpose register for the length of a stub
+-- which is a fact about this rewriter that was previously recorded as impossible. What it is
+not is a lever on this binary.
+
 ### Finding 248 -- the 949 saturated sites, measured rather than assumed
 
 Finding 247 ended by calling the frontier "saturation" and naming three guesses at what might

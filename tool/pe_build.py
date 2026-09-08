@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2628,6 +2628,77 @@ _start:
 func_end:
 	.p2align 5
 source:	.long 17, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# NO dead general-purpose register at all, which is 949 of the sites the
+# unconditional lowering refuses and 415 of them have what this one has: a
+# callee home space. All seven volatiles are set above the site and read
+# below it, so every one is live across it and `window_gpr_free` is empty.
+#
+# The `call` is not decoration -- it is what makes the 32 bytes of home
+# space real. Without it the function is a leaf, nothing can be lent, and
+# the site is refused.
+#
+# **The two registers borrowed need only be UNNAMED in the window, not
+# dead**, because they are saved and given back. The window here names only
+# rsi and rdi, both non-volatile, so the tool takes r11 for the block and
+# r10 for the index -- and both hold values the sum needs.
+#
+# 10 + 1 + 1 + 1 + 1 + 20 + 40 = 74, and 74 + 3 = 77. r10 carries 20 and
+# r11 carries 40, so a lost index restore and a lost block restore are
+# separately visible and neither is one away from passing: what a missing
+# index restore leaves behind is the small TLS index, and a missing block
+# restore leaves a whole pointer.
+PROGRAMS["nogpr"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$56, %rsp		/* 32 of home space, and alignment */
+	vzeroupper
+	call	helper			/* makes the home space real */
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movl	$10, %eax
+	movl	$1, %ecx
+	movl	$1, %edx
+	movl	$1, %r8d
+	movl	$1, %r9d
+	movl	$20, %r10d		/* the index borrow takes this one */
+	movl	$40, %r11d		/* and the block borrow this one */
+	vbroadcastss (%rsi), %ymm0	/* the site: nothing is dead here */
+	vmovups	%ymm0, (%rdi)
+	addl	%ecx, %eax		/* all seven are read below the site, */
+	addl	%edx, %eax		/* which is what makes them live across */
+	addl	%r8d, %eax
+	addl	%r9d, %eax
+	addl	%r10d, %eax
+	addl	%r11d, %eax		/* eax = 74 */
+	addl	16(%rdi), %eax		/* + 3 from an upper half */
+	addq	$56, %rsp
+	ret
+helper:
+	ret
+func_end:
+	.p2align 5
+source:	.long 3, 0, 0, 0
 	.p2align 5
 sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0

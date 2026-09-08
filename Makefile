@@ -188,7 +188,7 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap lanemem bcast permmem permil onegpr; do \
+	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -239,7 +239,11 @@ check-shadow-pe:
 	echo "check-shadow-pe: onegpr -- six of the seven volatile GPRs live"; \
 	echo "                 across the site, so the block pointer has ONE"; \
 	echo "                 dead register and the index borrows a live one,"; \
-	echo "                 stashed in an xmm. Cutting the restore gives 37"
+	echo "                 stashed in an xmm. Cutting the restore gives 37"; \
+	echo "check-shadow-pe: nogpr -- all SEVEN live, so nothing is dead and"; \
+	echo "                 both borrows are saved in the callee home space,"; \
+	echo "                 the block for the whole stub. Cutting the block"; \
+	echo "                 save gives 37, its restore 245, the index 57"
 
 # -- the software F16C conversions -------------------------------------------
 

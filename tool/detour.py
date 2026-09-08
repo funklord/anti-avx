@@ -757,6 +757,51 @@ def encode_tls_base(block, index, index_va, at, stash=None):
 	return bytes(out)
 
 
+def encode_gpr_home(register, save, offset):
+	"""Save or restore a general-purpose register at `offset(%rsp)`.
+
+	**The circularity Finding 69 named was never quite the whole truth.**
+	It says there is nowhere to save a general-purpose register that does
+	not need a register to address it -- and `(%rsp)` needs none. What is
+	actually scarce is not an addressing register but eight bytes of stack
+	that are ours to write: below `rsp` is nothing (Win64 has no red zone)
+	and above it is the caller's business, so the only place is the callee
+	home space the caller reserved, which `window_borrow` finds.
+
+	Always a disp32. The home space sits at a frame's own displacement and
+	a disp8 form would be right only in a fixture. Finding 249.
+	"""
+	out = bytearray()
+	out.append(0x48 | (0x04 if register >= 8 else 0))	# REX.W, REX.R
+	out += b"\x89" if save else b"\x8b"
+	out.append(0x80 | ((register & 7) << 3) | 4)		# mod 10, SIB
+	out.append(0x24)					# base rsp, no index
+	out += struct.pack("<i", offset)
+	return bytes(out)
+
+
+def window_gpr_unnamed(home, start, window):
+	"""Volatile GPRs no instruction in the window NAMES, as numbers.
+
+	Weaker than `window_gpr_free` on purpose, and the difference is the
+	whole of Finding 249. That one wants a register DEAD, because it
+	clobbers one and never puts it back; a register that is saved and
+	restored may be live, and all that matters is that nothing inside the
+	window reads or writes it while the borrow stands.
+	"""
+	if home is None:
+		return frozenset()
+	_starts, _ranges, _usable, state = home
+	plain = state["plain"]
+	named = set()
+	at = bisect.bisect_left(plain, (start,))
+	while at < len(plain) and plain[at][0] < start + window:
+		named |= gprs_named(plain[at][3] or "")
+		at += 1
+	return frozenset(GPR_NUMBERS[name]
+	                 for name in frozenset(VOLATILE_GPRS) - named)
+
+
 def encode_tls_spill(borrowed, save, block, offset):
 	"""Save or restore a borrowed xmm in the TLS slot at `offset(%block)`.
 
@@ -4476,13 +4521,30 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		# establish before the span was offered -- a pointer recomputed per
 		# member would cost three instructions each and a pointer clobbered
 		# mid-span would address somebody else's thread data.
-		# **The helper doubles as the stash**, which is what makes the
-		# one-dead-register form cost nothing: the index is restored three
-		# instructions later, before any member is emitted, so the
-		# register this borrows is one the body has not started using.
-		body += encode_tls_base(block[0], block[1], block[2], at,
-		                        helper if len(block) > 3 and block[3]
-		                        else None)
+		# **Three ways to stand the block pointer up**, and which one is
+		# used is decided by the collector from what the site can supply.
+		#
+		#   False   two dead registers, clobbered and never put back
+		#   True    one dead register; the index is stashed in an xmm
+		#   "home"  none; BOTH are saved in the callee home space
+		#
+		# The helper doubles as the stash in the second, which is what
+		# makes it cost nothing: the index is restored three instructions
+		# later, before any member is emitted, so the register it borrows
+		# is one the body has not started using.
+		mode = block[3] if len(block) > 3 else False
+		if mode == "home":
+			# The block's own save comes back at the very END of the stub,
+			# because unlike the index it has to hold the pointer for
+			# every member. See the restore below the member loop.
+			body += encode_gpr_home(block[0], True, block[4])
+			body += encode_gpr_home(block[1], True, block[4] + 8)
+			body += encode_tls_base(block[0], block[1], block[2],
+			                        at + len(body))
+			body += encode_gpr_home(block[1], False, block[4] + 8)
+		else:
+			body += encode_tls_base(block[0], block[1], block[2], at,
+			                        helper if mode else None)
 	for kind, address, encoding, mnemonic, operands, slot, moved, second, \
 			third in entries:
 		if kind == "plain":
@@ -4866,6 +4928,11 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		body += piece
 		body += span_slot_move(helper, True, base, slot, block,
 		                       at + len(body))
+	if block is not None and len(block) > 3 and block[3] == "home":
+		# **The one place it can go.** Past the refusals this function has
+		# a single exit, and every member above has finished with the
+		# pointer by the time control reaches it.
+		body += encode_gpr_home(block[0], False, block[4])
 	return bytes(body)
 
 
@@ -5487,17 +5554,39 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# happens to exist the plain sequence is used, because it is ten bytes
 	# shorter. Finding 247.
 	free = sorted(window_gpr_free(home, address, window), reverse=True)
-	if not free:
-		return refuse("no dead GPR for the block pointer")
 	if len(free) >= 2:
 		base, block = tls[1], (free[0], free[1], tls[0], False)
-	else:
+	elif free:
 		borrowed = next((n for n in sorted(GPR_NUMBERS[name]
 		                                   for name in VOLATILE_GPRS)
 		                 if n != free[0]), None)
 		if borrowed is None:
 			return refuse("no register to borrow for the index")
 		base, block = tls[1], (free[0], borrowed, tls[0], True)
+	else:
+		# **No dead register at all, so borrow two live ones and give them
+		# back.** The stash of the branch above frees the INDEX, which is
+		# clobbered for three instructions; the block pointer has to hold
+		# for every member, so freeing it needs somewhere that lasts the
+		# whole stub. The callee home space is that somewhere, and reaching
+		# it needs no register because `(%rsp)` is not a register the site
+		# has to spare.
+		#
+		# **What these registers must be is UNNAMED, not dead.** They are
+		# put back, so what the program does with them after the stub is
+		# no business of this; what matters is that nothing inside the
+		# window reads or writes them while the borrow stands. That is a
+		# weaker test than `window_gpr_free` and it is why sites with
+		# nothing dead can still be reached. Finding 249.
+		lent = window_borrow(home, address, window)
+		if lent is None:
+			return refuse("no dead GPR and no home space to save one")
+		spare = sorted(window_gpr_unnamed(home, address, window),
+		               reverse=True)
+		if len(spare) < 2:
+			return refuse("fewer than two unnamed GPRs to borrow")
+		base = tls[1]
+		block = (spare[0], spare[1], tls[0], "home", lent)
 
 	entries = span_entries(members, instructions, slots, scope, plain)
 	helpers, _whole = region_helpers(plain, instructions, index, last,
