@@ -13728,13 +13728,57 @@ either failing changes the answer.
 `$1,%xmm4,%ymm4,%ymm4` -- one machine register for all three operands -- so moving S1 into D
 before the store would overwrite the value the store exists to save.
 
-Routing them took the ISA-bound refusals from **628 to 156**, and the accounting closes
-exactly: 472 removed, being 461 direct and 11 that had been refused as swallowed neighbours.
-The residue is what was declined rather than a surprise -- 21 `vextractf128` and 16
-`vinsertf128` memory forms, 12 `vperm2f128` not implemented, and 107 broadcasts, cross-lane
-permutes and F16C. Only `$0x1` register forms are emitted, because that is the whole
-population: 362 of 383 and 141 of 157 in Starfield, and every `vextracti128` and
-`vinserti128`.
+Routing them took the ISA-bound refusals from **628 to 156** in a first pass, and the
+accounting closes exactly: 472 removed, being 461 direct and 11 that had been refused as
+swallowed neighbours. What that first pass declined was three forms it did not implement --
+21 `vextractf128` and 16 `vinsertf128` MEMORY operands, and 12 `vperm2f128` -- and a second
+pass took all three, leaving **107** and no lane operation among them.
+
+**The permute is selection, not arithmetic.** `imm[1:0]` picks the destination's low half and
+`imm[5:4]` its high one, from `SRC1.lo`, `SRC1.hi`, `SRC2.lo`, `SRC2.hi` in that order, with
+`imm[3]` and `imm[7]` overriding to zero. None of that is computation once the halves are
+separately addressable, which is what `lower.py` means by "moves, once halves are split".
+**Both sources are read into helpers before either destination half is written**, because every
+one of Starfield's twelve aliases the destination with a source -- eight are
+`%ymm0,%ymm0,%ymm0` -- so writing the low half first destroys what the high half still needs.
+
+**The memory forms are a half in each direction**, and the extract's is the one with a
+difference worth stating: `vextractf128 $1,%ymmS,mem` writes sixteen bytes of memory and no ymm
+at all, so unlike the register form there is **no destination slot to zero**. The imm8 has to
+be stripped from the tail before `encode_mem` carries everything from modrm onward, since a
+`movups` has no immediate.
+
+    Starfield, --shadow-regs=all      no lanes    register    + perm2 and memory
+    ISA-bound refusals                     628         156                   107
+    lane mnemonics refused                 510          49                     0
+    register pressure                    1,746       2,144                 2,182
+    unit sites lowered                      25         192                   210
+    unit windows                            17          58                    74
+    256-bit sites through a slot           ~283         428                   446
+
+**What is left is 107 and it is not a bound**: 56 broadcasts, 21 cross-lane permutes, 18
+`vpbroadcastd` and 12 F16C. Every one has a rule in `lower.py` already -- a broadcast is `movss`
+plus `shufps $0`, the permutes are `shufps` and `shufpd` pairs or a call into `src/permd.c`,
+F16C is `src/f16c.c`. They are refused because `unit_candidate` reaches the emitter through
+`lower_ymm_span`, which knows slot moves and prefix-strips and nothing else. That is the next
+piece of work.
+
+**Register pressure is now the largest cause**, and it grew from 1,746 to 2,182 across both
+passes. That is the refusal migrating down the pipeline as earlier ones are removed, not a
+regression: a site that used to stop at "no legacy encoding" now reaches the point of wanting
+two dead GPRs.
+
+Only `$0x1` is emitted for extract and insert, because that is the whole population -- 362 of
+383 and 141 of 157 in Starfield, and every `vextracti128` and `vinserti128`. `vperm2f128` takes
+any immediate, since its selector is read rather than matched.
+
+**The fixtures are sabotage-tested, not only flag-tested.** `--shadow-regs=off` returning 29
+proves the flag does something; it does not prove an emitter is right rather than accidentally
+right. `lanemem`'s 77 is 60 + 7 + 10, one term per mechanism, and breaking each in a scratch
+copy gives a distinct wrong answer: the permute's high selector forced to `SRC1` gives **67**,
+the extract-to-memory slot move removed gives **24**, the insert-from-memory slot store removed
+gives **70**. It covers both immediates that occur in the wild, `$0x1` and `$0x20`, which take
+different selector paths.
 
 **A strategy offered at every site collides with itself.** `laneswap`'s first run returned 29:
 three candidates built, one placed, 1 of 6 sites through a slot. Every adjacent 256-bit

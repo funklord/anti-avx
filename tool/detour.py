@@ -3708,6 +3708,23 @@ def canonical_ymm(field):
 	return found.group(0) if found else field
 
 
+def perm2_immediate(operands):
+	"""`vperm2f128`'s imm8 as an int, or None.
+
+	Read from the operand text rather than from the encoding's last byte
+	because the two agree and only one of them is unambiguous to a reader.
+	A form whose immediate objdump did not render as a constant is refused
+	rather than guessed at.
+	"""
+	fields = inplace.split_operands(operands or "")
+	if not fields or not fields[0].startswith("$"):
+		return None
+	try:
+		return int(fields[0][1:], 0) & 0xFF
+	except ValueError:
+		return None
+
+
 def ymm_alias(field):
 	"""`%ymm7` for `%xmm7` as well as for `%ymm7`, or None.
 
@@ -3729,8 +3746,14 @@ def ymm_alias(field):
 # uniform representation the rule is a 16-byte move, because an upper half
 # IS a slot: `lower.py` already writes `movaps shadow(%ymm1),%xmm0` and
 # calls that path Y2. Finding 246.
+# The shapes those mnemonics produce, which are emitted as slot moves and
+# are therefore the exemption from NO_LEGACY_FORM. Named once so the guard
+# and the shapes cannot drift apart.
+SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2")
+
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
-                   "vinsertf128", "vinserti128")
+                   "vinsertf128", "vinserti128",
+                   "vperm2f128", "vperm2i128")
 
 
 def lower_ymm_run(strategy, at, pool):
@@ -4048,18 +4071,43 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 	# `vinserti128` is. A memory form is refused rather than guessed at.
 	if SHADOW_REGS_RULE == SHADOW_REGS_ALL and mnemonic in SLOT_LANE_FORMS:
 		if mnemonic in ("vextractf128", "vextracti128"):
-			if (len(fields) == 3 and fields[0] == "$0x1"
-					and fields[1].startswith("%ymm")
-					and fields[2].startswith("%xmm")):
-				return ("extract", ymm_alias(fields[2]),
-				        canonical_ymm(fields[1]))
+			if len(fields) == 3 and fields[0] == "$0x1":
+				if fields[2].startswith("%xmm"):
+					return ("extract", ymm_alias(fields[2]),
+					        canonical_ymm(fields[1]))
+				# **To MEMORY, which needs no zeroing.** The register form
+				# writes %xmmD with a VEX.128 instruction and so must zero
+				# D's slot; this one writes sixteen bytes of memory and
+				# touches no ymm at all, so the only half in play is the
+				# source's. 21 of Starfield's 383.
+				if "(" in fields[2] and fields[1].startswith("%ymm"):
+					return ("extractmem", canonical_ymm(fields[1]))
 			return None
-		if (len(fields) == 4 and fields[0] == "$0x1"
-				and fields[1].startswith("%xmm")
-				and fields[2].startswith("%ymm")
-				and fields[3].startswith("%ymm")):
-			return ("insert", canonical_ymm(fields[3]),
-			        ymm_alias(fields[1]), canonical_ymm(fields[2]))
+		if mnemonic in ("vperm2f128", "vperm2i128"):
+			# **Pure 128-bit lane selection**, which `lower.py` has said
+			# since Finding 205 becomes moves "once halves are split" --
+			# and a permanent slot is exactly that split. The immediate
+			# picks each output half from one of the four input halves, or
+			# zeroes it, and is read at emit time rather than carried in
+			# the shape so that every shape here stays a list of
+			# registers. AT&T order is src2, src1, dst.
+			if (len(fields) == 4 and fields[1].startswith("%ymm")
+					and fields[2].startswith("%ymm")
+					and fields[3].startswith("%ymm")):
+				return ("perm2", canonical_ymm(fields[3]),
+				        canonical_ymm(fields[1]), canonical_ymm(fields[2]))
+			return None
+		if len(fields) == 4 and fields[0] == "$0x1" \
+				and fields[2].startswith("%ymm") \
+				and fields[3].startswith("%ymm"):
+			if fields[1].startswith("%xmm"):
+				return ("insert", canonical_ymm(fields[3]),
+				        ymm_alias(fields[1]), canonical_ymm(fields[2]))
+			# **FROM memory**: sixteen bytes read straight into the
+			# destination's slot. 16 of Starfield's 157.
+			if "(" in fields[1]:
+				return ("insertmem", canonical_ymm(fields[3]),
+				        canonical_ymm(fields[2]))
 		return None
 	if len(fields) == 2 and len(wide) == 1:
 		if "(" in fields[0] and wide[0] == fields[1]:
@@ -4147,12 +4195,13 @@ def span_entries(members, instructions, slots, scope, plain):
 			shape = span_operand_shape(vex, encoding[vex["length"]:],
 			                           operands, None, mnemonic)
 			if shape is not None and shape[0] in ("lanereg", "lanereg3",
-			                                      "extract"):
+			                                      "extract", "perm2"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
-			# text to look either of them up with.
-			if shape is not None and shape[0] == "lanereg3":
+			# text to look either of them up with. `perm2` is the same
+			# shape: it may read either half of either source.
+			if shape is not None and shape[0] in ("lanereg3", "perm2"):
 				third = slot_for(slots, shape[3])
 		out.append((kind, address, encoding, mnemonic, operands,
 		            slot_for(slots, register), moved, second, third))
@@ -4351,8 +4400,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		shape = span_operand_shape(vex, tail, operands, None, mnemonic)
 		if shape is None:
 			return refuse("no span shape at emit time")
-		if mnemonic in NO_LEGACY_FORM and shape[0] not in ("extract",
-		                                                   "insert"):
+		if mnemonic in NO_LEGACY_FORM and shape[0] not in SLOT_SHAPES:
 			# Narrowing this would emit bytes that decode to nothing. See
 			# NO_LEGACY_FORM. Finding 205. The two lane shapes are the
 			# exception and are not narrowed at all: they are emitted as
@@ -4432,6 +4480,78 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			                       at + len(body))
 			if low_dst != low_s1:
 				body += encode_movaps(low_dst, low_s1)
+			continue
+		if what == "extractmem":
+			# **The source's upper half, straight out to memory.** No slot
+			# is written: the destination is sixteen bytes of memory and
+			# no ymm is touched, so unlike the register form there is
+			# nothing to zero. The imm8 is dropped from the tail, because
+			# `encode_mem` carries everything from modrm onward and a
+			# `movups` has no immediate.
+			body += span_slot_move(helper, False, base, slot, block,
+			                       at + len(body))
+			piece = encode_mem(None, b"\x0f\x11", helper, vex, tail[:-1],
+			                   address, encoding, at + len(body))
+			if piece is None:
+				return refuse("extract to memory is out of reach")
+			body += piece
+			continue
+		if what == "insertmem":
+			# Sixteen bytes of memory into the destination's slot, and its
+			# low half from S1 where those differ.
+			piece = encode_mem(None, b"\x0f\x10", helper, vex, tail[:-1],
+			                   address, encoding, at + len(body))
+			if piece is None:
+				return refuse("insert from memory is out of reach")
+			body += piece
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			low_s1 = scratch_finder.xmm_numbers(shape[2])[0]
+			if low_dst != low_s1:
+				body += encode_movaps(low_dst, low_s1)
+			continue
+		if what == "perm2":
+			# **Each output half is one of four input halves, or zero.**
+			# imm[1:0] selects the low half and imm[5:4] the high one, from
+			# SRC1.lo, SRC1.hi, SRC2.lo, SRC2.hi in that order; imm[3] and
+			# imm[7] override with zero. Nothing about that is arithmetic
+			# once the halves are separately addressable.
+			#
+			# **Both sources are read before either destination half is
+			# written.** Every one of Starfield's twelve has the
+			# destination aliasing a source -- eight are `%ymm0,%ymm0,%ymm0`
+			# -- so writing the low half first would destroy the value the
+			# high half still needs.
+			if second_helper is None:
+				return refuse("perm2 wants a second helper")
+			if second is None or third is None:
+				return refuse("perm2 source is in no slot")
+			immediate = perm2_immediate(operands)
+			if immediate is None:
+				return refuse("perm2 immediate is not a constant")
+			destination, source2, source1 = shape[1], shape[2], shape[3]
+			low_s1 = scratch_finder.xmm_numbers(source1)[0]
+			low_s2 = scratch_finder.xmm_numbers(source2)[0]
+			# (machine register, slot) for the four selector values, in the
+			# SDM's order.
+			halves = ((low_s1, None), (None, third),
+			          (low_s2, None), (None, second))
+			for target, shift, zero in ((helper, 0, 0x08),
+			                            (second_helper, 4, 0x80)):
+				if immediate & zero:
+					body += encode_rr(None, b"\x0f\x57", target, target)
+					continue
+				register, from_slot = halves[(immediate >> shift) & 3]
+				if from_slot is not None:
+					body += span_slot_move(target, False, base, from_slot,
+					                       block, at + len(body))
+				else:
+					body += encode_movaps(target, register)
+			low_dst = scratch_finder.xmm_numbers(destination)[0]
+			body += encode_movaps(low_dst, helper)
+			body += span_slot_move(second_helper, True, base, slot, block,
+			                       at + len(body))
 			continue
 		if what == "lanereg3":
 			# **A destination of its own, so both halves are a move and an
@@ -4684,6 +4804,32 @@ def region_members(instructions, first, last, reasons=None):
 			# Reads no slot -- both sources are machine registers -- and
 			# DEFINES the destination's upper half, so it needs nothing
 			# proved about what came before it.
+			if register not in slots:
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
+			defined.add(register)
+		elif what == "extractmem":
+			# Reads the source's upper half and defines nothing: the
+			# destination is memory.
+			if register not in defined:
+				return refuse("extract-to-memory source from outside")
+		elif what == "insertmem":
+			# Reads memory and S1's low half; DEFINES the destination's
+			# upper half, so nothing has to be proved about what it held.
+			if shape[2] not in defined:
+				return refuse("insert-from-memory source from outside")
+			if register not in slots:
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
+			defined.add(register)
+		elif what == "perm2":
+			# Reads both sources' halves and defines the destination's.
+			if shape[2] not in defined or shape[3] not in defined:
+				return refuse("perm2 source from outside the region")
 			if register not in slots:
 				slots[register] = (shadow_index(register)
 				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
@@ -4999,7 +5145,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		if mnemonic in NO_LEGACY_FORM:
 			return refuse(f"{mnemonic} has no legacy encoding")
 		return refuse("shape " + (span_shape_name(encoding, operands) or "?"))
-	if mnemonic in NO_LEGACY_FORM and shape[0] not in ("extract", "insert"):
+	if mnemonic in NO_LEGACY_FORM and shape[0] not in SLOT_SHAPES:
 		return refuse(f"{mnemonic} has no legacy encoding")
 	what, register = shape[0], shape[1]
 	if shadow_index(register) is None:
@@ -5076,7 +5222,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 				             + (span_shape_name(nxt_encoding, nxt_operands)
 				                or "?"))
 			elif nxt_mnemonic in NO_LEGACY_FORM \
-					and nxt_shape[0] not in ("extract", "insert"):
+					and nxt_shape[0] not in SLOT_SHAPES:
 				stop = "neighbour " + nxt_mnemonic + " has no legacy form"
 			else:
 				told = take(last, nxt_shape)

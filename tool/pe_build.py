@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2281,6 +2281,80 @@ source:	.long 1, 2, 3, 4
 	.long 0, 0, 0, 0
 	.p2align 5
 sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# The three lane forms `laneswap` does not reach: a lane permute, and the
+# memory operands of extract and insert. All three are slot moves once the
+# halves are separately addressable, and none of them is arithmetic.
+#
+# **Two answers again, from two different mechanisms.** 70 comes back
+# through `vperm2f128` and `vextractf128`-to-memory: the permute swaps
+# ymm0's halves, so the half extracted to memory is the one that started
+# LOW, and a permute that did nothing would store 7 instead. 7 comes back
+# through `vinsertf128`-from-memory. 10 comes back through a SECOND
+# permute with `$0x20`, which selects the other source's low half -- a
+# different selector value, so the twelve sites in Starfield are covered
+# by their two immediates rather than by one. 60 + 7 + 10 = 77, so none of
+# the three can fail quietly.
+#
+# **The extract-to-memory form writes no ymm**, which is the difference
+# from the register form: there is no destination slot to zero, because
+# the destination is sixteen bytes of memory.
+PROGRAMS["lanemem"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	(%rsi), %ymm0		/* lo = 60, hi = 7 */
+	vmovups	0x40(%rsi), %ymm1	/* defined, so nothing reads a stale half */
+	vmovups	0x60(%rsi), %ymm2	/* lo = 10 */
+	vperm2f128 $0x1, %ymm0, %ymm0, %ymm0	/* swap: lo = 7, hi = 60 */
+	vextractf128 $0x1, %ymm0, (%rdi)	/* upper half -> memory, = 60 */
+	vinsertf128 $0x1, 0x20(%rsi), %ymm1, %ymm1	/* ymm1 upper = 7 */
+	vmovups	%ymm1, 0x20(%rdi)
+	vperm2f128 $0x20, %ymm2, %ymm1, %ymm3	/* hi = ymm2 LOW, the other
+						   selector: 2 rather than 1 */
+	vmovups	%ymm3, 0x40(%rdi)
+	movl	(%rdi), %eax		/* 60, only if the permute really swapped */
+	addl	48(%rdi), %eax		/* + 7 from the insert's memory operand */
+	addl	80(%rdi), %eax		/* + 10 from the $0x20 selector */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 60, 0, 0, 0
+	.long 7, 0, 0, 0
+	.long 7, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 10, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0

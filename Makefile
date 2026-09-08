@@ -188,7 +188,7 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap; do \
+	for name in crossregion laneswap lanemem; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -221,7 +221,11 @@ check-shadow-pe:
 	echo "                 reads 77 from its permanent slot, 29 without"; \
 	echo "check-shadow-pe: laneswap -- vextractf128 and vinsertf128 routed"; \
 	echo "                 to slot moves, and the extract zeroed the slot"; \
-	echo "                 its VEX.128 write implies"
+	echo "                 its VEX.128 write implies"; \
+	echo "check-shadow-pe: lanemem -- vperm2f128 on both its selectors, and"; \
+	echo "                 the memory operands of extract and insert. Its"; \
+	echo "                 77 is 60 + 7 + 10, one term per mechanism, and"; \
+	echo "                 sabotaging each gives 24, 70 and 67"
 
 # -- the software F16C conversions -------------------------------------------
 
