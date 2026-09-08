@@ -13779,6 +13779,92 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 254 -- three refusal labels, one problem, and a lever not built
+
+Two candidates were measured against the frontier and NEITHER was built. Both measurements are
+recorded because a null result with a number stops the next reader repeating the work, and both
+were nearly quoted at 20 to 25 times their real value.
+
+#### Backward widening: 99 that would serve, 4 that would lower
+
+`unit_candidate` widens only forward, so a site under five bytes whose NEXT instruction has an
+unemittable shape is refused. The ordinary path widens backward as well, and the predecessors
+are there:
+
+    too-short refusals with an unemittable neighbour   104
+      a predecessor would serve                         99
+      the site is a branch target                        3
+      the predecessor transfers control                  2
+
+**99 is a margin.** The widening loop runs BEFORE the block decision and before the helper
+decision, so not one of those sites had ever been asked whether it has a register. Crossed with
+what comes after -- the site's own shape, a helper or mover, a block:
+
+    lanereg3   no helper  no block    41
+    lanereg3   no helper  block       38
+    regmove    mover      no block     8
+    lanereg    no helper  block        7
+    regmove    mover      block        2   reachable
+    lane       xmm        block        2   reachable
+    lanereg    no helper  no block      1
+
+**Four.** Not built: four sites do not pay for a placement change that moves the site off the
+window's first byte and reaches into the jump and `preceding` machinery.
+
+**The useful part is not the four.** 79 of the 99 are `lanereg3` -- arithmetic wanting TWO
+vector registers with none free. They are the 604 in different clothes. Three labels on the
+refusal list -- `no xmm helper free`, `too short to place, neighbour shape ...`, and every
+remaining `shape ...` bucket, which is arithmetic to a line -- are largely ONE problem, and the
+list's shape makes them look like three.
+
+#### The non-volatile registers: 138, and whose decision it is
+
+Finding 124 set `VOLATILE_XMM = tuple(range(6))` deliberately, because a borrow of xmm6 through
+xmm15 is unsafe on a fault: the unwinder restores those from the primary's `UWOP_SAVE_XMM128`
+codes, which a function that never used the register does not have, and the caller's value is
+then gone. It closed with "a binary that needs one gets a named refusal rather than a silent
+risk".
+
+**The binary needs one now**, at 604 refusals. And the escape keeps safety-by-construction
+rather than trading it: borrow a non-volatile register ONLY where the enclosing function's own
+unwind data saves it. The unwinder then restores the caller's value from the function's slot and
+nothing is lost.
+
+    functions in .pdata                          236,427
+    saving at least one non-volatile xmm          16,878   7.1%
+      xmm6 14,344 | xmm7 8,685 | xmm8 6,509 | xmm9 5,223 | ...
+
+Crossed against the 604 -- the function saves it, the window does not NAME it, and there is
+home-space room to save it -- gives **138**: 21 wanting one helper, 117 wanting two.
+
+**Two corrections were needed to get that number**, and both are the same shape as the errors
+this document already records. The 243 quoted in Finding 253 was home-space room without the
+saved-by-the-function condition crossed in -- a margin. And the first crossing required the
+register to be DEAD and returned **zero**; dead is not the requirement, NAMED is, because a live
+register is fine when saved and restored. That zero was one step from being written down as "the
+non-volatile route is unavailable on this binary", which would have closed off the only lever
+left.
+
+**Not built, and deliberately.** The safety argument rests on unwind behaviour that no fixture
+in this tree exercises -- every one of the twenty assertions in `check-shadow-pe` proves itself
+by running a program and reading a number, and this would prove itself by reasoning about a path
+no fixture takes. It is testable: `pe_build` already emits `UNW_FLAG_EHANDLER`, so a fixture
+could fault inside a stub and check the register afterwards. But that is its own piece of work,
+and reversing a deliberate safety decision is not something to do while passing.
+
+#### What the session's estimates look like laid out
+
+    lever                        quoted   delivered   what was quoted
+    the block register saved        415           4   margin
+    the register-to-register move    71          26   margin
+    backward widening                99           4   margin, not built
+    the GPR mover                   740         738   CELL
+
+**The one that landed is the one where every condition was crossed before the number was
+spoken.** That is the whole of it, and it is cheaper to obey than to keep rediscovering: the
+crossing costs one run, and each of the three misses cost a run anyway plus the work built on a
+number that was never real.
+
 ### Finding 253 -- a refusal bucket holding three unrelated things
 
 "A register-to-register move" was 146 refusals, and it is not 146 moves. Read by mnemonic:
