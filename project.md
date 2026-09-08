@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **799,458 of 805,131 VEX
-sites -- 99.3%** -- through 202,838 detours, and every `make detour-verify` invariant
-holds on the result. 5,673 sites are left, and the rewritten binary loads 305 modules
+**Status:** the rewriter works. `tool/detour.py` rewrites **799,440 of 805,131 VEX
+sites -- 99.3%** -- through 202,836 detours, and every `make detour-verify` invariant
+holds on the result. 5,691 sites are left, and the rewritten binary loads 305 modules
 under Proton before the frontier at `0x1428D1492` stops it.
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
@@ -13740,6 +13740,16 @@ the correction cost eight windows, not a hundred and thirty-eight.
 legacy SSE gives 77; with the fix the run declines, the VEX survives and the program dies at 29.
 A silently wrong answer became an honest refusal, which is the trade this project makes
 everywhere else.
+
+**The frontier pays 18 sites for it**, and `make detour-verify` holds on the result:
+
+    VEX in .text  805,131 -> 5,691   was 5,673
+    removed             799,440      was 799,458, still 99.3%
+
+That is the whole price of the correction, and the status lines in `project.md` and `README.md`
+move with it -- caught by `make status`, which failed on all three claims before they were
+updated. A number that justifies the work is a number that has to be re-taken when the work
+changes, and the gate is what makes that automatic rather than remembered.
 
 #### `check-run-borrow`, and why its pass is 29
 

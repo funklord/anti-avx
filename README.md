@@ -19,7 +19,7 @@ performance argument against this approach does not hold.
 
 A translated binary that is 99.99% correct is worthless: the remaining 0.01%
 is a crash at an unpredictable moment. So the number to watch is not how much
-is translated but how much is left, and 5,673 sites are left.
+is translated but how much is left, and 5,691 sites are left.
 
 **Starfield has now been run, under Proton, and each run names the next site
 to work on.** The original dies on the first AVX instruction it executes.
