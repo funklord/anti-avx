@@ -13686,6 +13686,79 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 247 -- the block pointer costs one register, and it did not matter
+
+The largest named refusal on the unconditional lowering was "fewer than two dead GPRs for the
+block", at 1,526 sites, and Finding 246 closed by predicting that reducing it "would move more
+sites than every ISA lowering built here put together". **That prediction was wrong, and the
+measurement that shows why cost one run and could have been taken first.**
+
+#### The sequence, and why it needed two registers
+
+    movq %gs:0x58,%block             the thread's TLS array
+    mov  tls_index(%rip),%indexd     this module's index into it
+    movq (%block,%index,8),%block    the module's block
+
+Two values are live at once, so two registers, and neither is put back -- which is the
+circularity Finding 69 met: there is nowhere to save a general-purpose register that does not
+need a register to address it.
+
+**The way out is to save it somewhere that is not memory.** `movq %index,%xmm` and back is two
+instructions, touches nothing, and **sets no flags** -- which is the property that decides it.
+The instructions a stub replaces are SSE ones that write no flags, so something may have
+compared above the site and be about to branch below it; that is why the sequence is all `mov`
+and why folding the index in with a `shl` and an `add`, which was the first idea, cannot be
+used.
+
+**The stash costs no register of its own.** It is released three instructions later, before any
+member is emitted, so the caller hands it a helper it was about to use anyway. Ten bytes, and
+only at the sites that need it.
+
+`onegpr` is the control: six of the seven volatile GPRs live across the site, so the block has
+ONE dead register and the index borrows a live one. The region strategy still refuses that site
+for "fewer than two dead GPRs", which is what shows the site really is that shape. Cutting the
+restore gives **37**, exactly 77 - 40.
+
+#### What the histogram said, and what happened
+
+Taken at the 1,526 refused sites, before the change was believed:
+
+    sites refused for fewer than two dead GPRs   1,526
+      zero free GPRs                               949   62%
+      exactly one free GPR                         577   38%
+        ...and at least one free xmm                21   <- all the stash can reach
+        ...but no free xmm at all                  556   <- would be refused for that instead
+
+**The tool then built exactly 21 more candidates**, 416 to 437, and 556 refusals moved from the
+GPR bucket to "no xmm helper free" -- 737 to 1,293. Both numbers to the unit. That is a
+prediction made before the run and confirmed by it, which is worth more than the accounting
+Finding 246 did afterwards.
+
+Sites actually lowered went 212 to 220, and 256-bit sites through a slot 448 to **456**.
+
+#### The frontier is saturation, not sequence cost
+
+The refusal was never "two registers is one too many". It is that **949 sites have nothing free
+at all** and another 556 have one GPR and no vector register. A cheaper sequence cannot help a
+site with no registers, and no further sharpening of this one will: the next refusal is already
+waiting behind it.
+
+    strategy tried              removed   newly built   moved to another refusal
+    ISA lowerings (3 passes)        141            14                       127
+    the block pointer               577            21                       556
+
+**Both rows have the same shape and the same cause: choosing a target by the SIZE of its
+refusal bucket rather than by what is behind it.** `evidence.md` states the general form -- a
+count is not a gain, and what to ask of a number is what would also have to be true for it to
+mean what you are about to say it means. Twice now the answer has been "and the site must have
+a register", and twice it did not.
+
+**What would actually move these sites is somewhere to save a register to.** The stash proves
+such a place exists and is cheap when a vector register is free; the saturated sites have
+neither kind. What is left is the stack, which needs unwind data and is the trade this project
+already declined, or the MMX registers, which are volatile in Win64 and alias x87 -- and that
+wants the x87 usage of those functions measured before anything is written, not after.
+
 ### Finding 246 -- the unconditional lowering, and a set read as an ISA bound
 
 Finding 245 named the missing piece and this builds it: `unit_candidate`, offered below every

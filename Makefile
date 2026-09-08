@@ -188,7 +188,7 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap lanemem bcast permmem permil; do \
+	for name in crossregion laneswap lanemem bcast permmem permil onegpr; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -235,7 +235,11 @@ check-shadow-pe:
 	echo "check-shadow-pe: permil -- the variable-control in-lane permute,"; \
 	echo "                 lower_permilps called once per 128-bit half, with"; \
 	echo "                 control values carrying rubbish above bit 1 so a"; \
-	echo "                 missing mask cannot pass"
+	echo "                 missing mask cannot pass"; \
+	echo "check-shadow-pe: onegpr -- six of the seven volatile GPRs live"; \
+	echo "                 across the site, so the block pointer has ONE"; \
+	echo "                 dead register and the index borrows a live one,"; \
+	echo "                 stashed in an xmm. Cutting the restore gives 37"
 
 # -- the software F16C conversions -------------------------------------------
 

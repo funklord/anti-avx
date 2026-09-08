@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2563,6 +2563,71 @@ source:	.long 5, 2, 3, 4
 	.long 70, 2, 0, 0
 	.long 0, 0, 0, 0
 	.long 0x101, 0x104, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# One dead general-purpose register, which is what the block pointer costs
+# after Finding 247 and half of what it cost before. Six of the seven
+# volatile GPRs are live across the site -- set above it, read below it --
+# so only r11 is dead, and the old sequence would have refused this outright
+# with "fewer than two dead GPRs for the block".
+#
+# The register the index borrows is therefore a LIVE one, saved into an xmm
+# and put back three instructions later. It is the borrowed register's own
+# value that a missing restore destroys: the tool takes the lowest volatile
+# it did not pick for the block, which is rax, and rax is the accumulator.
+#
+# **rax holds 40 rather than 1, and that is not arbitrary.** What a missing
+# restore leaves in it is the module's TLS index, a small number -- with
+# rax = 1 the sabotage scored 76, one away from passing, and it would have
+# PASSED outright on a machine whose index happened to be 1. At 40 the
+# margin is the whole term and no plausible index can close it.
+#
+# 40 + 2 + 3 + 4 + 5 + 6 = 60, and 60 + 17 = 77, the 17 from an upper half.
+PROGRAMS["onegpr"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movl	$40, %eax		/* large on purpose: see below */
+	movl	$2, %ecx
+	movl	$3, %edx
+	movl	$4, %r8d
+	movl	$5, %r9d
+	movl	$6, %r10d
+	vbroadcastss (%rsi), %ymm0	/* 56, and it needs the block */
+	vmovups	%ymm0, (%rdi)
+	addl	%ecx, %eax		/* every one of the six is read here, */
+	addl	%edx, %eax		/* so all six were live ACROSS the site */
+	addl	%r8d, %eax
+	addl	%r9d, %eax
+	addl	%r10d, %eax		/* eax = 60 */
+	addl	16(%rdi), %eax		/* + 17 from the upper half */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 17, 0, 0, 0
 	.p2align 5
 sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0

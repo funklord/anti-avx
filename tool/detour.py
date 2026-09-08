@@ -678,7 +678,7 @@ GPR_NUMBERS = {"rax": 0, "rcx": 1, "rdx": 2,
                "r8": 8, "r9": 9, "r10": 10, "r11": 11}
 
 
-def encode_tls_base(block, index, index_va, at):
+def encode_tls_base(block, index, index_va, at, stash=None):
 	"""Put this module's TLS block in `block`, using `index` as scratch.
 
 	    movq %gs:0x58,%block
@@ -693,8 +693,35 @@ def encode_tls_base(block, index, index_va, at):
 	save a general-purpose register to that does not need a register to
 	address, which is the circularity Finding 69 met and Finding 141 broke
 	by finding registers that were already dead.
+
+	**`stash` breaks the circularity for the second register**, and it is an
+	xmm rather than memory precisely because memory is what needed a
+	register in the first place:
+
+	    movq %index,%stash
+	    ... the three above ...
+	    movq %stash,%index
+
+	`movq` between a GPR and an xmm touches no memory and **sets no flags**,
+	which is the property that matters here: the instructions this replaces
+	are SSE ones that write no flags either, so a stub may not either --
+	something may have compared above the site and be about to branch below
+	it. That is why the sequence above is all `mov` and why an `add` or a
+	`shl` cannot be used to fold the index in.
+
+	Only `block` need then be dead, halving what a site must supply. And the
+	stash costs no register of its own: it is released three instructions
+	later, before the body begins, so the caller passes a helper it is about
+	to use anyway. Finding 247.
 	"""
 	out = bytearray()
+	if stash is not None:
+		# movq %index,%stash -- 66 REX.W 0F 6E /r, reg is the xmm.
+		out += b"\x66"
+		out.append(0x48 | (0x04 if stash >= 8 else 0)
+		           | (0x01 if index >= 8 else 0))
+		out += b"\x0f\x6e"
+		out.append(0xC0 | ((stash & 7) << 3) | (index & 7))
 	out.append(0x65)						# %gs
 	out.append(0x48 | (0x04 if block >= 8 else 0))		# REX.W, REX.R
 	out += b"\x8b"
@@ -720,6 +747,13 @@ def encode_tls_base(block, index, index_va, at):
 	out += b"\x8b"
 	out.append(((block & 7) << 3) | 4)			# mod 00, rm 100 SIB
 	out.append(0xC0 | ((index & 7) << 3) | (block & 7))	# scale 8
+	if stash is not None:
+		# movq %stash,%index -- 66 REX.W 0F 7E /r, reg is the xmm.
+		out += b"\x66"
+		out.append(0x48 | (0x04 if stash >= 8 else 0)
+		           | (0x01 if index >= 8 else 0))
+		out += b"\x0f\x7e"
+		out.append(0xC0 | ((stash & 7) << 3) | (index & 7))
 	return bytes(out)
 
 
@@ -4442,7 +4476,13 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		# establish before the span was offered -- a pointer recomputed per
 		# member would cost three instructions each and a pointer clobbered
 		# mid-span would address somebody else's thread data.
-		body += encode_tls_base(block[0], block[1], block[2], at)
+		# **The helper doubles as the stash**, which is what makes the
+		# one-dead-register form cost nothing: the index is restored three
+		# instructions later, before any member is emitted, so the
+		# register this borrows is one the body has not started using.
+		body += encode_tls_base(block[0], block[1], block[2], at,
+		                        helper if len(block) > 3 and block[3]
+		                        else None)
 	for kind, address, encoding, mnemonic, operands, slot, moved, second, \
 			third in entries:
 		if kind == "plain":
@@ -5439,10 +5479,25 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# a permanent slot is not a thing one window owns.
 	if tls is None:
 		return refuse("no per-thread block, so no permanent slots")
+	# **One dead register, not two.** The block pointer has to survive the
+	# whole stub so it must be dead across the window; the index register
+	# is clobbered for three instructions and put back, so it need not be
+	# dead at all -- `encode_tls_base`'s stash saves it in an xmm, which
+	# touches no memory and sets no flags. Where a second dead register
+	# happens to exist the plain sequence is used, because it is ten bytes
+	# shorter. Finding 247.
 	free = sorted(window_gpr_free(home, address, window), reverse=True)
-	if len(free) < 2:
-		return refuse("fewer than two dead GPRs for the block")
-	base, block = tls[1], (free[0], free[1], tls[0])
+	if not free:
+		return refuse("no dead GPR for the block pointer")
+	if len(free) >= 2:
+		base, block = tls[1], (free[0], free[1], tls[0], False)
+	else:
+		borrowed = next((n for n in sorted(GPR_NUMBERS[name]
+		                                   for name in VOLATILE_GPRS)
+		                 if n != free[0]), None)
+		if borrowed is None:
+			return refuse("no register to borrow for the index")
+		base, block = tls[1], (free[0], borrowed, tls[0], True)
 
 	entries = span_entries(members, instructions, slots, scope, plain)
 	helpers, _whole = region_helpers(plain, instructions, index, last,
