@@ -13686,6 +13686,89 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 252 -- a run borrowed a register its own passengers use
+
+**138 windows in the shipped image carried wrong bytes**, and had done since runs learned to
+borrow. It was found by a fixture built to test something else entirely.
+
+#### What it does
+
+A run carries an upper half across a span in a reserved xmm. Where nothing is dead it borrows
+a live one, saves it, and restores it -- `assign_helpers`, the `lendable` branch. That branch
+chose from
+
+    free = set(VOLATILE_XMM) - taken - set(own)
+    for position in list(stores) + [load_at]:
+            free -= xmm_numbers(plain[position][3])
+
+which excludes the registers the lifetime's own load and stores name, and **nothing between
+them**. A run swallows what lies between into the same stub, and those passengers are
+re-emitted BETWEEN the carry-load and the carry-store. The comment said it picked "a register
+the run does not itself name"; the passengers are the run.
+
+The save and restore protect the CALLER's register across the stub and say nothing about the
+middle of it. From the shipped image, site `0x1404dab63`, stub `0x1489b27e1`:
+
+    movups %xmm0,(%rsp)          save the borrowed xmm0
+    movups 0x20(%r10),%xmm0      the carried upper half
+    ...
+    movups 0x10(%r11),%xmm0      a PASSENGER overwrites it
+    movups 0x30(%r11),%xmm0      and again
+    ...
+    movups %xmm0,0x20(%r11)      stores the PASSENGER's value as the upper half
+    movups (%rsp),%xmm0          restore
+
+Both directions are wrong: the passenger destroys the half in flight, and a passenger that
+merely READS the register reads the half instead of its own value.
+
+#### The scale, and the cost of fixing it
+
+    runs that borrow a helper                      347
+      a PLAIN passenger names the borrowed one     171
+        and the window is PLACED in the image      138
+
+    after the fix          before
+    run  2,045 / 6,717     2,053 / 6,797      -8 windows, -80 sites
+    plain 179,097/241,291  179,093/241,285    +4 / +6, picked up
+    detours    202,836        202,838         -2
+    stub refusals   37             46         -9
+
+**Only 8 of the 138 lost the run**; the rest simply get a different, non-clashing register. So
+the correction cost eight windows, not a hundred and thirty-eight.
+
+**And the failure mode changed direction.** `noxmm` computed **10** where the same arithmetic in
+legacy SSE gives 77; with the fix the run declines, the VEX survives and the program dies at 29.
+A silently wrong answer became an honest refusal, which is the trade this project makes
+everywhere else.
+
+#### `check-run-borrow`, and why its pass is 29
+
+The gate asserts 29 and names 10 as the defect. That is worth stating because **29 is not a
+lowering** -- it is an illegal instruction. A gate that could only tell "worked" from "crashed"
+would have called the broken build the healthier one, and this is the case where the crash is
+the correct outcome. Proved by reverting the one line in a scratch copy: the fixture returns 10
+and the gate rejects it.
+
+#### Three things about the finding, which are the reusable part
+
+**It came from a fixture built for something else.** `noxmm` exists to hold every volatile xmm
+live so the GPR mover of Finding 251 can be tested. The defect fell out of it. That is now the
+third time this session a measurement aimed at one question has answered a different and more
+important one.
+
+**The first probe measured nothing and looked clean.** Its print sat in `report_units`, which
+returns early without `--shadow-regs=all`, and the run was made without the flag. An empty
+result from a probe that cannot print is indistinguishable from a genuine absence -- and it
+would have read as "no clashes found".
+
+**The second probe over-counted, at 236.** It asked whether ANY member names the borrowed
+register, and `assign_helpers` does exclude the lifetime's own load and stores. The question
+that matters is narrower -- a PLAIN passenger -- and it gives 171 built and 138 placed. A
+number that is easy to compute is not thereby the number the claim needs.
+
+**`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
+clashing passenger, which is why the fixture had to come from outside it.
+
 ### Finding 250 -- the helper nobody needed, and the smallest bucket wins
 
 Four levers had been chosen by the size of a refusal bucket and had returned 35 sites between

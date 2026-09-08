@@ -74,7 +74,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs shapes cost-bench cost status probe why check-shadow check-shadow-pe check-spill check-tls check-unwind check-vex \
+        census spans gprs shapes cost-bench cost status probe why check-shadow check-shadow-pe check-run-borrow check-spill check-tls check-unwind check-vex \
         check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -151,6 +151,48 @@ check-lanes: | $(BUILD_DIR)
 # natively, because the span is pure SSE and that is the whole point.
 check-span: | $(BUILD_DIR)
 	$(PYTHON) tool/span_oracle.py $(BUILD_DIR)
+
+# **A run that borrows a helper must not borrow one its passengers name.**
+# `noxmm` holds every volatile xmm live across a load and a store six
+# instructions apart, which is the shape that makes `assign_helpers` borrow.
+# Before Finding 252 the borrow excluded only the load's and stores' own
+# operands, so a passenger overwrote the half in flight and the stub stored
+# the passenger's value as the upper half.
+#
+# **29 is the pass and 10 is the failure**, which is worth stating because
+# 29 is not a lowering. With the fix the run declines the site and the VEX
+# survives, so the program dies on an illegal instruction -- an honest
+# refusal. Without it the program RUNS and computes 10 where the same
+# arithmetic in legacy SSE gives 77. A gate that could only tell "worked"
+# from "crashed" would have called the broken one healthier.
+check-run-borrow: | $(BUILD_DIR)
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-run-borrow: wine is not installed"; exit 1; }
+	@set -e; \
+	$(PYTHON) tool/pe_build.py sample noxmm \
+		$(BUILD_DIR)/pe-noxmm-320.exe 320 >/dev/null; \
+	objdump -d -j .text $(BUILD_DIR)/pe-noxmm-320.exe \
+		> $(BUILD_DIR)/pe-noxmm-320.asm; \
+	mkdir -p $(PE_PREFIX); \
+	$(PYTHON) tool/detour.py apply $(BUILD_DIR)/pe-noxmm-320.exe \
+		$(BUILD_DIR)/pe-noxmm-320.asm \
+		$(BUILD_DIR)/sse-noxmm.exe > /dev/null; \
+	got=0; \
+	WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d \
+		wine $(BUILD_DIR)/sse-noxmm.exe > /dev/null 2>&1 || got=$$?; \
+	if [ "$$got" = "10" ]; then \
+		echo "check-run-borrow: returned 10 -- the run borrowed a register"; \
+		echo "                  one of its passengers names, and the stub"; \
+		echo "                  stored the passenger's value as the upper"; \
+		echo "                  half. That is Finding 252, reintroduced."; \
+		exit 1; \
+	fi; \
+	if [ "$$got" != "29" ]; then \
+		echo "check-run-borrow: returned $$got, want 29"; exit 1; \
+	fi; \
+	echo "check-run-borrow: the run declines rather than borrowing a"; \
+	echo "                  register its passengers name -- 29, an honest"; \
+	echo "                  refusal, where the defect computed 10"
 
 # The uniform shadow representation: every ymm has a PERMANENT slot, so a
 # 256-bit operation needs no proof of where its operands came from. This

@@ -771,13 +771,7 @@ def encode_gpr_home(register, save, offset):
 	Always a disp32. The home space sits at a frame's own displacement and
 	a disp8 form would be right only in a fixture. Finding 249.
 	"""
-	out = bytearray()
-	out.append(0x48 | (0x04 if register >= 8 else 0))	# REX.W, REX.R
-	out += b"\x89" if save else b"\x8b"
-	out.append(0x80 | ((register & 7) << 3) | 4)		# mod 10, SIB
-	out.append(0x24)					# base rsp, no index
-	out += struct.pack("<i", offset)
-	return bytes(out)
+	return encode_gpr_at(register, save, None, offset)
 
 
 def window_gpr_unnamed(home, start, window):
@@ -3543,8 +3537,23 @@ def assign_helpers(plain, positions, index, members, lendable=False):
 			# does not itself name. Finding 95.
 			if not lendable:
 				return None
+			# **Every instruction the helper is live across, not just the
+			# load and the stores.** A run swallows whatever lies between
+			# them into the same stub, and those passengers are re-emitted
+			# BETWEEN the carry-load and the carry-store -- so a passenger
+			# naming the borrowed register overwrites the half in flight,
+			# and the stub then stores the passenger's value as the upper
+			# half. The save and restore protect the CALLER's register
+			# across the stub and say nothing about the middle of it.
+			#
+			# Measured on Starfield before the fix: 347 runs borrowed, 171
+			# had a plain passenger naming the borrowed register, and 138
+			# of those were PLACED -- wrong bytes in the shipped image.
+			# The comment this replaces said it picked "a register the run
+			# does not itself name", and the passengers are the run.
+			# Finding 252.
 			free = set(VOLATILE_XMM) - taken - set(own)
-			for position in list(stores) + [load_at]:
+			for position in range(load_at, max(stores) + 1):
 				free -= set(scratch_finder.xmm_numbers(plain[position][3]))
 			if not free:
 				return None
@@ -3851,6 +3860,13 @@ SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2",
 # windows of which only 49 had no member wanting one. Finding 250.
 HELPER_FREE = frozenset(("plain", "insert", "bcastmem", "bcastreg",
                          "extract"))
+
+# **Kinds a general-purpose register can move instead.** Each of these puts
+# sixteen bytes between memory and a slot and does nothing to them on the
+# way, so two 8-byte `mov`s stand in for a vector round trip. The arithmetic
+# shapes are absent on purpose: a packed operation has to happen in a vector
+# register whatever else is free. Finding 251.
+GPR_MOVABLE = frozenset(("load", "store"))
 
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
                    "vinsertf128", "vinserti128",
@@ -4433,6 +4449,84 @@ def slot_for(slots, register):
 	return shadow_index(register)
 
 
+def encode_gpr_at(register, save, base_register, offset):
+	"""`mov` a 64-bit register to or from `offset(%base)`, disp32.
+
+	`base_register` is None for `(%rsp)`, which needs a SIB byte because
+	rm 100 is how the encoding says a base register follows.
+	"""
+	out = bytearray()
+	out.append(0x48 | (0x04 if register >= 8 else 0)
+	           | (0x01 if base_register is not None and base_register >= 8
+	              else 0))
+	out += b"\x89" if save else b"\x8b"
+	if base_register is None:
+		out.append(0x80 | ((register & 7) << 3) | 4)
+		out.append(0x24)
+	else:
+		out.append(0x80 | ((register & 7) << 3) | (base_register & 7))
+	out += struct.pack("<i", offset)
+	return bytes(out)
+
+
+def encode_mem64(register, save, vex, tail, address, encoding, at):
+	"""A 64-bit `mov` reusing the original instruction's memory operand.
+
+	`encode_mem`'s counterpart for general-purpose moves. It cannot be that
+	function because a GPR move needs REX.W and an SSE one must not have
+	it, and because the opcode pair is different: 8B loads, 89 stores.
+	"""
+	out = bytearray()
+	out.append(0x48 | ((register >> 3) << 2) | (vex["X"] << 1) | vex["B"])
+	out += b"\x89" if save else b"\x8b"
+	out.append((tail[1] & 0xC7) | ((register & 7) << 3))
+	out += tail[2:]
+	if rip_relative(tail):
+		old = struct.unpack_from("<i", out, len(out) - 4)[0]
+		target = address + len(encoding) + old
+		displacement = target - (at + len(out))
+		if not -(1 << 31) <= displacement < (1 << 31):
+			return None
+		out[len(out) - 4:] = struct.pack("<i", displacement)
+	return bytes(out)
+
+
+def gpr_move_half(mover, to_slot, vex, tail, address, encoding, at, base,
+                  slot, block, half):
+	"""One 8-byte half of a 16-byte move, through a general-purpose register.
+
+	**A 16-byte move needs no vector register.** `load`, `store` and the two
+	memory lane forms put an upper half between memory and a slot and do
+	nothing to it on the way, so a pair of 8-byte `mov`s does the same work
+	as a vector round trip -- four instructions instead of two, and a GPR
+	instead of an xmm. Measured: of 1,455 windows refused for want of a
+	helper, 883 contain nothing but moves. Finding 251.
+
+	The arithmetic shapes are not like this and never will be: `lanereg3`
+	applies a packed operation, which has to happen in a vector register.
+
+	`half` is 0 or 8. The memory side is the original operand advanced by
+	`SLOT + half`, which for a RIP operand has to be done by hand because
+	`offset_operand` refuses those -- it is not told where the stub put the
+	instruction, and `encode_mem64` is.
+	"""
+	if rip_relative(tail):
+		old = struct.unpack_from("<i", tail, 2)[0]
+		moved = tail[:2] + struct.pack("<i", old + SLOT + half)
+	else:
+		moved = inplace.offset_operand(tail, SLOT + half)
+		if moved is None:
+			return None
+	memory = encode_mem64(mover, not to_slot, vex, moved, address, encoding,
+	                      at)
+	if memory is None:
+		return None
+	slot_side = encode_gpr_at(mover, to_slot,
+	                          block[0] if block is not None else None,
+	                          base + slot * SLOT + half)
+	return memory + slot_side if to_slot else slot_side + memory
+
+
 def span_slot_zero(base, slot, block):
 	"""Sixteen zero bytes into slot `slot`, using no vector register.
 
@@ -4573,6 +4667,10 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		# later, before any member is emitted, so the register it borrows
 		# is one the body has not started using.
 		mode = block[3] if len(block) > 3 else False
+		if len(block) > 6 and block[6] is not None:
+			# The mover is a live register borrowed for the length of the
+			# stub, saved beside the block's own borrows.
+			body += encode_gpr_at(block[5], True, None, block[6])
 		if mode == "home":
 			# The block's own save comes back at the very END of the stub,
 			# because unlike the index it has to hold the pointer for
@@ -4605,10 +4703,13 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		vex = inplace.decode_vex(encoding)
 		if vex is None or not vex["L"]:
 			return refuse("member is not a 256-bit VEX")
-		if helper is None and kind not in HELPER_FREE:
+		if helper is None and kind not in HELPER_FREE \
+				and not (kind in GPR_MOVABLE and block is not None
+				         and len(block) > 5 and block[5] is not None):
 			# The collector decides whether a helper is wanted; this
 			# refuses rather than emitting bytes that name register None
-			# if the two ever disagree.
+			# if the two ever disagree. A move with a mover to hand is not
+			# a disagreement -- it is the case Finding 251 added.
 			return refuse(f"member {kind} wants a helper and has none")
 		tail = encoding[vex["length"]:]
 		shape = span_operand_shape(vex, tail, operands, None, mnemonic)
@@ -4635,6 +4736,16 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if low is None:
 				return refuse("load low half cannot be narrowed")
 			body += low
+			mover = block[5] if block is not None and len(block) > 5 else None
+			if helper is None and mover is not None:
+				for half in (0, 8):
+					piece = gpr_move_half(mover, True, vex, tail, address,
+					                      encoding, at + len(body), base,
+					                      slot, block, half)
+					if piece is None:
+						return refuse("load half cannot reach memory")
+					body += piece
+				continue
 			high_vex, high_tail = retarget(vex, tail, helper)
 			piece = narrow_piece(high_vex, high_tail, SLOT, address,
 			                     len(encoding), at + len(body))
@@ -4650,6 +4761,16 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if low is None:
 				return refuse("store low half cannot be narrowed")
 			body += low
+			mover = block[5] if block is not None and len(block) > 5 else None
+			if helper is None and mover is not None:
+				for half in (0, 8):
+					piece = gpr_move_half(mover, False, vex, tail, address,
+					                      encoding, at + len(body), base,
+					                      slot, block, half)
+					if piece is None:
+						return refuse("store half cannot reach memory")
+					body += piece
+				continue
 			body += span_slot_move(helper, False, base, slot, block,
 			                       at + len(body))
 			high_vex, high_tail = retarget(vex, tail, helper)
@@ -4973,6 +5094,8 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		body += piece
 		body += span_slot_move(helper, True, base, slot, block,
 		                       at + len(body))
+	if block is not None and len(block) > 6 and block[6] is not None:
+		body += encode_gpr_at(block[5], False, None, block[6])
 	if block is not None and len(block) > 3 and block[3] == "home":
 		# **The one place it can go.** Past the refusals this function has
 		# a single exit, and every member above has finished with the
@@ -5599,15 +5722,16 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# happens to exist the plain sequence is used, because it is ten bytes
 	# shorter. Finding 247.
 	free = sorted(window_gpr_free(home, address, window), reverse=True)
+	lent = window_borrow(home, address, window)
 	if len(free) >= 2:
-		base, block = tls[1], (free[0], free[1], tls[0], False)
+		base, block = tls[1], (free[0], free[1], tls[0], False, None)
 	elif free:
 		borrowed = next((n for n in sorted(GPR_NUMBERS[name]
 		                                   for name in VOLATILE_GPRS)
 		                 if n != free[0]), None)
 		if borrowed is None:
 			return refuse("no register to borrow for the index")
-		base, block = tls[1], (free[0], borrowed, tls[0], True)
+		base, block = tls[1], (free[0], borrowed, tls[0], True, None)
 	else:
 		# **No dead register at all, so borrow two live ones and give them
 		# back.** The stash of the branch above frees the INDEX, which is
@@ -5623,7 +5747,6 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		# window reads or writes them while the borrow stands. That is a
 		# weaker test than `window_gpr_free` and it is why sites with
 		# nothing dead can still be reached. Finding 249.
-		lent = window_borrow(home, address, window)
 		if lent is None:
 			return refuse("no dead GPR and no home space to save one")
 		spare = sorted(window_gpr_unnamed(home, address, window),
@@ -5646,8 +5769,32 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# three instructions. Finding 250.
 	wants = any(kind not in HELPER_FREE for kind, _p, _r in members) \
 		or (len(block) > 3 and block[3] is True)
+	mover, mover_save = None, None
 	if wants and not helpers:
-		return refuse("no xmm helper free at the site")
+		# **A 16-byte move needs no vector register.** Where every member
+		# that wanted a helper is a pure move, a general-purpose register
+		# does the same work in two 8-byte halves. The arithmetic shapes
+		# are not like this and get no second chance here. Finding 251.
+		needy = frozenset(k for k, _p, _r in members) - HELPER_FREE
+		if not needy <= GPR_MOVABLE:
+			return refuse("no xmm helper free at the site")
+		taken = {block[0], block[1]}
+		spare = [n for n in free if n not in taken]
+		if spare:
+			mover = spare[0]
+		elif lent is not None:
+			# The home space is four eight-byte slots. The block's own
+			# borrows use the first two where it needed them, so a third
+			# fits above whatever they took.
+			mover_save = lent + (16 if block[3] == "home" else 0)
+			borrowed = [n for n in sorted(window_gpr_unnamed(
+				home, address, window)) if n not in taken]
+			if not borrowed:
+				return refuse("no register to borrow for the move")
+			mover = borrowed[0]
+		else:
+			return refuse("no register to move a half through")
+	block = block[:5] + (mover, mover_save)
 	first = helpers[0] if helpers else None
 	second = helpers[1] if len(helpers) > 1 else None
 	told = []

@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2709,6 +2709,81 @@ helper:
 func_end:
 	.p2align 5
 source:	.long 3, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# NO free vector register, which is 1,455 of the sites the unconditional
+# lowering refuses. All six volatile xmm are loaded above the site and read
+# below it, so `region_helpers` offers nothing -- Win64 makes only xmm0
+# through xmm5 volatile, and every one of them is live here.
+#
+# The site is a load and a store, and **a 16-byte move needs no vector
+# register**: two 8-byte `mov`s through a general-purpose one do the same
+# work. That is the difference between this and the arithmetic shapes,
+# which have to apply a packed operation and cannot be helped this way.
+#
+# The loads use legacy `movss` rather than `vmovss` so that holding the
+# vector registers busy does not itself create 256-bit work to lower.
+#
+# **The distance between the load and the store is what makes this reach
+# the unconditional lowering at all.** Adjacent, they are a `pair`, which
+# takes the site long before `unit` is offered -- the first draft scored 77
+# with the unit path never asked, and the second had `pair` span them across
+# a swallowed branch and lower one site while `unit` took the other, which
+# is incoherent and died at 29. Six instructions apart they are two windows
+# of one member each, which is the shape 883 of the 1,455 refused windows
+# have.
+#
+# 6 x 2.0 = 12 proves all six survived, and 65 comes from the upper half,
+# which only exists if the move through a GPR carried it. 12 + 65 = 77.
+PROGRAMS["noxmm"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$56, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movss	two(%rip), %xmm0
+	movss	two(%rip), %xmm1
+	movss	two(%rip), %xmm2
+	movss	two(%rip), %xmm3
+	movss	two(%rip), %xmm4
+	movss	two(%rip), %xmm5
+	vmovups	(%rsi), %ymm7		/* a load, on its own ... */
+	addss	%xmm1, %xmm0		/* every volatile xmm is read here, */
+	addss	%xmm2, %xmm0		/* which is what makes them live across */
+	addss	%xmm3, %xmm0		/* -- and the distance is what keeps a */
+	addss	%xmm4, %xmm0		/* `pair` from spanning the two sites */
+	addss	%xmm5, %xmm0
+	cvttss2si %xmm0, %eax		/* 12 */
+	vmovups	%ymm7, (%rdi)		/* ... and a store, far from the load */
+	addl	16(%rdi), %eax		/* + 65 from the upper half */
+	addq	$56, %rsp
+	ret
+func_end:
+	.p2align 4
+two:	.float 2.0
+	.p2align 5
+source:	.long 0, 0, 0, 0
+	.long 65, 0, 0, 0
 	.p2align 5
 sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
