@@ -3843,6 +3843,15 @@ def ymm_alias(field):
 SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2",
                "bcastmem", "bcastreg", "permmem", "permil")
 
+# **Member kinds that put no value in a vector register.** A `load` moves an
+# upper half through one and a `lanereg3` needs two; these four move a half
+# straight between a machine register and its slot, or emit a constant, and
+# want nothing of their own. Naming them is what lets the collector ASK
+# whether a helper is needed rather than assume it -- which it did, at 1,704
+# windows of which only 49 had no member wanting one. Finding 250.
+HELPER_FREE = frozenset(("plain", "insert", "bcastmem", "bcastreg",
+                         "extract"))
+
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
                    "vinsertf128", "vinserti128",
                    "vperm2f128", "vperm2i128",
@@ -4424,6 +4433,37 @@ def slot_for(slots, register):
 	return shadow_index(register)
 
 
+def span_slot_zero(base, slot, block):
+	"""Sixteen zero bytes into slot `slot`, using no vector register.
+
+	**A VEX.128 write zeroes bits 255:128, and under this representation
+	that is a slot.** The obvious emission is `xorps` a helper against
+	itself and store it, and that is what this did -- which made every
+	`extract` want an xmm for no reason but a constant. Two immediate
+	stores write the same sixteen bytes and want nothing at all.
+
+	Measured before it was written: `extract` is the only shape whose
+	helper is used for a CONSTANT rather than for a value in flight, it
+	wanted one at 333 windows, and `extract` alone is 290 of them.
+	Finding 250.
+	"""
+	out = bytearray()
+	for half in (0, 8):
+		if block is None:
+			# `movq $0,disp32(%rsp)` -- rm 100 says a SIB follows, and the
+			# SIB names rsp with no index.
+			out += b"\x48\xc7\x84\x24"
+			out += struct.pack("<i", base + slot * SLOT + half)
+		else:
+			register = block[0]
+			out.append(0x48 | (0x01 if register >= 8 else 0))
+			out += b"\xc7"
+			out.append(0x80 | (register & 7))	# mod 10, /0, disp32
+			out += struct.pack("<i", base + slot * SLOT + half)
+		out += struct.pack("<i", 0)
+	return bytes(out)
+
+
 def span_slot_move(helper, save, base, slot, block, at):
 	"""Move `helper` to or from slot `slot`, wherever the slots live.
 
@@ -4565,6 +4605,11 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		vex = inplace.decode_vex(encoding)
 		if vex is None or not vex["L"]:
 			return refuse("member is not a 256-bit VEX")
+		if helper is None and kind not in HELPER_FREE:
+			# The collector decides whether a helper is wanted; this
+			# refuses rather than emitting bytes that name register None
+			# if the two ever disagree.
+			return refuse(f"member {kind} wants a helper and has none")
 		tail = encoding[vex["length"]:]
 		shape = span_operand_shape(vex, tail, operands, None, mnemonic)
 		if shape is None:
@@ -4627,10 +4672,10 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
 			body += span_slot_move(low_dst, False, base, second, block,
 			                       at + len(body))
-			# xorps helper,helper -- the zero for D's upper half.
-			body += encode_rr(None, b"\x0f\x57", helper, helper)
-			body += span_slot_move(helper, True, base, slot, block,
-			                       at + len(body))
+			# **The zero wants no register.** Two immediate stores rather
+			# than `xorps` a helper and save it, which is what made this
+			# shape ask for an xmm it never put a value in. Finding 250.
+			body += span_slot_zero(base, slot, block)
 			continue
 		if what == "insert":
 			# **`vinsertf128 $1,%xmmS,%ymmS1,%ymmD` reads no slot at all**:
@@ -5594,15 +5639,23 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	for entry in entries:
 		helpers -= set(scratch_finder.xmm_numbers(entry[4] or ""))
 	helpers = tuple(sorted(helpers))
-	if not helpers:
+	# **Asked, not assumed.** Every member here may be one that moves a
+	# half straight between a machine register and its slot, in which case
+	# the window needs no vector register at all -- and the block pointer
+	# only wants one in the middle mode, where an xmm holds the index for
+	# three instructions. Finding 250.
+	wants = any(kind not in HELPER_FREE for kind, _p, _r in members) \
+		or (len(block) > 3 and block[3] is True)
+	if wants and not helpers:
 		return refuse("no xmm helper free at the site")
+	first = helpers[0] if helpers else None
 	second = helpers[1] if len(helpers) > 1 else None
 	told = []
-	if lower_ymm_span(entries, base, helpers[0], address, address, block,
+	if lower_ymm_span(entries, base, first, address, address, block,
 	                  second, told) is None:
 		return refuse(told[-1] if told else "lowering refused, no reason")
 	return (address, encoding, operands, mnemonic, window, [], None, [],
-	        ("unit", (entries, helpers[0], block, base, second)))
+	        ("unit", (entries, first, block, base, second)))
 
 
 def report_units(candidates, placed, home, wide=0, original=None):

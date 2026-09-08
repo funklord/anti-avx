@@ -13686,6 +13686,84 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 250 -- the helper nobody needed, and the smallest bucket wins
+
+Four levers had been chosen by the size of a refusal bucket and had returned 35 sites between
+them. This one was chosen by measuring what was BEHIND a bucket first, it removed the fewest
+refusals of any of them, and it returned **220 sites** -- six times the other four together.
+
+#### What the measurement said
+
+    windows refused for "no xmm helper free"        1,704
+      some member genuinely needs a helper          1,655   97%
+      every member is helper-free                      49
+        ...and the block wants no stash either         31
+
+    shapes that want one   load 948 | lanereg3 499 | extract 333 | store 270
+    commonest windows      load 546 | extract 290 | lanereg3 209 | load+store 144
+
+**`extract` was the outlier and the measurement is what showed it.** It is the only shape whose
+helper held a CONSTANT rather than a value in flight: `xorps` a register against itself to make
+the sixteen zero bytes a VEX.128 write implies. Two `movq $0,disp(%base)` stores write the same
+bytes and want no vector register at all, so `span_slot_zero` replaces it and `extract` joins
+`plain`, `insert` and the broadcasts in `HELPER_FREE`.
+
+The second half is that the requirement was **assumed rather than asked**. `unit_candidate`
+refused any window with no free xmm, whether or not a single member wanted one. It computes the
+answer now, with a guard in `lower_ymm_span` refusing a member that wants a helper and was given
+none, so the two cannot drift.
+
+#### The prediction, and what happened
+
+**Stated before the run: about 321 new candidates**, being the 290 `extract`-only windows plus
+the 31 already helper-free. The block decision runs BEFORE the helper check, so every one of
+the 1,704 already had a working block path -- which is the cell rather than the margin, and the
+thing Finding 249 got wrong.
+
+    candidates built        441 ->   690    +249   against ~321 predicted
+    xmm helper refusal    1,704 -> 1,455    -249
+    256-bit through a slot  456 ->   676    +220
+    unit windows placed      77 ->   296
+    detours             202,865 -> 203,087
+
+249 against 321 is 23% high -- the shortfall is windows that cleared the helper check and were
+then refused by the emitter or the placer -- and it is the first prediction in this sequence
+that was the right size at all.
+
+    lever                          refusals removed   sites gained
+    ISA lowerings (three passes)                141             14
+    the block pointer, one register             577             21
+    the block register saved                    415              0
+    the xmm helper, computed                    249            220
+
+**The smallest bucket produced by far the largest gain**, which is the whole argument stated as
+a number: what matters is not how big a refusal is but whether anything is behind it. Three
+passes were spent removing refusals that had another refusal waiting; this one removed a
+requirement that was not real.
+
+The cost per site rose from 26.8 to 47.2 bytes, because an `extract`-only window is a single
+site carrying a whole block prologue. That is a real price and worth watching if the section
+size ever binds.
+
+#### A fixture that had never been able to fail
+
+Changing the zeroing prompted the question of whether `laneswap` still tested it. It did not,
+and never had. Its second term reads `%ymm2`'s upper half expecting 0 -- but nothing in that
+program ever wrote slot(2), and **the per-thread block arrives zero-filled from the loader**, so
+the term read 0 whatever the lowering did. Sabotaged, it scored 77.
+
+That fixture was written in this session for the express purpose of proving the VEX.128 zeroing,
+and recorded here as doing so. It passed for a reason unrelated to its claim, and nothing would
+have caught it: not the gate, not a review of the assembly, not the `--shadow-regs=off` arm.
+What caught it was replacing the implementation underneath and re-running the sabotage.
+
+It loads 222 into that slot first now. Sabotaged it scores **43**, which is (77 + 222) & 255.
+
+**The general form is worse than "test your tests".** A fixture that reads a location the
+program never writes is reading the ENVIRONMENT, and an environment that happens to supply the
+expected value makes the assertion vacuous in a way no amount of reading the fixture reveals --
+it is `evidence.md`'s vacuous pass, in a control rather than in a gate.
+
 ### Finding 249 -- the block register saved, and a cross-tab read at its margin
 
 Finding 248 ended saying the 937 sites with nothing free needed the BLOCK register saved across

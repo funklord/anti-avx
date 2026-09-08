@@ -2255,6 +2255,12 @@ tls_directory:
 # write ZEROES bits 255:128 -- so the destination's own slot has to be
 # zeroed, not left holding what it had. Summing them means either half
 # failing changes the answer.
+#
+# **ymm2 is loaded with 222 first, and that load IS the test.** The
+# per-thread block arrives zero-filled from the loader, so a slot nothing
+# ever wrote reads 0 anyway -- the first draft read 0 out of an untouched
+# slot and called that proof the zeroing had happened. Sabotaged, it scored
+# 77: the term could not fail. With 222 in the slot beforehand it can.
 PROGRAMS["laneswap"] = (77, """
 	.text
 	.globl _start
@@ -2263,6 +2269,8 @@ _start:
 	vzeroupper
 	leaq	source(%rip), %rsi
 	leaq	sink(%rip), %rdi
+	vmovups	0x40(%rsi), %ymm2	/* POISON: 222 into ymm2's slot, so the */
+					/* zeroing has something to clear */
 	vmovups	0x20(%rsi), %ymm3	/* defined, so nothing reads a stale half */
 	vmovups	(%rsi), %ymm1
 	vextractf128 $0x1, %ymm1, %xmm2	/* xmm2 = ymm1 upper; ymm2 upper = 0 */
@@ -2279,6 +2287,8 @@ source:	.long 1, 2, 3, 4
 	.long 77, 6, 7, 8
 	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
+	.long 111, 111, 111, 111
+	.long 222, 222, 222, 222
 	.p2align 5
 sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
