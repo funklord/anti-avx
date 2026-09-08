@@ -188,7 +188,7 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap lanemem; do \
+	for name in crossregion laneswap lanemem bcast permmem; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -225,7 +225,13 @@ check-shadow-pe:
 	echo "check-shadow-pe: lanemem -- vperm2f128 on both its selectors, and"; \
 	echo "                 the memory operands of extract and insert. Its"; \
 	echo "                 77 is 60 + 7 + 10, one term per mechanism, and"; \
-	echo "                 sabotaging each gives 24, 70 and 67"
+	echo "                 sabotaging each gives 24, 70 and 67"; \
+	echo "check-shadow-pe: bcast -- all four broadcast forms, each read from"; \
+	echo "                 the LAST lane of an upper half, so a missing"; \
+	echo "                 splat and a missing slot both score zero"; \
+	echo "check-shadow-pe: permmem -- cross-lane 64-bit permutes from memory"; \
+	echo "                 through movsd and movhpd, read asymmetrically so"; \
+	echo "                 an inverted selector cannot sum to 77 anyway"
 
 # -- the software F16C conversions -------------------------------------------
 

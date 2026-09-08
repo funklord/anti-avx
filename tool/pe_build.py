@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2351,6 +2351,150 @@ source:	.long 60, 0, 0, 0
 	.long 0, 0, 0, 0
 	.long 10, 0, 0, 0
 	.long 0, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# The broadcasts, which under this representation are the ordinary SSE
+# broadcast plus one more store: both halves of the result are the same
+# 128 bits, so the slot copy IS the 256-bit part. All four forms that occur
+# in Starfield, and each answer is read from the LAST LANE of the UPPER
+# half. Upper, so a lowering that produced a correct low half and no slot
+# scores zero; last, so one that set lane 0 and skipped the shuffle scores
+# zero too. The first draft read lane 0 and would have passed a broadcast
+# that broadcast nothing.
+#
+# **Only ymm0 and xmm1 are used**, deliberately: Win64 makes just xmm0
+# through xmm5 volatile, so a fixture naming six of them leaves the
+# lowering no helper and is refused for a reason that has nothing to do
+# with broadcasts. The first draft did exactly that.
+#
+# 20 + 7 + 40 + 10 = 77: vbroadcastss from memory, vbroadcastss from a
+# register, vpbroadcastd from a register, and vbroadcastsd from memory,
+# which needs no shuffle because movddup duplicates the low quadword by
+# itself.
+PROGRAMS["bcast"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vbroadcastss (%rsi), %ymm0		/* 20, from memory */
+	vmovups	%ymm0, (%rdi)
+	vmovups	0x10(%rsi), %xmm1
+	vbroadcastss %xmm1, %ymm0		/* 7, from a register */
+	vmovups	%ymm0, 0x20(%rdi)
+	vmovups	0x20(%rsi), %xmm1
+	vpbroadcastd %xmm1, %ymm0		/* 40, integer domain */
+	vmovups	%ymm0, 0x40(%rdi)
+	vbroadcastsd 0x30(%rsi), %ymm0		/* 10, 64-bit, no shuffle */
+	vmovups	%ymm0, 0x60(%rdi)
+	movl	28(%rdi), %eax			/* the LAST lane of each upper half: */
+	addl	60(%rdi), %eax			/* upper, so the slot copy is tested, */
+	addl	92(%rdi), %eax			/* and last, so the splat is too -- at */
+	addl	120(%rdi), %eax			/* lane 0 a missing shuffle would pass */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 20, 0, 0, 0
+	.long 7, 0, 0, 0
+	.long 40, 0, 0, 0
+	.long 10, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# The cross-lane 64-bit permutes, whose source is memory -- which is what
+# makes them easy rather than hard. Every quadword of the source has its
+# own address, so each output quadword is a 64-bit load and no shuffle unit
+# is involved: `movsd` fills the low half and zeroes the high one, `movhpd`
+# then fills the high one.
+#
+# Source quadwords are 1, 3, 5, 70. `$0x1b` reverses them to 70, 5, 3, 1
+# and `$0x4e` swaps the 128-bit halves to 5, 70, 1, 3, so every selector
+# value 0 through 3 is exercised. 70 + 1 + 5 + 1 = 77, and two of the four
+# terms are read from an UPPER half, which is a slot.
+#
+# **The read positions are deliberately ASYMMETRIC between the two
+# immediates.** `$0x1b` and `$0x4e` differ by exactly one bit per selector,
+# so a lowering that inverted that bit would swap the two results -- and
+# the first draft read the same offsets from both, which makes the sum
+# invariant under exactly that swap. It scored 77 with the selector
+# sabotaged. Reading offset 0 from one and offsets 8 and 24 from the other
+# breaks the symmetry: the sabotage now scores 81.
+#
+# The third site uses a SIB memory operand, because `offset_operand` has to
+# grow a displacement on an operand that has none and the base+index form
+# is where that is easiest to get wrong.
+PROGRAMS["permmem"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	xorl	%eax, %eax
+	vpermq	$0x1b, (%rsi), %ymm0		/* reverse: 70, 4, 2, 1 */
+	vmovups	%ymm0, (%rdi)
+	vpermq	$0x4e, (%rsi), %ymm0		/* swap halves: 4, 70, 1, 2 */
+	vmovups	%ymm0, 0x20(%rdi)
+	vpermpd	$0x1b, (%rsi,%rax,8), %ymm0	/* the same, through a SIB */
+	vmovups	%ymm0, 0x40(%rdi)
+	movl	(%rdi), %eax			/* 70 */
+	addl	48(%rdi), %eax			/* 1, an UPPER half */
+	addl	72(%rdi), %eax			/* 5 */
+	addl	88(%rdi), %eax			/* 1, an UPPER half */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.quad 1, 3, 5, 70
 	.p2align 5
 sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0

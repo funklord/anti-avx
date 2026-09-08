@@ -13748,25 +13748,43 @@ at all, so unlike the register form there is **no destination slot to zero**. Th
 be stripped from the tail before `encode_mem` carries everything from modrm onward, since a
 `movups` has no immediate.
 
-    Starfield, --shadow-regs=all      no lanes    register    + perm2 and memory
-    ISA-bound refusals                     628         156                   107
-    lane mnemonics refused                 510          49                     0
-    register pressure                    1,746       2,144                 2,182
-    unit sites lowered                      25         192                   210
-    unit windows                            17          58                    74
-    256-bit sites through a slot           ~283         428                   446
+**A broadcast makes both halves the same 128 bits**, so it is the ordinary SSE broadcast plus
+one more store, and that store IS the 256-bit part. `movss` and `movd` zero the rest of the
+register, which is what lets the shuffle that follows splat lane 0 across it; `movddup` does
+the 64-bit case alone and needs no shuffle. All four forms that occur: `vbroadcastss` from
+memory (37) and from a register (18), `vpbroadcastd` from a register (18), `vbroadcastsd` from
+memory (1).
 
-**What is left is 107 and it is not a bound**: 56 broadcasts, 21 cross-lane permutes, 18
-`vpbroadcastd` and 12 F16C. Every one has a rule in `lower.py` already -- a broadcast is `movss`
-plus `shufps $0`, the permutes are `shufps` and `shufpd` pairs or a call into `src/permd.c`,
-F16C is `src/f16c.c`. They are refused because `unit_candidate` reaches the emitter through
-`lower_ymm_span`, which knows slot moves and prefix-strips and nothing else. That is the next
-piece of work.
+**The cross-lane 64-bit permutes are easy because their source is MEMORY**, which is the whole
+of why they are here and `vpermd` is not. Every quadword of the source has its own address, so
+each output quadword is a 64-bit load -- `movsd` for the low half, `movhpd` for the high one --
+and no shuffle unit is involved. Emitted for any immediate rather than special-cased for the
+two that occur, because a special case is a thing to be wrong about and the general form is no
+longer.
 
-**Register pressure is now the largest cause**, and it grew from 1,746 to 2,182 across both
-passes. That is the refusal migrating down the pipeline as earlier ones are removed, not a
-regression: a site that used to stop at "no legacy encoding" now reaches the point of wanting
-two dead GPRs.
+    Starfield, --shadow-regs=all    no lanes  register  + perm2/mem  + bcast/perm
+    ISA-bound refusals                   628       156          107            23
+    lane mnemonics refused               510        49            0             0
+    register pressure                  1,746     2,144        2,182         2,259
+    unit candidates built                  ?         ?          409           416
+    unit sites lowered                    25       192          210           212
+    256-bit sites through a slot        ~283       428          446           448
+
+**Removing an ISA refusal does not lower a site; it moves the refusal.** That is the finding of
+the last pass and it is worth more than the headline it spoils. 84 refusals left the ISA bucket
+and only **7** became candidates: the other **77** reappeared immediately as "fewer than two
+dead GPRs" (1,450 to 1,518) or "no xmm helper free" (729 to 737). The accounting is exact,
+7 + 77 = 84. Sites actually lowered went from 446 to 448.
+
+So a count of removed refusals is not a count of gained sites, and reporting 628 -> 23 without
+the second number would be the flattering denominator again in a different costume.
+
+**What the pass really bought is a change of bottleneck.** Register pressure is now 2,259 of
+3,124 refusals, 72% of them, and the instruction set has stopped being a cause worth naming.
+The 23 that remain are `vpermilps` (8) and `vpermd` (3), whose control operand is a REGISTER
+rather than an immediate, and 12 F16C. `lower.py` answers the first two with a helper routine
+and the third with `src/f16c.c`; a helper routine is a different kind of work and is not built
+here.
 
 Only `$0x1` is emitted for extract and insert, because that is the whole population -- 362 of
 383 and 141 of 157 in Starfield, and every `vextracti128` and `vinserti128`. `vperm2f128` takes
@@ -13778,7 +13796,27 @@ right. `lanemem`'s 77 is 60 + 7 + 10, one term per mechanism, and breaking each 
 copy gives a distinct wrong answer: the permute's high selector forced to `SRC1` gives **67**,
 the extract-to-memory slot move removed gives **24**, the insert-from-memory slot store removed
 gives **70**. It covers both immediates that occur in the wild, `$0x1` and `$0x20`, which take
-different selector paths.
+different selector paths. `bcast` gives 57, 67 and 0; `permmem` gives 81, 144 and 75.
+
+**And two fixtures were wrong in a way only the sabotage could show**, which is the argument
+for running one rather than trusting a green result.
+
+`permmem` scored **77 with its selector deliberately inverted**. `$0x1b` and `$0x4e` differ by
+exactly the bit the sabotage flipped, so it swapped the two results -- and the first draft read
+the SAME offsets from both, which makes the sum invariant under precisely that swap. The
+fixture was correct, it passed for the right reason, and it could not have failed for the one
+error most likely in that emitter. Reading offset 0 from one site and 8 and 24 from the other
+breaks the symmetry.
+
+`bcast` read lane 0 of each upper half, so a lowering that set lane 0 and skipped the splat
+entirely would have passed. It reads the LAST lane now: upper, so a missing slot scores zero,
+and last, so a missing shuffle does too.
+
+**A third thing the fixtures taught, about the tool rather than themselves.** `bcast`'s first
+draft named `%ymm0` through `%ymm5` and was refused with "no xmm helper free at the site". Win64
+makes only xmm0 through xmm5 volatile, so a fixture naming six of them leaves the lowering
+nothing to borrow. The tool was right and the fixture was greedy -- and that same scarcity is
+what the frontier now consists of.
 
 **A strategy offered at every site collides with itself.** `laneswap`'s first run returned 29:
 three candidates built, one placed, 1 of 6 sites through a slot. Every adjacent 256-bit

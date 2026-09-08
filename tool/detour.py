@@ -3749,11 +3749,14 @@ def ymm_alias(field):
 # The shapes those mnemonics produce, which are emitted as slot moves and
 # are therefore the exemption from NO_LEGACY_FORM. Named once so the guard
 # and the shapes cannot drift apart.
-SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2")
+SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2",
+               "bcastmem", "bcastreg", "permmem")
 
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
                    "vinsertf128", "vinserti128",
-                   "vperm2f128", "vperm2i128")
+                   "vperm2f128", "vperm2i128",
+                   "vbroadcastss", "vbroadcastsd", "vpbroadcastd",
+                   "vpermq", "vpermpd")
 
 
 def lower_ymm_run(strategy, at, pool):
@@ -4082,6 +4085,35 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 				# source's. 21 of Starfield's 383.
 				if "(" in fields[2] and fields[1].startswith("%ymm"):
 					return ("extractmem", canonical_ymm(fields[1]))
+			return None
+		if mnemonic in ("vpermq", "vpermpd"):
+			# **A cross-lane 64-bit permute whose source is MEMORY**, which
+			# is what makes it easy rather than hard: every quadword of the
+			# source has its own address, so each output quadword is a
+			# 64-bit load and no shuffle unit is involved at all. Two bits
+			# of the immediate choose each one.
+			#
+			# The register-source form is not this: it would have to reach
+			# a quadword inside a machine xmm, and is not built.
+			if (len(fields) == 3 and fields[0].startswith("$")
+					and "(" in fields[1]
+					and fields[2].startswith("%ymm")):
+				return ("permmem", canonical_ymm(fields[2]))
+			return None
+		if mnemonic in ("vbroadcastss", "vbroadcastsd", "vpbroadcastd"):
+			# **A broadcast makes both halves the same 128 bits**, so
+			# under this representation it is the ordinary SSE broadcast
+			# followed by a copy of the result into the slot. `lower.py`
+			# has emitted the 128-bit half since Finding 205 -- "a
+			# broadcast is `movss` plus `shufps $0`" -- and the second
+			# half is that same register stored once more.
+			if len(fields) != 2 or not fields[1].startswith("%ymm"):
+				return None
+			if fields[0].startswith("%xmm"):
+				return ("bcastreg", canonical_ymm(fields[1]),
+				        ymm_alias(fields[0]))
+			if "(" in fields[0]:
+				return ("bcastmem", canonical_ymm(fields[1]))
 			return None
 		if mnemonic in ("vperm2f128", "vperm2i128"):
 			# **Pure 128-bit lane selection**, which `lower.py` has said
@@ -4481,6 +4513,81 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if low_dst != low_s1:
 				body += encode_movaps(low_dst, low_s1)
 			continue
+		if what == "permmem":
+			# Four 64-bit loads: `movsd` fills the low quadword and zeroes
+			# the high one, `movhpd` then fills the high one. Uniform for
+			# every immediate rather than special-cased for the two that
+			# occur, because a special case is a thing to be wrong about
+			# and the general form is no longer.
+			immediate = perm2_immediate(operands)
+			if immediate is None:
+				return refuse("permute immediate is not a constant")
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			bare = tail[:-1]
+			failed = False
+			for target, first_bits, second_bits in ((low_dst, 0, 2),
+			                                        (helper, 4, 6)):
+				for prefix, opcode, bits in ((0xF2, b"\x0f\x10", first_bits),
+				                             (0x66, b"\x0f\x16",
+				                              second_bits)):
+					moved = inplace.offset_operand(
+						bare, 8 * ((immediate >> bits) & 3))
+					if moved is None:
+						failed = True
+						break
+					piece = encode_mem(prefix, opcode, target, vex, moved,
+					                   address, encoding, at + len(body))
+					if piece is None:
+						failed = True
+						break
+					body += piece
+				if failed:
+					break
+			if failed:
+				return refuse("permute source is out of reach")
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
+		if what in ("bcastmem", "bcastreg"):
+			# **Both halves of a broadcast are the same 128 bits.** So it
+			# is the SSE broadcast into the destination's low half, then
+			# that register copied once more into its slot -- and the
+			# slot copy is the whole of what makes it 256-bit.
+			#
+			# `movss` and `movd` write 32 bits and zero the rest of the
+			# xmm, which is why the shuffle that follows can splat lane 0
+			# across the register. `movddup` does the 64-bit case on its
+			# own, duplicating the low quadword into both halves, so it
+			# needs no shuffle at all.
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			if what == "bcastmem":
+				prefix, opcode = ((0xF2, b"\x0f\x12")	# movddup
+				                  if mnemonic == "vbroadcastsd"
+				                  else (0xF3, b"\x0f\x10"))	# movss
+				piece = encode_mem(prefix, opcode, low_dst, vex, tail,
+				                   address, encoding, at + len(body))
+				if piece is None:
+					return refuse("broadcast source is out of reach")
+				body += piece
+				if mnemonic != "vbroadcastsd":
+					# shufps $0,%xmmD,%xmmD -- lane 0 across all four.
+					body += encode_rr(None, b"\x0f\xc6", low_dst, low_dst,
+					                  0x00)
+			elif mnemonic == "vpbroadcastd":
+				# pshufd $0,%xmmS,%xmmD -- integer domain, and it reads
+				# the source directly so no move is needed first.
+				low_src = scratch_finder.xmm_numbers(shape[2])[0]
+				body += encode_rr(0x66, b"\x0f\x70", low_dst, low_src,
+				                  0x00)
+			else:
+				low_src = scratch_finder.xmm_numbers(shape[2])[0]
+				if low_dst != low_src:
+					body += encode_movaps(low_dst, low_src)
+				body += encode_rr(None, b"\x0f\xc6", low_dst, low_dst,
+				                  0x00)
+			body += span_slot_move(low_dst, True, base, slot, block,
+			                       at + len(body))
+			continue
 		if what == "extractmem":
 			# **The source's upper half, straight out to memory.** No slot
 			# is written: the destination is sixteen bytes of memory and
@@ -4804,6 +4911,24 @@ def region_members(instructions, first, last, reasons=None):
 			# Reads no slot -- both sources are machine registers -- and
 			# DEFINES the destination's upper half, so it needs nothing
 			# proved about what came before it.
+			if register not in slots:
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
+			defined.add(register)
+		elif what == "permmem":
+			# Reads memory only, and defines the destination.
+			if register not in slots:
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
+			defined.add(register)
+		elif what in ("bcastmem", "bcastreg"):
+			# Defines the destination's upper half from a value that is
+			# not an upper half at all, so nothing has to be proved about
+			# what came before it.
 			if register not in slots:
 				slots[register] = (shadow_index(register)
 				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
