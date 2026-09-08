@@ -13762,29 +13762,67 @@ and no shuffle unit is involved. Emitted for any immediate rather than special-c
 two that occur, because a special case is a thing to be wrong about and the general form is no
 longer.
 
-    Starfield, --shadow-regs=all    no lanes  register  + perm2/mem  + bcast/perm
-    ISA-bound refusals                   628       156          107            23
-    lane mnemonics refused               510        49            0             0
-    register pressure                  1,746     2,144        2,182         2,259
-    unit candidates built                  ?         ?          409           416
-    unit sites lowered                    25       192          210           212
-    256-bit sites through a slot        ~283       428          446           448
+**The variable-control in-lane permute is two of the 128-bit one.**
+`vpermilps` permutes within each 128-bit half by that half's own control and never across, so
+the 256-bit form is `lower_permilps` called twice -- a function that already existed, with the
+`pshufb` byte-index trick and its three pooled constants. What it needed was a register:
+the sequence wants a scratch distinct from destination, data and control, and for the upper
+half the control is a copy just loaded out of a slot, so clobbering it costs nothing.
+`clobber_control` says that explicitly rather than duplicating the sequence, and it is what
+keeps the 256-bit form inside TWO spare registers instead of three.
 
-**Removing an ISA refusal does not lower a site; it moves the refusal.** That is the finding of
-the last pass and it is worth more than the headline it spoils. 84 refusals left the ISA bucket
-and only **7** became candidates: the other **77** reappeared immediately as "fewer than two
-dead GPRs" (1,450 to 1,518) or "no xmm helper free" (729 to 737). The accounting is exact,
-7 + 77 = 84. Sites actually lowered went from 446 to 448.
+    Starfield, --shadow-regs=all  no lanes register +perm2/mem +bcast/perm +permil
+    ISA-bound refusals                 628      156         107          23      15
+    lane mnemonics refused             510       49           0           0       0
+    register pressure                1,746    2,144       2,182       2,259   2,267
+    unit candidates built                ?        ?         409         416     416
+    unit sites lowered                  25      192         210         212     212
+    256-bit sites through a slot      ~283      428         446         448     448
 
-So a count of removed refusals is not a count of gained sites, and reporting 628 -> 23 without
-the second number would be the flattering denominator again in a different costume.
+#### Removing an ISA refusal does not lower a site; it moves the refusal
 
-**What the pass really bought is a change of bottleneck.** Register pressure is now 2,259 of
-3,124 refusals, 72% of them, and the instruction set has stopped being a cause worth naming.
-The 23 that remain are `vpermilps` (8) and `vpermd` (3), whose control operand is a REGISTER
-rather than an immediate, and 12 F16C. `lower.py` answers the first two with a helper routine
-and the third with `src/f16c.c`; a helper routine is a different kind of work and is not built
-here.
+This is the finding of the whole exercise and it is worth more than the headline it spoils.
+Measured across three passes, each of which removed real refusals and was verified by a
+sabotage-tested fixture:
+
+    pass                     ISA removed   newly built   moved to pressure
+    perm2 and memory forms            49             7                  42
+    broadcasts and permutes           84             7                  77
+    the variable in-lane permute       8             0                   8
+    total                            141            14                 127
+
+**141 ISA refusals removed, 14 sites gained.** The accounting closes exactly in every row: a
+site that stopped saying "no legacy encoding" said "fewer than two dead GPRs for the block"
+(1,450 to 1,526) or "no xmm helper free" (729 to 737) instead. Sites lowered through a slot
+went 446 to 448 and then did not move at all.
+
+**The last pass is the clearest case and the least excusable.** All eight `vpermilps` sites
+moved to register pressure and not one gained a lowering. The lowering is correct -- the
+fixture proves it, and its sabotages give 5, 145 and 5 -- but correctness was never the binding
+constraint at those sites, and the evidence for that was already on the table after the
+broadcasts, where 77 of 84 went the same way.
+
+So: **the ISA work was worth doing once**, to retire a claim about a hard floor that was wrong,
+and the first pass paid for itself at 7 sites. Continuing past the second measurement was
+following the visible number rather than the binding one. `evidence.md` has the general form --
+a count is not a gain, and the question to ask of a number is what would also have to be true
+for it to mean what you are about to say it means.
+
+**What the frontier is now made of.** Register pressure is 2,267 of 3,124 refusals, 73% of
+them: 1,526 wanting two dead GPRs for the block pointer and 737 wanting one free volatile xmm.
+Win64 makes only xmm0 through xmm5 volatile and the block costs two GPRs at every site, so
+anything that reduces either -- a cheaper addressing mode, or a block pointer held across a
+window rather than recomputed per site -- would move more sites than every ISA lowering built
+here put together. That is the next piece of work, and it is not an instruction-set problem.
+
+**The 15 left are ISA-bound and two of them are measured, not argued.** 12 are F16C, which
+`lower.py` answers with `src/f16c.c`. Three are `vpermd`, the one genuinely cross-lane variable
+permute: neither output half can be computed from one input half, so the register-only form
+permutes BOTH data halves by the same byte indices and selects with a mask from bit 2 -- about
+fourteen instructions per half needing five or six scratch xmm. Its three sites name xmm0, 2, 9
+and 10, and with only xmm0 through xmm5 volatile that leaves at most four candidates, the
+destination being xmm0 itself. It does not fit. `src/permd.h` also records that every one of
+its sites is inside CPUID-gated checksum code that never executes on a host without AVX2.
 
 Only `$0x1` is emitted for extract and insert, because that is the whole population -- 362 of
 383 and 141 of 157 in Starfield, and every `vextracti128` and `vinserti128`. `vperm2f128` takes
@@ -13811,6 +13849,13 @@ breaks the symmetry.
 `bcast` read lane 0 of each upper half, so a lowering that set lane 0 and skipped the splat
 entirely would have passed. It reads the LAST lane now: upper, so a missing slot scores zero,
 and last, so a missing shuffle does too.
+
+**And one duplication was introduced and then removed.** The first broadcast emitter was a
+second copy of `lower_broadcast` -- the same knowledge that `movss` zeroes the rest of the
+register, that `movddup` needs no shuffle, and how to correct a RIP displacement for the move
+into a stub. It now calls that function and adds the slot store, which is the only part that is
+its own. Two implementations of one lowering is the drift this tree keeps recording, and it was
+caught by writing the second one rather than by anything checking.
 
 **A third thing the fixtures taught, about the tool rather than themselves.** `bcast`'s first
 draft named `%ymm0` through `%ymm5` and was refused with "no xmm helper free at the site". Win64

@@ -188,7 +188,7 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap lanemem bcast permmem; do \
+	for name in crossregion laneswap lanemem bcast permmem permil; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -231,7 +231,11 @@ check-shadow-pe:
 	echo "                 splat and a missing slot both score zero"; \
 	echo "check-shadow-pe: permmem -- cross-lane 64-bit permutes from memory"; \
 	echo "                 through movsd and movhpd, read asymmetrically so"; \
-	echo "                 an inverted selector cannot sum to 77 anyway"
+	echo "                 an inverted selector cannot sum to 77 anyway"; \
+	echo "check-shadow-pe: permil -- the variable-control in-lane permute,"; \
+	echo "                 lower_permilps called once per 128-bit half, with"; \
+	echo "                 control values carrying rubbish above bit 1 so a"; \
+	echo "                 missing mask cannot pass"
 
 # -- the software F16C conversions -------------------------------------------
 

@@ -845,7 +845,8 @@ def encode_pslld_immediate(destination, amount):
 	return bytes(out)
 
 
-def lower_permilps(vex, tail, operands, scratch, at, pool):
+def lower_permilps(vex, tail, operands, scratch, at, pool,
+                   clobber_control=False):
 	"""vpermilps, both forms.
 
 	The immediate form is a shufps and needs nothing. The variable form has
@@ -861,6 +862,15 @@ def lower_permilps(vex, tail, operands, scratch, at, pool):
 
 	Operand order is control, data, dst: the VEX vvvv field holds the DATA
 	and r/m the CONTROL, which is the opposite of vpermd.
+
+	**`clobber_control` lets the scratch BE the control register**, which
+	the guard below otherwise refuses. It is safe exactly when the caller
+	owns the control -- the sequence reads it once, in the first `movaps`,
+	and everything after works on the scratch. For a 128-bit site the
+	control is a live architectural register and the refusal is right; for
+	the upper half of a 256-bit one it is a copy this lowering just loaded
+	out of a slot, and destroying it costs nothing. That is what lets the
+	256-bit form need two spare registers rather than three. Finding 246.
 	"""
 	if vex["L"]:
 		return None			# 256-bit needs the Y representation
@@ -884,7 +894,9 @@ def lower_permilps(vex, tail, operands, scratch, at, pool):
 		                  immediate)
 		return bytes(body)
 
-	if scratch is None or scratch in (destination, data, control):
+	if scratch is None or scratch in (destination, data):
+		return None
+	if scratch == control and not clobber_control:
 		return None
 
 	body = bytearray()
@@ -3750,13 +3762,13 @@ def ymm_alias(field):
 # are therefore the exemption from NO_LEGACY_FORM. Named once so the guard
 # and the shapes cannot drift apart.
 SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2",
-               "bcastmem", "bcastreg", "permmem")
+               "bcastmem", "bcastreg", "permmem", "permil")
 
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
                    "vinsertf128", "vinserti128",
                    "vperm2f128", "vperm2i128",
                    "vbroadcastss", "vbroadcastsd", "vpbroadcastd",
-                   "vpermq", "vpermpd")
+                   "vpermq", "vpermpd", "vpermilps")
 
 
 def lower_ymm_run(strategy, at, pool):
@@ -4086,6 +4098,27 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 				if "(" in fields[2] and fields[1].startswith("%ymm"):
 					return ("extractmem", canonical_ymm(fields[1]))
 			return None
+		if mnemonic == "vpermilps":
+			# **In-lane, which is the whole reason it is here.** Each
+			# 128-bit half is permuted by its own half of the control and
+			# neither reaches across, so the 256-bit form is exactly two
+			# of the 128-bit one -- `lower_permilps`, twice. The
+			# cross-lane variable permute is `vpermd`, and it is a
+			# different problem.
+			#
+			# Operand order is control, data, destination: VEX.vvvv holds
+			# the DATA and r/m the CONTROL, which is the opposite way
+			# round from `vpermd`. See src/permil.h, which decoded a real
+			# site to settle it.
+			#
+			# Only the variable form reaches here; the immediate one is a
+			# `shufps` that the ordinary path already takes.
+			if (len(fields) == 3 and fields[0].startswith("%ymm")
+					and fields[1].startswith("%ymm")
+					and fields[2].startswith("%ymm")):
+				return ("permil", canonical_ymm(fields[2]),
+				        canonical_ymm(fields[1]), canonical_ymm(fields[0]))
+			return None
 		if mnemonic in ("vpermq", "vpermpd"):
 			# **A cross-lane 64-bit permute whose source is MEMORY**, which
 			# is what makes it easy rather than hard: every quadword of the
@@ -4227,13 +4260,15 @@ def span_entries(members, instructions, slots, scope, plain):
 			shape = span_operand_shape(vex, encoding[vex["length"]:],
 			                           operands, None, mnemonic)
 			if shape is not None and shape[0] in ("lanereg", "lanereg3",
-			                                      "extract", "perm2"):
+			                                      "extract", "perm2",
+			                                      "permil"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
 			# text to look either of them up with. `perm2` is the same
 			# shape: it may read either half of either source.
-			if shape is not None and shape[0] in ("lanereg3", "perm2"):
+			if shape is not None and shape[0] in ("lanereg3", "perm2",
+			                                      "permil"):
 				third = slot_for(slots, shape[3])
 		out.append((kind, address, encoding, mnemonic, operands,
 		            slot_for(slots, register), moved, second, third))
@@ -4513,6 +4548,46 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if low_dst != low_s1:
 				body += encode_movaps(low_dst, low_s1)
 			continue
+		if what == "permil":
+			# **Twice, once per 128-bit lane.** The low half is the
+			# ordinary 128-bit lowering on the architectural registers,
+			# with a spare xmm for its scratch. The high half is the same
+			# sequence on copies pulled out of the two sources' slots --
+			# and there the scratch may BE the control copy, since this
+			# owns it, which is what keeps the whole thing inside two
+			# spare registers instead of three.
+			if second_helper is None:
+				return refuse("permil wants a second helper")
+			if second is None or third is None:
+				return refuse("permil source is in no slot")
+			low = lower_permilps(dict(vex, L=0), tail, operands, helper,
+			                     at + len(body), pool)
+			if low is None:
+				return refuse("permil low half would not lower")
+			body += low
+			# data.hi into `helper`, control.hi into `second_helper`.
+			# `second` is shape[2]'s slot, which is the DATA; `third` is
+			# shape[3]'s, the control. Getting these the wrong way round
+			# permutes the control by the data, which is nonsense that
+			# still runs -- src/permd.h warns about exactly that mistake
+			# one instruction over.
+			body += span_slot_move(helper, False, base, second, block,
+			                       at + len(body))
+			body += span_slot_move(second_helper, False, base, third,
+			                       block, at + len(body))
+			high_vex = dict(vex, L=0, R=helper >> 3, X=0,
+			                B=second_helper >> 3, vvvv=helper)
+			high_tail = tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
+			                              | (second_helper & 7)])
+			high = lower_permilps(high_vex, high_tail, "%xmm,%xmm,%xmm",
+			                      second_helper, at + len(body), pool,
+			                      clobber_control=True)
+			if high is None:
+				return refuse("permil high half would not lower")
+			body += high
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
 		if what == "permmem":
 			# Four 64-bit loads: `movsd` fills the low quadword and zeroes
 			# the high one, `movhpd` then fills the high one. Uniform for
@@ -4549,42 +4624,23 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			                       at + len(body))
 			continue
 		if what in ("bcastmem", "bcastreg"):
-			# **Both halves of a broadcast are the same 128 bits.** So it
-			# is the SSE broadcast into the destination's low half, then
-			# that register copied once more into its slot -- and the
-			# slot copy is the whole of what makes it 256-bit.
+			# **Both halves of a broadcast are the same 128 bits**, so it
+			# is the ordinary 128-bit lowering followed by one more store,
+			# and that store is the whole of the 256-bit part.
 			#
-			# `movss` and `movd` write 32 bits and zero the rest of the
-			# xmm, which is why the shuffle that follows can splat lane 0
-			# across the register. `movddup` does the 64-bit case on its
-			# own, duplicating the low quadword into both halves, so it
-			# needs no shuffle at all.
+			# `lower_broadcast` is that 128-bit lowering and is reused
+			# rather than repeated: it already knows that `movss` and
+			# `movd` zero the rest of the register so the shuffle after
+			# can splat lane 0, that `movddup` does the 64-bit case alone,
+			# and how to correct a RIP displacement for the move into the
+			# stub. A second copy of that here would be a second thing to
+			# be wrong about, and the first draft was one.
+			piece = lower_broadcast(dict(vex, L=0), tail, mnemonic,
+			                        encoding, address, at + len(body))
+			if piece is None:
+				return refuse(f"{mnemonic} would not lower")
+			body += piece
 			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
-			if what == "bcastmem":
-				prefix, opcode = ((0xF2, b"\x0f\x12")	# movddup
-				                  if mnemonic == "vbroadcastsd"
-				                  else (0xF3, b"\x0f\x10"))	# movss
-				piece = encode_mem(prefix, opcode, low_dst, vex, tail,
-				                   address, encoding, at + len(body))
-				if piece is None:
-					return refuse("broadcast source is out of reach")
-				body += piece
-				if mnemonic != "vbroadcastsd":
-					# shufps $0,%xmmD,%xmmD -- lane 0 across all four.
-					body += encode_rr(None, b"\x0f\xc6", low_dst, low_dst,
-					                  0x00)
-			elif mnemonic == "vpbroadcastd":
-				# pshufd $0,%xmmS,%xmmD -- integer domain, and it reads
-				# the source directly so no move is needed first.
-				low_src = scratch_finder.xmm_numbers(shape[2])[0]
-				body += encode_rr(0x66, b"\x0f\x70", low_dst, low_src,
-				                  0x00)
-			else:
-				low_src = scratch_finder.xmm_numbers(shape[2])[0]
-				if low_dst != low_src:
-					body += encode_movaps(low_dst, low_src)
-				body += encode_rr(None, b"\x0f\xc6", low_dst, low_dst,
-				                  0x00)
 			body += span_slot_move(low_dst, True, base, slot, block,
 			                       at + len(body))
 			continue
@@ -4911,6 +4967,16 @@ def region_members(instructions, first, last, reasons=None):
 			# Reads no slot -- both sources are machine registers -- and
 			# DEFINES the destination's upper half, so it needs nothing
 			# proved about what came before it.
+			if register not in slots:
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
+			defined.add(register)
+		elif what == "permil":
+			# Reads both sources' halves and defines the destination's.
+			if shape[2] not in defined or shape[3] not in defined:
+				return refuse("permil source from outside the region")
 			if register not in slots:
 				slots[register] = (shadow_index(register)
 				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL

@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2501,6 +2501,70 @@ sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# The variable-control in-lane permute. `vpermilps` permutes within each
+# 128-bit half by that half's own control, and never across -- which is
+# what makes the 256-bit form exactly two of the 128-bit one rather than a
+# new problem. `lower_permilps` already emits the 128-bit sequence; this
+# fixture is about calling it twice and moving the halves.
+#
+# Operand order is control, data, destination, and it is the easy thing to
+# get backwards: VEX.vvvv holds the DATA and r/m the CONTROL, which is the
+# opposite way round from vpermd. Reversed, it permutes the control by the
+# data -- nonsense that still runs.
+#
+# data     = 5, 2, 3, 4 | 70, 2, 0, 0
+# control  = 0, 0, 0, 0 | 0x101, 0x104, 0, 0
+#
+# **The control values carry rubbish above bit 1 on purpose.** The SDM says
+# bits 31:2 of each element are ignored and the compiler really does emit
+# controls with junk up there, so 0x101 must select element 1 and 0x104
+# element 0. A lowering that skipped the mask would index with 0x101 and
+# read somewhere else entirely.
+#
+# 5 from the low half, then 2 and 70 from the upper half, which is a slot.
+PROGRAMS["permil"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	(%rsi), %ymm0		/* data */
+	vmovups	0x20(%rsi), %ymm1	/* control, with rubbish above bit 1 */
+	vpermilps %ymm1, %ymm0, %ymm2
+	vmovups	%ymm2, (%rdi)
+	movl	(%rdi), %eax		/* 5, the low half's own permute */
+	addl	16(%rdi), %eax		/* 2, upper half element 0 */
+	addl	20(%rdi), %eax		/* 70, upper half element 1 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 5, 2, 3, 4
+	.long 70, 2, 0, 0
+	.long 0, 0, 0, 0
+	.long 0x101, 0x104, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
 	.p2align 4
 tls_raw:
