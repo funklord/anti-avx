@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56, "regmove": 56}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2849,6 +2849,64 @@ source:	.long 0, 0, 0, 0
 	.p2align 5
 sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
+""")
+
+
+# A 256-bit register-to-register move, which the shape walk refused as "a
+# register-to-register move" along with 57 conversions and a mask extract
+# that are nothing of the kind. Only the moves are moves: the low half is
+# the same instruction one width down and the upper half is sixteen bytes
+# from one slot to another, wanting no vector register of its own.
+#
+# The answer travels ymm1 -> slot(1) -> slot(2) -> xmm6 -> memory, so a
+# move that copied only the low half, or copied the wrong slot, returns 0.
+#
+# **ymm3 is loaded in between, and that load is the whole test.** A load
+# leaves the upper half it just moved sitting in the helper, so a `regmove`
+# that WROTE the helper to its destination slot without READING its source
+# slot first would still write the right value -- the first draft of this
+# fixture scored 77 with exactly that sabotage applied, right by
+# coincidence. Loading ymm3 puts 11 in the helper instead, so the missing
+# read now scores 11.
+PROGRAMS["regmove"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$56, %rsp
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	(%rsi), %ymm1		/* slot(1) gets 77 */
+	vmovups	0x20(%rsi), %ymm3	/* slot(3) gets 11, and the helper now */
+					/* holds 11 rather than 77 */
+	vmovups	%ymm1, %ymm2		/* the move: slot(1) -> slot(2) */
+	vextractf128 $0x1, %ymm2, %xmm6	/* reads slot(2) */
+	movups	%xmm6, (%rdi)
+	movl	(%rdi), %eax
+	addq	$56, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 0, 0, 0, 0
+	.long 77, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 11, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
 """)
 
 

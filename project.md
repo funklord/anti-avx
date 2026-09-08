@@ -13779,6 +13779,83 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 253 -- a refusal bucket holding three unrelated things
+
+"A register-to-register move" was 146 refusals, and it is not 146 moves. Read by mnemonic:
+
+    vmovups / vmovdqu / vmovaps       71   genuine ymm -> ymm moves
+    vcvtdq2ps / vcvtps2dq             57   CONVERSIONS -- arithmetic
+    vpmovmskb                          7   writes a GENERAL-PURPOSE register
+
+Only the first group is a move, and a 256-bit register-to-register move is not arithmetic at
+all: the low half is the same instruction one width down and the upper half is sixteen bytes
+from one slot to another, which the mover of Finding 251 already carries in two halves. So
+`regmove` joins `GPR_MOVABLE` and the shape walk learns it.
+
+#### It bought 24 candidates, not 71, and the reason is the same one twice
+
+    shape "a register-to-register move"   146 ->    74   the 71 left; conversions stay
+    candidates built                    1,428 -> 1,452   +24
+    sites through a slot                1,165 -> 1,191   +26
+    unit sites lowered                    924 ->   952   +28
+
+    no xmm helper free                    588 ->   604   +16
+    no dead GPR and no home space         534 ->   551   +17
+    no register to move a half through    143 ->   154   +11
+
+**The 71 split 24 to candidates and about 44 to a resource refusal**, immediately. The shape
+measurement was right -- exactly 71 left the bucket, and the 74 that remain are the conversions
+and the mask extract. What was not measured is whether those 71 sites had a HELPER or a MOVER,
+and that is a second condition.
+
+**Shape is checked before resources**, so a site refused for shape has never been asked the
+resource question at all. Every one of them was an unknown, and quoting 71 treated them as
+though the answer were yes.
+
+This is the margin-for-a-cell error of Finding 249 in a new place, and the contrast with
+Finding 251 is exact: there the number quoted was moves-only AND a third register, both
+conditions crossed, and 740 came back 738. Here one condition was crossed and the estimate was
+three times high.
+
+**So the rule the next pass needs is not "measure what is behind a bucket" -- that was done --
+it is CROSS the condition you are removing with the conditions that come after it.** Three of
+the last four buckets have had a second gate immediately behind them.
+
+#### Two fixture faults, and both of them passed
+
+**The shape branch was unreachable in its first draft.** It was written inside the block gated
+on `mnemonic in SLOT_LANE_FORMS`, and `vmovups` is not a lane form, so it could never fire. An
+unreachable branch and a working one are indistinguishable from outside; the fixture is what
+showed it, and only because the fixture existed before the code was believed.
+
+**Then the fixture was right by coincidence.** Sabotaging the slot READ -- leaving `regmove`
+writing the helper to its destination without loading its source -- still scored 77. A `load`
+leaves the upper half it just moved sitting in the helper, so writing the helper writes the
+correct value anyway. A second load between them puts 11 there instead, and the sabotage now
+scores 11.
+
+That is `evidence.md`'s consumer-right-by-coincidence, in a fixture rather than in code: every
+additional passing case increased confidence in the wrong thing, and what separates the two
+mechanisms is not a better assertion but breaking the coincidence.
+
+#### What was NOT picked, and why it is a decision rather than an oversight
+
+The other candidate measured was the 588 windows refused for want of a vector register. Since
+Finding 249 the callee home space can hold a borrow, which puts the **non-volatile** xmm6
+through xmm15 in reach, and the room is there for **243** of them -- 43 wanting one helper with
+a slot free, 200 wanting two with two.
+
+It was not built, because it introduces a correctness class this tool does not have. Win64
+makes xmm6 through xmm15 callee-saved: if an exception unwinds out of a stub before the
+restore, the unwinder restores that register from the ORIGINAL function's unwind data, which
+knows nothing of a home-space save -- and where the function never saved it itself, the
+caller's value is gone. Every borrow made today is of a VOLATILE register, which no unwinder
+touches, so the hazard has never arisen.
+
+That is the same broken-unwind trade this project declined for stack spilling, and it is the
+copyright holder's to make rather than one to arrive at while working on something else. The
+243 is recorded so the decision has a number attached to it.
+
 ### Finding 251 -- a sixteen-byte move needs no vector register
 
 The largest refusal left was "no xmm helper free at the site" at 1,455 windows. Finding 250's

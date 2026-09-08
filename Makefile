@@ -230,7 +230,7 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm; do \
+	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -289,7 +289,11 @@ check-shadow-pe:
 	echo "check-shadow-pe: noxmm -- every volatile xmm live, so the load's"; \
 	echo "                 upper half moves through a GPR in two 8-byte"; \
 	echo "                 halves and a vextractf128 reads it back. Losing"; \
-	echo "                 the mover gives 29, mis-addressing it 12"
+	echo "                 the mover gives 29, mis-addressing it 12"; \
+	echo "check-shadow-pe: regmove -- a 256-bit register-to-register move is"; \
+	echo "                 a move: one slot copied to another. A second load"; \
+	echo "                 sits between, because a load leaves its upper half"; \
+	echo "                 IN the helper and the test was right by accident"
 
 # -- the software F16C conversions -------------------------------------------
 

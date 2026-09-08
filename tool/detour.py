@@ -3850,7 +3850,15 @@ def ymm_alias(field):
 # are therefore the exemption from NO_LEGACY_FORM. Named once so the guard
 # and the shapes cannot drift apart.
 SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2",
-               "bcastmem", "bcastreg", "permmem", "permil")
+               "bcastmem", "bcastreg", "permmem", "permil", "regmove")
+
+# **A 256-bit register-to-register move, which is not arithmetic.** The
+# refusal bucket called "a register-to-register move" holds three different
+# things and only these are moves: 53 `vmovups`, 12 `vmovdqu` and 6
+# `vmovaps`. The other 57 are `vcvtdq2ps` and `vcvtps2dq`, which CONVERT and
+# so need a vector register, and 7 are `vpmovmskb`, which writes a
+# general-purpose one. Finding 253.
+YMM_REGISTER_MOVES = frozenset(("vmovups", "vmovaps", "vmovdqu", "vmovdqa"))
 
 # **Member kinds that put no value in a vector register.** A `load` moves an
 # upper half through one and a `lanereg3` needs two; these four move a half
@@ -3866,7 +3874,7 @@ HELPER_FREE = frozenset(("plain", "insert", "bcastmem", "bcastreg",
 # way, so two 8-byte `mov`s stand in for a vector round trip. The arithmetic
 # shapes are absent on purpose: a packed operation has to happen in a vector
 # register whatever else is free. Finding 251.
-GPR_MOVABLE = frozenset(("load", "store"))
+GPR_MOVABLE = frozenset(("load", "store", "regmove"))
 
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
                    "vinsertf128", "vinserti128",
@@ -4278,6 +4286,19 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 				return ("insertmem", canonical_ymm(fields[3]),
 				        canonical_ymm(fields[2]))
 		return None
+	# **A 256-bit register-to-register move**, which is a move and not
+	# arithmetic: the low half is the same instruction one width down and
+	# the upper half is sixteen bytes from one slot to another. It needs
+	# the permanent slots, so it is gated with them -- and it sits at THIS
+	# level rather than inside the lane block above, which is keyed on
+	# `SLOT_LANE_FORMS` and so could never have reached a `vmovups`. The
+	# first draft was written inside it and could not fire at all, which
+	# the fixture caught and nothing else would have. Finding 253.
+	if SHADOW_REGS_RULE == SHADOW_REGS_ALL \
+			and mnemonic in YMM_REGISTER_MOVES and len(fields) == 2 \
+			and len(wide) == 2:
+		return ("regmove", canonical_ymm(fields[1]),
+		        canonical_ymm(fields[0]))
 	if len(fields) == 2 and len(wide) == 1:
 		if "(" in fields[0] and wide[0] == fields[1]:
 			return ("load", canonical_ymm(fields[1]))
@@ -4365,7 +4386,7 @@ def span_entries(members, instructions, slots, scope, plain):
 			                           operands, None, mnemonic)
 			if shape is not None and shape[0] in ("lanereg", "lanereg3",
 			                                      "extract", "perm2",
-			                                      "permil"):
+			                                      "permil", "regmove"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
@@ -4856,6 +4877,35 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
+		if what == "regmove":
+			# **Both halves are moves.** The low one is the instruction
+			# with `VEX.L` cleared, acting on the machine registers the
+			# program already uses; the high one is sixteen bytes from one
+			# slot to another, which a general-purpose register carries in
+			# two halves exactly as it carries a load. Finding 253.
+			if second is None:
+				return refuse("regmove source is in no slot")
+			low = narrow_piece(vex, tail, 0, address, len(encoding),
+			                   at + len(body))
+			if low is None:
+				return refuse("regmove low half cannot be narrowed")
+			body += low
+			mover = block[5] if block is not None and len(block) > 5 else None
+			if helper is not None:
+				body += span_slot_move(helper, False, base, second, block,
+				                       at + len(body))
+				body += span_slot_move(helper, True, base, slot, block,
+				                       at + len(body))
+			elif mover is not None:
+				for half in (0, 8):
+					where = block[0] if block is not None else None
+					body += encode_gpr_at(mover, False, where,
+					                      base + second * SLOT + half)
+					body += encode_gpr_at(mover, True, where,
+					                      base + slot * SLOT + half)
+			else:
+				return refuse("regmove has neither helper nor mover")
+			continue
 		if what == "permmem":
 			# Four 64-bit loads: `movsd` fills the low quadword and zeroes
 			# the high one, `movhpd` then fills the high one. Uniform for
@@ -5252,6 +5302,16 @@ def region_members(instructions, first, last, reasons=None):
 			# Reads both sources' halves and defines the destination's.
 			if shape[2] not in defined or shape[3] not in defined:
 				return refuse("permil source from outside the region")
+			if register not in slots:
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
+			defined.add(register)
+		elif what == "regmove":
+			# Reads the source's upper half and defines the destination's.
+			if shape[2] not in defined:
+				return refuse("regmove source from outside the region")
 			if register not in slots:
 				slots[register] = (shadow_index(register)
 				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
