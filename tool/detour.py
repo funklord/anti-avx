@@ -2114,15 +2114,19 @@ def saved_xmm_map(binary):
 		if off is None or off + 4 > len(data):
 			continue
 		count = data[off + 2]
-		codes, j, found = off + 4, 0, set()
+		codes, j, found = off + 4, 0, {}
 		while j < count and codes + j * 2 + 1 < len(data):
 			packed = data[codes + j * 2 + 1]
 			op, info = packed & 0xF, packed >> 4
 			if op == 8:				# UWOP_SAVE_XMM128
-				found.add(info)
+				where = struct.unpack_from(
+					"<H", data, codes + (j + 1) * 2)[0] * 16
+				found[info] = where
 				j += 2
 			elif op == 9:				# UWOP_SAVE_XMM128_FAR
-				found.add(info)
+				where = struct.unpack_from(
+					"<I", data, codes + (j + 1) * 2)[0]
+				found[info] = where
 				j += 3
 			elif op == 1:				# UWOP_ALLOC_LARGE
 				j += 2 if info else 3
@@ -2133,7 +2137,13 @@ def saved_xmm_map(binary):
 			else:
 				j += 1
 		if found:
-			out[base + begin] = frozenset(r for r in found if r >= 6)
+			# **The OFFSET is kept, not just the register.** A borrow that
+			# wrote over the function's own save slot would corrupt the
+			# very bytes the unwinder restores from -- the guarantee this
+			# whole condition rests on, destroyed by the thing relying on
+			# it. `unit_candidate` checks the home-space slot against
+			# these. Finding 256.
+			out[base + begin] = {r: w for r, w in found.items() if r >= 6}
 	return {a: r for a, r in out.items() if r}
 
 
@@ -5700,6 +5710,12 @@ SLOT_CARRYING = ("span", "region", "unit")
 # See `saved_xmm_map`. Finding 255.
 SAVED_XMM = {}
 
+# **Borrows declined because the home-space slot would have landed on the
+# function's own save area.** Counted rather than assumed zero: the guard
+# is cheap and the alternative is a silent corruption of the one thing the
+# non-volatile borrow depends on. Finding 256.
+OVERLAP_REFUSED = Counter()
+
 UNIT_REFUSED = Counter()
 UNIT_EXAMPLES = {}
 WIDE_SITES = Counter()
@@ -5997,7 +6013,20 @@ def unit_candidate(instructions, plain, index, blocked, home,
 				break
 			if lent is None or home_used + SLOT > HOME_SPACE:
 				break
-			taken.append((register, lent + home_used))
+			where = lent + home_used
+			# **Never over the function's own save area.** The condition
+			# this borrow rests on is that the unwinder can restore the
+			# caller's value from the function's slot; writing the borrow
+			# into that slot would destroy exactly what makes it safe.
+			# Measured to overlap nowhere in Starfield, and checked anyway
+			# because "nowhere today" is not a property of the next
+			# binary. Finding 256.
+			clash = any(where < offset + SLOT and offset < where + SLOT
+			            for offset in saved.values())
+			if clash:
+				OVERLAP_REFUSED[register] += 1
+				continue
+			taken.append((register, where))
 			home_used += SLOT
 		if len(taken) < need:
 			return refuse("no non-volatile xmm this function saves")
@@ -6048,6 +6077,11 @@ def report_units(candidates, placed, home, wide=0, original=None):
 	taken = sum(1 for c in candidates if c[8] and c[8][0] == "unit")
 	missed = sum(UNIT_REFUSED.values())
 	asked = taken + missed
+	if OVERLAP_REFUSED:
+		print(f"apply: non-volatile borrows declined for landing on the "
+		      f"function's own save area: {sum(OVERLAP_REFUSED.values()):,}")
+		for _r, _n in sorted(OVERLAP_REFUSED.items()):
+			print(f"apply:   xmm{_r:<3} {_n:>7,}")
 	print(f"apply: unconditional lowering: {taken:,} built, "
 	      f"{missed:,} refused, of {asked:,} sites it was asked about")
 	for why, count in sorted(UNIT_REFUSED.items(), key=lambda kv: -kv[1]):
@@ -8320,6 +8354,7 @@ def collect(binary, listing, context=None):
 	out of memory before it was noticed. One build, shared.
 	"""
 	# A run reports its own numbers, not the previous one's.
+	OVERLAP_REFUSED.clear()
 	SAVED_XMM.clear()
 	SAVED_XMM.update(saved_xmm_map(binary))
 	REGION_REFUSED.clear()

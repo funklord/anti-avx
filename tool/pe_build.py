@@ -1134,13 +1134,14 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56, "regmove": 56, "nonvol": 72, "nonvolbad": 72}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56, "regmove": 56, "nonvol": 72, "nonvolbad": 72, "unwindsave": 72}
 
 # **Samples whose prologue saves a non-volatile xmm**, as `(register,
 # offset from rsp)`. The sample must really do the save in its code AND
 # carry a `prologue_end` label, because the unwind codes below are a claim
 # about the instructions rather than a decoration. Finding 255.
-SAVES = {"nonvol": ((6, 0x20), (7, 0x30))}
+SAVES = {"nonvol": ((6, 0x20), (7, 0x30)),
+         "unwindsave": ((6, 0x20), (7, 0x30))}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -3015,6 +3016,90 @@ tls_directory:
 # A control for the precondition rather than for the mechanism: it fails if
 # the tool ever borrows a register the function does not promise to save.
 PROGRAMS["nonvolbad"] = PROGRAMS["nonvol"]
+
+
+# **What an unwind would actually read.** The non-volatile borrow is safe
+# because a fault has the unwinder restore xmm6 from THIS function's own
+# UWOP_SAVE_XMM128 slot -- so the one thing that would destroy the
+# guarantee is the borrow writing over that slot. The home space the borrow
+# uses and the save area are different regions of the frame, but "different
+# today" is not a property of the next binary, and one Starfield function
+# declares xmm10 saved at offset +0, which is exactly where a callee home
+# space begins.
+#
+# This puts 7.0 in xmm6 BEFORE the declared save, so the slot holds a value
+# the test knows, runs an arithmetic site that forces the borrow, and then
+# reads the slot back. If the stub wrote into the save area the 7 is gone.
+#
+# 7 from the save slot and 70 from the upper half of the vpaddd = 77. It
+# does not fault, and cannot: a fixture that faults inside a stub needs SEH
+# the samples here have no imports for. What this proves is the tool-side
+# half -- that the bytes the unwinder would read are still the caller's --
+# and `nonvolbad` proves the other half, that the borrow is only taken
+# where those bytes exist at all.
+PROGRAMS["unwindsave"] = (77, """
+	.text
+	.globl _start
+_start:
+	movss	seven(%rip), %xmm6	/* stands in for the caller's value */
+	subq	$72, %rsp
+	movups	%xmm6, 0x20(%rsp)	/* the DECLARED save: what an unwind */
+	movups	%xmm7, 0x30(%rsp)	/* would restore xmm6 from */
+prologue_end:
+	call	helper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movss	two(%rip), %xmm0
+	movss	two(%rip), %xmm1
+	movss	two(%rip), %xmm2
+	movss	two(%rip), %xmm3
+	movss	two(%rip), %xmm4
+	movss	two(%rip), %xmm5
+	vmovups	(%rsi), %ymm8
+	vmovups	0x20(%rsi), %ymm9
+	vpaddd	%ymm8, %ymm9, %ymm9	/* forces the xmm6/xmm7 borrow */
+	vmovups	%ymm9, (%rdi)
+	addss	%xmm1, %xmm0		/* holds every volatile xmm live */
+	addss	%xmm2, %xmm0
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0
+	movss	0x20(%rsp), %xmm10	/* the save slot, read back */
+	cvttss2si %xmm10, %eax		/* 7 if the stub left it alone */
+	addl	16(%rdi), %eax		/* + 70 from the upper half */
+	movups	0x20(%rsp), %xmm6
+	movups	0x30(%rsp), %xmm7
+	addq	$72, %rsp
+	ret
+helper:
+	ret
+func_end:
+	.p2align 4
+two:	.float 2.0
+seven:	.float 7.0
+	.p2align 5
+source:	.long 0, 0, 0, 0
+	.long 65, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 5, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
 
 
 PROGRAMS["mxcsr"] = (55, """

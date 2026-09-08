@@ -230,7 +230,7 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove nonvol; do \
+	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove nonvol unwindsave; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -317,7 +317,11 @@ check-shadow-pe:
 	fi; \
 	echo "check-shadow-pe: nonvolbad -- the same .text with the unwind codes"; \
 	echo "                 removed is REFUSED at 29, so the borrow rests on"; \
-	echo "                 the function's own promise and not on luck"
+	echo "                 the function's own promise and not on luck"; \
+	echo "check-shadow-pe: unwindsave -- the function's OWN save slot still"; \
+	echo "                 holds the caller's value after the stub ran, so"; \
+	echo "                 the bytes an unwind would restore from survive."; \
+	echo "                 Writing the borrow onto that slot gives 70"
 
 # -- the software F16C conversions -------------------------------------------
 

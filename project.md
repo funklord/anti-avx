@@ -13779,6 +13779,65 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 256 -- what an unwind fixture can prove, and what it cannot
+
+Finding 255 borrows a non-volatile xmm where the function declares it saved, and closed saying
+the unwind argument itself was unproven. This builds what can be built, and is explicit about
+the part that stays read rather than run.
+
+#### The property a fixture CAN reach
+
+A fixture that faults inside a stub would mostly be testing Windows: whether its unwinder
+honours `UWOP_SAVE_XMM128` is the platform's business, and the tool-side condition -- borrow
+only where the codes exist -- is what `nonvolbad` already tests.
+
+**But there is a property an unwind depends on that the TOOL could break.** The borrow saves the
+register into the callee home space. If that slot landed on the function's OWN save slot, the
+stub would destroy the very bytes the unwinder restores from -- the guarantee wrecked by the
+thing relying on it. That needs no exception to observe: read the slot back afterwards.
+
+`unwindsave` puts 7.0 in xmm6 BEFORE the declared save, runs an arithmetic site that forces the
+borrow, and reads the save slot. **77** correct; forcing the borrow's save onto that slot gives
+**70**, the 7 exactly gone.
+
+So `saved_xmm_map` keeps the offsets now, not just the registers, and `unit_candidate` refuses a
+slot that overlaps one.
+
+#### The guard is capable and unnecessary, and those are two findings
+
+    non-volatile borrows declined for landing on the save area:  0
+    unit candidates built                                    1,590   unchanged
+    256-bit sites through a slot                             1,296   unchanged
+
+**It never fires on Starfield and costs nothing.** What makes that a different statement from
+the emitter guard of Finding 246 -- which has also never fired -- is that this one **has been
+seen to fail**: the sabotage above produces 70, so it is demonstrably able to speak. The other
+could not be made to fire at all and had to be recorded as a floor of unproven value.
+
+**And a claim made while building it was too strong.** Reading the offsets turned up a Starfield
+function declaring xmm10 saved at **+0**, which is where a callee home space begins, and that was
+written down as the guard being "warranted by the binary". The measurement says no borrow site
+actually collides. Overlap is possible in principle; it does not occur here. Those are different
+claims and the weaker one is the true one.
+
+#### What stays unproven, precisely
+
+The pair proves two halves and neither is the platform's:
+
+    nonvolbad    the borrow is taken ONLY where the unwind codes exist
+    unwindsave   the bytes those codes point at are still the caller's
+
+What is not proved is that Windows' unwinder does what the contract says. No fixture here faults
+inside a stub, because SEH needs imports these samples do not have -- `pe_build` emits
+`UNW_FLAG_EHANDLER` and a handler could be written, but the handler would have to inspect a
+CONTEXT and the samples have no way to report one. That half rests on the x64 unwind contract as
+READ.
+
+**Which is worth stating rather than leaving implied**, because Finding 124 declined this whole
+route on exactly that contract, and reversing it on the same contract read the same way is a
+symmetrical argument, not a stronger one. What changed is not the confidence in the contract but
+that the condition is now checked instead of assumed.
+
 ### Finding 255 -- Finding 124's blanket becomes a condition, for 138 sites
 
 Finding 124 restricted borrowing to xmm0-xmm5 and closed with "a binary that needs one gets a
