@@ -1134,7 +1134,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2758,7 +2758,6 @@ PROGRAMS["noxmm"] = (77, """
 	.globl _start
 _start:
 	subq	$56, %rsp
-	vzeroupper
 	leaq	source(%rip), %rsi
 	leaq	sink(%rip), %rdi
 	movss	two(%rip), %xmm0
@@ -2767,15 +2766,17 @@ _start:
 	movss	two(%rip), %xmm3
 	movss	two(%rip), %xmm4
 	movss	two(%rip), %xmm5
-	vmovups	(%rsi), %ymm7		/* a load, on its own ... */
+	vmovups	(%rsi), %ymm7		/* the load: no xmm is free, so its */
+					/* upper half moves through a GPR */
 	addss	%xmm1, %xmm0		/* every volatile xmm is read here, */
 	addss	%xmm2, %xmm0		/* which is what makes them live across */
-	addss	%xmm3, %xmm0		/* -- and the distance is what keeps a */
-	addss	%xmm4, %xmm0		/* `pair` from spanning the two sites */
+	addss	%xmm3, %xmm0		/* -- and the distance keeps a `pair` */
+	addss	%xmm4, %xmm0		/* from spanning the two sites */
 	addss	%xmm5, %xmm0
-	cvttss2si %xmm0, %eax		/* 12 */
-	vmovups	%ymm7, (%rdi)		/* ... and a store, far from the load */
-	addl	16(%rdi), %eax		/* + 65 from the upper half */
+	cvttss2si %xmm0, %eax		/* 12, if all six survived */
+	vextractf128 $0x1, %ymm7, %xmm6	/* reads the slot the mover wrote */
+	movups	%xmm6, (%rdi)
+	addl	(%rdi), %eax		/* + 65, only if the GPR carried it */
 	addq	$56, %rsp
 	ret
 func_end:
@@ -2801,6 +2802,53 @@ tls_callbacks:
 tls_directory:
 	.quad	0, 0, 0, 0
 	.long	0, 0
+""")
+
+
+# The run-borrow defect of Finding 252, kept as its own fixture because a
+# control shared with another test is a control that dies when that test is
+# reshaped -- which is exactly what happened: `noxmm` grew a `vextractf128`
+# to read the slot, stopped being a load-and-store run, and both the fixed
+# and the broken tool then answered 29.
+#
+# Six instructions between the load and the store, all naming volatile xmm,
+# so `assign_helpers` borrows a register and the passengers are re-emitted
+# between the carry-load and the carry-store. Broken, the run borrows one
+# the passengers name and the program computes **10**; fixed, it declines
+# the site, the VEX survives and the program dies at **29**.
+PROGRAMS["runborrow"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$56, %rsp
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movss	two(%rip), %xmm0
+	movss	two(%rip), %xmm1
+	movss	two(%rip), %xmm2
+	movss	two(%rip), %xmm3
+	movss	two(%rip), %xmm4
+	movss	two(%rip), %xmm5
+	vmovups	(%rsi), %ymm7		/* the run's load ... */
+	addss	%xmm1, %xmm0		/* ... six passengers, every one of */
+	addss	%xmm2, %xmm0		/* which names a volatile xmm ... */
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0
+	cvttss2si %xmm0, %eax		/* 12 */
+	vmovups	%ymm7, (%rdi)		/* ... and the run's store */
+	addl	16(%rdi), %eax		/* + 65 from the upper half */
+	addq	$56, %rsp
+	ret
+func_end:
+	.p2align 4
+two:	.float 2.0
+	.p2align 5
+source:	.long 0, 0, 0, 0
+	.long 65, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
 """)
 
 

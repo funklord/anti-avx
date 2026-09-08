@@ -153,7 +153,7 @@ check-span: | $(BUILD_DIR)
 	$(PYTHON) tool/span_oracle.py $(BUILD_DIR)
 
 # **A run that borrows a helper must not borrow one its passengers name.**
-# `noxmm` holds every volatile xmm live across a load and a store six
+# `runborrow` holds every volatile xmm live across a load and a store six
 # instructions apart, which is the shape that makes `assign_helpers` borrow.
 # Before Finding 252 the borrow excluded only the load's and stores' own
 # operands, so a passenger overwrote the half in flight and the stub stored
@@ -169,17 +169,17 @@ check-run-borrow: | $(BUILD_DIR)
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-run-borrow: wine is not installed"; exit 1; }
 	@set -e; \
-	$(PYTHON) tool/pe_build.py sample noxmm \
-		$(BUILD_DIR)/pe-noxmm-320.exe 320 >/dev/null; \
-	objdump -d -j .text $(BUILD_DIR)/pe-noxmm-320.exe \
-		> $(BUILD_DIR)/pe-noxmm-320.asm; \
+	$(PYTHON) tool/pe_build.py sample runborrow \
+		$(BUILD_DIR)/pe-runborrow.exe >/dev/null; \
+	objdump -d -j .text $(BUILD_DIR)/pe-runborrow.exe \
+		> $(BUILD_DIR)/pe-runborrow.asm; \
 	mkdir -p $(PE_PREFIX); \
-	$(PYTHON) tool/detour.py apply $(BUILD_DIR)/pe-noxmm-320.exe \
-		$(BUILD_DIR)/pe-noxmm-320.asm \
-		$(BUILD_DIR)/sse-noxmm.exe > /dev/null; \
+	$(PYTHON) tool/detour.py apply $(BUILD_DIR)/pe-runborrow.exe \
+		$(BUILD_DIR)/pe-runborrow.asm \
+		$(BUILD_DIR)/sse-runborrow.exe > /dev/null; \
 	got=0; \
 	WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d \
-		wine $(BUILD_DIR)/sse-noxmm.exe > /dev/null 2>&1 || got=$$?; \
+		wine $(BUILD_DIR)/sse-runborrow.exe > /dev/null 2>&1 || got=$$?; \
 	if [ "$$got" = "10" ]; then \
 		echo "check-run-borrow: returned 10 -- the run borrowed a register"; \
 		echo "                  one of its passengers names, and the stub"; \
@@ -230,7 +230,7 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr; do \
+	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -285,7 +285,11 @@ check-shadow-pe:
 	echo "check-shadow-pe: nogpr -- all SEVEN live, so nothing is dead and"; \
 	echo "                 both borrows are saved in the callee home space,"; \
 	echo "                 the block for the whole stub. Cutting the block"; \
-	echo "                 save gives 37, its restore 245, the index 57"
+	echo "                 save gives 37, its restore 245, the index 57"; \
+	echo "check-shadow-pe: noxmm -- every volatile xmm live, so the load's"; \
+	echo "                 upper half moves through a GPR in two 8-byte"; \
+	echo "                 halves and a vextractf128 reads it back. Losing"; \
+	echo "                 the mover gives 29, mis-addressing it 12"
 
 # -- the software F16C conversions -------------------------------------------
 

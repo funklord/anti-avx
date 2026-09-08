@@ -13779,6 +13779,82 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 251 -- a sixteen-byte move needs no vector register
+
+The largest refusal left was "no xmm helper free at the site" at 1,455 windows. Finding 250's
+lesson was to measure what is behind a bucket before picking it, so that is what was done, and
+the split it found is structural:
+
+    windows refused for no helper                  1,455
+      only 16-byte MOVES, a GPR could do it          883   61%
+        ...and a third register is available         740
+        ...but no third register                     143
+      has arithmetic, needs a vector register        572
+        lanereg3 499 | lanereg 115 | lane 44 | permmem 7 | perm2 6 | permil 1
+
+**`load` and `store` put sixteen bytes between memory and a slot and do nothing to them on the
+way**, so two 8-byte `mov`s through a general-purpose register stand in for the vector round
+trip -- four instructions instead of two, and a GPR instead of an xmm. The arithmetic shapes
+are not like this at any price: `lanereg3` applies a packed operation and that has to happen in
+a vector register.
+
+`gpr_move_half` does one half; `encode_mem64` is `encode_mem`'s counterpart for a 64-bit move,
+which cannot be the same function because a GPR move needs REX.W and an SSE one must not have
+it. A RIP operand is advanced by hand, because `offset_operand` refuses those -- it is not told
+where the stub put the instruction and `encode_mem64` is.
+
+The mover is chosen beside the block's own borrows: a dead register if one is left, otherwise a
+third slot of the callee home space, saved and restored like the others.
+
+#### The prediction, and the cell it came from
+
+**Stated before the run: 740 new candidates**, being the cell where a window is moves-only AND
+a third register exists -- not the 883 margin, which is the mistake Finding 249 made.
+
+    unit candidates built        690 ->  1,428     +738   against 740 predicted
+    sites through a slot         676 ->  1,165     +489
+    unit windows placed          296 ->    524     +228
+    unit sites lowered           440 ->    924     +484
+    xmm helper refusal         1,455 ->    588     -867
+    detours                  203,087 -> 203,239    +152
+
+**738 against 740, and the 143 arrived as a refusal named for them** -- "no register to move a
+half through", to the unit. Both halves of the histogram were confirmed by the run. This is the
+closest prediction of the sequence and the difference from the earlier ones is not luck: it is
+that the number quoted was the cell rather than a margin.
+
+The cost is 47.5 bytes per site, which is what a one-member window carrying a block prologue
+costs and is worth watching if the section size ever binds.
+
+#### The fixture took three attempts and the failures are the useful part
+
+`noxmm` holds every volatile xmm live -- six `movss` above the site and five `addss` below --
+so `region_helpers` offers nothing. Getting it to REACH the mover was the hard part:
+
+- **Adjacent load and store are a `pair`**, which takes the site long before `unit` is offered.
+  The first draft scored 77 with the unit path never asked.
+- **Separated by a branch, `pair` spanned them anyway** across the swallowed transfer, lowering
+  one site while `unit` took the other -- incoherent, and it died at 29.
+- **Separated by six instructions**, the store is claimed by the long-pair coordination and
+  never reaches `unit` either.
+
+What works is changing what READS the slot: `vextractf128` reads it and has been helper-free
+since Finding 250, so only the load needs the mover. Two windows, two sites, 77.
+
+Sabotaged: the mover disabled gives **29**, both halves written to one offset **12**, the memory
+side reading the low half **12**.
+
+**And reshaping `noxmm` silently killed another gate.** `check-run-borrow` used it to detect
+Finding 252, and once it grew a `vextractf128` it stopped being a load-and-store run -- the
+fixed and the broken tool then both answered 29. The gate passed and detected nothing. It has
+its own fixture now, `runborrow`, verified by reverting the line.
+
+That is the third control this session to pass while proving nothing, after `check-shadow-pe`
+calibrated against a bug and `laneswap` reading a slot the loader had already zeroed. The
+pattern is worth more than any of the three: **a control breaks silently when something it
+depends on is reshaped for an unrelated reason**, and only deliberately re-running its sabotage
+finds out.
+
 ### Finding 250 -- the helper nobody needed, and the smallest bucket wins
 
 Four levers had been chosen by the size of a refusal bucket and had returned 35 sites between
