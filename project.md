@@ -13686,6 +13686,78 @@ showed `0x1060`, because `make build/pe-switchtable.exe` rebuilds the binary and
 listing is a separate target. Reading a listing generated before the fix is this file's own
 artifact-not-plan rule, met from a direction nobody had listed.
 
+### Finding 248 -- the 949 saturated sites, measured rather than assumed
+
+Finding 247 ended by calling the frontier "saturation" and naming three guesses at what might
+break it. This measures which of them is true, and the answer retires two of the three.
+
+**All 949 are inside a known function range**, so none of it is a gap in the code oracle:
+
+    inside a range                            949
+      the site itself has no free GPR         938   99%
+      the window lost what the site had        11   the run absorption's own cost
+    179 distinct functions, top four hold     305   32%
+
+**It is not a flood from an unknown edge either**, which was the first hypothesis and the
+cheapest to check. The largest function has **zero** unresolved and **zero** leaving positions,
+so nothing seeds `exit_live` with everything. What saturates it is `gpr_effect`'s stated rule --
+*every mention is a read and almost nothing is a write*, with `mov`, `movabs` and `lea` the only
+kills -- in a 332-instruction function where all seven volatile GPRs are read somewhere. All
+seven are live at the function's FIRST instruction, and 254 of its 332 positions have nothing
+free.
+
+#### An upper bound is worth more than another guess
+
+Rather than propose a liveness improvement, the question asked was what ANY liveness improvement
+could be worth. The ceiling treats every two-operand destination as a kill and a call as killing
+every volatile -- deliberately unsound, and a bound rather than a proposal. Six functions, 2,567
+instructions:
+
+    now                                    1,799 positions with nothing free
+    + movzx/movsx recognised (SOUND)       1,689     -110    6%
+    + a call kills every volatile          1,799        0    nothing at all
+    both, the unsound ceiling              1,076     -723
+
+**The call rule the project already argued about costs nothing**, and that is the most useful
+row. `gpr_effect`'s docstring defends "a call reads the four argument registers and writes
+NOTHING" against the obvious ABI rule, citing this binary's `__chkstk` preserving `r10` and
+`r11` and a caller holding `rax` live across the call. Adopting the aggressive rule here frees
+**zero** positions. The conservative choice was argued from two examples and is now measured to
+be free.
+
+**And the 40% the ceiling appears to offer is almost all unsound.** It comes from treating
+`add`, `sub`, `and`, `or` and `imul` as kills, and they read their destinations -- which is
+exactly what the docstring says the three-mnemonic list is narrow to avoid, "the cost of getting
+that wrong is a borrow over a live value". What is genuinely available is `movzx`/`movsx`, at
+110 of 1,799 positions. Not built: 6% of a bucket that has now twice failed to convert refusals
+into sites, and this document has a table about that.
+
+#### Both register files are full, and the third is free but out of reach
+
+Of the 949, **937 have no free xmm either**, so the stash of Finding 247 cannot reach them.
+Scanned for x87 and MMX in the six functions holding the most sites -- 2,567 instructions --
+and there are **zero**, so `mm0` through `mm7` are architecturally available there. Measured on
+six functions holding 363 of the 949; the other 173 are not measured.
+
+**But availability is not the blocker, and this is the part worth carrying.** The stash frees
+the INDEX register, which is clobbered for three instructions and put back. The BLOCK POINTER
+has to survive the whole stub, so one dead GPR is still required, and these sites have none.
+Reaching them means saving the block register too, across every exit path of the stub rather
+than across three instructions -- a different and larger change, and one that would want its
+own bound measured before it is written.
+
+#### Four levers, measured
+
+    lever                          refusals removed   sites gained
+    ISA lowerings (three passes)                141             14
+    the block pointer                           577             21
+    liveness, sound portion              6% of 1,799      not built
+    a third register file                          -      not built
+
+**Three have now been chosen by the size of a refusal bucket and three have disappointed.** The
+measurement that would have predicted each was available beforehand and cost a single run. That
+is the finding, and it is about method rather than about registers.
+
 ### Finding 247 -- the block pointer costs one register, and it did not matter
 
 The largest named refusal on the unconditional lowering was "fewer than two dead GPRs for the
