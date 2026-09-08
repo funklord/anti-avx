@@ -1134,7 +1134,13 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56, "regmove": 56}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56, "regmove": 56, "nonvol": 72, "nonvolbad": 72}
+
+# **Samples whose prologue saves a non-volatile xmm**, as `(register,
+# offset from rsp)`. The sample must really do the save in its code AND
+# carry a `prologue_end` label, because the unwind codes below are a claim
+# about the instructions rather than a decoration. Finding 255.
+SAVES = {"nonvol": ((6, 0x20), (7, 0x30))}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -2910,6 +2916,107 @@ tls_directory:
 """)
 
 
+# NO free vector register at all, and an ARITHMETIC site -- which a
+# general-purpose mover cannot serve, because a packed operation has to
+# happen in a vector register whatever else is free.
+#
+# What serves it is xmm6 and xmm7, which this function SAVES in its
+# prologue and declares with UWOP_SAVE_XMM128. That declaration is the
+# whole precondition: on a fault the unwinder restores those two from this
+# function's own slots, so a borrow that clobbers them cannot lose the
+# caller's value. Finding 124 refused xmm6-xmm15 outright for want of
+# exactly that guarantee; Finding 255 makes it a condition instead.
+#
+# All six volatile xmm are held live across the site by the movss loads
+# above and the addss chain below, so `region_helpers` offers nothing.
+#
+# 12 from the six volatiles, 3 from xmm6 and 62 from the upper half of the
+# vpaddd, which only exists if a borrowed register carried it.
+#
+# **xmm6 holds 3.0 ACROSS the site, and that is deliberate.** The first
+# draft loaded it only in the prologue and never read it again, so a borrow
+# that clobbered it without saving would have gone unnoticed -- the fixture
+# would have proved the borrow happened and not that it was given back.
+PROGRAMS["nonvol"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	movups	%xmm6, 0x20(%rsp)	/* the prologue saves, and the unwind */
+	movups	%xmm7, 0x30(%rsp)	/* codes say so -- see SAVES */
+prologue_end:
+	call	helper			/* makes the home space real */
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movss	three(%rip), %xmm6	/* LIVE across the site: the borrow */
+					/* must give this back */
+	movss	two(%rip), %xmm0
+	movss	two(%rip), %xmm1
+	movss	two(%rip), %xmm2
+	movss	two(%rip), %xmm3
+	movss	two(%rip), %xmm4
+	movss	two(%rip), %xmm5
+	vmovups	(%rsi), %ymm8
+	vmovups	0x20(%rsi), %ymm9
+	vpaddd	%ymm8, %ymm9, %ymm9	/* lanereg: wants TWO vector registers */
+	vmovups	%ymm9, (%rdi)
+	addss	%xmm1, %xmm0		/* every volatile xmm is read here */
+	addss	%xmm2, %xmm0
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0
+	addss	%xmm6, %xmm0		/* + 3, only if xmm6 came back */
+	cvttss2si %xmm0, %eax		/* 15 */
+	addl	16(%rdi), %eax		/* + 62 from the upper half */
+	movups	0x20(%rsp), %xmm6
+	movups	0x30(%rsp), %xmm7
+	addq	$72, %rsp
+	ret
+helper:
+	ret
+func_end:
+	.p2align 4
+two:	.float 2.0
+three:	.float 3.0
+	.p2align 5
+source:	.long 0, 0, 0, 0
+	.long 57, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 5, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# **The same program with the unwind codes taken away**, and the whole of
+# the safety condition expressed as a number. `nonvol` and `nonvolbad` are
+# byte-identical code; only `SAVES` differs, so only the unwind data does.
+#
+# With the codes, the rewriter may borrow xmm6 and returns 77. Without
+# them, borrowing would be the Finding 124 hazard -- a fault would have the
+# unwinder restore xmm6 from data that does not mention it, losing the
+# caller's value -- so the site must be REFUSED and the program dies at 29.
+#
+# A control for the precondition rather than for the mechanism: it fails if
+# the tool ever borrows a register the function does not promise to save.
+PROGRAMS["nonvolbad"] = PROGRAMS["nonvol"]
+
+
 PROGRAMS["mxcsr"] = (55, """
 	.text
 	.globl _start
@@ -3117,8 +3224,14 @@ def align(value, to):
 
 
 def build(path, text, code_size, handler=None, frame=0, readonly=False,
-          symbols=None):
-	"""Write a PE whose entry point is the start of `text`."""
+          symbols=None, saves=(), saves_end=0):
+	"""Write a PE whose entry point is the start of `text`.
+
+	`saves` is `[(xmm register, byte offset from rsp)]` for a sample whose
+	prologue really does save those registers, and `saves_end` is how far
+	into the function the prologue runs. See the `UWOP_SAVE_XMM128` note
+	below for why a fixture would want them.
+	"""
 	# .xdata first, because .pdata points into it. A minimal UNWIND_INFO:
 	# version 1, no flags, no prolog, no unwind codes. Nothing here ever
 	# unwinds; it exists so the function HAS unwind data, which is what
@@ -3146,11 +3259,31 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 		# UWOP_ALLOC_SMALL, and the array is padded to an even node count.
 		codes = struct.pack("<BB", 0, (((frame - 8) // 8) << 4) | 2) + b"\0\0"
 		count = 1
+	# **`UWOP_SAVE_XMM128`, which is what makes a non-volatile borrow legal
+	# rather than lucky.** The rewriter borrows xmm6-xmm15 only where the
+	# enclosing function's own unwind data says it saves the register, so a
+	# fixture testing that path has to carry the code -- and carrying it is
+	# not decoration: it is the whole precondition. Two slots per save, the
+	# register in the info field, the offset in units of sixteen.
+	#
+	# The prologue length is set to cover them, because a save recorded at
+	# an offset past the prologue is a claim the unwinder would reject.
+	# Finding 255.
+	prologue = 0
+	if saves:
+		for register, where in saves:
+			if where % 16:
+				raise SystemExit(f"pe_build.py: xmm save at {where} is not "
+				                 f"sixteen-byte aligned")
+			codes = struct.pack("<BBH", saves_end, (register << 4) | 8,
+			                    where // 16) + codes
+			count += 2
+		prologue = saves_end
 	if handler is None:
-		xdata = struct.pack("<BBBB", 1, 0, count, 0) + codes
+		xdata = struct.pack("<BBBB", 1, prologue, count, 0) + codes
 	else:
-		xdata = struct.pack("<BBBB", 1 | (1 << 3), 0, count, 0) + codes \
-			+ struct.pack("<I", SECTION_ALIGNMENT + handler)
+		xdata = struct.pack("<BBBB", 1 | (1 << 3), prologue, count, 0) \
+			+ codes + struct.pack("<I", SECTION_ALIGNMENT + handler)
 
 	sections = []
 	rva = SECTION_ALIGNMENT
@@ -3294,7 +3427,8 @@ def main(argv):
 	text, symbols = assemble(source)
 	code_size = symbols["func_end"]
 	sections = build(output, text, code_size, symbols.get("handler"),
-	                 FRAMES.get(name, 0), name in READONLY, symbols)
+	                 FRAMES.get(name, 0), name in READONLY, symbols,
+	                 SAVES.get(name, ()), symbols.get("prologue_end", 0))
 	print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
 	      f"function is {code_size} of them, expected exit code {expected}")
 	return 0

@@ -230,7 +230,7 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove; do \
+	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove nonvol; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -293,7 +293,31 @@ check-shadow-pe:
 	echo "check-shadow-pe: regmove -- a 256-bit register-to-register move is"; \
 	echo "                 a move: one slot copied to another. A second load"; \
 	echo "                 sits between, because a load leaves its upper half"; \
-	echo "                 IN the helper and the test was right by accident"
+	echo "                 IN the helper and the test was right by accident"; \
+	echo "check-shadow-pe: nonvol -- an arithmetic site with every volatile"; \
+	echo "                 xmm live, served by borrowing xmm6, which this"; \
+	echo "                 function declares with UWOP_SAVE_XMM128. It holds"; \
+	echo "                 3.0 across the site, so a lost save gives 74"; \
+	$(PYTHON) tool/pe_build.py sample nonvolbad \
+		$(BUILD_DIR)/pe-nonvolbad.exe 320 >/dev/null; \
+	objdump -d -j .text $(BUILD_DIR)/pe-nonvolbad.exe \
+		> $(BUILD_DIR)/pe-nonvolbad.asm; \
+	$(PYTHON) tool/detour.py --shadow-regs=all apply \
+		$(BUILD_DIR)/pe-nonvolbad.exe $(BUILD_DIR)/pe-nonvolbad.asm \
+		$(BUILD_DIR)/sse-nonvolbad.exe > /dev/null; \
+	got=0; \
+	WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d \
+		wine $(BUILD_DIR)/sse-nonvolbad.exe > /dev/null 2>&1 || got=$$?; \
+	if [ "$$got" != "29" ]; then \
+		echo "check-shadow-pe: nonvolbad returned $$got, want 29 -- the"; \
+		echo "                 tool borrowed a non-volatile register this"; \
+		echo "                 function does NOT promise to save, which a"; \
+		echo "                 fault would turn into a lost caller value"; \
+		exit 1; \
+	fi; \
+	echo "check-shadow-pe: nonvolbad -- the same .text with the unwind codes"; \
+	echo "                 removed is REFUSED at 29, so the borrow rests on"; \
+	echo "                 the function's own promise and not on luck"
 
 # -- the software F16C conversions -------------------------------------------
 

@@ -2060,6 +2060,83 @@ def copy_reaches_home(rows, frame, region=None, hazards=None):
 	return False
 
 
+def saved_xmm_map(binary):
+	"""`{function start: frozenset of non-volatile xmm it saves}`.
+
+	**This is what makes a non-volatile borrow safe rather than lucky.**
+	Finding 124 restricted borrowing to xmm0-xmm5 because the only way out
+	of a live borrow bracket is a FAULT, and there the unwinder restores
+	xmm6-xmm15 from the primary's `UWOP_SAVE_XMM128` codes -- which a
+	function that never used the register does not have, so the caller's
+	value, sitting in a home-space slot at that moment, is lost.
+
+	A function that DOES save the register has the opposite property: the
+	unwinder restores the caller's value from the function's own slot,
+	whatever a borrow left in the register or in the home space. So the
+	borrow is safe exactly where this map says the function saves it, and
+	the restriction becomes a condition rather than a blanket. Finding 255.
+
+	Read straight from `.pdata` and the `UNWIND_INFO` it points at, because
+	that is the same data the unwinder itself will read. `UWOP_SAVE_XMM128`
+	is opcode 8 with a two-slot node; the `_FAR` form is 9 with three. The
+	register is the info field.
+	"""
+	with open(binary, "rb") as image:
+		data = image.read()
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	opt = pe + 24
+	magic = struct.unpack_from("<H", data, opt)[0]
+	dirs = opt + (112 if magic == 0x20B else 96)
+	at_rva, size = struct.unpack_from("<II", data, dirs + 3 * 8)
+	base = struct.unpack_from("<Q", data, opt + 24)[0] if magic == 0x20B \
+		else struct.unpack_from("<I", data, opt + 28)[0]
+	sections = struct.unpack_from("<H", data, pe + 6)[0]
+	table = opt + struct.unpack_from("<H", data, pe + 20)[0]
+
+	def offset_of(rva):
+		for i in range(sections):
+			entry = table + i * 40
+			va, virtual = struct.unpack_from("<II", data, entry + 12)
+			raw, pointer = struct.unpack_from("<II", data, entry + 16)
+			if va <= rva < va + max(virtual, raw):
+				return pointer + (rva - va)
+		return None
+
+	at = offset_of(at_rva)
+	out = {}
+	if at is None:
+		return out
+	for i in range(size // 12):
+		begin, end, unwind = struct.unpack_from("<III", data, at + i * 12)
+		if end <= begin:
+			continue
+		off = offset_of(unwind)
+		if off is None or off + 4 > len(data):
+			continue
+		count = data[off + 2]
+		codes, j, found = off + 4, 0, set()
+		while j < count and codes + j * 2 + 1 < len(data):
+			packed = data[codes + j * 2 + 1]
+			op, info = packed & 0xF, packed >> 4
+			if op == 8:				# UWOP_SAVE_XMM128
+				found.add(info)
+				j += 2
+			elif op == 9:				# UWOP_SAVE_XMM128_FAR
+				found.add(info)
+				j += 3
+			elif op == 1:				# UWOP_ALLOC_LARGE
+				j += 2 if info else 3
+			elif op in (4, 6, 10):			# SAVE_NONVOL, EPILOG, ...
+				j += 2
+			elif op == 5:				# SAVE_NONVOL_FAR
+				j += 3
+			else:
+				j += 1
+		if found:
+			out[base + begin] = frozenset(r for r in found if r >= 6)
+	return {a: r for a, r in out.items() if r}
+
+
 def home_space_map(binary, plain, ranges, blocked):
 	"""Which functions can lend their callee home space to a stub.
 
@@ -3876,6 +3953,12 @@ HELPER_FREE = frozenset(("plain", "insert", "bcastmem", "bcastreg",
 # register whatever else is free. Finding 251.
 GPR_MOVABLE = frozenset(("load", "store", "regmove"))
 
+# **Shapes wanting TWO vector registers**, which decides how many a
+# non-volatile borrow has to find. `lanereg` and `lanereg3` move both
+# sources' upper halves into registers before operating; `perm2` and
+# `permil` do the same. Finding 255.
+TWO_HELPERS = frozenset(("lanereg", "lanereg3", "perm2", "permil"))
+
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
                    "vinsertf128", "vinserti128",
                    "vperm2f128", "vperm2i128",
@@ -4692,6 +4775,13 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# The mover is a live register borrowed for the length of the
 			# stub, saved beside the block's own borrows.
 			body += encode_gpr_at(block[5], True, None, block[6])
+		for register, where in (block[7] if len(block) > 7 else ()):
+			# **A non-volatile xmm the enclosing function itself saves.**
+			# `movups`, not `movaps`: nothing aligns the home space beyond
+			# what the caller's own frame happened to give it, which is
+			# `encode_spill`'s argument and the same one. Finding 255.
+			body += encode_spill(register, True, at + len(body), 0, 0,
+			                     where)
 		if mode == "home":
 			# The block's own save comes back at the very END of the stub,
 			# because unlike the index it has to hold the pointer for
@@ -5144,6 +5234,12 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		body += piece
 		body += span_slot_move(helper, True, base, slot, block,
 		                       at + len(body))
+	for register, where in (block[7] if block is not None and len(block) > 7
+	                        else ()):
+		# Back before the stub returns, so the function finds the register
+		# as it left it. A fault in between is answered by the function's
+		# OWN save, which is the condition the borrow was chosen under.
+		body += encode_spill(register, False, at + len(body), 0, 0, where)
 	if block is not None and len(block) > 6 and block[6] is not None:
 		body += encode_gpr_at(block[5], False, None, block[6])
 	if block is not None and len(block) > 3 and block[3] == "home":
@@ -5599,6 +5695,11 @@ def region_candidate(instructions, plain, positions, index, blocked, home,
 # site by other means and leaves its upper half to the machine register,
 # which under this representation is nobody maintaining it.
 SLOT_CARRYING = ("span", "region", "unit")
+# **Which non-volatile xmm each function saves**, filled once per run from
+# `.pdata` and read by `unit_candidate` when no volatile register is free.
+# See `saved_xmm_map`. Finding 255.
+SAVED_XMM = {}
+
 UNIT_REFUSED = Counter()
 UNIT_EXAMPLES = {}
 WIDE_SITES = Counter()
@@ -5783,6 +5884,12 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# shorter. Finding 247.
 	free = sorted(window_gpr_free(home, address, window), reverse=True)
 	lent = window_borrow(home, address, window)
+	# **The callee home space is 32 bytes and three things may want it**:
+	# the block's two GPR saves at 8 bytes each, the mover's one, and a
+	# borrowed non-volatile xmm at 16. Handing out fixed offsets worked
+	# while there were two claimants and would have silently overlapped
+	# with a third, so it is allocated. Finding 255.
+	home_used = 0
 	if len(free) >= 2:
 		base, block = tls[1], (free[0], free[1], tls[0], False, None)
 	elif free:
@@ -5815,6 +5922,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 			return refuse("fewer than two unnamed GPRs to borrow")
 		base = tls[1]
 		block = (spare[0], spare[1], tls[0], "home", lent)
+		home_used = 16
 
 	entries = span_entries(members, instructions, slots, scope, plain)
 	helpers, _whole = region_helpers(plain, instructions, index, last,
@@ -5836,25 +5944,71 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		# does the same work in two 8-byte halves. The arithmetic shapes
 		# are not like this and get no second chance here. Finding 251.
 		needy = frozenset(k for k, _p, _r in members) - HELPER_FREE
-		if not needy <= GPR_MOVABLE:
-			return refuse("no xmm helper free at the site")
-		taken = {block[0], block[1]}
-		spare = [n for n in free if n not in taken]
-		if spare:
-			mover = spare[0]
-		elif lent is not None:
-			# The home space is four eight-byte slots. The block's own
-			# borrows use the first two where it needed them, so a third
-			# fits above whatever they took.
-			mover_save = lent + (16 if block[3] == "home" else 0)
-			borrowed = [n for n in sorted(window_gpr_unnamed(
-				home, address, window)) if n not in taken]
-			if not borrowed:
-				return refuse("no register to borrow for the move")
-			mover = borrowed[0]
-		else:
-			return refuse("no register to move a half through")
-	block = block[:5] + (mover, mover_save)
+		# An arithmetic shape cannot use a general-purpose register at any
+		# price and falls through to the non-volatile borrow below, which
+		# is the only thing left that can serve it.
+		if needy <= GPR_MOVABLE:
+			taken = {block[0], block[1]}
+			spare = [n for n in free if n not in taken]
+			if spare:
+				mover = spare[0]
+			elif lent is not None and home_used + 8 <= HOME_SPACE:
+				mover_save = lent + home_used
+				home_used += 8
+				borrowed = [n for n in sorted(window_gpr_unnamed(
+					home, address, window)) if n not in taken]
+				if not borrowed:
+					return refuse("no register to borrow for the move")
+				mover = borrowed[0]
+			else:
+				return refuse("no register to move a half through")
+	# **A non-volatile xmm, where the function itself saves it.** Finding
+	# 124 refused xmm6-xmm15 outright, because the only way out of a live
+	# borrow is a fault and the unwinder restores those from the primary's
+	# `UWOP_SAVE_XMM128` codes -- which a function that never used the
+	# register does not have. A function that DOES save it has the opposite
+	# property: the unwinder restores the caller's value from the
+	# function's own slot, whatever the borrow left behind. So the blanket
+	# becomes a condition, and `saved_xmm_map` is that condition read from
+	# the same bytes the unwinder will read. Finding 255.
+	borrowed_xmm = ()
+	if wants and not helpers and mover is None:
+		start = None
+		if home is not None:
+			starts, ranges_here, _usable, _state = home
+			at = bisect.bisect_right(starts, address) - 1
+			if 0 <= at < len(ranges_here) and address < ranges_here[at][1]:
+				start = ranges_here[at][0]
+		saved = SAVED_XMM.get(start, frozenset()) if start is not None \
+			else frozenset()
+		# **Not NAMED by the window, which is weaker than dead**: this
+		# saves and restores, so what the program does with the register
+		# outside the stub is not the borrow's business -- only that no
+		# member reads or writes it while the borrow stands.
+		usable = set(saved)
+		for kind, position, _r in members:
+			usable -= set(scratch_finder.xmm_numbers(
+				instructions[position][3] or ""))
+		need = 2 if any(kind in TWO_HELPERS for kind, _p, _r in members) \
+			else 1
+		taken = []
+		for register in sorted(usable):
+			if len(taken) == need:
+				break
+			if lent is None or home_used + SLOT > HOME_SPACE:
+				break
+			taken.append((register, lent + home_used))
+			home_used += SLOT
+		if len(taken) < need:
+			return refuse("no non-volatile xmm this function saves")
+		borrowed_xmm = tuple(taken)
+		helpers = tuple(register for register, _o in taken)
+	if wants and not helpers and mover is None:
+		# A mover is not a helper, and a window served by one wants no
+		# vector register at all -- refusing here for want of one refused
+		# every GPR-movable window the moment this check was added.
+		return refuse("no xmm helper free at the site")
+	block = block[:5] + (mover, mover_save, borrowed_xmm)
 	first = helpers[0] if helpers else None
 	second = helpers[1] if len(helpers) > 1 else None
 	told = []
@@ -8166,6 +8320,8 @@ def collect(binary, listing, context=None):
 	out of memory before it was noticed. One build, shared.
 	"""
 	# A run reports its own numbers, not the previous one's.
+	SAVED_XMM.clear()
+	SAVED_XMM.update(saved_xmm_map(binary))
 	REGION_REFUSED.clear()
 	REGION_EXAMPLES.clear()
 	UNIT_REFUSED.clear()

@@ -13779,6 +13779,89 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 255 -- Finding 124's blanket becomes a condition, for 138 sites
+
+Finding 124 restricted borrowing to xmm0-xmm5 and closed with "a binary that needs one gets a
+named refusal rather than a silent risk". The binary needed one, at 604 refusals, and the
+refusal it got was named. This turns the blanket into the condition it was standing in for.
+
+#### Why xmm6-xmm15 were refused, and what makes one safe
+
+The only way out of a live borrow bracket is a FAULT, and there the unwinder restores
+xmm6-xmm15 from the primary's `UWOP_SAVE_XMM128` codes -- which a function that never used the
+register does not have. The caller's value, sitting in a home-space slot at that moment, is
+lost.
+
+**A function that DOES save the register has the opposite property.** The unwinder restores the
+caller's value from the function's own slot, whatever the borrow left in the register or in the
+home space. So the borrow is safe exactly where the function promises to save, and
+`saved_xmm_map` reads that promise from `.pdata` -- the same bytes the unwinder will read.
+
+    functions in .pdata                          236,427
+    saving at least one non-volatile xmm          16,878   7.1%
+      xmm6 14,344 | xmm7 8,685 | xmm8 6,509 | xmm9 5,223 | ...
+
+#### 138 predicted, 138 built
+
+The cell: the function saves it, the window does not NAME it -- weaker than dead, because this
+saves and restores -- and there is home-space room for the save. 21 windows wanting one
+register, 117 wanting two.
+
+    no xmm helper free                    604 ->  gone
+    no non-volatile xmm this function saves      466      604 - 466 = 138
+    unit candidates built               1,452 -> 1,590    +138
+    sites through a slot                1,191 -> 1,296    +105
+    unit windows placed                   532 ->   578
+    unit sites lowered                    952 -> 1,058
+
+**To the unit.** That is the second exact prediction here, after the GPR mover's 740 against
+738, and both have the same cause: every condition crossed before the number was spoken. The
+table in Finding 254 now reads 415/4, 71/26, 99/4 for the margins and 740/738, 138/138 for the
+cells.
+
+#### The control is the precondition, not the mechanism
+
+`nonvol` and `nonvolbad` are **byte-identical `.text`**; only `SAVES` differs, so only the
+unwind data does.
+
+    nonvol      declares xmm6 and xmm7 with UWOP_SAVE_XMM128    77
+    nonvolbad   the same code with the codes removed            29, refused
+
+A fixture pair that isolates exactly one variable, and it fails if the tool ever borrows a
+register the enclosing function does not promise to save. `nonvol` additionally holds 3.0 in
+xmm6 ACROSS the site, so sabotaging the save gives 74, the restore 74, and emptying the map 29.
+
+**`pe_build` had to learn to emit `UWOP_SAVE_XMM128`** for this, with the prologue length set to
+cover the saves -- a save recorded past the prologue is a claim the unwinder would reject. The
+codes are not decoration in this fixture; they are the entire precondition under test.
+
+#### Three faults found by the fixtures, all of which had passed
+
+**The home space had fixed offsets for two claimants and now has three.** Block saves at 8 bytes
+each, the mover at 8, a borrowed xmm at 16 -- and the mover's offset was `lent + (16 if home
+else 0)`, which would have silently overlapped the xmm. It is an allocator now.
+
+**The new "no helper" refusal rejected every GPR-movable window**, because a mover is not a
+helper and a window served by one wants no vector register at all. `noxmm` caught it going
+77 -> 29 -> 77.
+
+**The first `nonvol` never used xmm6 across the site**, so a clobbered borrow was invisible: it
+proved the borrow happened and not that it was returned. That is the same shape as `laneswap`
+reading a slot the loader had already zeroed, and it is the fifth control this session that
+passed while proving nothing.
+
+**And a sabotage silently failed to apply for the third time**, reporting 77 from an unsabotaged
+copy. The assertion catches it; the habit that matters is checking the bytes are gone before
+believing the number, because a sabotage that did not land and a check that cannot fail are
+indistinguishable from the output.
+
+#### What is not proved
+
+The unwind argument itself. No fixture here faults inside a stub and inspects the register
+afterwards -- `nonvolbad` proves the tool RESPECTS the condition, not that the condition is
+sufficient. `pe_build` already emits `UNW_FLAG_EHANDLER`, so such a fixture is buildable, and
+until one exists this rests on the x64 unwind contract as read rather than as run.
+
 ### Finding 254 -- three refusal labels, one problem, and a lever not built
 
 Two candidates were measured against the frontier and NEITHER was built. Both measurements are
