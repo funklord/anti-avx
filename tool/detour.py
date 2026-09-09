@@ -6461,7 +6461,29 @@ LOOP_ROUNDS = 6
 # How many times `apply` may drop windows and re-place. Dropping one
 # un-swallows what it covered, which can expose a producer that was hidden
 # inside it, so the repair has to settle rather than run once. Finding 197.
-REPAIR_ROUNDS = 6
+#
+# **This is a safety valve and was being used as a termination
+# condition.** At 6 the loop fell out of its `range` having settled
+# nothing, placed the windows it had just called guilty, and said nothing
+# -- the failure then surfaced downstream as "the producer is not an
+# in-place patch and cannot be reverted", which is a misattribution: the
+# producer IS a patch, inside a window the repair gave up on. That wrong
+# message is why the class read as an irreducible floor rather than as a
+# cap set too low.
+#
+# Measured under `--shadow-regs=all`, where the uniform representation
+# puts far more producers inside windows: the repair settles after 15
+# rounds having dropped 277 windows, and the newly-guilty count decays
+# 136, 52, 25, 13, 11, 11, 6, 5, 2, 3, 3, 3, 3, 2, 2, 0. At 6 it stopped
+# at 248 dropped, leaving 29 guilty windows in the image and 12 surviving
+# 256-bit reads of an upper half that was no longer in its register.
+#
+# 64 is headroom over a measured 15, not a second guess. The loop
+# terminates without any cap -- each round adds at least one window to a
+# set bounded by the candidate list -- so exceeding this means the
+# reasoning is wrong, and `repaired_placement` refuses rather than
+# shipping. Finding 259.
+REPAIR_ROUNDS = 64
 
 # How many joins deep the stale-read walk may recurse. It was 4 because 4
 # was enough for the memset shape Finding 84 built it for, and a census of
@@ -12509,6 +12531,7 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 	in a comment is not a mechanism. Finding 197.
 	"""
 	dropped = set()
+	settled = False
 	for _round in range(REPAIR_ROUNDS):
 		keep = [item for item in candidates if item[0] not in dropped]
 		placed, _blob, _swallowed, _over, _refused = place_stubs(
@@ -12535,8 +12558,20 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 		if CODE_SABOTAGE == "staleupper":
 			guilty = set()		# the repair keeps nothing: see CODE_SABOTAGE
 		if not guilty - dropped:
+			settled = True
 			break
 		dropped |= guilty
+	# **Not settling means the windows below are known-guilty.** The
+	# previous version placed them and left a wrong image for `verify` to
+	# find. Refusing is the only honest end: there is no partial repair
+	# here, because a window that is still guilty ships a surviving
+	# 256-bit read of an upper half that is no longer in its register.
+	if not settled:
+		raise SystemExit(
+			f"apply: the stale-read repair did not settle in "
+			f"{REPAIR_ROUNDS} rounds, having dropped {len(dropped):,} "
+			f"window(s). Placing what is left would ship a surviving "
+			f"256-bit read of an upper half no longer in its register.")
 	placed, blob, swallowed, overlapped, refused = place_stubs(
 		[item for item in candidates if item[0] not in dropped], stub_base,
 		spill_base, stub_reasons, home=home, tls=tls)
@@ -13348,10 +13383,29 @@ def apply_all(binary, listing, output):
 		# and the difference was visible nowhere until `verify` read the
 		# image. Findings 194 and 197.
 		stuck.append((reader, field, producer))
-	if stuck:
-		print(f"apply: {len(stuck):,} stale read(s) whose producer is not an "
-		      f"in-place patch and cannot be reverted", file=sys.stderr)
-		for reader, field, producer in sorted(stuck)[:8]:
+	# **Two different failures were being reported as one sentence.** A
+	# producer inside a window is a repair that did not finish; a producer
+	# that is not an in-place patch at all is a site no mechanism here
+	# reaches. The first is a bug and the second is a floor, and calling
+	# both "not an in-place patch" sent every reader of this line at the
+	# wrong one -- which is how a cap set too low read as an ISA limit for
+	# as long as it did. `repaired_placement` settles or refuses now, so
+	# the first count must be zero; it is printed rather than asserted
+	# because a wrong image is worth a sentence even when it cannot
+	# happen. Finding 259.
+	inside = [row for row in stuck if row[2] in covered]
+	outside = [row for row in stuck if row[2] not in covered]
+	if inside:
+		print(f"apply: {len(inside):,} stale read(s) whose producer sits "
+		      f"inside a placed window -- the repair did not finish and "
+		      f"these bytes are wrong", file=sys.stderr)
+		for reader, field, producer in sorted(inside)[:8]:
+			print(f"    0x{reader:x} reads {field}, decided at "
+			      f"0x{producer:x}", file=sys.stderr)
+	if outside:
+		print(f"apply: {len(outside):,} stale read(s) whose producer is not "
+		      f"an in-place patch and cannot be reverted", file=sys.stderr)
+		for reader, field, producer in sorted(outside)[:8]:
 			print(f"    0x{reader:x} reads {field}, decided at "
 			      f"0x{producer:x}", file=sys.stderr)
 	if reverted:

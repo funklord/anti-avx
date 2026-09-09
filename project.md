@@ -13779,6 +13779,31 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 259 -- a cap standing in for a termination condition
+
+`repaired_placement` drops windows whose lowering would leave a surviving 256-bit read of an
+upper half no longer in its register, and iterates because dropping one un-swallows what it
+covered and can expose a producer hidden inside it. It ran `for _round in range(6)`. When six
+rounds were not enough it **fell out of the loop, placed the windows it had just called
+guilty, and said nothing.**
+
+Measured under the uniform representation, where far more producers sit inside windows, the
+repair needs **15 rounds and drops 277 windows**; the newly-guilty count decays 136, 52, 25,
+13, 11, 11, 6, 5, 2, 3, 3, 3, 3, 2, 2, 0. At six it stopped at 248, leaving 29 guilty
+windows in the image and 12 surviving stale reads that `verify` caught.
+
+**What kept this hidden was the message downstream.** Those readers were reported as "stale
+read(s) whose producer is not an in-place patch and cannot be reverted" -- but the producer
+IS a patch, inside a window the repair abandoned. Two different failures, a bug and a floor,
+were being printed as the same sentence, which is why the class read as an irreducible limit
+rather than as a cap set too low. They are counted and printed separately now.
+
+The loop terminates without any cap: each round adds at least one window to a set bounded by
+the candidate list. So 64 is headroom over a measurement, and exceeding it means the
+reasoning is wrong -- `repaired_placement` raises rather than placing known-guilty windows.
+The control sets the cap to 2 and requires the refusal: exit 1, the check's own words, and
+**no image written**, with 188 dropped, which is rounds 0 and 1 of the probe exactly.
+
 ### Finding 258 -- three register fields is not three-operand arithmetic
 
 `vfmadd231ps %ymm1,%ymm2,%ymm8` has three register fields exactly like `vaddps`, and
