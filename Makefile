@@ -308,16 +308,29 @@ check-shadow-pe:
 	got=0; \
 	WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d \
 		wine $(BUILD_DIR)/sse-nonvolbad.exe > /dev/null 2>&1 || got=$$?; \
-	if [ "$$got" != "29" ]; then \
-		echo "check-shadow-pe: nonvolbad returned $$got, want 29 -- the"; \
-		echo "                 tool borrowed a non-volatile register this"; \
-		echo "                 function does NOT promise to save, which a"; \
-		echo "                 fault would turn into a lost caller value"; \
+	if [ "$$got" != "77" ]; then \
+		echo "check-shadow-pe: nonvolbad returned $$got, want 77 -- the"; \
+		echo "                 volatile borrow serves this site now, and 77"; \
+		echo "                 needs every live volatile xmm handed back"; \
 		exit 1; \
 	fi; \
 	echo "check-shadow-pe: nonvolbad -- the same .text with the unwind codes"; \
-	echo "                 removed is REFUSED at 29, so the borrow rests on"; \
-	echo "                 the function's own promise and not on luck"; \
+	echo "                 removed used to be REFUSED at 29. Finding 262"; \
+	echo "                 gave the borrow a second source -- a live"; \
+	echo "                 VOLATILE xmm stashed in one of the block's own"; \
+	echo "                 scratch slots, which needs no unwind promise"; \
+	echo "                 because nothing preserves xmm0-5 across a call."; \
+	echo "                 So its 77 is now a POSITIVE test of that path:"; \
+	echo "                 xmm0-5 and xmm6 are all live across the site and"; \
+	echo "                 read after it, so a borrow that lost one could"; \
+	echo "                 not reach 77. The property it used to guard is"; \
+	echo "                 now structural rather than tested -- the saved"; \
+	echo "                 set is the only source of a NON-volatile borrow"; \
+	echo "                 and the new path draws only from VOLATILE_XMM,"; \
+	echo "                 so no fixture can make either borrow the wrong"; \
+	echo "                 register. The mode-True refusal that Finding 262"; \
+	echo "                 adds is NOT covered by a fixture: see the entry"; \
+	echo "                 for what was tried and why it failed"; \
 	echo "check-shadow-pe: unwindsave -- the function's OWN save slot still"; \
 	echo "                 holds the caller's value after the stub ran, so"; \
 	echo "                 the bytes an unwind would restore from survive."; \

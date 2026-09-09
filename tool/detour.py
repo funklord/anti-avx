@@ -4854,6 +4854,16 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		else:
 			body += encode_tls_base(block[0], block[1], block[2], at,
 			                        helper if mode else None)
+		# **After the pointer, not before.** The non-volatile borrow above
+		# is stashed in the callee home space and addressed off `rsp`, so
+		# it can be saved first. A scratch slot is addressed off the block
+		# pointer and cannot be written until that pointer stands up --
+		# which is also why mode True is refused for this borrow rather
+		# than emitted: it stands the pointer up USING an xmm, and that
+		# xmm is the register being saved. Finding 262.
+		for register, slot in (block[8] if len(block) > 8 else ()):
+			body += span_slot_move(register, True, base, slot, block,
+			                       at + len(body))
 	for kind, address, encoding, mnemonic, operands, slot, moved, second, \
 			third in entries:
 		if kind == "plain":
@@ -4886,7 +4896,23 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		shape = span_operand_shape(vex, tail, operands, None, mnemonic)
 		if shape is None:
 			return refuse("no span shape at emit time")
-		if mnemonic in NO_LEGACY_FORM and shape[0] not in SLOT_SHAPES:
+		# **The SLOT_SHAPES exemption is for mnemonics whose SEMANTICS are a
+		# move, and an FMA's are not.** The exemption exists because a lane
+		# operation is emitted as a 16-byte slot move rather than by clearing
+		# `VEX.L` -- so having no legacy encoding costs it nothing. `lanemem` is
+		# in that list, and `lanemem` is also what `vfmadd213ps (%rax),%ymm1,%ymm2`
+		# classifies as: three operands, two ymm, one memory. That shape IS
+		# narrowed -- `movaps S1,D` then the opcode against memory -- so the
+		# exemption handed the emitter exactly the instruction the set exists to
+		# refuse, and 12 `66 0f 38 a8` sequences decoded to nothing.
+		#
+		# It was unreachable until Finding 258 put the FMA family in
+		# NO_LEGACY_FORM, which is what makes this that fix's own hole rather
+		# than an old one: before it, no member of the set could produce a
+		# `lanemem`. Finding 263.
+		if mnemonic in NO_LEGACY_FORM and (
+				shape[0] not in SLOT_SHAPES
+				or mnemonic in FMA_FORMS):
 			# Narrowing this would emit bytes that decode to nothing. See
 			# NO_LEGACY_FORM. Finding 205. The two lane shapes are the
 			# exception and are not narrowed at all: they are emitted as
@@ -5323,6 +5349,14 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			return refuse("lane high half cannot be narrowed")
 		body += piece
 		body += span_slot_move(helper, True, base, slot, block,
+		                       at + len(body))
+	for register, slot in (block[8] if block is not None and len(block) > 8
+	                       else ()):
+		# Back before the block pointer goes, because the slot is
+		# addressed off it. A fault in between leaves a volatile register
+		# clobbered, which is what volatile means: no unwinder restores
+		# xmm0-5 and no caller expects them across a call. Finding 262.
+		body += span_slot_move(register, False, base, slot, block,
 		                       at + len(body))
 	for register, where in (block[7] if block is not None and len(block) > 7
 	                        else ()):
@@ -5878,7 +5912,12 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		if mnemonic in NO_LEGACY_FORM:
 			return refuse(f"{mnemonic} has no legacy encoding")
 		return refuse("shape " + (span_shape_name(encoding, operands) or "?"))
-	if mnemonic in NO_LEGACY_FORM and shape[0] not in SLOT_SHAPES:
+	# See the note in `lower_ymm_span`: an FMA classifies as `lanemem`
+	# and that shape is narrowed, so it must not take the
+	# SLOT_SHAPES exemption. Finding 263.
+	if mnemonic in NO_LEGACY_FORM and (
+			shape[0] not in SLOT_SHAPES
+			or mnemonic in FMA_FORMS):
 		return refuse(f"{mnemonic} has no legacy encoding")
 	what, register = shape[0], shape[1]
 	if shadow_index(register) is None:
@@ -6078,6 +6117,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# becomes a condition, and `saved_xmm_map` is that condition read from
 	# the same bytes the unwinder will read. Finding 255.
 	borrowed_xmm = ()
+	stashed_xmm = ()
 	if wants and not helpers and mover is None:
 		start = None
 		if home is not None:
@@ -6091,10 +6131,11 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		# saves and restores, so what the program does with the register
 		# outside the stub is not the borrow's business -- only that no
 		# member reads or writes it while the borrow stands.
-		usable = set(saved)
+		touched = set()
 		for kind, position, _r in members:
-			usable -= set(scratch_finder.xmm_numbers(
+			touched |= set(scratch_finder.xmm_numbers(
 				instructions[position][3] or ""))
+		usable = set(saved) - touched
 		need = 2 if any(kind in TWO_HELPERS for kind, _p, _r in members) \
 			else 1
 		taken = []
@@ -6119,15 +6160,54 @@ def unit_candidate(instructions, plain, index, blocked, home,
 			taken.append((register, where))
 			home_used += SLOT
 		if len(taken) < need:
-			return refuse("no non-volatile xmm this function saves")
-		borrowed_xmm = tuple(taken)
-		helpers = tuple(register for register, _o in taken)
+			# **A live VOLATILE xmm, stashed in the block's own scratch.**
+			# The restriction above is an UNWIND argument and it is exact
+			# for xmm6-15: a non-volatile register the function never
+			# saves still holds the CALLER's value, and clobbering it
+			# destroys that with no unwind code to repair it. xmm0-5 carry
+			# no such obligation -- nothing preserves them across a call,
+			# so an unwind past this frame owes the caller nothing for
+			# them, and the save/restore this borrow already performs is
+			# the whole requirement. Finding 124's blanket was about the
+			# non-volatile half; the volatile case was never revisited
+			# because `helpers` above already takes any xmm that is DEAD.
+			#
+			# The stash goes in the block rather than the callee home
+			# space because home space is what actually binds. Measured at
+			# the refusal, under the real window: of 1,122 sites, 890 have
+			# a free volatile xmm, and only 314 of those have 32 bytes of
+			# home space left once the GPR mover has taken its share. The
+			# block carries four 16-byte scratch slots that no `unit`
+			# window ever assigns -- every one of the 1,122 already has a
+			# block pointer, and not one had a scratch slot in use.
+			#
+			# **Mode True cannot compose and is refused here rather than
+			# emitted wrongly.** That mode stands the pointer up by
+			# stashing the index GPR in an xmm helper, which is the very
+			# register being borrowed, so the value a slot would hold is
+			# gone before the slot exists. It costs 337 of the 890 and
+			# wants its own change: stash the index in a slot too, and it
+			# needs no xmm at all. Finding 262.
+			mode_here = block[3] if block is not None and len(block) > 3 \
+				else False
+			if block is None or mode_here is True:
+				return refuse("no non-volatile xmm this function saves")
+			spare = [i for i in range(TLS_SLOTS)
+			         if i not in set(slots.values())]
+			loose = [n for n in VOLATILE_XMM if n not in touched]
+			if len(loose) < need or len(spare) < need:
+				return refuse("no volatile xmm and scratch slot to stash it")
+			stashed_xmm = tuple(zip(loose[:need], spare[:need]))
+			helpers = tuple(register for register, _s in stashed_xmm)
+		else:
+			borrowed_xmm = tuple(taken)
+			helpers = tuple(register for register, _o in taken)
 	if wants and not helpers and mover is None:
 		# A mover is not a helper, and a window served by one wants no
 		# vector register at all -- refusing here for want of one refused
 		# every GPR-movable window the moment this check was added.
 		return refuse("no xmm helper free at the site")
-	block = block[:5] + (mover, mover_save, borrowed_xmm)
+	block = block[:5] + (mover, mover_save, borrowed_xmm, stashed_xmm)
 	first = helpers[0] if helpers else None
 	second = helpers[1] if len(helpers) > 1 else None
 	told = []

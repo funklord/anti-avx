@@ -13779,6 +13779,97 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 263 -- an exemption written for moves, handed an arithmetic
+
+`NO_LEGACY_FORM` is consulted as `mnemonic in NO_LEGACY_FORM and shape[0] not in
+SLOT_SHAPES`, so a shape in that list is exempt. The exemption is sound for what it was
+written for: a lane operation is emitted as a 16-byte slot MOVE rather than by clearing
+`VEX.L`, so having no legacy encoding costs it nothing.
+
+`lanemem` is in the list, and `lanemem` is also what this classifies as:
+
+    vfmadd213ps (%rax),%ymm1,%ymm2    ->  ('lanemem', '%ymm2', '%ymm1')
+
+Three operands, two ymm, one memory -- the mem,S,D shape of Finding 257, which **is**
+narrowed: `movaps S1,D` then the opcode against memory. So the exemption handed the emitter
+exactly the instruction the set exists to refuse, and twelve `66 0f 38 a8` sequences in the
+stub decoded to nothing.
+
+**It is Finding 258's own hole rather than an old one.** Before that finding put the FMA
+family in `NO_LEGACY_FORM`, no member of the set could produce a `lanemem`, so the exemption
+had never been asked a question it could get wrong. It stayed unreachable for one more
+change, and surfaced only when Finding 262's borrow formed enough extra windows to reach
+those twelve sites -- a fix, a second fix that widened the population, and only then the
+symptom.
+
+Both guard sites now refuse an FMA whatever its shape. The lesson is narrower than "check
+exemptions": **an exemption is a claim about a POPULATION, and adding members to the set it
+exempts from re-asks the question nobody re-asked.**
+
+### Finding 262 -- the borrow's second source, and where its 16 bytes go
+
+`unit_candidate` borrows a live non-volatile xmm where the function declares it saved. That
+restriction is an UNWIND argument and it is exact for xmm6-15: a register the function never
+saves still holds the CALLER's value, and clobbering it destroys that with no unwind code to
+repair it.
+
+**It does not apply to xmm0-5 at all.** Nothing preserves them across a call, so an unwind
+past this frame owes the caller nothing for them, and the save/restore the borrow already
+performs is the whole requirement. Finding 124's blanket was about the non-volatile half; the
+volatile case was never revisited because `helpers` already takes any xmm that is DEAD.
+
+**Home space is what actually binds, so the stash goes in the block.** Measured at the
+refusal, under the real window and the real `home_used`:
+
+    sites refused "no non-volatile xmm this function saves"   1,122
+      a free volatile xmm exists                                890
+        ... and 32 bytes of home space left                     314
+      no free volatile xmm                                      232
+
+The block carries four 16-byte scratch slots that no `unit` window assigns. Every one of the
+1,122 already has a block pointer and not one had a scratch slot in use, so routing the stash
+there lifts the ceiling from 314 to 890 -- less mode True.
+
+**Mode True cannot compose, and that is a measurement rather than a guess.** It stands the
+pointer up by stashing the index GPR in an xmm helper, which is the register being borrowed;
+a slot written after that holds nothing worth restoring. 337 of the 890.
+
+    TLS stash would serve      890     mode 'home'   377
+      COMPOSES                 553     mode False    176
+                                       mode True     337   refused
+
+**553 predicted, 553 delivered:**
+
+    no non-volatile xmm this function saves          1,122  ->    395
+    no volatile xmm and scratch slot to stash it         -  ->    174
+
+**And the frontier moved by 68, not by 553, which is the part worth carrying.** The two are
+different quantities. Lowering more sites through slots creates more places a surviving
+256-bit reader can meet a stale register, so the repair withholds 176 more windows and each
+costs its sites:
+
+    VEX in .text                     3,384  ->  3,316     -68
+    sites through a slot            32,810  -> 32,896     +86
+    windows not placed                 277  ->    453    +176
+    stub section                 4,582,697  -> 4,585,736  +3,039 bytes
+
+A refusal count is not a frontier count. The cell was exact about the thing it measured and
+says nothing about the thing downstream of it.
+
+**A control was retired and is not fully replaced.** `nonvolbad` existed to prove the tool
+would not borrow an unsaved non-volatile xmm; it now LOWERS and returns 77, and its 77 is a
+strong positive test of the new path -- xmm0-5 and xmm6 are all live across its site and read
+after it, so a borrow that lost one could not reach 77. The property it used to guard is now
+structural: `usable` is drawn from `set(saved)` and the new path draws only from
+`VOLATILE_XMM`, so no fixture can make either borrow the wrong register.
+
+**The mode True refusal is NOT covered by a fixture, and the attempt is recorded because it
+failed instructively.** A fixture combining `nonvol`'s live xmm with `onegpr`'s six live GPRs
+refused at `no per-thread block, so no permanent slots` -- an earlier check entirely, so it
+controlled nothing. It was removed rather than kept: a fixture whose name implies coverage it
+does not provide is worse than none. The branch is conservative, declining work rather than
+emitting it, and it is unproven.
+
 ### Finding 261 -- the instrument that decides what to work on, wrong three ways
 
 `census` reads the rewritten image and reports what survives and why. It is what a session
