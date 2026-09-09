@@ -8576,6 +8576,38 @@ def collect(binary, listing, context=None):
 			# offered. A deficit is only meaningful against the whole.
 			WIDE_SITES["256-bit"] += 1
 
+		# **Under the uniform representation the unconditional lowering
+		# goes FIRST, and this is the same argument Finding 160 made for
+		# the region, one step further.** `pair`, `run`, `zero`, `spill`
+		# and `plain` are consumer-driven: each takes a site because it can
+		# do something cheap with the shape in front of it, and none of them
+		# maintains a slot. So under `--shadow-regs=all` every site one of
+		# them takes is a HOLE in the invariant, and offering `unit` after
+		# them means it only ever sees what they declined.
+		#
+		# Measured on Starfield: offered last, 1,329 of 35,844 sites are
+		# lowered through a slot and the representation is 3.7% whole.
+		# Offered first, 32,810 are and it is 91.5% whole. The frontier
+		# falls 4,776 -> 3,384.
+		#
+		# **The correctness axes move with it, which is the part worth
+		# keeping.** A slot-maintaining lowering leaves a live upper half
+		# where a surviving 256-bit reader looks, so the conflicts that cost
+		# windows fall rather than rise: patches reverted 176 -> 47, and the
+		# upper-half sources the walk cannot resolve 149 -> 81. The cost is
+		# the stub, 3,828,001 -> 4,582,697 bytes, about 24 bytes per site
+		# for a slot that is maintained.
+		#
+		# It is gated on the rule because it is only right under it: with no
+		# permanent slots there is no invariant to protect, and `unit` is
+		# then simply the most expensive way to lower a site. Finding 260.
+		if SHADOW_REGS_RULE == SHADOW_REGS_ALL and vex["L"]:
+			lone = unit_candidate(instructions, plain, index, blocked,
+			                      home, ranges, scope, tls_slot_offset)
+			if lone is not None:
+				candidates.append(lone)
+				continue
+
 		strategy = None
 		y_reason = []
 		# What a Y strategy said when it could not lower this site. **A

@@ -13779,6 +13779,30 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 260 -- a strategy that maintains no slot must not go first
+
+Under `--shadow-regs=all` the unconditional lowering was offered LAST, after `pair`, `run`,
+`zero`, `spill` and `plain`. Every one of those is consumer-driven: it takes a site because
+it can do something cheap with the shape in front of it, and **none of them maintains a
+slot**. So each site they took was a hole in the uniform representation, and `unit` only
+ever saw what they declined. This is Finding 160's argument for the region, one step
+further: offered last, a strategy competes for leftovers.
+
+    sites lowered through a slot     1,329 of 35,844 (3.7%)  ->  32,810 (91.5%)
+    VEX left in .text                              4,776     ->   3,384
+    stub section                               3,828,001     ->   4,582,697 bytes
+
+**The correctness axes move with it, which is the part worth keeping.** A slot-maintaining
+lowering leaves a live upper half exactly where a surviving 256-bit reader looks, so the
+conflicts that cost windows fall rather than rise: in-place patches reverted 176 -> 47, and
+the upper-half sources the walk cannot resolve 149 -> 81. The price is about 24 bytes per
+site, `unit` costing 37.5 against `plain`'s 13.2.
+
+It is gated on the rule because it is only right under it. With no permanent slots there is
+no invariant to protect and `unit` is merely the most expensive way to lower a site, so the
+default build is untouched -- measured, 5,691 left and 799,440 removed, the recorded status
+exactly.
+
 ### Finding 259 -- a cap standing in for a termination condition
 
 `repaired_placement` drops windows whose lowering would leave a surviving 256-bit read of an
