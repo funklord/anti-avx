@@ -12082,17 +12082,79 @@ def census(binary, listing, patched):
 	surviving address against a set of window *starts* missed every site
 	whose window began on the instruction before it.
 	"""
-	_patches, candidates, _stats, _skipped, declined, home = collect(
-		binary, listing)
-	placed, _blob, swallowed, overlapped, refused = place_stubs(
-		candidates, stub_base_of(open(binary, "rb").read()), home=home,
+	# **An empty parse and a clean image are the same output.** The third
+	# argument is a LISTING of the rewritten binary, and handing this the
+	# binary itself makes `parse_listing` yield nothing -- whereupon every
+	# count below is zero and the tool reports a finished translator. That
+	# is the vacuous pass in the one place whose whole job is to say what
+	# is left, so it refuses rather than reporting a total over an empty
+	# set. Finding 261.
+	lines = list(inplace.parse_listing(patched))
+	if not lines:
+		raise SystemExit(
+			f"census: {patched} parsed to no instructions. It wants a "
+			f"disassembly of the rewritten binary -- "
+			f"`objdump -d -j .text <patched.exe>` -- rather than the "
+			f"binary itself.")
+	context = analysis_context(binary, listing)
+	instructions, _plain, blocked, sources, _tables, _seen = context
+	patches, candidates, _stats, _skipped, declined, home = collect(
+		binary, listing, context)
+
+	# **This placed the stubs itself and did not run the repair, so it was
+	# reconciling against an image nobody builds.** `apply` withholds every
+	# window whose lowering would leave a surviving 256-bit read of an upper
+	# half no longer in its register -- 277 of them under the uniform
+	# representation -- and those windows are not in the artifact. Counting
+	# their sites as "inside a committed window" asserted a commitment the
+	# computation never checked, and it is why 278 of the survivors carried
+	# a label that could not be true of them.
+	#
+	# This is Finding 197 exactly, in a third tool. That finding fixed the
+	# same drift between `apply` and `verify`, and its own note says a
+	# promise in a comment is not a mechanism -- so `census` goes through
+	# the one function too, rather than through a second copy of the
+	# placement that is correct until somebody changes the first.
+	# Finding 261.
+	stub_base = stub_base_of(open(binary, "rb").read())
+	spill_base = 0
+	if SPILL == SPILL_POOL:
+		spill_base = stub_base
+		stub_base += SECTION_ALIGNMENT
+	unrepaired, _b, _sw, _ov, _rf = place_stubs(
+		candidates, stub_base, spill_base, Counter(), home=home,
 		tls=tls_pair_of(tls_for(binary)))
+	placed, _blob, overlapped, refused, dropped, swallowed = \
+		repaired_placement(instructions, blocked, sources, candidates,
+		                   {address for address, *_rest in patches},
+		                   stub_base, spill_base, Counter(), home,
+		                   tls_pair_of(tls_for(binary)))
 	rewritten = {address for address, _window, *_rest in placed}
 	covered = set()
 	for address, window, *_rest in placed:
 		covered.update(range(address, address + window))
+	# What the repair cost, as a set rather than as a count: a window it
+	# withheld is a window whose sites are still VEX, and they belong in a
+	# bucket that says so instead of falling out as unaccounted.
+	withheld = set()
+	for address, window, *_rest in unrepaired:
+		if address in dropped:
+			withheld.update(range(address, address + window))
 
-	survivors = {a for a, e, _m, _o in inplace.parse_listing(patched)
+	# **`apply` also REVERTS, and this did not model that either.** A
+	# patch whose zeroing a surviving 256-bit instruction still reads is
+	# put back as it was, so the site is VEX in the artifact while being
+	# neither declined, refused, windowed nor overlapped -- it fell out as
+	# unaccounted. Same root as the bucket above: a second copy of what
+	# `apply` does, kept correct by nobody. Finding 261.
+	stale, _unresolved, unsure = stale_upper_reads(
+		instructions, blocked, sources, placed,
+		{address for address, *_rest in patches}, conservative=True)
+	undone = {address for address, *_rest in patches}
+	reverted = {producer for _reader, _field, producer in stale + unsure
+	            if producer in undone and producer not in covered}
+
+	survivors = {a for a, e, _m, _o in lines
 	             if e[:1] in (b"\xc4", b"\xc5")}
 
 	print(f"declined by the collector      {len(declined):>10,}")
@@ -12133,6 +12195,8 @@ def census(binary, listing, patched):
 	buckets = (("declined by the collector", set(declined)),
 	           ("refused, stub not buildable", spread(refused)),
 	           ("inside a committed window", covered),
+	           ("in a window the repair dropped", withheld),
+	           ("in-place patch reverted", reverted),
 	           ("skipped for overlap", spread(overlapped)),
 	           ("undecodable, never classified", undecodable))
 	accounted = set()

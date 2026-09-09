@@ -13779,6 +13779,39 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 261 -- the instrument that decides what to work on, wrong three ways
+
+`census` reads the rewritten image and reports what survives and why. It is what a session
+consults before choosing work, so its errors do not stay inside it -- they choose the work.
+Three, found in one afternoon:
+
+**It reported a perfect score from an empty parse.** The third argument is a LISTING of the
+rewritten binary; handed the binary itself, `parse_listing` yields nothing, `survivors` is
+empty, and every count prints zero -- including `unaccounted`, which corroborates. A finished
+translator, manufactured by passing the wrong file type. It refuses now, and refuses BEFORE
+the eight-minute collect rather than after: 3.8 seconds instead of a false report.
+
+**It placed the stubs a second way and skipped the repair.** `apply` and `verify` both go
+through `repaired_placement`, which withholds every window whose lowering would leave a
+surviving 256-bit read of a stale upper half -- 277 of them. `census` called `place_stubs`
+directly, so it reconciled against an image nobody builds, and called 278 survivors "inside a
+committed window" when their window was never committed. **This is Finding 197 in a third
+tool**: that finding fixed the identical drift between `apply` and `verify` and recorded that
+a promise in a comment is not a mechanism. `census` was not brought along, and the same
+sentence had to be paid for twice.
+
+    inside a committed window        278  ->    0
+    in a window the repair dropped     --  ->  278
+
+**And it did not model the revert.** `apply` puts back 47 in-place patches whose zeroing a
+surviving reader still needs, so those sites are VEX in the artifact while belonging to no
+bucket -- they fell out as `unaccounted`, which the tool prints with a note saying it should
+be zero.
+
+The three are one fault: **a second copy of what `apply` does, kept correct by nobody.** The
+remedy is the one this workspace already prescribes -- read the artifact, or share the
+function that produced it, rather than reproducing the derivation beside it.
+
 ### Finding 260 -- a strategy that maintains no slot must not go first
 
 Under `--shadow-regs=all` the unconditional lowering was offered LAST, after `pair`, `run`,
