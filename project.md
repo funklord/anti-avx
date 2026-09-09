@@ -13779,6 +13779,33 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 258 -- three register fields is not three-operand arithmetic
+
+`vfmadd231ps %ymm1,%ymm2,%ymm8` has three register fields exactly like `vaddps`, and
+`span_operand_shape` splits on field count -- so it returned "a register second source, D of
+its own", a member of `SPAN_EMITTABLE`, and the emitter narrowed it to `movaps %ymm2,%ymm8`
+plus the opcode with `VEX.L` cleared. `NO_LEGACY_FORM` named no FMA mnemonic, so nothing
+refused it.
+
+Wrong twice over, and neither fault is visible in the field count. There is no legacy
+encoding: the strip produces `66 0f 38 b6`, which decodes to nothing --
+
+    148de03da:  44 0f 28 c4        movaps %xmm4,%xmm8
+    148de03de:  66 44 0f 38 b6     data16 rex.R (bad)
+
+And an FMA's destination is also an accumulator SOURCE, so the `movaps` that sets it up
+destroys a live operand. **That half would still be wrong if the encoding existed**, which is
+why the fix is a refusal rather than a better encoder.
+
+Latent rather than new. `span` and `region` reach the same classifier and would emit the same
+bytes; they had placed 25 and 17 windows, few enough that no FMA had yet fallen into one.
+Offering the unconditional lowering first put 18,279 windows through that path and 20 byte
+sequences in the stub decoded to nothing.
+
+The sixty mnemonics are derived rather than typed, because a name missing from a hand-written
+list is a silent wrong encoding rather than an error. All 24 FMA mnemonics that occur in
+`.text` (421 instructions) are covered and `vaddps` is not swept in.
+
 ### Finding 257 -- the right conditions measured under the wrong window
 
 `op mem,%ymmS1,%ymmD` with a destination of its own was 296 refusals, the largest shape left.

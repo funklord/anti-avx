@@ -2817,6 +2817,40 @@ def rip_target(tail, address, length):
 # Starfield's 93 region sites happen to contain none of these, so nothing
 # has shipped wrong; the defect was found by the first fixture ever written
 # for the region strategy, on its first run. Finding 205.
+# **The FMA3 family, which the operand-count classifier cannot see.**
+# `vfmadd231ps %ymm1,%ymm2,%ymm8` has three register fields exactly like
+# `vaddps`, so `span_operand_shape` calls it "a register second source, D
+# of its own" -- a member of SPAN_EMITTABLE -- and the emitter narrows it
+# to `movaps %ymm2,%ymm8` followed by the opcode with VEX.L cleared. That
+# is wrong twice over, and neither fault is visible in the field count
+# which was the only thing separating these from ordinary arithmetic.
+# There is no legacy encoding: the strip produces `66 0f 38 b6`, which
+# decodes to nothing. And an FMA's destination is also an accumulator
+# SOURCE, so the `movaps` that sets it up destroys a live operand -- this
+# would still be wrong if the encoding existed.
+#
+# It is latent rather than new. `span` and `region` reach the same
+# classifier and would emit the same bytes; they placed few enough
+# windows that no FMA had yet fallen into one. Offering the unconditional
+# lowering first put 18,279 windows through that path and 20 byte
+# sequences in the stub decoded to nothing. Finding 258.
+#
+# Derived rather than typed: sixty mnemonics is too many to list without
+# getting one wrong, and a name missing from the set is a silent wrong
+# encoding rather than an error.
+FMA_FORMS = frozenset(
+	f"vf{negated}m{operation}{order}{width}"
+	for negated in ("", "n")
+	for operation in ("add", "sub")
+	for order in ("132", "213", "231")
+	for width in ("ps", "pd", "ss", "sd")
+) | frozenset(
+	f"vfm{operation}{order}{width}"
+	for operation in ("addsub", "subadd")
+	for order in ("132", "213", "231")
+	for width in ("ps", "pd")
+)
+
 NO_LEGACY_FORM = frozenset((
 	"vbroadcastss", "vbroadcastsd", "vbroadcastf128", "vbroadcasti128",
 	"vpbroadcastb", "vpbroadcastw", "vpbroadcastd", "vpbroadcastq",
@@ -2826,7 +2860,7 @@ NO_LEGACY_FORM = frozenset((
 	"vpmaskmovq", "vzeroupper", "vzeroall", "vgatherdps", "vgatherqps",
 	"vgatherdpd", "vgatherqpd", "vpgatherdd", "vpgatherqd", "vpgatherdq",
 	"vpgatherqq", "vtestps", "vtestpd", "vcvtph2ps", "vcvtps2ph",
-))
+)) | FMA_FORMS
 
 
 def narrow_piece(vex, tail, delta, address, length, at):
