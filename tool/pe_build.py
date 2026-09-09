@@ -78,7 +78,31 @@ DATA = 0x40000040		# INITIALIZED_DATA | READ
 # Exit codes are small and far apart on purpose. A wrong lowering should not
 # be able to look like a rounding difference.
 
-PROGRAMS = {}
+class _Programs(dict):
+	"""A dict that refuses a second assignment to the same name.
+
+	**A duplicate key silently replaces a fixture**, and every gate naming
+	it keeps passing while testing something else. That nearly happened
+	here: `lanemem` was reused for a second shape, both entries expected
+	77, and `check-shadow-pe` would have gone on reporting a `vperm2f128`
+	result while running an arithmetic one. The collision was found by an
+	unrelated edit failing to match its anchor.
+
+	Refusing at definition time is the only place it can be caught for
+	free -- once the dict is built the two are indistinguishable.
+	Finding 257.
+	"""
+
+	def __setitem__(self, name, value):
+		if name in self:
+			raise SystemExit(f"pe_build.py: {name!r} is defined twice; a "
+			                 f"second definition would silently replace the "
+			                 f"first and every gate naming it would keep "
+			                 f"passing")
+		super().__setitem__(name, value)
+
+
+PROGRAMS = _Programs()
 
 # 1. The aliasing case, and the reason this file exists.
 #
@@ -1134,7 +1158,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56, "regmove": 56, "nonvol": 72, "nonvolbad": 72, "unwindsave": 72}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56, "regmove": 56, "nonvol": 72, "nonvolbad": 72, "unwindsave": 72, "memsrc": 56}
 
 # **Samples whose prologue saves a non-volatile xmm**, as `(register,
 # offset from rsp)`. The sample must really do the save in its code AND
@@ -3084,6 +3108,75 @@ source:	.long 0, 0, 0, 0
 	.long 5, 0, 0, 0
 	.p2align 5
 sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# `op mem,%ymmS1,%ymmD` -- arithmetic against memory with a destination of
+# its own, which is 296 refusals and the largest shape left. SSE has no
+# three-operand form, so the low half is `movaps S1,D; op mem,D` and the
+# upper half is S1's slot into a helper, the operation against memory plus
+# sixteen, and the helper into D's slot. Two different slots, which is the
+# whole difference from the `lane` shape beside it.
+#
+# ymm1 is left UNTOUCHED and read afterwards, because a lowering that wrote
+# the result back into the source instead of the destination would still
+# give the right answer at %ymm2 and be wrong -- 5 comes back only if the
+# source survived.
+#
+# 12 from the destination's LOW half, 60 from its upper and 5 from the
+# source's = 77.
+#
+# **The low half is read, and the destination is poisoned with 100 first.**
+# The first draft read only upper halves, so removing the `movaps S1,D`
+# that SSE needs for a three-operand form changed nothing and scored 77 --
+# it tested the upper half twice and the copy not at all. It also declared
+# 77 while the data summed to 65, the comment having been copied from a
+# fixture with six volatile loads this one does not have.
+PROGRAMS["memsrc"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$56, %rsp
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	0x40(%rsi), %ymm2	/* POISON: 100 in the destination's low */
+					/* half, so a missing copy is definite */
+	vmovups	0x20(%rsi), %ymm1	/* src1: low 5, upper 5 */
+	vpaddd	(%rsi), %ymm1, %ymm2	/* mem,S1,D with D of its own */
+	vmovups	%ymm2, (%rdi)
+	vmovups	%ymm1, 0x20(%rdi)	/* the source must be unharmed */
+	movl	(%rdi), %eax		/* 7 + 5 = 12, the LOW half */
+	addl	16(%rdi), %eax		/* + 55 + 5 = 60, the upper half */
+	addl	48(%rdi), %eax		/* + 5, the source's own upper half */
+	addq	$56, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 7, 0, 0, 0
+	.long 55, 0, 0, 0
+	.long 5, 0, 0, 0
+	.long 5, 0, 0, 0
+	.long 100, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
 	.p2align 4
 tls_raw:

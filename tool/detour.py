@@ -3937,7 +3937,8 @@ def ymm_alias(field):
 # are therefore the exemption from NO_LEGACY_FORM. Named once so the guard
 # and the shapes cannot drift apart.
 SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2",
-               "bcastmem", "bcastreg", "permmem", "permil", "regmove")
+               "bcastmem", "bcastreg", "permmem", "permil", "regmove",
+               "lanemem")
 
 # **A 256-bit register-to-register move, which is not arithmetic.** The
 # refusal bucket called "a register-to-register move" holds three different
@@ -4399,6 +4400,20 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 			return ("store", canonical_ymm(fields[0]))
 		return None
 	if len(fields) == 3 and len(wide) == 2 and "(" in fields[0] \
+			and fields[1] != fields[2]:
+		# **`op mem,%ymmS1,%ymmD` with a destination of its own.** The same
+		# shape as `lane` below except that src1 is not the destination, so
+		# SSE's two-operand form needs the source copied into the
+		# destination first -- `movaps S1,D; op mem,D` -- which is what
+		# `lower_vex` does for a Class C site one width down. The upper
+		# half is the same: S1's slot into the helper, the operation
+		# against memory plus sixteen, the helper into D's slot.
+		#
+		# 296 refusals in Starfield, of which 61 have a helper and a block
+		# -- 53 of those only because a non-volatile borrow exists.
+		# Finding 257.
+		return ("lanemem", canonical_ymm(fields[2]), canonical_ymm(fields[1]))
+	if len(fields) == 3 and len(wide) == 2 and "(" in fields[0] \
 			and fields[1] == fields[2]:
 		# `op mem,%ymmD,%ymmD` -- src1 IS the destination, so the SSE form
 		# is the prefix dropped and nothing rearranged.
@@ -4479,7 +4494,8 @@ def span_entries(members, instructions, slots, scope, plain):
 			                           operands, None, mnemonic)
 			if shape is not None and shape[0] in ("lanereg", "lanereg3",
 			                                      "extract", "perm2",
-			                                      "permil", "regmove"):
+			                                      "permil", "regmove",
+			                                      "lanemem"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
@@ -5216,6 +5232,36 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
+		if what == "lanemem":
+			# The same as `lane` below, with the source copied into the
+			# destination first because SSE has no three-operand form.
+			# `narrow_piece` emits `op mem,%xmmD` -- the VEX's own modrm
+			# names D -- so after the copy it computes D = S1 op mem.
+			if second is None:
+				return refuse("lanemem source is in no slot")
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			low_s1 = scratch_finder.xmm_numbers(shape[2])[0]
+			if low_dst != low_s1:
+				body += encode_movaps(low_dst, low_s1)
+			low = narrow_piece(vex, tail, 0, address, len(encoding),
+			                   at + len(body))
+			if low is None:
+				return refuse("lanemem low half cannot be narrowed")
+			body += low
+			# The upper half reads SRC1's slot and writes the
+			# DESTINATION's, which are different slots -- the one thing
+			# that separates this from `lane`.
+			body += span_slot_move(helper, False, base, second, block,
+			                       at + len(body))
+			high_vex, high_tail = retarget(vex, tail, helper)
+			piece = narrow_piece(high_vex, high_tail, SLOT, address,
+			                     len(encoding), at + len(body))
+			if piece is None:
+				return refuse("lanemem high half cannot be narrowed")
+			body += piece
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
 		# A lane-wise operation whose other source is memory. The low half
 		# is the instruction with L cleared; the upper half is the same
 		# opcode between the slot and the helper.
@@ -5408,6 +5454,16 @@ def region_members(instructions, first, last, reasons=None):
 			# Reads both sources' halves and defines the destination's.
 			if shape[2] not in defined or shape[3] not in defined:
 				return refuse("permil source from outside the region")
+			if register not in slots:
+				slots[register] = (shadow_index(register)
+				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL
+				                   and shadow_index(register) is not None
+				                   else len(slots))
+			defined.add(register)
+		elif what == "lanemem":
+			# Reads src1's upper half and defines the destination's.
+			if shape[2] not in defined:
+				return refuse("lanemem source from outside the region")
 			if register not in slots:
 				slots[register] = (shadow_index(register)
 				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL

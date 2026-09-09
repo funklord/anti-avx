@@ -13779,6 +13779,69 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 257 -- the right conditions measured under the wrong window
+
+`op mem,%ymmS1,%ymmD` with a destination of its own was 296 refusals, the largest shape left.
+SSE has no three-operand form, so the low half is `movaps S1,D; op mem,D` -- what `lower_vex`
+does for a Class C site one width down -- and the upper half is S1's slot into a helper, the
+operation against memory plus sixteen, and the helper into D's slot. **Two different slots,
+which is the whole difference from the `lane` shape beside it.**
+
+It needs no `--shadow-regs=all`: span-local slots serve it, so this reaches the default build
+and `memsrc` sits in `PE_NAMES` rather than in the shadow gate.
+
+#### 61 predicted, 11 built, and the cause is not the usual one
+
+    shape "mem,S,D with a destination of its own"   296 ->  gone
+    no dead GPR and no home space                   551 ->   694
+    no non-volatile xmm this function saves         466 ->   636
+    unit candidates built                         1,590 -> 1,601   +11
+    256-bit sites through a slot                  1,296 -> 1,329   +33
+
+**The conditions were crossed and the crossing was still wrong.** The probe asked exactly the
+right questions -- has this site a helper, has it a block -- and asked them of a ONE-INSTRUCTION
+window, because the shape check runs before the widening loop and `window` does not exist yet.
+The stand-in chosen was `len(encoding)`, and the comment written at the time says it is "the
+smallest window the site could have".
+
+That sentence is true and is the error. A register has to be free across the WHOLE window, so
+the narrowest window makes every resource look maximally available: the substitution biased the
+estimate optimistic by construction, and the reason was written down without being seen.
+
+**So the rule of Finding 254 needs a second half.** Crossing the conditions is necessary and not
+sufficient -- they have to be evaluated under the same parameters the code will use. A cell
+measured at the wrong window is a margin wearing a cell's clothes.
+
+    lever                        quoted   delivered   how it was measured
+    the block register saved        415           4   margin
+    the register-to-register move    71          26   margin
+    backward widening                99           4   margin, not built
+    the GPR mover                   740         738   cell, real window
+    the non-volatile xmm            138         138   cell, real window
+    mem,S,D                          61          11   cell, ONE-INSTRUCTION window
+
+#### A fixture name collided, and the gate would never have said so
+
+The new fixture was called `lanemem`, which **already existed** -- the `vperm2f128` and
+memory-lane-forms fixture `check-shadow-pe` runs. Two `PROGRAMS["lanemem"]` assignments, the
+later silently winning, and **both expect 77**: the gate would have gone on reporting a
+`vperm2f128` result while running an arithmetic one, green throughout.
+
+It surfaced only because an unrelated edit failed to match its anchor. `PROGRAMS` is a dict that
+refuses a second assignment now, proven by attempting one, because after the dict is built the
+two are indistinguishable -- definition time is the only place it can be caught for free.
+
+#### And two faults in the fixture itself
+
+**The declared answer was 77 while the data summed to 65.** The comment said "12 from the
+volatiles" and had been copied from a fixture with six volatile loads this one does not have.
+The program was right and the expectation was wrong.
+
+**It tested the upper half twice and the source copy not at all.** Every read was of an upper
+half, so removing the `movaps S1,D` -- the one thing SSE's two-operand form requires -- scored
+77. It reads the low half now and poisons the destination with 100 beforehand, so that sabotage
+scores 172 and reading the wrong slot scores 72.
+
 ### Finding 256 -- what an unwind fixture can prove, and what it cannot
 
 Finding 255 borrows a non-volatile xmm where the function declares it saved, and closed saying
