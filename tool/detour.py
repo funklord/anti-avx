@@ -6233,7 +6233,8 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# the TLS index where it meant to store nothing. `verify` cannot see
 	# this: it reads decoding, VEX survival and stale upper halves, not
 	# liveness. Finding 264.
-	if len(block) > 3 and block[3] is True and first is None:
+	if len(block) > 3 and block[3] is True and first is None \
+			and CODE_SABOTAGE != "modetrue":
 		# **Rebuild it as mode "home", which needs no xmm at all.** Both
 		# GPRs go to the callee home space and come back, so nothing has
 		# to hold the index for three instructions -- which is the only
@@ -13753,6 +13754,156 @@ def is_call(data, at):
 		and ((data[at + 1] >> 3) & 7) == 2
 
 
+# The 64-bit name, the 32-bit name and the byte name are one register, and
+# a stub that writes `%eax` has written `%rax` -- a 32-bit write zeroes the
+# top half rather than leaving it. Built from GPR_NUMBERS so a register
+# cannot be in one table and not the other.
+GPR_ALIASES = {}
+for _name, _number in GPR_NUMBERS.items():
+	GPR_ALIASES[_name] = _number
+	if _name.startswith("r") and _name[1:].isdigit():
+		for _suffix in ("d", "w", "b"):
+			GPR_ALIASES[_name + _suffix] = _number
+	else:
+		GPR_ALIASES["e" + _name[1:]] = _number
+		GPR_ALIASES[_name[1:]] = _number
+		GPR_ALIASES[_name[1] + "l"] = _number
+
+
+def stub_gpr_problems(text, placed, home, base, size,
+                      instructions):
+	"""Registers a stub clobbers that the site was still using.
+
+	**The one class every other check in this file is blind to.** `verify`
+	reads decoding, VEX survival, stale upper halves and structure; none of
+	them looks at a general-purpose register. Finding 264 was exactly that
+	-- mode True loaded the TLS index into `%rax` and never put it back,
+	while the original set `%rax` to zero four instructions above the site
+	and read it five below -- and it passed every gate here, on every run,
+	for as long as it existed. It was found by sizing an unrelated
+	optimisation, which is luck rather than method.
+
+	The invariant is the one the emitter already believes: **a stub may
+	clobber a general-purpose register only where that register is dead
+	across the window, or where the stub saves and restores it itself.**
+
+	**A stub also RE-EMITS the instructions its window swallowed**, and
+	those write general-purpose registers exactly as the original program
+	did. The first version of this counted them and reported 20,631 of
+	33,215 stubs -- 62%, which is a detector fault rather than a defect
+	rate, and it is what a gate looks like just before somebody switches it
+	off with an ignore list. A register the original window wrote is
+	therefore allowed too.
+
+	This reads the emitted disassembly rather than the plan, so it cannot
+	agree with the generator by construction the way a regenerate-and-diff
+	gate does. What it knows about the site comes from `window_gpr_free`,
+	which is the same question the collector asks -- but asked of the
+	FINISHED bytes, so a mode chosen for one reason and emitted under
+	another is caught between the two. Finding 266.
+	"""
+	rows = []
+	for line in text.splitlines():
+		head, _tab, rest = line.partition("\t")
+		if not rest or ":" not in head:
+			continue
+		try:
+			at = int(head.strip().rstrip(":"), 16)
+		except ValueError:
+			continue
+		body = rest.partition("\t")[2].strip()
+		if not body:
+			continue
+		rows.append((at, body))
+	rows.sort()
+	starts = [at for at, _b in rows]
+
+	def targets_of(operands, mnemonic):
+		"""The general-purpose register an AT&T operand list writes."""
+		operands = (operands or "").split("#")[0].strip()
+		fields = inplace.split_operands(operands) if operands else []
+		if len(fields) < 2 or mnemonic.startswith("j"):
+			return None, None
+		return fields[0], fields[-1]
+
+	sites = sorted(a for a, _e, _m, _o, *_r in instructions)
+	rows_by_site = {a: (m, o) for a, _e, m, o, *_r in instructions}
+
+	problems = []
+	for site, window, stub_at, stub_size, _prologue in placed:
+		if not (base <= stub_at < base + size):
+			continue
+		lo = bisect.bisect_left(starts, stub_at)
+		hi = bisect.bisect_left(starts, stub_at + stub_size)
+		written = set()
+		saved, restored = defaultdict(set), defaultdict(set)
+		for _at, body in rows[lo:hi]:
+			mnemonic, _sp, operands = body.partition(" ")
+			operands = operands.split("#")[0].strip()
+			if not operands or mnemonic.startswith("j"):
+				continue
+			fields = inplace.split_operands(operands)
+			if len(fields) < 2:
+				continue
+			source, target = fields[0], fields[-1]
+			# A destination that is a register is written; one that is
+			# memory is not, and is a SAVE when its source is a register.
+			if target.startswith("%"):
+				number = GPR_ALIASES.get(target[1:])
+				if number is None:
+					# **An xmm destination taking a GPR is a STASH**, and
+					# it is how mode True frees the index register:
+					# `movq %rcx,%xmm4` ... `movq %xmm4,%rcx`. Memory is
+					# not the only place a register can be kept, and
+					# reading only memory reported 257 correct stubs as
+					# clobbering the very register they had just put
+					# back -- the mechanism at the heart of Finding 264,
+					# working, called a fault by the gate written for it.
+					held = (GPR_ALIASES.get(source[1:])
+					        if source.startswith("%") else None)
+					if held is not None and mnemonic.startswith("mov"):
+						saved[held].add(target)
+					continue
+				written.add(number)
+				# A restore reads from somewhere that is not another GPR:
+				# memory, or the xmm a stash put it in.
+				if mnemonic.startswith("mov") and (
+						not source.startswith("%")
+						or GPR_ALIASES.get(source[1:]) is None):
+					restored[number].add(source)
+			elif source.startswith("%"):
+				number = GPR_ALIASES.get(source[1:])
+				if number is not None and mnemonic.startswith("mov"):
+					saved[number].add(target)
+		# **Saved AND restored to the SAME place, or it is not
+		# preserved.** A save with no matching restore is a register left
+		# clobbered with extra steps.
+		#
+		# Locations are sets rather than one apiece, because the mover
+		# does its own work through `mov %reg,mem` as well: keyed by
+		# register alone, its last data store overwrote the record of
+		# where it had been saved, and %rdx was reported clobbered in
+		# almost every stub. That took the first control to 20,502 of
+		# 33,215, and the reading of one stub to explain.
+		preserved = {n for n in saved if saved[n] & restored[n]}
+		# What the ORIGINAL window wrote, which the stub re-emits.
+		lo_o = bisect.bisect_left(sites, site)
+		hi_o = bisect.bisect_left(sites, site + window)
+		theirs = set()
+		for address in sites[lo_o:hi_o]:
+			mnemonic, operands = rows_by_site[address]
+			source, target = targets_of(operands, mnemonic or "")
+			if target and target.startswith("%"):
+				number = GPR_ALIASES.get(target[1:])
+				if number is not None:
+					theirs.add(number)
+		dead = set(window_gpr_free(home, site, window))
+		loose = written - preserved - dead - theirs
+		if loose:
+			problems.append((site, stub_at, sorted(loose)))
+	return problems
+
+
 def verify(original, patched, listing=None):
 	a = open(original, "rb").read()
 	b = open(patched, "rb").read()
@@ -14199,6 +14350,28 @@ def verify(original, patched, listing=None):
 		problems += 1
 	else:
 		print("verify: every instruction in the stub section decodes")
+	# **The register class, which nothing else here reads.** See
+	# `stub_gpr_problems`: every other check in this file is blind to a
+	# general-purpose register, and Finding 264 shipped through all of them.
+	if stubs is not None and placed:
+		where = struct.unpack_from("<Q", b, pe + 24 + 24)[0] + stubs[0]
+		loose = stub_gpr_problems(done.stdout, placed, home, where,
+		                          stubs[1], instructions)
+		if loose:
+			print(f"verify: FAILED -- {len(loose):,} stub(s) clobber a "
+			      f"general-purpose register the site was still using",
+			      file=sys.stderr)
+			for site, stub_at, registers in loose[:8]:
+				names = ", ".join("%" + name for name in sorted(
+					n for n, number in GPR_NUMBERS.items()
+					if number in registers))
+				print(f"    site 0x{site:x}, stub 0x{stub_at:x}: {names}",
+				      file=sys.stderr)
+			problems += 1
+		else:
+			print(f"verify: no stub clobbers a general-purpose register "
+			      f"its site was still using, across {len(placed):,} "
+			      f"placed window(s)")
 	# **Every call in the stub section is a swallowed one, and this counts
 	# them rather than forbidding them.** The first version of this check
 	# asserted that no stub contains a call at all, which is a stronger

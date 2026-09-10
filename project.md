@@ -13779,6 +13779,52 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 266 -- the gate for the class nothing checked, and four wrong instruments
+
+Finding 264 was a wrong-code defect that passed every gate here on every run, because none of
+them reads a general-purpose register. `verify` now asserts the invariant the emitter already
+believes: **a stub may clobber a GPR only where that register is dead across the window, where
+the stub saves and restores it itself, or where the original window wrote it too.** It reads
+the emitted disassembly, so it cannot agree with the generator by construction.
+
+    correct image     exit 0    0 findings across 201,585 placed windows
+    sabotaged image   exit 1    793 stubs, every one %rax
+
+793 is exactly 1,050 - 257: the false positives removed from the good image account precisely
+for the drop on the bad one, which is two numbers agreeing on a quantity neither was fitted
+to.
+
+**Getting there cost four wrong instruments and one wrong artifact, and the artifact was
+right.** In order:
+
+  * **Passengers.** A stub re-emits what its window swallowed, and those instructions write
+    GPRs exactly as the original did. Counting them reported 20,631 of 33,215 stubs -- 62%,
+    which is a detector fault, not a defect rate.
+  * **The mover's own stores.** `saved` was keyed by register with one location, and the mover
+    does its work through `mov %reg,mem` as well -- so its last data store overwrote the
+    record of where it had been saved, and %rdx was reported clobbered nearly everywhere.
+    Locations are sets now.
+  * **The control itself.** `verify` recomputes placement with the CURRENT tool, and the image
+    under test had been built by the previous one. Every `stub_at -> bytes` mapping was
+    shifted, which is why the count sat near 20,000 whatever was fixed and why a flagged
+    register turned out to belong to the neighbouring stub. **The two fixes above were real
+    and neither explained the count**, and they were reported as though they had.
+  * **The xmm stash.** Mode True saves the index in an xmm, not in memory. Reading only memory
+    reported 257 correct stubs as clobbering the register they had just put back -- the
+    mechanism at the heart of Finding 264, working, called a fault by the gate written for its
+    absence.
+
+**The lesson is about which artifact a check may be pointed at.** A gate that recomputes the
+plan can only be run against an image its own tool built; against any other it measures the
+difference between two placements and calls it a defect. That is why the control is a
+SABOTAGE -- `ANTI_AVX_SABOTAGE=modetrue` disables Finding 265's fallback, and one tool builds
+and checks -- rather than an older image kept on disk. This workspace already knew to prefer a
+receipt over a fresh measurement; this is the same rule for a gate.
+
+`make check-liveness` runs it, and asserts the sabotaged image fails **through the liveness
+check by name**, because failing for another reason proves nothing. It needs the game binary
+and about an hour, so it is not part of `check`.
+
 ### Finding 265 -- the mode the site could have had all along
 
 Finding 264 refused mode True where nothing could stash the index, at 1,850 sites and 624

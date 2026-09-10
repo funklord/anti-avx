@@ -74,7 +74,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs shapes cost-bench cost status probe why check-shadow check-shadow-pe check-run-borrow check-spill check-tls check-unwind check-vex \
+        census spans gprs shapes cost-bench cost status probe why check-shadow check-shadow-pe check-run-borrow check-spill check-tls check-unwind check-vex check-liveness \
         check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -566,6 +566,44 @@ $(DETOURED): $(TARGET) $(LISTING) tool/detour.py tool/patch.py | $(BUILD_DIR)
 	$(PYTHON) tool/detour.py $(SPILL_FLAGS) apply $(TARGET) $(LISTING) $@
 
 detour: $(DETOURED)
+
+# **The liveness gate, and the sabotage that proves it can speak.** The
+# check itself runs on every `verify`, fixtures included. What needs the
+# game binary is the CONTROL: no fixture reaches mode True with no xmm to
+# stash in, so the only way to make the gate fail is to reintroduce
+# Finding 264 and build with the same tool that checks -- which is the
+# whole point, because verifying an image against a tool that did not
+# build it recomputes a different placement and reports thousands of
+# phantom findings. Findings 264 and 266.
+#
+# Measured: the sabotaged image reports 793 stubs, every one %rax; the
+# correct image reports 0 across 201,585 placed windows.
+#
+# Termination: two bounded invocations over a fixed input, each under a
+# timeout. Roughly an hour, so it is not part of `check`.
+check-liveness: $(LISTING)
+	@set -e; \
+	echo "check-liveness: building a deliberately broken image"; \
+	ANTI_AVX_SABOTAGE=modetrue timeout 3000 $(PYTHON) tool/detour.py \
+		--shadow-regs=all apply $(TARGET) $(LISTING) \
+		$(BUILD_DIR)/sse-modetrue.exe > $(BUILD_DIR)/modetrue.log 2>&1; \
+	if ANTI_AVX_SABOTAGE=modetrue timeout 3600 $(PYTHON) tool/detour.py \
+		--shadow-regs=all verify $(TARGET) \
+		$(BUILD_DIR)/sse-modetrue.exe $(LISTING) \
+		> $(BUILD_DIR)/modetrue-verify.log 2>&1; then \
+		echo "check-liveness: the sabotaged image PASSED verify, so the"; \
+		echo "                liveness gate cannot see a clobbered"; \
+		echo "                register and its silence means nothing"; \
+		exit 1; \
+	fi; \
+	grep -q "clobber a general-purpose register" \
+		$(BUILD_DIR)/modetrue-verify.log || \
+		{ echo "check-liveness: the sabotaged image failed, but NOT"; \
+		  echo "                through the liveness check -- so that"; \
+		  echo "                check may never have run"; exit 1; }; \
+	echo "check-liveness: the gate refuses a stub that clobbers a register"; \
+	echo "                its site was still using, and passes the same"; \
+	echo "                tree built correctly"
 
 detour-verify: $(DETOURED) $(LISTING)
 	$(PYTHON) tool/detour.py $(SPILL_FLAGS) verify $(TARGET) $(DETOURED) \
