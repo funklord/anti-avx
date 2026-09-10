@@ -6234,7 +6234,33 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# this: it reads decoding, VEX survival and stale upper halves, not
 	# liveness. Finding 264.
 	if len(block) > 3 and block[3] is True and first is None:
-		return refuse("mode True has no xmm to stash the index in")
+		# **Rebuild it as mode "home", which needs no xmm at all.** Both
+		# GPRs go to the callee home space and come back, so nothing has
+		# to hold the index for three instructions -- which is the only
+		# thing mode True wanted an xmm for. Measured on Starfield: all
+		# 1,850 sites the guard refuses have home space, two unnamed GPRs
+		# and 16 bytes free after the mover's 8, so the fallback is total
+		# rather than partial.
+		#
+		# **The mover is excluded by name.** It was chosen against the OLD
+		# block's two registers, so nothing yet stops the rebuild handing
+		# the same register to the pointer -- which would have the stub
+		# save a register, load the block over it, and restore rubbish.
+		#
+		# And its saves start at `lent + home_used` rather than at `lent`:
+		# the mover already holds the first eight bytes, and the original
+		# construction below sets `home_used = 16` because it runs before
+		# the mover exists. Finding 265.
+		unnamed = [n for n in sorted(window_gpr_unnamed(home, address,
+		                                                window),
+		                             reverse=True)
+		           if n != mover]
+		if lent is None or len(unnamed) < 2 \
+				or home_used + 2 * 8 > HOME_SPACE:
+			return refuse("mode True has no xmm to stash the index in")
+		block = (unnamed[0], unnamed[1], block[2], "home",
+		         lent + home_used) + block[5:]
+		home_used += 2 * 8
 	told = []
 	if lower_ymm_span(entries, base, first, address, address, block,
 	                  second, told) is None:

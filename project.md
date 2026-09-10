@@ -13779,6 +13779,36 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 265 -- the mode the site could have had all along
+
+Finding 264 refused mode True where nothing could stash the index, at 1,850 sites and 624
+frontier sites. Measured at that refusal, **all 1,850 could have been built as mode "home"
+instead**: home space present, two unnamed GPRs, and 16 bytes free after the mover's 8. None
+was blocked by space, by registers, or by exhaustion.
+
+Mode "home" saves BOTH GPRs to the callee home space and gives them back, so nothing has to
+hold the index for three instructions -- which is the only thing mode True wanted an xmm for.
+The site never needed the mode it was given.
+
+    VEX in .text        3,316 wrong  ->  3,940 refused  ->  3,316 correct
+    stub section    4,585,736        ->  4,513,617      ->  4,612,038
+
+So the whole price of correctness here is **26,302 stub bytes**, not 624 sites.
+
+**Two details the measurement could not have supplied, both found by reading.** The mover is
+excluded from the rebuild by name: it chose itself against the OLD block's two registers, so
+nothing otherwise stopped the pointer being handed the same register -- the stub would save
+it, load the block over it and restore rubbish, which is Finding 264's shape exactly. And the
+saves start at `lent + home_used` rather than at `lent`, because the original construction
+hard-codes `home_used = 16` while running BEFORE the mover exists.
+
+**The mode is chosen from what is dead, and never revisited when that stops mattering.**
+`len(free) >= 2` gives mode False, `free` gives True, neither gives "home" -- a ladder read
+top-down on register availability alone. Mode True is picked because ONE register is dead,
+which sounds better than borrowing two, and it silently commits the site to owning an xmm.
+Nothing re-asked the question when the xmm failed to appear. **A cheaper mode chosen early is
+a constraint accepted early**, and the ladder had no rung for giving one back.
+
 ### Finding 264 -- two correct mechanisms, never guarded together
 
 Mode True stands the block pointer up with one dead register. The INDEX register is not
