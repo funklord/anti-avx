@@ -13779,6 +13779,57 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 264 -- two correct mechanisms, never guarded together
+
+Mode True stands the block pointer up with one dead register. The INDEX register is not
+checked for being dead at all -- Finding 247 says so in as many words, because
+`encode_tls_base`'s stash saves it in an xmm for three instructions and puts it back. The
+stash is a `movq` between a GPR and an xmm precisely because memory would need a register to
+address, which is the circularity Finding 69 met.
+
+Finding 251's mover runs BEFORE the xmm borrow, and when it finds a general-purpose register
+the borrow block is **skipped entirely**. So `helpers` stays empty, `first` is None, and the
+emitter is handed `helper if mode else None` -- which for mode True is None. It emits no
+stash, and the index register is loaded with the TLS index and never put back.
+
+**Read out of the image rather than argued from the source.** Site `0x140055e9e`, whose stub
+begins:
+
+    mov  %rdx,0x0(%rsp)             the MOVER, saved and later restored
+    mov  %gs:0x58,%rcx
+    mov  -0x2b7620a(%rip),%eax      the index, into RAX
+    mov  (%rcx,%rax,8),%rcx
+
+and whose original reads:
+
+    140055e95:  xor  %eax,%eax                 RAX = 0
+    140055e9e:  vmovups %ymm0,...              the site
+    140055ebe:  mov  %rax,0x5f59fa3(%rip)      RAX read here
+
+RAX is defined four instructions above the site and read five below it, so the program stores
+the TLS index where it meant to store zero. The mover is saved and restored; the index is
+not. 2,213 mode True candidates, **1,675 of them with no xmm at all** and a mover in every
+one.
+
+**Neither mechanism is wrong and neither is new.** What was missing is a guard on their
+conjunction, and nothing pointed at it: each half reads correctly in isolation, and the
+comment on each explains why it is safe on its own terms. A GPR cannot stand in for the
+stash, so the site has to be refused.
+
+**`verify` cannot see this class at all**, which is why every run stayed green. It reads
+decoding, VEX survival, stale upper halves and structure -- not general-purpose liveness. A
+green verify is evidence about the invariants it checks and silence about the rest, and this
+is the sharpest instance of that in the tree: a wrong-code defect that survived every gate
+because no gate was pointed at registers.
+
+It is confined to `--shadow-regs=all`. `unit_candidate` returns immediately unless the rule
+is `all`, so the shipped build never reached it.
+
+**How it surfaced is worth keeping.** Nobody was looking for it. It came out of sizing an
+unrelated optimisation -- whether the GPR mover could use the block's scratch slots -- and
+reading the mode split closely enough to ask what mode True does when the mover wins. The
+measurement that found it was aimed somewhere else entirely.
+
 ### Finding 263 -- an exemption written for moves, handed an arithmetic
 
 `NO_LEGACY_FORM` is consulted as `mnemonic in NO_LEGACY_FORM and shape[0] not in

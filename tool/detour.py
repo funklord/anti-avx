@@ -6210,6 +6210,31 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	block = block[:5] + (mover, mover_save, borrowed_xmm, stashed_xmm)
 	first = helpers[0] if helpers else None
 	second = helpers[1] if len(helpers) > 1 else None
+	# **Mode True stashes a LIVE index register in an xmm, so it cannot
+	# stand without one.** The index is chosen as the lowest volatile GPR
+	# that is not the block pointer and is NOT checked for being dead --
+	# Finding 247 says in as many words that it "need not be dead at all"
+	# because the stash saves it. With no xmm the emitter is handed None,
+	# `encode_tls_base` emits no stash, and the register is loaded with the
+	# TLS index and never put back.
+	#
+	# The two halves are each correct and were never guarded together.
+	# Finding 251's mover runs BEFORE the xmm borrow and, when it finds a
+	# general-purpose register, the borrow block is skipped entirely -- so
+	# `helpers` stays empty and mode True loses the one thing it depends
+	# on. A GPR cannot serve: the stash is a `movq` between a GPR and an
+	# xmm precisely because memory would need a register to address.
+	#
+	# Measured on Starfield: 2,213 mode True candidates, 1,675 of them
+	# with no xmm at all and a mover in every one. Read out of the image
+	# at 0x140055e9e, whose stub loads the index into %rax and never
+	# restores it -- while the original sets %rax to zero four
+	# instructions above and reads it five below, so the program stored
+	# the TLS index where it meant to store nothing. `verify` cannot see
+	# this: it reads decoding, VEX survival and stale upper halves, not
+	# liveness. Finding 264.
+	if len(block) > 3 and block[3] is True and first is None:
+		return refuse("mode True has no xmm to stash the index in")
 	told = []
 	if lower_ymm_span(entries, base, first, address, address, block,
 	                  second, told) is None:
