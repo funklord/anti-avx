@@ -13779,6 +13779,50 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 270 -- Finding 268 contradicts Finding 68, and Finding 68 is right
+
+**Finding 268's mode "frame" must be reverted.** It emits `sub $0x10,%rsp` inside a stub,
+and Findings 46, 49, 67 and 68 closed exactly that on measured evidence:
+
+  * Wine hands a spilling stub an establisher frame **sixteen bytes out**, because a chained
+    fragment's own unwind codes are not applied (Finding 67).
+  * Of 65,255 unwind operations inside chained fragments in this binary, **not one allocates
+    stack** -- SAVE_NONVOL and SAVE_XMM128 only. The toolchain never does it because the ABI
+    says a fragment shares its primary's frame rather than having one of its own
+    (Finding 68).
+  * The alternative, an unchained entry with a frame of its own, **loses the handler**,
+    because the chain is what reaches it (Finding 49).
+  * `--spill=stack` therefore exists to carry the measurement and is NOT the default; the
+    default is `none` and the handover section says in as many words that **a stub that moves
+    `rsp` cannot be described.**
+
+**How it was got wrong, because the mistake is repeatable.** `stub_unwind`'s docstring says
+"the sixteen bytes are described rather than silently missing", and that was read as evidence
+the mechanism was safe. It is not that claim: it says the TOOL is honest about what it
+emitted, not that the UNWINDER honours it. The existence of `STACK_OPEN`, a `--spill=stack`
+mode and a prologue field all read as precedent, and every one of them is machinery built to
+measure a thing the project then declined to use.
+
+**The decision was recorded in "Picking this up again" -- the section written for exactly
+this -- and was not read before building.** Four findings and a standing directive, and the
+search that would have found them is one grep for `rsp` in project.md.
+
+**Scope.** Mode "frame" is reached only under `--shadow-regs=all`, which is not the default,
+so the shipped build never emits it. What is affected is the uniform-slot mode at 1,879
+sites: an exception raised in, or unwound through, one of those stubs gets a frame sixteen
+bytes wrong. It is latent rather than visible -- `verify` reads bytes and structure, not what
+an unwinder would compute, which is the same blindness Finding 264 exploited.
+
+**What to do.** Revert the "frame" arm of `block_off_xmm` and the mode "frame" emission, and
+let those sites refuse as they did before Finding 268. That returns the frontier from 2,944
+to about 3,268 and restores `no dead GPR and no home space to save one` at 1,599. The
+`ANTI_AVX_SABOTAGE=frame` hook and `make check-frame` go with it.
+
+**And the 2,006 sites stay blocked for the reason Finding 267 named**: a slot is addressed
+off the block pointer and cannot hold the registers that stand it up, `(%rsp)` can but cannot
+be described in a fragment, and those are the only two places that need no register. That is
+a floor, not a gap.
+
 ### Finding 269 -- two decisions in the wrong order, and the refactor that cost 531
 
 The xmm borrow refused a volatile stash whenever the block was mode True, because mode True
