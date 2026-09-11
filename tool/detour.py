@@ -4864,6 +4864,13 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		for register, slot in (block[8] if len(block) > 8 else ()):
 			body += span_slot_move(register, True, base, slot, block,
 			                       at + len(body))
+		# The mover, where its eight bytes went to a scratch slot rather
+		# than to the callee home space. Same reason as the stash above:
+		# a slot is addressed off the block pointer, so it cannot be
+		# written until that pointer stands up. Finding 267.
+		if len(block) > 9 and block[9] is not None:
+			body += encode_gpr_at(block[5], True, block[0],
+			                      base + block[9] * SLOT)
 	for kind, address, encoding, mnemonic, operands, slot, moved, second, \
 			third in entries:
 		if kind == "plain":
@@ -5350,6 +5357,10 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		body += piece
 		body += span_slot_move(helper, True, base, slot, block,
 		                       at + len(body))
+	if block is not None and len(block) > 9 and block[9] is not None:
+		# Back before the pointer goes, for the same reason.
+		body += encode_gpr_at(block[5], False, block[0],
+		                      base + block[9] * SLOT)
 	for register, slot in (block[8] if block is not None and len(block) > 8
 	                       else ()):
 		# Back before the block pointer goes, because the slot is
@@ -6082,7 +6093,12 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# three instructions. Finding 250.
 	wants = any(kind not in HELPER_FREE for kind, _p, _r in members) \
 		or (len(block) > 3 and block[3] is True)
-	mover, mover_save = None, None
+	mover, mover_save, mover_slot = None, None, None
+	# **One claim list for the block's four scratch slots.** The mover and
+	# the xmm stash both draw from them and the mover is chosen first, so
+	# a set each would hand the same slot out twice. Seeded from the slots
+	# the members already occupy. Finding 267.
+	claimed = {i for i in slots.values() if i < TLS_SLOTS}
 	if wants and not helpers:
 		# **A 16-byte move needs no vector register.** Where every member
 		# that wanted a helper is a pure move, a general-purpose register
@@ -6106,7 +6122,26 @@ def unit_candidate(instructions, plain, index, blocked, home,
 					return refuse("no register to borrow for the move")
 				mover = borrowed[0]
 			else:
-				return refuse("no register to move a half through")
+				# **The home space is 32 bytes and the block carries 64
+				# more.** The branch above wants eight of the callee's,
+				# and where they are gone the same eight fit in one of
+				# the per-thread block's scratch slots -- addressed off
+				# the pointer this window has already stood up, which is
+				# why the save has to be emitted after it rather than at
+				# the top of the stub with the rest.
+				#
+				# Measured at this refusal: all 642 sites have a free
+				# scratch slot, and mode True is no obstacle because the
+				# mover is drawn from registers that exclude the block's
+				# two. Finding 267.
+				loose = [i for i in range(TLS_SLOTS) if i not in claimed]
+				borrowed = [n for n in sorted(window_gpr_unnamed(
+					home, address, window)) if n not in taken]
+				if not loose or not borrowed:
+					return refuse("no register to move a half through")
+				mover_slot = loose[0]
+				claimed.add(mover_slot)
+				mover = borrowed[0]
 	# **A non-volatile xmm, where the function itself saves it.** Finding
 	# 124 refused xmm6-xmm15 outright, because the only way out of a live
 	# borrow is a fault and the unwinder restores those from the primary's
@@ -6192,8 +6227,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 				else False
 			if block is None or mode_here is True:
 				return refuse("no non-volatile xmm this function saves")
-			spare = [i for i in range(TLS_SLOTS)
-			         if i not in set(slots.values())]
+			spare = [i for i in range(TLS_SLOTS) if i not in claimed]
 			loose = [n for n in VOLATILE_XMM if n not in touched]
 			if len(loose) < need or len(spare) < need:
 				return refuse("no volatile xmm and scratch slot to stash it")
@@ -6207,7 +6241,8 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		# vector register at all -- refusing here for want of one refused
 		# every GPR-movable window the moment this check was added.
 		return refuse("no xmm helper free at the site")
-	block = block[:5] + (mover, mover_save, borrowed_xmm, stashed_xmm)
+	block = block[:5] + (mover, mover_save, borrowed_xmm, stashed_xmm,
+	                     mover_slot)
 	first = helpers[0] if helpers else None
 	second = helpers[1] if len(helpers) > 1 else None
 	# **Mode True stashes a LIVE index register in an xmm, so it cannot

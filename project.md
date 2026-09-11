@@ -13779,6 +13779,45 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 267 -- the mover moves off the home space, and meets the next wall
+
+`no register to move a half through` was 642 sites: no spare dead GPR, and no room in the
+32-byte callee home space for the eight bytes a borrowed one needs. The block carries 64 more
+in its four scratch slots, and `encode_gpr_at` already takes a base register, so the same call
+addresses a slot off the pointer the window has already stood up.
+
+Measured at the refusal first: all 642 had a free slot, and mode True was no obstacle because
+the mover is drawn from registers that exclude the block's two -- unlike the xmm stash, where
+the index wants the very register being borrowed.
+
+    no register to move a half through            642  ->      0
+    mode True has no xmm to stash the index in      0  ->    407
+    unit refusals                               4,369  ->  4,134     -235
+    VEX in .text                                3,316  ->  3,268      -48
+
+**All 642 were rescued at the mover and 407 met the next wall immediately.** They proceed to
+the block-pointer decision, and they have no home space AT ALL -- which is exactly why the
+mover needed a slot. Mode True wants an xmm they do not have; Finding 265's mode "home"
+fallback wants 16 bytes of home space that is not there.
+
+**And those 407 are blocked by the same circularity as the 1,599**: a slot is addressed off
+the block pointer, so it cannot hold the registers that stand that pointer up. The mover can
+use one precisely because it runs AFTER the pointer exists. The block's own saves never can.
+
+That reframes what is left. **Home space, not registers, is the binding resource, and the
+block pointer is the one consumer that cannot be moved off it.** Every lever since Finding 262
+has been the same act -- taking a claimant off the 32 bytes and putting it in the 64 -- and
+the claimant that would free the most is the one the addressing forbids.
+
+**Two build details worth keeping.** The four slots need ONE claim list: the mover is chosen
+before the xmm stash and both draw from them, so a set each would hand the same slot out
+twice -- Finding 265's mover/pointer collision, one layer down. And the save must be emitted
+after the pointer stands up and restored before it goes, which is where a home-space save
+cannot be and a slot save must be.
+
+The liveness gate of Finding 266 was silent across 201,577 placed windows on this build, which
+borrows more general-purpose registers than any before it.
+
 ### Finding 266 -- the gate for the class nothing checked, and four wrong instruments
 
 Finding 264 was a wrong-code defect that passed every gate here on every run, because none of
