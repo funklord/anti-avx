@@ -902,6 +902,39 @@ SLOT = 16
 VOLATILE_XMM = tuple(range(6))
 
 # sub $16,%rsp and add $16,%rsp, which the pool spill does not need.
+def block_off_xmm(block, mover, home, instructions, index, address,
+                  window, lent, home_used):
+	"""Rebuild a mode True block as one needing no xmm, or None.
+
+	Mode True stands the block pointer up by stashing a live index register
+	in an xmm for three instructions. Where no xmm is going to be available
+	-- or where one is, but only as a stash in a slot the pointer setup
+	would destroy first -- the mode has to become one that wants none:
+	"home" if the caller lent space, otherwise "frame", which allocates
+	sixteen bytes of its own.
+
+	**One implementation, because there are two callers and Finding 261 is
+	what two copies of a derivation cost.** The xmm borrow asks before
+	choosing a stash, and the guard after it asks again for the sites the
+	borrow left unserved.
+
+	`mover` is excluded by name: it was chosen against the OLD block's two
+	registers, so nothing else stops the rebuild handing the same one to
+	the pointer -- the stub would save it, load the block over it, and
+	restore rubbish. Findings 265, 268 and 269.
+	"""
+	unnamed = [n for n in sorted(window_gpr_unnamed(home, address, window),
+	                             reverse=True) if n != mover]
+	if len(unnamed) < 2:
+		return None
+	if lent is None or home_used + 2 * 8 > HOME_SPACE:
+		if window_touches_rsp(instructions, index, address, window):
+			return None
+		return (unnamed[0], unnamed[1], block[2], "frame", 0), home_used
+	return ((unnamed[0], unnamed[1], block[2], "home", lent + home_used),
+	        home_used + 2 * 8)
+
+
 def window_touches_rsp(instructions, index, address, window):
 	"""Does anything in this window read or move `rsp`?
 
@@ -6285,15 +6318,33 @@ def unit_candidate(instructions, plain, index, blocked, home,
 			# gone before the slot exists. It costs 337 of the 890 and
 			# wants its own change: stash the index in a slot too, and it
 			# needs no xmm at all. Finding 262.
-			mode_here = block[3] if block is not None and len(block) > 3 \
-				else False
-			if block is None or mode_here is True:
+			if block is None:
 				return refuse("no non-volatile xmm this function saves")
 			spare = [i for i in range(TLS_SLOTS) if i not in claimed]
 			loose = [n for n in VOLATILE_XMM if n not in touched]
 			if len(loose) < need or len(spare) < need:
 				return refuse("no volatile xmm and scratch slot to stash it")
+			# **Mode True is rewritten HERE, not forty lines below.** The
+			# guard after this one already rebuilds a mode True block as
+			# one wanting no xmm -- but it runs after the borrow, so the
+			# borrow was refusing a slot stash on the strength of a mode
+			# that was about to change. 322 of 381 sites refused "no
+			# non-volatile xmm this function saves" have a free volatile
+			# xmm, a free slot and somewhere for the block's own saves:
+			# they were declined by the order of two decisions rather than
+			# by anything the site lacked. Finding 269.
+			if (len(block) > 3 and block[3] is True
+					and CODE_SABOTAGE != "modetrue"):
+				rebuilt = block_off_xmm(block, mover, home, instructions,
+				                        index, address, window, lent,
+				                        home_used)
+				if rebuilt is None:
+					return refuse("no non-volatile xmm this function saves")
+				block, home_used = rebuilt
+			elif len(block) > 3 and block[3] is True:
+				return refuse("no non-volatile xmm this function saves")
 			stashed_xmm = tuple(zip(loose[:need], spare[:need]))
+			claimed.update(slot for _r, slot in stashed_xmm)
 			helpers = tuple(register for register, _s in stashed_xmm)
 		else:
 			borrowed_xmm = tuple(taken)
@@ -6332,40 +6383,29 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# liveness. Finding 264.
 	if len(block) > 3 and block[3] is True and first is None \
 			and CODE_SABOTAGE != "modetrue":
-		# **Rebuild it as mode "home", which needs no xmm at all.** Both
-		# GPRs go to the callee home space and come back, so nothing has
-		# to hold the index for three instructions -- which is the only
-		# thing mode True wanted an xmm for. Measured on Starfield: all
-		# 1,850 sites the guard refuses have home space, two unnamed GPRs
-		# and 16 bytes free after the mover's 8, so the fallback is total
-		# rather than partial.
+		# **The sites the borrow above left unserved.** It rewrites the
+		# mode when it takes a slot stash; this catches a mode True block
+		# that reached here with no xmm at all -- Finding 264's defect,
+		# where the mover won and the borrow was skipped entirely, so the
+		# emitter would have been handed `helper=None` and emitted no
+		# stash, leaving a live index register clobbered.
 		#
-		# **The mover is excluded by name.** It was chosen against the OLD
-		# block's two registers, so nothing yet stops the rebuild handing
-		# the same register to the pointer -- which would have the stub
-		# save a register, load the block over it, and restore rubbish.
-		#
-		# And its saves start at `lent + home_used` rather than at `lent`:
-		# the mover already holds the first eight bytes, and the original
-		# construction below sets `home_used = 16` because it runs before
-		# the mover exists. Finding 265.
-		unnamed = [n for n in sorted(window_gpr_unnamed(home, address,
-		                                                window),
-		                             reverse=True)
-		           if n != mover]
-		if len(unnamed) < 2:
+		# Both callers go through `block_off_xmm` so there is one
+		# derivation rather than two that drift. Findings 264, 265, 269.
+		rebuilt = block_off_xmm(block, mover, home, instructions, index,
+		                        address, window, lent, home_used)
+		if rebuilt is None:
 			return refuse("mode True has no xmm to stash the index in")
-		if lent is None or home_used + 2 * 8 > HOME_SPACE:
-			# No callee home space to fall back into either, so the stub
-			# allocates its own. Finding 268.
-			if window_touches_rsp(instructions, index, address, window):
-				return refuse("mode True has no xmm to stash the index in")
-			block = (unnamed[0], unnamed[1], block[2], "frame",
-			         0) + block[5:]
-		else:
-			block = (unnamed[0], unnamed[1], block[2], "home",
-			         lent + home_used) + block[5:]
-			home_used += 2 * 8
+		# **The tail, which the helper does not carry.** `block` is the
+		# ten-tuple by the time this runs -- mover, mover_save, the two
+		# borrows and the mover's slot -- while `block_off_xmm` returns
+		# only the five fields that describe the pointer. Dropping the
+		# rest took `block[5]` away, and `lower_ymm_span` allows a member
+		# no helper only where a mover is there: 2,025 sites refused
+		# "member load/store wants a helper and has none" and the frontier
+		# went backwards by 531. The borrow's caller above is unaffected
+		# because `block` is still five fields there. Finding 269.
+		block, home_used = rebuilt[0] + block[5:], rebuilt[1]
 	told = []
 	if lower_ymm_span(entries, base, first, address, address, block,
 	                  second, told) is None:

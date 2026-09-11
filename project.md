@@ -13779,6 +13779,42 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 269 -- two decisions in the wrong order, and the refactor that cost 531
+
+The xmm borrow refused a volatile stash whenever the block was mode True, because mode True
+stands its pointer up USING an xmm and a slot stash would be destroyed before the slot
+exists. Forty lines later, Finding 265's guard rebuilt that same block as "home" or "frame" --
+modes wanting no xmm at all, under which the stash composes perfectly.
+
+**322 of 381 sites refused "no non-volatile xmm this function saves" were declined by the
+order of two decisions rather than by anything the site lacked.** Measured before building:
+58 had no free volatile xmm and 1 nowhere for the block's saves.
+
+    no non-volatile xmm this function saves     381  ->      1
+    unit refusals                             2,566  ->  2,258     -308
+    VEX in .text                              3,008  ->  2,944      -64
+
+It is not a reorder: the borrow needs the final mode, and the guard's trigger depends on what
+the borrow found. The rewrite moved into `block_off_xmm`, called from both -- one derivation
+rather than two, which is Finding 261's lesson applied before rather than after.
+
+**And the first attempt made it 531 sites WORSE.** `block_off_xmm` returns the five fields
+describing the pointer; the guard operates on the ten-tuple, and truncating it dropped
+`block[5]`, the mover. `lower_ymm_span` allows a member no helper only where a mover is there,
+so 2,025 sites were refused `member load/store wants a helper and has none`. The borrow's
+caller is unaffected because `block` is genuinely five fields there, which is exactly why one
+helper serving two callers with different tuple shapes was the wrong seam.
+
+**What caught it was the frontier number, and nothing else could have.** All 13 fixtures
+passed. `verify` held every invariant -- no stale upper halves, every stub decoding, no VEX in
+the stub, and the liveness gate of Finding 266 silent. The image was CORRECT and merely much
+worse.
+
+**A regression that only loses work is invisible to every check in this tree.** Every gate here
+asks whether the bytes are right; none asks whether there are fewer of them than last time.
+The only instrument that sees it is comparing the frontier across builds, which is a thing a
+person does by hand -- and would not have done, had the number not been in front of them.
+
 ### Finding 268 -- the stub allocates its own sixteen bytes
 
 Everything since Finding 262 moved a claimant off the 32-byte callee home space and into the
