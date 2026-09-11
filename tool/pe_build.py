@@ -3042,6 +3042,85 @@ tls_directory:
 PROGRAMS["nonvolbad"] = PROGRAMS["nonvol"]
 
 
+# **A leaf, so there is no home space to lend.** `nonvol` says it in its
+# own listing -- `call helper` is what "makes the home space real" -- and
+# without one `borrow_offset` returns None, which is the condition Finding
+# 268's stub-allocated frame exists for. All seven volatile GPRs are live
+# across the site and every volatile xmm holds a value read afterwards, so
+# nothing is dead and nothing can be lent: the block pointer has to come
+# from sixteen bytes the STUB allocates with `sub $16,%rsp`.
+#
+# 77 is 15 from the xmm chain and 62 from an upper half, exactly as
+# `nonvol` computes it. A frame that failed to restore `rsp` would return
+# into rubbish rather than give a wrong number, and one that failed to
+# restore a borrowed GPR loses the 21 the seven registers contribute.
+PROGRAMS["noframe"] = (77, """
+	.text
+	.globl _start
+_start:
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movl	$1, %eax
+	movl	$2, %ecx
+	movl	$3, %edx
+	movl	$4, %r8d
+	movl	$5, %r9d
+	movl	$6, %r10d
+	movl	$0, %r11d
+	movss	two(%rip), %xmm0
+	movss	two(%rip), %xmm1
+	movss	two(%rip), %xmm2
+	movss	two(%rip), %xmm3
+	movss	two(%rip), %xmm4
+	movss	three(%rip), %xmm5
+	vmovups	(%rsi), %ymm8
+	vmovups	0x20(%rsi), %ymm9
+	vpaddd	%ymm8, %ymm9, %ymm9	/* wants a block and two helpers */
+	vmovups	%ymm9, (%rdi)
+	addl	%ecx, %eax		/* all seven GPRs read after the site */
+	addl	%edx, %eax
+	addl	%r8d, %eax
+	addl	%r9d, %eax
+	addl	%r10d, %eax
+	addl	%r11d, %eax		/* eax = 21, and discarded below */
+	addss	%xmm1, %xmm0		/* every volatile xmm read after it */
+	addss	%xmm2, %xmm0
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0
+	cvttss2si %xmm0, %eax		/* 13 */
+	addl	16(%rdi), %eax		/* + 62 from the upper half = 75 */
+	addl	$2, %eax		/* = 77 */
+	ret
+func_end:
+	.p2align 4
+two:	.float 2.0
+three:	.float 3.0
+	.p2align 5
+source:	.long 0, 0, 0, 0
+	.long 57, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 5, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **What an unwind would actually read.** The non-volatile borrow is safe
 # because a fault has the unwinder restore xmm6 from THIS function's own
 # UWOP_SAVE_XMM128 slot -- so the one thing that would destroy the

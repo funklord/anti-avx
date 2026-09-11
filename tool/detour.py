@@ -902,6 +902,30 @@ SLOT = 16
 VOLATILE_XMM = tuple(range(6))
 
 # sub $16,%rsp and add $16,%rsp, which the pool spill does not need.
+def window_touches_rsp(instructions, index, address, window):
+	"""Does anything in this window read or move `rsp`?
+
+	**A stub that allocates its own sixteen bytes shifts every `(%rsp)` a
+	passenger uses.** The window's instructions are re-emitted inside the
+	stub, so one that reads `0x20(%rsp)` would read sixteen bytes off after
+	a `sub`. `call`, `push` and `pop` count too: each moves `rsp` on its
+	own, and a call also wants the alignment the allocation preserves.
+
+	Counted rather than adjusted, because adjusting a displacement is a
+	per-instruction rewrite and refusing is one test. Measured on
+	Starfield: 1,879 of 2,006 blocked sites never touch it. Finding 268.
+	"""
+	end = address + window
+	for entry in instructions[index:]:
+		if entry[0] >= end:
+			return False
+		if "%rsp" in (entry[3] or ""):
+			return True
+		if entry[2] in ("push", "pushq", "pop", "popq", "call"):
+			return True
+	return False
+
+
 STACK_OPEN = bytes([0x48, 0x83, 0xEC, 0x10])
 STACK_CLOSE = bytes([0x48, 0x83, 0xC4, 0x10])
 
@@ -4842,7 +4866,20 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# `encode_spill`'s argument and the same one. Finding 255.
 			body += encode_spill(register, True, at + len(body), 0, 0,
 			                     where)
-		if mode == "home":
+		if mode == "frame":
+			# **The stub's own sixteen bytes, at `(%rsp)`.** Identical to
+			# the "home" arm below except for the bracket: the offsets are
+			# 0 and 8 off the freshly lowered `rsp` rather than into the
+			# caller's frame. `window_touches_rsp` has already refused any
+			# window whose passengers read `(%rsp)`, so nothing inside
+			# shifts. Finding 268.
+			body += STACK_OPEN
+			body += encode_gpr_home(block[0], True, 0)
+			body += encode_gpr_home(block[1], True, 8)
+			body += encode_tls_base(block[0], block[1], block[2],
+			                        at + len(body))
+			body += encode_gpr_home(block[1], False, 8)
+		elif mode == "home":
 			# The block's own save comes back at the very END of the stub,
 			# because unlike the index it has to hold the pointer for
 			# every member. See the restore below the member loop.
@@ -5377,6 +5414,11 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		body += encode_spill(register, False, at + len(body), 0, 0, where)
 	if block is not None and len(block) > 6 and block[6] is not None:
 		body += encode_gpr_at(block[5], False, None, block[6])
+	if block is not None and len(block) > 3 and block[3] == "frame":
+		# The pointer back, then the sixteen bytes given up -- `rsp` is
+		# where the site left it before the single exit below.
+		body += encode_gpr_home(block[0], False, 0)
+		body += STACK_CLOSE
 	if block is not None and len(block) > 3 and block[3] == "home":
 		# **The one place it can go.** Past the refusals this function has
 		# a single exit, and every member above has finished with the
@@ -6070,15 +6112,35 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		# window reads or writes them while the borrow stands. That is a
 		# weaker test than `window_gpr_free` and it is why sites with
 		# nothing dead can still be reached. Finding 249.
-		if lent is None:
-			return refuse("no dead GPR and no home space to save one")
 		spare = sorted(window_gpr_unnamed(home, address, window),
 		               reverse=True)
 		if len(spare) < 2:
 			return refuse("fewer than two unnamed GPRs to borrow")
 		base = tls[1]
-		block = (spare[0], spare[1], tls[0], "home", lent)
-		home_used = 16
+		# `frame` forces the stub-allocated path where the home space
+		# would have served, so a fixture can exercise an emission no
+		# fixture reaches naturally: on Starfield `lent is None` comes
+		# from frame states this cannot reproduce by hand. Finding 268.
+		if lent is None or CODE_SABOTAGE == "frame":
+			# **The stub allocates its own sixteen bytes.** Everything
+			# since Finding 262 has moved a claimant off the 32-byte
+			# callee home space and into the block's 64 bytes of scratch,
+			# and the block pointer is the one claimant that cannot go:
+			# a slot is addressed off the pointer, so it cannot hold the
+			# registers that stand the pointer up. `(%rsp)` can, because
+			# it needs no register to address -- the same property the
+			# home space has, without needing the caller to have left one.
+			#
+			# `--spill=stack` already emits this and `stub_unwind`
+			# already describes it with UWOP_ALLOC_SMALL, so this reuses
+			# both rather than inventing a second. Finding 268.
+			if window_touches_rsp(instructions, index, address, window):
+				return refuse("no home space, and the window uses rsp")
+			block = (spare[0], spare[1], tls[0], "frame", 0)
+			home_used = 0
+		else:
+			block = (spare[0], spare[1], tls[0], "home", lent)
+			home_used = 16
 
 	entries = span_entries(members, instructions, slots, scope, plain)
 	helpers, _whole = region_helpers(plain, instructions, index, last,
@@ -6291,12 +6353,19 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		                                                window),
 		                             reverse=True)
 		           if n != mover]
-		if lent is None or len(unnamed) < 2 \
-				or home_used + 2 * 8 > HOME_SPACE:
+		if len(unnamed) < 2:
 			return refuse("mode True has no xmm to stash the index in")
-		block = (unnamed[0], unnamed[1], block[2], "home",
-		         lent + home_used) + block[5:]
-		home_used += 2 * 8
+		if lent is None or home_used + 2 * 8 > HOME_SPACE:
+			# No callee home space to fall back into either, so the stub
+			# allocates its own. Finding 268.
+			if window_touches_rsp(instructions, index, address, window):
+				return refuse("mode True has no xmm to stash the index in")
+			block = (unnamed[0], unnamed[1], block[2], "frame",
+			         0) + block[5:]
+		else:
+			block = (unnamed[0], unnamed[1], block[2], "home",
+			         lent + home_used) + block[5:]
+			home_used += 2 * 8
 	told = []
 	if lower_ymm_span(entries, base, first, address, address, block,
 	                  second, told) is None:
@@ -7917,6 +7986,15 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				if reasons is not None:
 					reasons["the span operand cannot be moved"] += 1
 				return None, 0
+			# **Where a frame-backed block's allocation completes**, which
+			# is what the unwind code's offset means. `lower_ymm_span`
+			# emits `STACK_OPEN` as the first thing in what it returns, so
+			# the `sub` ends that many bytes into this body -- and a
+			# backward-widened window has already emitted its swallowed
+			# instructions above, which is why it is measured here rather
+			# than assumed to be zero. Finding 268.
+			if len(span_block) > 3 and span_block[3] == "frame":
+				prologue = len(body) + len(STACK_OPEN)
 			body += lowered
 			lowered = b""
 		else:

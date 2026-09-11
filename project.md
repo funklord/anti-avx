@@ -13779,6 +13779,49 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 268 -- the stub allocates its own sixteen bytes
+
+Everything since Finding 262 moved a claimant off the 32-byte callee home space and into the
+block's 64 bytes of scratch, and Finding 267 ended by naming the one claimant that cannot go:
+a slot is addressed off the block pointer, so it cannot hold the registers that stand the
+pointer up. 2,006 sites were refused for it -- 1,599 with no dead GPR and no home space, and
+407 where mode True had no xmm and mode "home" had no space to fall back into.
+
+**`(%rsp)` needs no register to address either**, which is the property the home space has and
+the slots lack. So where the caller has lent nothing, the stub allocates sixteen bytes of its
+own. It is not new machinery: `--spill=stack` already emits `sub $0x10,%rsp`, and
+`stub_unwind` already writes `UWOP_ALLOC_SMALL` for any non-zero prologue, so the only unwind
+work was threading the measured offset out of `build_stub`. Mode "frame" is mode "home" with
+`block[4] = 0` and a bracket.
+
+Measured at the refusal before building, counting `call`, `push` and `pop` as unsafe along
+with any `%rsp` read:
+
+    no dead GPR and no home space   1,599     rsp untouched 1,488    touches 111
+    mode True, no stash               407     rsp untouched   391    touches  16
+
+**1,879 predicted, 1,879 delivered**: the refusals fell to exactly 111 and 16.
+
+    unit candidates built     33,411  -> 34,410     +999
+    unit refusals              4,134  ->  2,566   -1,568
+    sites through a slot      33,072  -> 33,639     +567
+    VEX in .text               3,268  ->  3,008     -260
+    windows not placed           468  ->    902     +434
+    stub section           4,618,730  -> 4,652,959
+
+260 frontier sites against a predicted 250-350. **The withheld windows nearly doubled**, which
+is the same pull every lever here has met: lowering more sites through slots creates more
+places a surviving 256-bit reader can meet a stale register.
+
+**No fixture reaches this path, and the attempt to build one is worth recording.** `noframe`
+is a leaf with no `call`, written on the strength of `nonvol`'s own comment that a call is
+what "makes the home space real" -- and it lowered through mode "home" anyway, because a leaf
+entered by the loader still has a return address and the caller's home space above `rsp`. On
+Starfield `lent is None` comes from frame states that cannot be reproduced by hand. So the
+path is forced instead: `ANTI_AVX_SABOTAGE=frame` takes it where the home space WOULD have
+served, and `make check-frame` asserts a frame was actually emitted before believing the 77 --
+because a fixture that quietly took the other path would pass and prove nothing.
+
 ### Finding 267 -- the mover moves off the home space, and meets the next wall
 
 `no register to move a half through` was 642 sites: no spare dead GPR, and no room in the
