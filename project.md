@@ -13987,6 +13987,12 @@ receipt over a fresh measurement; this is the same rule for a gate.
 check by name**, because failing for another reason proves nothing. It needs the game binary
 and about an hour, so it is not part of `check`.
 
+**Re-proved after Finding 269 changed the mode logic the sabotage depends on**: exit 1, **898
+stubs, every one %rax**, still headed by `0x140055e9e`. It was 793 when the gate was built --
+higher now because more sites reach a slot, which is the control tracking the tree rather than
+drifting from it. A control that has quietly gone inert is worse than none, so it is re-run
+whenever the decision it sabotages is touched.
+
 ### Finding 265 -- the mode the site could have had all along
 
 Finding 264 refused mode True where nothing could stash the index, at 1,850 sites and 624
