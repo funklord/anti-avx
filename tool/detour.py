@@ -2758,6 +2758,25 @@ def moved_instruction(entry, at, pool=0, reasons=None):
 	"""
 	address, moved, comment, moved_operands, moved_mnemonic = entry[:5]
 	scratch = entry[5] if len(entry) > 5 else None
+	# **EVEX is recognised and left alone, and a window that swallows one
+	# has not left it alone.** `isa_guard` requires every EVEX instruction
+	# in `.text` to be byte-identical: 179 of them are unreachable on a
+	# pre-AVX host only because a runtime CPUID test says so, and the
+	# rewriter's job at 512 bits is to recognise them and stop. A window
+	# widened over one copies it into the stub verbatim and writes a jump
+	# and padding over the original, which is not leaving it alone however
+	# faithful the copy.
+	#
+	# Nothing refused it before because no window had ever reached one.
+	# Finding 271's immediate form moved the placement enough that a
+	# four-byte `vpaddd` at 0x1434d8eaf widened forward over the six-byte
+	# `vpdpbusd` at 0x1434d8eb3, and `isa_guard` caught it -- which is the
+	# gate doing exactly what it was written for. Refusing here costs the
+	# window and keeps the bytes. Finding 272.
+	if moved and moved[0] == 0x62:
+		if reasons is not None:
+			reasons["a swallowed instruction is EVEX"] += 1
+		return None
 	if moved and moved[0] in (0xC4, 0xC5):
 		# The swallowed instruction is VEX as well. Lower it here rather
 		# than carry it across.

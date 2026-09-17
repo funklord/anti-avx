@@ -13779,6 +13779,32 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 272 -- a window may not swallow what the rewriter promised to leave alone
+
+`isa_guard` requires every EVEX instruction in `.text` to be byte-identical. 179 of them are
+unreachable on a pre-AVX host only because a runtime CPUID test says so, and **the rewriter's
+job at 512 bits is to recognise them and stop.**
+
+`moved_instruction` has a case for VEX and none for EVEX, so a swallowed one fell through to
+the generic byte copy: the instruction is reproduced faithfully inside the stub and a jump
+with padding is written over the original. That is not leaving it alone.
+
+    original   62 d2 75 28 50 e0   vpdpbusd %ymm8,%ymm1,%ymm4
+    after      05 0f 1f 44 00 00   the tail of a jmp, then a nop
+
+A four-byte `vpaddd %ymm3,%ymm6,%ymm7` at `0x1434d8eaf` widened forward over the six-byte
+EVEX at `0x1434d8eb3` to make room for its jump.
+
+**Nothing refused it because no window had ever reached one**, and the hole is as old as the
+swallow path. Finding 271's immediate form shifted the placement enough to make this window
+placeable, which is the FMA exemption's shape exactly: a dormant gap that needs a change
+somewhere else before it can be entered. Refusing costs the window and keeps the bytes.
+
+**`isa_guard` caught it and no fixture could have.** There is no EVEX in any fixture, and the
+frontier number on the broken image was 3,228 -- better than the 3,231 the fix produces. A
+build that corrupts two instructions and reports a better number than the correct one is
+exactly what a structural gate is for, and exactly what a scoreboard is not.
+
 ### Finding 270 -- Finding 268 contradicts Finding 68, and Finding 68 is right
 
 **Finding 268's mode "frame" must be reverted.** It emits `sub $0x10,%rsp` inside a stub,
