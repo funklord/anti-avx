@@ -74,7 +74,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
-        census spans gprs shapes cost-bench cost status probe why check-shadow check-shadow-pe check-run-borrow check-spill check-tls check-unwind check-vex check-liveness check-frame \
+        census spans gprs shapes cost-bench cost status probe why check-shadow check-shadow-pe check-run-borrow check-spill check-tls check-unwind check-vex check-liveness \
         check-lanes check-span check-shapes \
         detour-plan detour-verify hooks clean \
         distclean help
@@ -581,50 +581,6 @@ detour: $(DETOURED)
 #
 # Termination: two bounded invocations over a fixed input, each under a
 # timeout. Roughly an hour, so it is not part of `check`.
-# **The stub-allocated frame, forced onto fixtures that do not need it.**
-# No fixture reaches mode "frame" naturally: it wants `lent is None`, and a
-# leaf entered by the loader still has the caller's home space above `rsp`
-# -- `noframe` was built to have none and lowered through mode "home"
-# anyway. On Starfield the condition comes from frame states that cannot be
-# reproduced by hand, so `ANTI_AVX_SABOTAGE=frame` takes the path where the
-# home space WOULD have served and the answer must not change. Finding 268.
-#
-# Cheap: fixtures only, no game binary.
-check-frame:
-	@command -v wine >/dev/null 2>&1 || \
-		{ echo "check-frame: wine is not installed"; exit 1; }
-	@set -e; \
-	for name in nogpr noframe; do \
-		$(PYTHON) tool/pe_build.py sample $$name \
-			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
-		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
-			> $(BUILD_DIR)/pe-$$name-320.asm; \
-		ANTI_AVX_SABOTAGE=frame $(PYTHON) tool/detour.py \
-			--shadow-regs=all apply $(BUILD_DIR)/pe-$$name-320.exe \
-			$(BUILD_DIR)/pe-$$name-320.asm \
-			$(BUILD_DIR)/sse-$$name-frame.exe > /dev/null; \
-		frames=`objdump -d -j .avxsse \
-			$(BUILD_DIR)/sse-$$name-frame.exe 2>/dev/null \
-			| grep -c 'sub .*0x10,%rsp' || true`; \
-		if [ "$$frames" = "0" ]; then \
-			echo "check-frame: $$name emitted NO stub frame, so its"; \
-			echo "             77 says nothing about the path here"; \
-			exit 1; \
-		fi; \
-		got=0; \
-		WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all \
-			WINEDLLOVERRIDES=winedbg.exe=d \
-			wine $(BUILD_DIR)/sse-$$name-frame.exe >/dev/null 2>&1 \
-			|| got=$$?; \
-		if [ "$$got" != "77" ]; then \
-			echo "check-frame: $$name returned $$got through a stub-"; \
-			echo "             allocated frame, want 77"; \
-			exit 1; \
-		fi; \
-		echo "check-frame: $$name -- $$frames frame(s), rsp given back,"; \
-		echo "             and the answer survived"; \
-	done
-
 check-liveness: $(LISTING)
 	@set -e; \
 	echo "check-liveness: building a deliberately broken image"; \

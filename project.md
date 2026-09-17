@@ -13813,10 +13813,25 @@ sites: an exception raised in, or unwound through, one of those stubs gets a fra
 bytes wrong. It is latent rather than visible -- `verify` reads bytes and structure, not what
 an unwinder would compute, which is the same blindness Finding 264 exploited.
 
-**What to do.** Revert the "frame" arm of `block_off_xmm` and the mode "frame" emission, and
-let those sites refuse as they did before Finding 268. That returns the frontier from 2,944
-to about 3,268 and restores `no dead GPR and no home space to save one` at 1,599. The
-`ANTI_AVX_SABOTAGE=frame` hook and `make check-frame` go with it.
+**Done, and priced.** The "frame" arm of `block_off_xmm`, the mode "frame" emission, the
+`ANTI_AVX_SABOTAGE=frame` hook, `make check-frame` and the `noframe` fixture are gone;
+`STACK_OPEN` and `STACK_CLOSE` stay, because they belong to `--spill=stack`, which is not the
+default for this reason. Finding 267's mover slot stays too -- it never moves `rsp`.
+
+    no dead GPR and no home space to save one        0  ->  1,599
+    mode True has no xmm to stash the index in       0  ->    407
+    unit refusals                                2,258  ->  4,002
+    sites through a slot                        33,699  -> 33,078
+    VEX in .text                                 2,944  ->  3,262
+
+318 sites, against a predicted 318. Every invariant still holds, the liveness gate of Finding
+266 included.
+
+**Re-measured before reverting rather than taken from the record**, since a fact recorded
+without re-measurement has a shelf life and wine has moved since Finding 49: `unwind` 42,
+`unwindstub` 42, **`unwindspill` 99**. The defect is live today, not historical -- and the
+gate asserting the mechanism is broken had been passing beside mode "frame" the whole time it
+existed.
 
 **And the 2,006 sites stay blocked for the reason Finding 267 named**: a slot is addressed
 off the block pointer and cannot hold the registers that stand it up, `(%rsp)` can but cannot
