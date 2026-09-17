@@ -3042,6 +3042,74 @@ tls_directory:
 PROGRAMS["nonvolbad"] = PROGRAMS["nonvol"]
 
 
+# **An in-lane operation with an immediate, all three narrowings.** Finding
+# 271: 108 sites, every one per-lane, and the opcode decides how each is
+# narrowed. This exercises all three rather than the common one:
+#
+#   vpslld $1,%ymm1,%ymm2   the shift group with src != dst, so the low
+#                           half needs `movaps S,D` before the operation
+#   vpsrld $2,%ymm1,%ymm1   the shift group with src == dst, no move
+#   vpshufd $1,%ymm3,%ymm4  ModRM.reg is a register, so it strips straight
+#
+# 77 is 8 + 16 + 1 + 2 + 30 + 20, one term per half of each site, and every
+# term is read. A shift applied to the wrong operand, an immediate dropped
+# from one half, or an upper half taken from the wrong slot each change a
+# term rather than cancelling: there is no pair here that sums the same
+# way round.
+PROGRAMS["immreg"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	(%rsi), %ymm1		/* low 4, high 8 */
+	vpslld	$1, %ymm1, %ymm2	/* src != dst: 8 and 16 */
+	vmovups	%ymm2, (%rdi)
+	vpsrld	$2, %ymm1, %ymm1	/* src == dst: 1 and 2 */
+	vmovups	%ymm1, 0x20(%rdi)
+	vmovups	0x20(%rsi), %ymm3
+	vpshufd	$1, %ymm3, %ymm4	/* dst[0] = src[1], per lane: 30 and 20 */
+	vmovups	%ymm4, 0x40(%rdi)
+	movl	(%rdi), %eax		/* 8 */
+	addl	16(%rdi), %eax		/* + 16 */
+	addl	0x20(%rdi), %eax	/* + 1 */
+	addl	0x30(%rdi), %eax	/* + 2 */
+	addl	0x40(%rdi), %eax	/* + 30 */
+	addl	0x50(%rdi), %eax	/* + 20 = 77 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 4, 0, 0, 0
+	.long 8, 0, 0, 0
+	.long 0, 30, 0, 0
+	.long 0, 20, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 
 # **What an unwind would actually read.** The non-volatile borrow is safe
 # because a fault has the unwinder restore xmm6 from THIS function's own

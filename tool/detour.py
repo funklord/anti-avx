@@ -4156,7 +4156,8 @@ def span_shape_name(encoding, operands):
 # what is built.
 SPAN_EMITTABLE = frozenset(("load", "store", "lane mem,D,D",
                             "a register second source, src1 is D",
-                            "a register second source, D of its own"))
+                            "a register second source, D of its own",
+                            "an immediate form"))
 
 
 def region_start(instructions, index, blocked, limit=192):
@@ -4505,6 +4506,28 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 		# `op mem,%ymmD,%ymmD` -- src1 IS the destination, so the SSE form
 		# is the prefix dropped and nothing rearranged.
 		return ("lane", canonical_ymm(fields[2]))
+	if len(fields) == 3 and len(wide) == 2 and fields[0].startswith("$"):
+		# **`op $imm,%ymmS,%ymmD` -- an in-lane operation with an
+		# immediate.** Every one of the 108 in Starfield operates within
+		# each 128-bit lane, so both halves take the SAME immediate
+		# unchanged: 104 shifts, two `vroundps` and two `vpshufd`. The
+		# cross-lane immediates -- `vperm2f128`, `vpermq`, `vpermilps` --
+		# are held out by NO_LEGACY_FORM and this shape is deliberately
+		# NOT in SLOT_SHAPES, so they stay refused rather than reaching
+		# here and being split per lane, which would be wrong.
+		#
+		# **Two narrowings, and the opcode is what tells them apart.**
+		# `0F 71/72/73` is the immediate-shift group: ModRM.reg is an
+		# opcode extension and `vvvv` carries the DESTINATION, so the SSE
+		# form puts the destination in r/m and the operands move.
+		# Everything else uses ModRM.reg as a register and the prefix
+		# strips directly. `vvvv` cannot be the discriminator, because
+		# `decode_vex` normalises the inverted field and an unused vvvv
+		# is indistinguishable from register 0 -- `vpslld $2,%ymm1,%ymm0`
+		# would read as the non-destructive form and be emitted wrong.
+		# Finding 271.
+		return ("immreg", canonical_ymm(fields[2]),
+		        canonical_ymm(fields[1]))
 	if len(fields) == 3 and len(wide) == 3 and fields[1] == fields[2]:
 		# `op %ymmS,%ymmD,%ymmD` -- the second source is a REGISTER, so its
 		# upper half is in a slot of its own and the operation has to reach
@@ -4582,7 +4605,7 @@ def span_entries(members, instructions, slots, scope, plain):
 			if shape is not None and shape[0] in ("lanereg", "lanereg3",
 			                                      "extract", "perm2",
 			                                      "permil", "regmove",
-			                                      "lanemem"):
+			                                      "lanemem", "immreg"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
@@ -5268,6 +5291,55 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			low_dst = scratch_finder.xmm_numbers(destination)[0]
 			body += encode_movaps(low_dst, helper)
 			body += span_slot_move(second_helper, True, base, slot, block,
+			                       at + len(body))
+			continue
+		if what == "immreg":
+			# **One immediate, applied to each half unchanged**, which is
+			# what makes an in-lane operation splittable at all. The
+			# classifier has already refused the cross-lane immediates.
+			#
+			# The shift group takes its destination from `vvvv` and the
+			# SSE form puts it in r/m, so the low half needs the source
+			# moved into the destination first -- `movaps S,D; op $imm,D`
+			# -- exactly as a Class C site does one width down. Every
+			# other immediate form has the same operand layout in both
+			# encodings and strips straight through. Finding 271.
+			if second is None:
+				return refuse("immreg source is in no slot")
+			destination, source = shape[1], shape[2]
+			low_dst = scratch_finder.xmm_numbers(destination)[0]
+			low_src = scratch_finder.xmm_numbers(source)[0]
+			shift = vex["map"] == 1 and tail[:1] in (b"\x71", b"\x72",
+			                                        b"\x73")
+			immediate = tail[2:]
+
+			def immediate_op(reg, rm, extension=None):
+				"""The narrowed operation, `reg` ignored for a shift."""
+				field = extension if extension is not None else reg
+				return inplace.sse_encoding(
+					dict(vex, L=0, X=0,
+					     R=0 if extension is not None else reg >> 3,
+					     B=rm >> 3),
+					tail[:1] + bytes([0xC0 | ((field & 7) << 3)
+					                  | (rm & 7)]) + immediate)
+
+			extension = ((tail[1] >> 3) & 7) if shift else None
+			if shift and low_dst != low_src:
+				body += encode_movaps(low_dst, low_src)
+			low = immediate_op(low_dst, low_dst if shift else low_src,
+			                   extension)
+			if low is None:
+				return refuse("immreg low operation has no SSE form")
+			body += low
+			# The upper half: the source's slot into the helper, the same
+			# operation on it, the helper into the destination's slot.
+			body += span_slot_move(helper, False, base, second, block,
+			                       at + len(body))
+			high = immediate_op(helper, helper, extension)
+			if high is None:
+				return refuse("immreg high operation has no SSE form")
+			body += high
+			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
 		if what == "lanereg3":

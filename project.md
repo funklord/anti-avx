@@ -13805,6 +13805,44 @@ frontier number on the broken image was 3,228 -- better than the 3,231 the fix p
 build that corrupts two instructions and reports a better number than the correct one is
 exactly what a structural gate is for, and exactly what a scoreboard is not.
 
+### Finding 271 -- the immediate form, and what a shape refusal actually costs
+
+`op $imm,%ymmS,%ymmD` was refused outright: `span_operand_shape` returned None for a
+three-operand form whose first field is an immediate. 108 sites.
+
+**Every one is per-lane**, which is what makes the shape splittable at all -- 104 shifts, two
+`vroundps`, two `vpshufd`. The cross-lane immediates are held out by `NO_LEGACY_FORM`, and
+`immreg` is deliberately NOT in `SLOT_SHAPES` so they stay refused rather than reaching the
+emitter and being split per lane, which would be wrong.
+
+**Two narrowings, and the opcode decides.** `0F 71/72/73` is the immediate-shift group:
+ModRM.reg is an opcode extension and `vvvv` carries the DESTINATION, so the SSE form puts the
+destination in r/m, the operands move, and the low half needs `movaps S,D` first. Every other
+immediate form has the same layout in both encodings and strips straight through.
+
+**`vvvv` cannot be the discriminator**, which is the part worth keeping. `decode_vex`
+normalises the inverted field, so an unused `vvvv` and register 0 are both 0 --
+`vpslld $2,%ymm1,%ymm0` would read as the non-destructive form and be emitted wrong. The
+opcode is the reliable test.
+
+**The prediction was 108 and the delivery was 31**, and the reasoning that produced 108 was
+sound about the wrong question. Intersecting refusals with survivors showed shape classes
+surviving at 100% -- nothing else emits them either -- and that IS true: the refusal is
+dissolved and `shape an immediate form` is gone from the census. But accepting the shape only
+removes the FIRST wall. 68 of the 108 then hit a resource one, and the three register
+refusals rose by 162 between them to receive them.
+
+    shape an immediate form                        216  ->      0
+    no dead GPR and no home space to save one    1,599  ->  1,667
+    no non-volatile xmm this function saves        183  ->    235
+    no volatile xmm and scratch slot to stash it   216  ->    258
+    unit refusals                                4,002  ->  3,912
+    VEX in .text                                 3,262  ->  3,231
+
+So **"100% of a shape class survives" is not "accepting the shape lowers 100% of it"**. The
+first says nothing else can emit these; the second requires the site to clear every later
+gate too, and at 99.6% most sites are short of something.
+
 ### Finding 270 -- Finding 268 contradicts Finding 68, and Finding 68 is right
 
 **Finding 268's mode "frame" must be reverted.** It emits `sub $0x10,%rsp` inside a stub,
