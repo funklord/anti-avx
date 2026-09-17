@@ -13779,6 +13779,50 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 275 -- the xmm shortage is registers, and the mode is finished at 99.6%
+
+The last class never looked inside was the 258-site xmm shortage. Measured at the refusal:
+
+    reached the volatile borrow            987
+      no free volatile xmm (need 2)        292
+      block is None                          0
+      no free scratch slot                   0
+    members touch: 14 xmm (42), 9 (40), 7 (36), 13 (36), 5 (32), 10 (32), 12 (22)
+
+**The slots are never the limit and the block is always there.** It is registers every time:
+a window whose members name five to fourteen distinct xmm leaves nothing among the six
+volatile ones. The exclusion is window-wide and has to be -- a helper is clobbered, so a
+register any member READS cannot serve, and a borrowed one holds the helper's value for the
+window's length rather than its owner's.
+
+So it joins the 908 as register pressure rather than bookkeeping, and the frontier at 3,231
+is:
+
+    structurally impossible -- no register, nowhere to save          908
+    in a window the repair dropped -- downstream of readers          529
+    FMA and friends, no legacy encoding exists                      ~370
+    xmm pressure                                                     258
+    undecodable -- not instructions at all                           180
+    shapes this could emit but placement absorbs                     155
+
+**Only the last row is work, and the last attempt at that row produced a byte-identical
+image.** Finding 273 lowered 97 sites' worth of shape, built 33 candidates, and placed none.
+That is the evidence that the binding constraint has left the classes a census can enumerate
+and moved into placement, and it is why `src2-is-D` and the register-to-register move are not
+picked here: they are the same work whose last instance paid nothing.
+
+**One idea remains untried and its risk is known.** `unit_candidate` absorbs the whole run of
+adjacent 256-bit sites rather than stopping at five bytes, so its windows are large and their
+members touch many registers -- which is exactly what starves the helper. A shorter window
+would touch fewer. But the greedy absorption exists because the first version produced one
+window per site, each overlapping the next: three candidates built and one placed. Trimming
+trades a helper shortage for an overlap problem, and which wins is not predictable from here.
+
+**The larger number is not inside this mode.** `--shadow-regs=all` reaches 3,231 where the
+shipped default reaches 5,691 -- **2,460 sites** -- for about 20% more stub. Whether that
+trade is taken is the copyright holder's, and it is worth more than everything left in the
+list above combined.
+
 ### Finding 274 -- the repair's cost is mostly the site itself, and a fix for the rest lost
 
 The stale-read repair withholds 583 windows and the census attributes 529 survivors to them,
