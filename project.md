@@ -13779,6 +13779,43 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 273 -- the shape lands, the image does not change, and that is the finding
+
+`op $imm,%ymmS2,%ymmS1,%ymmD` -- `lanereg3` with a selector. 95 `vshufps` and 2 `vpblendw`
+of the 111 sites in the four-operand bucket, all per-lane. The other 14 are `vblendvps` and
+`vblendvpd`, which carry a REGISTER mask that SSE takes only in the implicit `xmm0`; they are
+excluded by requiring an immediate rather than by a list.
+
+    shape four operands                    222  ->     28
+    unit candidates built               33,522  -> 33,555     +33
+    unit refusals                        3,912  ->  3,846     -66
+    windows not placed                     550  ->    583     +33
+    VEX in .text                         3,231  ->  3,231      0
+
+**The output image is byte-identical.** Every one of the 33 new candidates was built and
+none was placed: the placer table is unchanged to the site -- `unit placed 18,390` before and
+after -- and the repair withheld exactly as many windows as the shape added. 111 sites
+offered, 97 accepted, 33 reaching a candidate, **0 reaching the image.**
+
+**So shape work is now bounded by the stale-read repair rather than by shapes.** It withholds
+528, then 550, then 583 windows across this session, rising with every improvement that
+lowers more sites through slots, because each one creates more places a surviving 256-bit
+reader can meet a stale register. The census attributes **529 survivors** to windows it
+dropped -- larger than any remaining shape class.
+
+The code is kept because it is correct and proven, and because the thing blocking it is
+named: anything that reduces the withheld windows makes this pay without being rewritten.
+What it is not is progress on the frontier today, and reporting it as a dissolved refusal
+class would have said the opposite.
+
+**Two fixture lessons, both from sabotage rather than from review.** The first version was
+VACUOUS -- `off=77` -- because a contiguous load-shuffle-store is a span and a span keeps the
+upper half in a helper; `crossregion`'s branch target is what forces the permanent slots. And
+the swap sabotage **returned 77 with the fixture silent**: exchanging the two sources swaps
+`dst[0]` with `dst[2]` within a lane, and reading both with equal weight sums identically.
+The comment had claimed no two terms could cancel, asserted and never checked. Reading one
+term per lane twice fixes it, and the swap now gives 112.
+
 ### Finding 272 -- a window may not swallow what the rewriter promised to leave alone
 
 `isa_guard` requires every EVEX instruction in `.text` to be byte-identical. 179 of them are

@@ -3056,6 +3056,76 @@ PROGRAMS["nonvolbad"] = PROGRAMS["nonvol"]
 # from one half, or an upper half taken from the wrong slot each change a
 # term rather than cancelling: there is no pair here that sums the same
 # way round.
+# **Four operands with an immediate: `lanereg3` plus a selector.** Finding
+# 273. `vshufps $0,%ymm2,%ymm1,%ymm0` takes dst[0] and dst[1] from src1 and
+# dst[2] and dst[3] from src2, within each 128-bit lane -- so reading dword
+# 0 and dword 2 of each lane separates the two sources AND the two lanes,
+# which is four distinct terms from one site.
+#
+# 77 is 5 + 5 + 11 + 7 + 7 + 42, and **two of the four terms are read twice
+# on purpose.** Read once each, swapping the two sources exchanges dst[0]
+# with dst[2] WITHIN a lane and the pair sums identically -- measured: the
+# sabotage that swaps the slots returned 77 and the fixture said nothing.
+# A weight of two on one term per lane is what makes a swap change the
+# total, and the first version of this comment claimed that property
+# without anybody having checked it.
+#
+# **The branch is what makes it need the slots**, borrowed from
+# `crossregion`: `here` is a branch target, so the region holding the
+# shuffle did not define %ymm1 and only a PERMANENT slot carries its upper
+# half. Without one the fixture answered 77 anyway -- a contiguous
+# load-shuffle-store is a span, and the span keeps the upper half in a
+# helper. That version proved nothing about this path.
+PROGRAMS["immreg3"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	(%rsi), %ymm1		/* src1: low 5, high 7 */
+	movl	$1, %ecx		/* src2 is low 11, high 42 */
+	testl	%ecx, %ecx
+	jne	here			/* always taken; `here` is a target */
+here:
+	vmovups	0x20(%rsi), %ymm2	/* a new region starts here */
+	vshufps	$0, %ymm2, %ymm1, %ymm0	/* reads %ymm1, defined outside */
+	vmovups	%ymm0, (%rdi)
+	movl	(%rdi), %eax		/* dst[0] low  = src1 low  = 5 */
+	addl	(%rdi), %eax		/* twice, so a swap cannot cancel */
+	addl	8(%rdi), %eax		/* dst[2] low  = src2 low  = 11 */
+	addl	16(%rdi), %eax		/* dst[0] high = src1 high = 7 */
+	addl	16(%rdi), %eax		/* twice, for the same reason */
+	addl	24(%rdi), %eax		/* dst[2] high = src2 high = 42 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 5, 0, 0, 0
+	.long 7, 0, 0, 0
+	.long 11, 0, 0, 0
+	.long 42, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 PROGRAMS["immreg"] = (77, """
 	.text
 	.globl _start

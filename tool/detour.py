@@ -4055,7 +4055,8 @@ GPR_MOVABLE = frozenset(("load", "store", "regmove"))
 # non-volatile borrow has to find. `lanereg` and `lanereg3` move both
 # sources' upper halves into registers before operating; `perm2` and
 # `permil` do the same. Finding 255.
-TWO_HELPERS = frozenset(("lanereg", "lanereg3", "perm2", "permil"))
+TWO_HELPERS = frozenset(("lanereg", "lanereg3", "perm2", "permil",
+                         "immreg3"))
 
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
                    "vinsertf128", "vinserti128",
@@ -4506,6 +4507,22 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 		# `op mem,%ymmD,%ymmD` -- src1 IS the destination, so the SSE form
 		# is the prefix dropped and nothing rearranged.
 		return ("lane", canonical_ymm(fields[2]))
+	if len(fields) == 4 and len(wide) == 3 and fields[0].startswith("$"):
+		# **`op $imm,%ymmS2,%ymmS1,%ymmD`** -- `lanereg3` with an
+		# immediate, and per-lane for the same reason the three-operand
+		# immediates are: `vshufps` and `vpblendw` apply the same imm8
+		# within each 128-bit lane independently. 95 and 2 of the 111
+		# sites in this bucket.
+		#
+		# **The other 14 are excluded by requiring an immediate**, and
+		# that is the point rather than an accident: `vblendvps` and
+		# `vblendvpd` carry a REGISTER mask in the fourth operand, and
+		# SSE's `blendvps` takes that mask only in the implicit `xmm0`,
+		# which is a different lowering and is not built here. An FMA in
+		# this bucket is refused by NO_LEGACY_FORM before reaching it.
+		# Finding 273.
+		return ("immreg3", canonical_ymm(fields[3]),
+		        canonical_ymm(fields[1]), canonical_ymm(fields[2]))
 	if len(fields) == 3 and len(wide) == 2 and fields[0].startswith("$"):
 		# **`op $imm,%ymmS,%ymmD` -- an in-lane operation with an
 		# immediate.** Every one of the 108 in Starfield operates within
@@ -4605,14 +4622,15 @@ def span_entries(members, instructions, slots, scope, plain):
 			if shape is not None and shape[0] in ("lanereg", "lanereg3",
 			                                      "extract", "perm2",
 			                                      "permil", "regmove",
-			                                      "lanemem", "immreg"):
+			                                      "lanemem", "immreg",
+			                                      "immreg3"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
 			# text to look either of them up with. `perm2` is the same
 			# shape: it may read either half of either source.
 			if shape is not None and shape[0] in ("lanereg3", "perm2",
-			                                      "permil"):
+			                                      "permil", "immreg3"):
 				third = slot_for(slots, shape[3])
 		out.append((kind, address, encoding, mnemonic, operands,
 		            slot_for(slots, register), moved, second, third))
@@ -5291,6 +5309,46 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			low_dst = scratch_finder.xmm_numbers(destination)[0]
 			body += encode_movaps(low_dst, helper)
 			body += span_slot_move(second_helper, True, base, slot, block,
+			                       at + len(body))
+			continue
+		if what == "immreg3":
+			# **`lanereg3` with an immediate.** `movaps S1,D` then the
+			# operation against S2 with the selector, and the upper half
+			# the same between three slots. The immediate is the last
+			# byte of the tail and rides through unchanged, because the
+			# classifier has already established the operation is
+			# per-lane. Finding 273.
+			if second_helper is None:
+				return refuse("immreg3 wants a second helper")
+			if second is None or third is None:
+				return refuse("immreg3 source is in no slot")
+			destination, source2, source1 = shape[1], shape[2], shape[3]
+			low_dst = scratch_finder.xmm_numbers(destination)[0]
+			low_s2 = scratch_finder.xmm_numbers(source2)[0]
+			low_s1 = scratch_finder.xmm_numbers(source1)[0]
+			immediate = tail[2:]
+
+			def shuffle(reg, rm):
+				return inplace.sse_encoding(
+					dict(vex, L=0, R=reg >> 3, X=0, B=rm >> 3),
+					tail[:1] + bytes([0xC0 | ((reg & 7) << 3)
+					                  | (rm & 7)]) + immediate)
+
+			body += encode_movaps(low_dst, low_s1)
+			low = shuffle(low_dst, low_s2)
+			if low is None:
+				return refuse("immreg3 low operation has no SSE form")
+			body += low
+			# The upper half, between the three slots.
+			body += span_slot_move(helper, False, base, third, block,
+			                       at + len(body))
+			body += span_slot_move(second_helper, False, base, second,
+			                       block, at + len(body))
+			high = shuffle(helper, second_helper)
+			if high is None:
+				return refuse("immreg3 high operation has no SSE form")
+			body += high
+			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
 		if what == "immreg":
