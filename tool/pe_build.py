@@ -3126,6 +3126,134 @@ tls_directory:
 """)
 
 
+# **A site that can only widen BACKWARD.** Finding 277. `vpaddd` between
+# two ymm is four bytes, a jump needs five, and the instruction after it
+# transfers control -- so the forward walk ends under five and the window
+# has to start on the instruction before instead, swallowing the site.
+#
+# `movl $70,%ecx` is that instruction, and it is read afterwards: a window
+# that swallowed it without re-emitting it returns 7 rather than 77, which
+# separates "the neighbour was carried" from "the site was lowered". The
+# upper half supplies the other term, so a slot that is not maintained
+# gives 70.
+PROGRAMS["backward"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	(%rsi), %ymm1
+	vmovups	0x20(%rsi), %ymm2
+	movl	$70, %ecx		/* swallowed by the backward window */
+	vpaddd	%ymm1, %ymm2, %ymm2	/* four bytes; forward is blocked */
+	jmp	here			/* the next instruction transfers control */
+here:
+	vmovups	%ymm2, (%rdi)
+	movl	16(%rdi), %eax		/* the upper half: 0 + 7 = 7 */
+	addl	%ecx, %eax		/* + 70, only if the movl was re-emitted */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 0, 0, 0, 0
+	.long 7, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# **A site that can only widen backward, and must not.** The shape is
+# `backward`'s with one thing added: a never-taken `jne` names the site,
+# so the site's own address is a branch target. A window widening back
+# over the instruction before it starts a jump THERE, which buries the
+# site's first byte in the middle of that jump -- and anything reaching
+# the site by the branch lands inside an instruction.
+#
+# So `unit_candidate` refuses, the site keeps its VEX form, and the
+# program answers 77 along the taken path without ever executing it.
+# That is the fixture passing, and it is also what makes it a control:
+# run the same tree under `ANTI_AVX_SABOTAGE=backtarget` and the window
+# is built, placed, and `verify` reports a direct branch target that no
+# longer begins an instruction.
+#
+# **The site is on dead code deliberately.** A guard whose job is to
+# REFUSE leaves the site unlowered, so a fixture that executed it would
+# take SIGILL on a host without AVX -- the guard working would look
+# exactly like the guard failing. The taken path exercises the slot
+# maintenance instead (70 from the low half, 7 from the upper), which is
+# what shows the rewrite happened at all.
+PROGRAMS["backtarget"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	(%rsi), %ymm1
+	vmovups	0x20(%rsi), %ymm2
+	vmovups	%ymm2, (%rdi)
+	movl	(%rdi), %eax		/* 70, the low half */
+	movl	16(%rdi), %edx		/* 7, the upper half through a slot */
+	addl	%edx, %eax		/* 77 */
+	xorl	%edx, %edx
+	testl	%edx, %edx
+	jne	site			/* never taken; names `site` a target */
+	addq	$40, %rsp
+	ret
+	movl	$70, %ecx		/* what a backward window would swallow */
+site:
+	vpaddd	%ymm1, %ymm2, %ymm2	/* four bytes; forward is blocked */
+	jmp	after			/* the next instruction transfers control */
+after:
+	vmovups	%ymm2, (%rdi)
+	movl	$1, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.long 70, 0, 0, 0
+	.long 7, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
 PROGRAMS["immreg"] = (77, """
 	.text
 	.globl _start

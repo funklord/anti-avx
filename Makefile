@@ -230,7 +230,8 @@ check-shadow-pe:
 		{ echo "check-shadow-pe: wine is not installed"; exit 1; }
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
-	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove nonvol unwindsave; do \
+	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove nonvol unwindsave \
+	            backward backtarget; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -335,6 +336,17 @@ check-shadow-pe:
 	echo "                 holds the caller's value after the stub ran, so"; \
 	echo "                 the bytes an unwind would restore from survive."; \
 	echo "                 Writing the borrow onto that slot gives 70"
+	@echo "check-shadow-pe: backward -- a site whose forward walk ends"
+	@echo "                 under five bytes, lowered by a window that"
+	@echo "                 starts on the instruction BEFORE it and"
+	@echo "                 re-emits it; carrying it without re-emitting"
+	@echo "                 gives 7 rather than 77"
+	@echo "check-shadow-pe: backtarget -- the same shape with the site"
+	@echo "                 named by a never-taken jne, so widening back"
+	@echo "                 would bury a branch target. The guard refuses"
+	@echo "                 and the site keeps its VEX form on dead code;"
+	@echo "                 check-verify runs the same tree sabotaged and"
+	@echo "                 watches verify reject the buried target"
 
 # -- the software F16C conversions -------------------------------------------
 
@@ -604,6 +616,7 @@ check-liveness: $(LISTING)
 	echo "check-liveness: the gate refuses a stub that clobbers a register"; \
 	echo "                its site was still using, and passes the same"; \
 	echo "                tree built correctly"
+
 
 detour-verify: $(DETOURED) $(LISTING)
 	$(PYTHON) tool/detour.py $(SPILL_FLAGS) verify $(TARGET) $(DETOURED) \
@@ -988,7 +1001,61 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 		$(BUILD_DIR)/verify-bad-switchbase.log || \
 		{ echo "check-verify: the switchbase control failed, but not"; \
 		  echo "              through the switch-dispatch check"; exit 1; }
-	@echo "check-verify: all thirteen controls rejected, each by its own check"
+# The backward-widening guard. A unit window may start on the instruction
+# BEFORE its site, which puts the site's first byte past the jump -- and if
+# anything branches to the site, arriving there runs the padding and falls
+# out of the window having skipped the stub entirely.
+#
+# **Two earlier controls for this were worthless and are worth recording.**
+# The first ran against Starfield and reported all 1,191,105 direct branch
+# targets intact, because it ran while the `preceding` accounting bug made
+# verify exit on lost boundaries before the branch-target check spoke. The
+# second disabled the guard and compared images: 388 sites got past it, one
+# built a candidate, and that candidate lost at placement -- so the image
+# was byte-identical and the control could not fail. A fixture is the only
+# instrument here that puts the window somewhere nothing competes for.
+#
+# It needs the permanent slots, so it builds its own pair rather than using
+# the pattern rules, and the two images must DIFFER before anything below
+# is believed. Finding 279.
+	@set -e; \
+	$(PYTHON) tool/pe_build.py sample backtarget \
+		$(BUILD_DIR)/pe-backtarget-320.exe 320 >/dev/null; \
+	objdump -d -j .text $(BUILD_DIR)/pe-backtarget-320.exe \
+		> $(BUILD_DIR)/pe-backtarget-320.asm; \
+	$(PYTHON) tool/detour.py --shadow-regs=all apply \
+		$(BUILD_DIR)/pe-backtarget-320.exe \
+		$(BUILD_DIR)/pe-backtarget-320.asm \
+		$(BUILD_DIR)/sse-backtarget-all.exe > /dev/null; \
+	ANTI_AVX_SABOTAGE=backtarget $(PYTHON) tool/detour.py --shadow-regs=all \
+		apply $(BUILD_DIR)/pe-backtarget-320.exe \
+		$(BUILD_DIR)/pe-backtarget-320.asm \
+		$(BUILD_DIR)/bad-backtarget.exe > /dev/null; \
+	if cmp -s $(BUILD_DIR)/sse-backtarget-all.exe \
+		  $(BUILD_DIR)/bad-backtarget.exe; then \
+		echo "check-verify: the backtarget sabotage produced a"; \
+		echo "              byte-identical image, so it did not apply and"; \
+		echo "              a green result below would mean nothing"; \
+		exit 1; \
+	fi; \
+	if ANTI_AVX_SABOTAGE=backtarget timeout 300 $(PYTHON) tool/detour.py \
+		--shadow-regs=all verify $(BUILD_DIR)/pe-backtarget-320.exe \
+		$(BUILD_DIR)/bad-backtarget.exe \
+		$(BUILD_DIR)/pe-backtarget-320.asm \
+		> $(BUILD_DIR)/verify-bad-backtarget.log 2>&1; then \
+		echo "check-verify: the backtarget control PASSED verify, so"; \
+		echo "              nothing watches a window bury a branch target"; \
+		exit 1; \
+	fi; \
+	grep -q "land inside a placed window" \
+		$(BUILD_DIR)/verify-bad-backtarget.log || \
+		{ echo "check-verify: the backtarget control failed, but not"; \
+		  echo "              through the buried-target check -- and the"; \
+		  echo "              check that reads like it covers this, the"; \
+		  echo "              swallowed-instruction one, does not: the"; \
+		  echo "              buried instruction is the window's member"; \
+		  echo "              rather than a passenger"; exit 1; }
+	@echo "check-verify: all fourteen controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its

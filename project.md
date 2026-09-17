@@ -13779,6 +13779,98 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 279 -- the guard that could not be watched, and a check the padding defeats
+
+`unit_candidate` refuses to widen back over a site that is a branch target, because a
+window's jump buries every byte after its first. **Three attempts to watch that refusal fail,
+and the first two were worthless.**
+
+The first ran against Starfield while Finding 278's `preceding` bug was still live. `verify`
+exited 1 on lost boundaries before the branch-target check had anything to say, and that
+check duly reported all 1,191,105 targets intact. A control that fails through the wrong
+check has not run.
+
+The second disabled the guard and compared images. Instrumented, **388 sites got past it** --
+not the 30 the probe in Finding 277 suggested, which counted one rung of the ladder. Of those
+388, 387 are refused further down for other reasons, one builds a candidate, and that
+candidate loses at placement. The image comes out byte-identical, so the control reports "the
+sabotage did not apply" and cannot fail. **Starfield is the wrong instrument here**: on a
+binary this dense every window competes, and the one site where the guard decides anything is
+a site something else already covers.
+
+**The third attempt found that the check I was aiming at cannot see the fault.** A fixture
+puts the window where nothing competes for it, and with the guard off the window is placed:
+
+    140001034:  e9 3e 30 00 00    jmp 0x140004077
+    140001039:  0f 1f 40 00       nopl 0x0(%rax)      <- the jne lands here
+
+The site at `0x140001039` is one past the jump's last byte, and the four bytes its `vpaddd`
+occupied are NOP padding. So the target **still begins an instruction**, `verify: all 2 direct
+branch targets still begin an instruction` passes, and the program is wrong: arriving by the
+`jne` runs the padding, falls out of the far end of the window, and skips everything the stub
+would have done. Nothing crashes and the answer is silently different.
+
+The swallowed-instruction check sitting directly above it does not cover this either, and
+reads exactly as though it should. The buried instruction is the window's **member** -- the
+site being lowered -- not a passenger the window swallowed, so it never enters `swallowed`.
+
+So `verify` gains the check that was missing: **no direct branch target may lie strictly
+inside a placed window.** The window start is excluded deliberately, being the one address in
+a window it is correct to arrive at. It reports zero across Starfield's 201,624 windows and
+names `0x140001039` on the sabotaged fixture.
+
+**The first version of that check turned a 17-minute `verify` into one still running at
+39 minutes.** It asked each of 1.19 million targets about each of 201,624 windows. Sorting
+the targets once and bisecting per window makes it free. A gate that slow is a gate somebody
+stops running, which costs the same as a gate nobody can make fail.
+
+Two gaps closed on the way. `backward` was in no gate at all -- it needs `--shadow-regs=all`
+and neither `PE_NAMES` nor `check-shadow-pe` listed it -- and both fixtures are in
+`check-shadow-pe` now, with `backtarget`'s sabotage as `check-verify`'s fourteenth control.
+And I read `apply=0 verify=0` for three unwired fixtures as evidence they worked under the
+plain pattern rule: **`verify` exits 0 when nothing was lowered**, so that was a vacuous pass
+of my own. What separates them is the strategy row, which is Finding 205's rule again.
+
+### Finding 278 -- backward widening lands, and both bugs were in the bookkeeping
+
+Finding 277 refused this twice and blamed a `call` between the loads and the site. Neither bug
+was in the emission, which was correct in every version, and neither had anything to do with
+the `call`.
+
+**A name collision.** The new variable is `window_start` because `unit_candidate` already has
+a `start` -- the enclosing FUNCTION's address, used forty lines below for the `SAVED_XMM`
+lookup. The first two versions called it `start`, so every window that reached the xmm borrow
+anchored at the head of its function, swallowing the prologue and a `call`. Only `nonvol` and
+`unwindsave` broke because only they reach the borrow: a shadowed name is invisible to every
+fixture that does not execute the line that reads it.
+
+**The wrong tuple field.** A candidate is `(start, encoding, operands, mnemonic, window,
+displaced, scratch, preceding, strategy)`. The swallowed neighbour went into field 5,
+`displaced`, and belongs in field 7, `preceding`. `build_stub` emits it correctly from either,
+which is why all 15 fixtures passed; `place_stubs` accounts it from `preceding` alone, so the
+boundary it consumed was recorded nowhere -- `verify: FAILED -- 22 boundaries lost that were
+not swallowed on purpose`.
+
+**The second is the one worth keeping.** The image is byte-identical with the bug and without
+it; the only difference is what the accounting knows. A change that emits correctly and
+accounts wrongly passes every fixture and every behavioural test there is, and is caught by
+exactly one thing -- a verifier that re-derives the placement and asks whether the bytes it
+finds were meant to be there.
+
+Measured, `--shadow-regs=all`, against the committed 3,199:
+
+    VEX in .text            805,131 -> 3,172        was 3,199
+    unconditional lowering  33,845 built, 3,408 refused, of 37,253
+                                                    was 33,664 / 3,632 of 37,296
+    unit                    18,435 placed, 14,619 overlapped, 18 refused
+    boundaries lost         83,958, every one deliberate
+    stub section            4,623,702 bytes         was 4,622,202
+
+**27 sites, against the 795 Finding 277 priced**, and the gap is the one Finding 271 already
+measured for the immediate form: a shape refusal is the first wall and never the only one.
+Of the 795 that can reach five bytes backwards, almost all are then refused for a register, a
+helper or a neighbour.
+
 ### Finding 277 -- the census row that was mine, and 795 sites behind a bookkeeping wall
 
 **Two instrument faults in one change, and the second chose the next item.** Finding 276's
@@ -13802,7 +13894,7 @@ check than to argue. The honest census:
     shape a register-to-register move              148
     no volatile xmm and scratch slot                108
 
-#### Backward widening: 795 sites, and why it is not in the tree
+#### Backward widening: 795 sites, priced here and landed in Finding 278
 
 `unit_candidate` widens only forward; the plain path has used both directions since the
 beginning. Measured at the refusal:
@@ -13816,21 +13908,17 @@ beginning. Measured at the refusal:
 itself, which needs only that the site is not a branch target -- an address strictly inside a
 window is one nothing may branch to.
 
-It was built twice and reverted twice. `nonvol` and `unwindsave` both returned 5 instead of
-77 with `verify` naming **four boundaries lost that were not swallowed on purpose** and **a
-`call` inside a placed window that no stub re-emitted**. Putting the swallowed neighbour in
-the members emits it correctly and accounts it nowhere; moving it to `preceding`, which
-`place_stubs` reads for exactly that bookkeeping and `build_stub` emits before the span,
-did not fix it either.
+It was built twice and reverted twice, and the diagnosis written here was wrong. It said the
+two failing fixtures had **a `call` between the loads and the site** in common and that the
+next attempt should start there. They do, and it is a coincidence: what `nonvol` and
+`unwindsave` actually have in common is that they are the two fixtures that reach the xmm
+borrow, which is where the real bug -- a shadowed variable name -- did its damage. Finding
+278 has both causes and the numbers.
 
-**What the two fixtures have in common is a `call` between the loads and the site**, and that
-is where the next attempt should start rather than in the emission, which is correct in both
-versions -- the wrong answer is 5, not rubbish, and the stub decodes.
-
-The finding is that **the 795 are behind a bookkeeping wall rather than a semantic one**. No
-part of the placer's swallow accounting has a case for a window that begins before its own
-site: it reads `preceding` and `displaced`, and the unit strategy populates neither. That is
-a real piece of work and it is not one to do blind at the end of a session.
+The half of this that held is the pricing: **the 795 were behind a bookkeeping wall rather
+than a semantic one**, and no part of the placer's swallow accounting had a case for a window
+beginning before its own site. It delivers 27 sites rather than 795, for the reason Finding
+271 already measured -- a shape refusal is the first wall and never the only one.
 
 ### Finding 276 -- a shorter window finds a helper, and the trade pays
 

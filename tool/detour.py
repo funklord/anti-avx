@@ -6080,7 +6080,12 @@ def unit_shortening(instructions, plain, index, blocked, home,
 
 	before = snapshot()
 	last = None
-	for cap in UNIT_LIMITS:
+	# Forward at every length, then backward at every length. Forward is
+	# the direction the strategy was measured with, so it keeps first
+	# refusal on every site it can serve, and backward is asked only for
+	# what it leaves. Finding 277.
+	for cap, back in [(cap, False) for cap in UNIT_LIMITS] \
+			+ [(cap, True) for cap in UNIT_LIMITS]:
 		# **Each attempt starts from the snapshot**, so a site leaves ONE
 		# refusal behind rather than one per rung. Without this a failing
 		# site recorded all four, and the census every measurement here is
@@ -6090,7 +6095,7 @@ def unit_shortening(instructions, plain, index, blocked, home,
 		UNIT_REFUSED, UNIT_EXAMPLES = before[0].copy(), {
 			why: list(seen) for why, seen in before[1].items()}
 		lone = unit_candidate(instructions, plain, index, blocked, home,
-		                      ranges, scope, tls, limit=cap)
+		                      ranges, scope, tls, limit=cap, back=back)
 		if lone is not None:
 			UNIT_REFUSED, UNIT_EXAMPLES = before
 			return lone
@@ -6113,7 +6118,7 @@ def unit_shortening(instructions, plain, index, blocked, home,
 
 
 def unit_candidate(instructions, plain, index, blocked, home,
-                   ranges, scope, tls=None, limit=12):
+                   ranges, scope, tls=None, limit=12, back=False):
 	"""A candidate lowering ONE 256-bit instruction, or None.
 
 	**The strategy none of the others is.** Every lowering above this one
@@ -6207,6 +6212,57 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# which is exactly what this representation is for: `region_members`
 	# refuses a source it did not itself define, and here there is nothing
 	# to refuse because every source already has one.
+	# **Widening backward, where forward is blocked.** The window starts on
+	# the instruction BEFORE the site and swallows the site itself -- the
+	# second of the two directions this tool has always had, which the
+	# plain path uses and this strategy did not. Measured at the refusal:
+	# 837 sites end the forward walk under five bytes and 795 reach five
+	# going the other way, 12 refused because the previous instruction
+	# transfers control.
+	#
+	# **The branch-target refusal below fires 388 times, not the 30 that
+	# probe reported** -- it sampled one rung of the ladder and this is
+	# asked at four. Of the 388, 387 are refused further down anyway and
+	# the one candidate that survives loses at placement, so removing the
+	# guard leaves this binary's image byte-identical. That is why it is
+	# watched by a fixture rather than by Starfield. Finding 279.
+	#
+	# The neighbour is carried in `preceding` rather than as a member:
+	# `build_stub` emits that list before the span, which is the order it
+	# already executed in, and `place_stubs` reads it to record which
+	# boundaries a window swallows deliberately. As a member it is emitted
+	# correctly and accounted nowhere.
+	#
+	# **It is `window_start` and not `start` because this function already
+	# has a `start`** -- the enclosing FUNCTION's address, used for the
+	# `SAVED_XMM` lookup forty lines below. The first two versions of this
+	# called it `start` and anchored every window that reached the xmm
+	# borrow at the head of its function, swallowing the prologue and a
+	# `call`; `nonvol` and `unwindsave` answered 5 and `verify` named four
+	# boundaries lost and a call no stub re-emitted. The emission was
+	# correct throughout. Finding 277.
+	window_start, first_member, carried = address, len(encoding), None
+	if back:
+		if index == 0:
+			return refuse("nothing before it to widen into")
+		if address in blocked and CODE_SABOTAGE != "backtarget":
+			return refuse("widening back would bury a branch target")
+		before_address, before_encoding, before_mnemonic, before_operands, \
+			before_comment = instructions[index - 1]
+		if before_address + len(before_encoding) != address:
+			return refuse("previous not adjacent")
+		if before_mnemonic.startswith(CONTROL_PREFIXES):
+			return refuse("previous transfers control")
+		if before_encoding[:1] == b"\x62":
+			return refuse("previous is EVEX")
+		carried = (before_address, before_encoding, before_comment,
+		           before_operands, before_mnemonic,
+		           swallowed_scratch(plain, index - 1, before_address,
+		                             before_encoding, before_operands,
+		                             before_mnemonic, scope))
+		window_start = before_address
+		first_member += len(before_encoding)
+
 	told = take(index, shape)
 	if told is not None:
 		return refuse(told)
@@ -6227,7 +6283,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# hazard is the same: an address in the middle of a window is an
 	# address nothing may reach.
 	last = index + 1
-	window = len(encoding)
+	window = first_member
 	while last - index < limit and last < len(instructions):
 		nxt_address, nxt_encoding, nxt_mnemonic, nxt_operands, _nc = \
 			instructions[last]
@@ -6236,7 +6292,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		if not wide_next and window >= 5:
 			break			# long enough, and nothing left to absorb
 		stop = None
-		if nxt_address != address + window:
+		if nxt_address != window_start + window:
 			stop = "next not adjacent"
 		elif nxt_address in blocked:
 			stop = "next is a branch target"
@@ -6280,7 +6336,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	if window < 5:
 		return refuse("too short to place, nothing follows")
 
-	if not inplace.covered_by(ranges, address, window):
+	if not inplace.covered_by(ranges, window_start, window):
 		return refuse("window outside .pdata")
 	# **The block, and only the block.** `window_borrow` is not consulted:
 	# a home-space displacement is valid for the length of one window and
@@ -6577,7 +6633,19 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	if lower_ymm_span(entries, base, first, address, address, block,
 	                  second, told) is None:
 		return refuse(told[-1] if told else "lowering refused, no reason")
-	return (address, encoding, operands, mnemonic, window, [], None, [],
+	# **`preceding`, which is field SEVEN, not field five.** A candidate is
+	# `(start, encoding, operands, mnemonic, window, displaced, scratch,
+	# preceding, strategy)`, and `preceding` is the slot for instructions
+	# BEFORE the site -- exactly what widening backward produces. Put in
+	# `displaced` instead it is still emitted, so every fixture passed,
+	# and `place_stubs` accounts it as though it were AFTER the site:
+	# `swallowed.add(entry[0])` marks the window's first byte, which keeps
+	# its boundary, and never marks the site, which loses one. 22
+	# boundaries lost that were not swallowed on purpose, every one a
+	# four-byte `vmovups %ymm0,(%rax)` behind a four-byte `vpxor`.
+	# Finding 277.
+	return (window_start, encoding, operands, mnemonic, window, [], None,
+	        [carried] if carried is not None else [],
 	        ("unit", (entries, first, block, base, second)))
 
 
@@ -12875,6 +12943,7 @@ SABOTAGE = {
 	"staleupper": "the repair withholds what would ship a stale upper half",
 	"conservative": "a conservative candidate keeps its VEX form",
 	"switchbase": "a recognised switch dispatch resolves its table",
+	"backtarget": "a window widened backwards never buries a branch target",
 }
 
 
@@ -14512,6 +14581,46 @@ def verify(original, patched, listing=None):
 	else:
 		print(f"verify: all {len(inside):,} direct branch targets still begin "
 		      f"an instruction")
+
+	# **A branch target that still begins an instruction can still be
+	# wrong, and the check above cannot tell.** A window that buries its
+	# own member pads the bytes after its jump, so the target lands on a
+	# `nop`, the sweep finds a boundary there and is content. What it has
+	# landed in is a window whose work the jump already skipped: arriving
+	# by the branch runs the padding, falls out of the far end, and misses
+	# everything the stub would have done. Nothing crashes and the answer
+	# is wrong.
+	#
+	# Every widening strategy refuses to cross a branch target, and until
+	# this existed nothing watched any of those refusals. Disabling the
+	# backward one left every check in this file green -- including the
+	# swallowed-instruction check above, which looks like it covers this
+	# and does not: the buried instruction is the window's MEMBER, not a
+	# passenger it swallowed, so it is not in `swallowed` at all.
+	#
+	# The window start is excluded deliberately. A branch arriving there
+	# hits the jump, which is the one place in a window it is correct to
+	# arrive. Finding 279.
+	# **Bisect rather than scan.** The obvious loop asks every target about
+	# every window, which on this binary is 201,624 windows against 1.19
+	# million targets: the first version of this check turned a seventeen
+	# minute `verify` into one still running at thirty-nine. A gate that
+	# slow is a gate somebody stops running.
+	ordered = sorted(inside)
+	buried = set()
+	for window_at, window_len, *_rest in placed:
+		low = bisect.bisect_right(ordered, window_at)
+		high = bisect.bisect_left(ordered, window_at + window_len)
+		buried.update(ordered[low:high])
+	if buried:
+		print(f"verify: FAILED -- {len(buried):,} direct branch target(s) land "
+		      f"inside a placed window, past its jump", file=sys.stderr)
+		for address in sorted(buried)[:8]:
+			print(f"    0x{address:x}", file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: no direct branch target lands inside a placed window, "
+		      f"across {len(placed):,} window(s)")
 
 	# **Does anything still read an upper half this rewrite left stale?**
 	# Six lowerings leave one, and each is supposed to have proved nothing
