@@ -13779,6 +13779,57 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 276 -- a shorter window finds a helper, and the trade pays
+
+Finding 275 measured the xmm shortage as register pressure and named one untried idea with
+its risk attached: `unit_candidate` absorbs whole runs of adjacent 256-bit sites, so its
+members name five to fourteen distinct xmm, and the helper must avoid every one -- a helper
+is clobbered, so a register any member READS cannot serve. With six volatile registers that
+is what leaves nothing. **A window with fewer members touches fewer.**
+
+So where the long window refuses, ask for a shorter one. The ladder is the absorption limit
+the function already took: **12, 6, 3, 1**, ending at a single site, which is the shape the
+strategy is named for. No restructuring.
+
+    unit placed              18,390  -> 18,401     +11
+    unit overlapped          14,593  -> 14,613     +20
+    windows not placed          583  ->    661     +78
+    sites through a slot     33,101  -> 33,133     +32
+    VEX in .text              3,231  ->  3,199     -32
+    apply wall time             ~10m  -> 14m23s
+
+**The trade landed the right way and it was genuinely a trade.** The greed is not
+gratuitous: the first version of this strategy produced one window per site, each overlapping
+the next -- three candidates built and one placed -- so a shorter window is one more likely
+to be overlapped, and the repair withheld 78 more of them. It still places enough more to pay
+32 sites. Nothing about that was predictable from the measurement; only the binary could say.
+
+**And the first version of it corrupted the instrument.** The refusal counters were restored
+when a retry SUCCEEDED and not when all four rungs failed, so a failing site recorded four
+reasons instead of one: `14,724 refused of 48,388 sites`, against a true `3,632 of 37,296`.
+Every measurement in this file is taken off those counters, so the inflation would have
+travelled into the next several findings rather than staying in this one. Each rung starts
+from the snapshot now, and a failing site keeps the SHORTEST window's reason -- the one that
+says why the site itself cannot be lowered rather than what a window around it was carrying.
+
+Confirmed by `cmp`: the counter fix leaves the image byte-identical, which is what a
+bookkeeping change has to do and is cheaper to check than to argue.
+
+The clean census, which is the one to quote:
+
+    no dead GPR and no home space to save one    1,412
+    too short to place, nothing follows            866
+    mode True has no xmm to stash the index in     396
+    vfmadd231ps has no legacy encoding             186
+    no non-volatile xmm this function saves        184
+    shape a register second source, src2 is D      162
+    shape a register-to-register move              148
+
+`too short to place, nothing follows` is new and is the limit=1 rung speaking: a four-byte
+site with nothing absorbable beside it cannot reach the five a jump needs. That is the most
+fundamental refusal in the list and it was previously hidden behind whatever a longer window
+happened to complain about first.
+
 ### Finding 275 -- the xmm shortage is registers, and the mode is finished at 99.6%
 
 The last class never looked inside was the 258-site xmm shortage. Measured at the refusal:

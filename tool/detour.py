@@ -6034,9 +6034,72 @@ SAVED_XMM = {}
 # non-volatile borrow depends on. Finding 256.
 OVERLAP_REFUSED = Counter()
 
+# How many instructions a unit window may absorb, longest first. 12 is what
+# the strategy was built with; the rest are what it retries at when the long
+# window cannot find a helper. Finding 276.
+UNIT_LIMITS = (12, 6, 3, 1)
+
 UNIT_REFUSED = Counter()
 UNIT_EXAMPLES = {}
 WIDE_SITES = Counter()
+
+
+def unit_shortening(instructions, plain, index, blocked, home,
+                    ranges, scope, tls):
+	"""`unit_candidate`, retried with shorter windows where it refuses.
+
+	**A greedy window starves its own helper.** `unit_candidate` absorbs the
+	whole run of adjacent 256-bit sites rather than stopping at five bytes,
+	so its members name many registers -- measured at five to fourteen
+	distinct xmm -- and the helper must avoid every one of them, because a
+	helper is clobbered and a register any member READS cannot serve. With
+	six volatile registers that is what leaves nothing. A window with fewer
+	members touches fewer.
+
+	So where the long window refuses, ask for a shorter one. The ladder is
+	the absorption limit the function already takes, and it descends to a
+	single site, which is the shape the strategy is named for.
+
+	**The greed is not gratuitous and this is a trade, not a fix.** It
+	exists because the first version produced one window per site, each
+	overlapping the next -- three candidates built and one placed. A
+	shorter window is one more likely to be overlapped by its neighbour, so
+	this buys a helper with an overlap and only the binary says which wins.
+	Finding 276.
+
+	The refusal counters are snapshotted and restored around the retries,
+	so a site that succeeds at a shorter length does not also leave the
+	long window's reason behind -- the census would otherwise count a
+	refusal for a site that was lowered.
+	"""
+	global UNIT_REFUSED, UNIT_EXAMPLES
+
+	def snapshot():
+		return UNIT_REFUSED.copy(), {why: list(seen)
+		                             for why, seen in UNIT_EXAMPLES.items()}
+
+	before = snapshot()
+	last = None
+	for cap in UNIT_LIMITS:
+		# **Each attempt starts from the snapshot**, so a site leaves ONE
+		# refusal behind rather than one per rung. Without this a failing
+		# site recorded all four, and the census every measurement here is
+		# taken from would have been inflated fourfold for exactly the
+		# sites it is consulted about. Measured once in that state: 14,724
+		# refusals "of 48,388 sites", against 3,912 of 37,401.
+		UNIT_REFUSED, UNIT_EXAMPLES = before[0].copy(), {
+			why: list(seen) for why, seen in before[1].items()}
+		lone = unit_candidate(instructions, plain, index, blocked, home,
+		                      ranges, scope, tls, limit=cap)
+		if lone is not None:
+			UNIT_REFUSED, UNIT_EXAMPLES = before
+			return lone
+		last = snapshot()
+	# The SHORTEST window's reason is the one kept: it says why the site
+	# itself cannot be lowered, independent of how much a window around it
+	# was trying to carry.
+	UNIT_REFUSED, UNIT_EXAMPLES = last
+	return None
 
 
 def unit_candidate(instructions, plain, index, blocked, home,
@@ -8972,8 +9035,8 @@ def collect(binary, listing, context=None):
 		# permanent slots there is no invariant to protect, and `unit` is
 		# then simply the most expensive way to lower a site. Finding 260.
 		if SHADOW_REGS_RULE == SHADOW_REGS_ALL and vex["L"]:
-			lone = unit_candidate(instructions, plain, index, blocked,
-			                      home, ranges, scope, tls_slot_offset)
+			lone = unit_shortening(instructions, plain, index, blocked,
+			                       home, ranges, scope, tls_slot_offset)
 			if lone is not None:
 				candidates.append(lone)
 				continue
@@ -9540,8 +9603,8 @@ def collect(binary, listing, context=None):
 		# refusing there is a hole in the invariant rather than a miss.
 		# Finding 246.
 		if vex["L"] and strategy is None:
-			lone = unit_candidate(instructions, plain, index, blocked,
-			                      home, ranges, scope, tls_slot_offset)
+			lone = unit_shortening(instructions, plain, index, blocked,
+			                       home, ranges, scope, tls_slot_offset)
 			if lone is not None:
 				candidates.append(lone)
 				continue
