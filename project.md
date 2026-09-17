@@ -13779,6 +13779,52 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 274 -- the repair's cost is mostly the site itself, and a fix for the rest lost
+
+The stale-read repair withholds 583 windows and the census attributes 529 survivors to them,
+which made it the largest single item left -- bigger than any shape class. **Two remedies are
+closed by construction**: the lost zeroing cannot be reproduced, because only a 256-bit write
+zeroes an upper half and the stub may contain no VEX; and `unit_candidate` widens only
+forward, so there is no second direction to try.
+
+**Measured before building**, over 1,481 guilty-window observations:
+
+    producer at +0    460     the window's own SITE is the guilty write
+    producer at +8     95
+    producer at +5     90
+    producer at +4     58
+    window sizes: 5 (86), 8 (86), 9 (55), 6 (54), 16 (51), 10 (46), 24 (46), 26 (38)
+
+**460 are irreducible**: a window cannot exist without its site. The rest are passengers in
+windows of 16, 24 and 26 bytes, carrying length they did not need -- so the collector was
+made to ask `upper_half_read_later` before swallowing a VEX.128 write, stopping the window
+short rather than letting the repair drop it later. Local, no architecture change, and
+conservative the safe way.
+
+**It lost, and the numbers say why:**
+
+    windows not placed          583  ->    585      +2
+    too short to place, next loses a zeroing  -> 278
+    unit candidates built    33,555  -> 33,316    -239
+    sites through a slot     33,101  -> 32,890    -211
+    VEX in .text              3,231  ->  3,258     +27
+
+The check fires 278 times, costs 239 candidates, and prevents **essentially no drops**. It
+cannot: the dominant case is the site itself at offset 0, which a check on SWALLOWED
+NEIGHBOURS never sees, while `upper_half_read_later` returning "read" on an unresolved walk
+refuses windows that would never have been guilty. Reverted.
+
+**The measurement was right and the reading of it was wrong.** 460 of 1,481 was in front of
+me before a line was written, and it says the majority is untouchable by anything that trims
+a window. What it does not say -- and what I supplied without checking -- is that the
+remaining 1,021 were reachable. A conservative walk aimed at a minority spent more on false
+refusals than the minority was worth.
+
+**So the repair is not the lever it looked like.** Its 529 survivors are downstream of
+surviving READERS, and a reader survives because it is in the structural floor or a shape
+this cannot emit. The way to shrink the repair's cost is to lower the readers, which is the
+frontier problem itself rather than a separate one.
+
 ### Finding 273 -- the shape lands, the image does not change, and that is the finding
 
 `op $imm,%ymmS2,%ymmS1,%ymmD` -- `lanereg3` with a selector. 95 `vshufps` and 2 `vpblendw`
