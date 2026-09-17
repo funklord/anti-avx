@@ -673,6 +673,31 @@ def spill_register(registers):
 # holds a pointer that must be FOLLOWED before it is indexed. Finding 139.
 TEB_TLS_POINTER = 0x58
 
+# **A segment-prefixed absolute address needs no register at all**, which
+# is the third register-free location Finding 270 said did not exist. It
+# said a slot needs the block pointer and `(%rsp)` cannot be described in a
+# chained fragment, and that those were the only two. `%gs:disp32` is a
+# complete effective address -- no base, no index -- it is per-thread by
+# construction, it does not move `rsp`, and there is nothing in it for an
+# unwinder to describe. Measured under wine: a write and a read back at
+# both 0x28 and 0x7c8 return 77 on every run.
+#
+# Sixteen bytes of it replace what the callee home space was doing, which
+# takes the block's two borrows off the caller entirely.
+#
+# **What it does NOT settle is whose bytes those are**, and that is why
+# there is no default. Every offset in the TEB belongs to somebody:
+# `TlsSlots` is `TlsAlloc`'s to hand out, `ArbitraryUserPointer` is read by
+# some `NtCreateFile` paths, and the OpenGL reserved block is free only in
+# a process that never loads legacy GL. A stub cannot preserve what it
+# borrows here -- preserving it means reading it first, into the register
+# it has not got -- so the bytes have to be genuinely unowned rather than
+# merely quiet. Until that is settled for a real process this carries a
+# measurement and nothing else, exactly as `--spill=stack` does for the
+# stack borrow it is not allowed to take. Finding 280.
+TEB_SCRATCH = None
+TEB_SCRATCH_BYTES = 16
+
 # rax, rcx, rdx and r8-r11 by number, which is what an encoding wants.
 GPR_NUMBERS = {"rax": 0, "rcx": 1, "rdx": 2,
                "r8": 8, "r9": 9, "r10": 10, "r11": 11}
@@ -689,10 +714,18 @@ def encode_tls_base(block, index, index_va, at, stash=None):
 	rip-relative and a displacement is measured from the END of it.
 
 	Both registers are clobbered and neither is put back. That is the whole
-	reason this needs `gpr_live_out` rather than a save: there is nowhere to
-	save a general-purpose register to that does not need a register to
-	address, which is the circularity Finding 69 met and Finding 141 broke
-	by finding registers that were already dead.
+	reason this needs `gpr_live_out` rather than a save: Finding 69 met a
+	circularity in which saving a general-purpose register needed a
+	register to address the place it went, and Finding 141 broke it by
+	finding registers that were already dead.
+
+	**The circularity was never complete, and this comment used to say it
+	was.** `(%rsp)` needs no register (Finding 249, the callee home space)
+	and neither does `%gs:disp32`, which is a whole effective address with
+	no base and no index (Finding 280, mode "teb"). What is scarce is
+	eight bytes that are OURS to write, not a register to address them
+	with -- three different answers to that, and the register was never
+	the question.
 
 	**`stash` breaks the circularity for the second register**, and it is an
 	xmm rather than memory precisely because memory is what needed a
@@ -757,6 +790,32 @@ def encode_tls_base(block, index, index_va, at, stash=None):
 	return bytes(out)
 
 
+def encode_gpr_teb(register, save, offset):
+	"""Save or restore a general-purpose register at `%gs:offset`.
+
+	    65 48 89 04 25 <disp32>    movq %reg,%gs:offset
+	    65 48 8b 04 25 <disp32>    movq %gs:offset,%reg
+
+	Mod 00 with rm 100 selects a SIB byte, and a SIB of 0x25 is base 101
+	index 100 -- no base, no index, disp32. That is what makes the address
+	need no register, and the disp32 is not optional: there is no shorter
+	form of an absolute address, so a near offset costs the same nine bytes
+	as a far one.
+
+	`movq` and not `movl`, because a block pointer is 64 bits and the
+	register being borrowed may hold anything. It sets no flags, which is
+	the same requirement `encode_tls_base` is written to. Finding 280.
+	"""
+	out = bytearray()
+	out.append(0x65)					# %gs
+	out.append(0x48 | (0x04 if register >= 8 else 0))	# REX.W, REX.R
+	out.append(0x8B if not save else 0x89)
+	out.append(((register & 7) << 3) | 4)			# mod 00, rm 100 SIB
+	out.append(0x25)					# no base, no index
+	out += struct.pack("<I", offset)
+	return bytes(out)
+
+
 def encode_gpr_home(register, save, offset):
 	"""Save or restore a general-purpose register at `offset(%rsp)`.
 
@@ -767,6 +826,10 @@ def encode_gpr_home(register, save, offset):
 	that are ours to write: below `rsp` is nothing (Win64 has no red zone)
 	and above it is the caller's business, so the only place is the callee
 	home space the caller reserved, which `window_borrow` finds.
+
+	Where the caller reserved none, `encode_gpr_teb` is the same argument
+	in the TEB: also no register to address it, and also a question of
+	whose bytes they are rather than how to reach them. Finding 280.
 
 	Always a disp32. The home space sits at a frame's own displacement and
 	a disp8 form would be right only in a fixture. Finding 249.
@@ -930,8 +993,16 @@ def block_off_xmm(block, mover, home, instructions, index, address,
 	                             reverse=True) if n != mover]
 	if len(unnamed) < 2:
 		return None
-	if lent is None or home_used + 2 * 8 > HOME_SPACE:
-		return None
+	if lent is None or home_used + 2 * 8 > HOME_SPACE \
+			or (TEB_SCRATCH is not None and CODE_SABOTAGE == "teb"):
+		# **The TEB takes what the caller did not lend.** Mode "teb" is
+		# mode "home" with a segment-prefixed absolute address instead of
+		# `offset(%rsp)`, so it consumes no home space and the caller
+		# need not have reserved any. Finding 280.
+		if TEB_SCRATCH is None:
+			return None
+		return ((unnamed[0], unnamed[1], block[2], "teb", TEB_SCRATCH),
+		        home_used)
 	return ((unnamed[0], unnamed[1], block[2], "home", lent + home_used),
 	        home_used + 2 * 8)
 
@@ -4936,15 +5007,20 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# `encode_spill`'s argument and the same one. Finding 255.
 			body += encode_spill(register, True, at + len(body), 0, 0,
 			                     where)
-		if mode == "home":
+		if mode in ("home", "teb"):
 			# The block's own save comes back at the very END of the stub,
 			# because unlike the index it has to hold the pointer for
 			# every member. See the restore below the member loop.
-			body += encode_gpr_home(block[0], True, block[4])
-			body += encode_gpr_home(block[1], True, block[4] + 8)
+			#
+			# "teb" differs from "home" in one thing: WHERE the eight
+			# bytes are. Both borrow two live registers and give them
+			# back, and the sequence between is identical. Finding 280.
+			keep = encode_gpr_home if mode == "home" else encode_gpr_teb
+			body += keep(block[0], True, block[4])
+			body += keep(block[1], True, block[4] + 8)
 			body += encode_tls_base(block[0], block[1], block[2],
 			                        at + len(body))
-			body += encode_gpr_home(block[1], False, block[4] + 8)
+			body += keep(block[1], False, block[4] + 8)
 		else:
 			body += encode_tls_base(block[0], block[1], block[2], at,
 			                        helper if mode else None)
@@ -5560,11 +5636,12 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		body += encode_spill(register, False, at + len(body), 0, 0, where)
 	if block is not None and len(block) > 6 and block[6] is not None:
 		body += encode_gpr_at(block[5], False, None, block[6])
-	if block is not None and len(block) > 3 and block[3] == "home":
+	if block is not None and len(block) > 3 and block[3] in ("home", "teb"):
 		# **The one place it can go.** Past the refusals this function has
 		# a single exit, and every member above has finished with the
 		# pointer by the time control reaches it.
-		body += encode_gpr_home(block[0], False, block[4])
+		keep = encode_gpr_home if block[3] == "home" else encode_gpr_teb
+		body += keep(block[0], False, block[4])
 	return bytes(body)
 
 
@@ -6387,16 +6464,27 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		if len(spare) < 2:
 			return refuse("fewer than two unnamed GPRs to borrow")
 		base = tls[1]
-		# **Nowhere left where the caller lent nothing.** A stub cannot
-		# allocate its own sixteen bytes: a chained fragment's
-		# UWOP_ALLOC_SMALL is not applied, so the handler gets an
-		# establisher frame sixteen bytes out, and unchaining to get the
-		# code applied loses the handler instead. `unwindspill` measures
-		# it at 99. Findings 49, 67, 68 and 270.
-		if lent is None:
-			return refuse("no dead GPR and no home space to save one")
-		block = (spare[0], spare[1], tls[0], "home", lent)
-		home_used = 16
+		# **A stub still cannot allocate its own sixteen bytes**: a
+		# chained fragment's UWOP_ALLOC_SMALL is not applied, so the
+		# handler gets an establisher frame sixteen bytes out, and
+		# unchaining to get the code applied loses the handler instead.
+		# `unwindspill` measures it at 99. Findings 49, 67, 68 and 270.
+		# Mode "teb" below takes the sixteen bytes somewhere that needs
+		# no allocation and no unwind code at all.
+		# **Unless the TEB is carrying it.** `lent is None` cannot be
+		# reproduced by hand -- Finding 268 tried, and a leaf entered by
+		# the loader still has the caller's home space above `rsp` -- so
+		# the path is forced instead, exactly as mode "frame" was, and
+		# `check-teb` asserts a teb block was really emitted before
+		# believing the answer. Finding 280.
+		if lent is None or (TEB_SCRATCH is not None
+		                    and CODE_SABOTAGE == "teb"):
+			if TEB_SCRATCH is None:
+				return refuse("no dead GPR and no home space to save one")
+			block = (spare[0], spare[1], tls[0], "teb", TEB_SCRATCH)
+		else:
+			block = (spare[0], spare[1], tls[0], "home", lent)
+			home_used = 16
 
 	entries = span_entries(members, instructions, slots, scope, plain)
 	helpers, _whole = region_helpers(plain, instructions, index, last,
@@ -12759,7 +12847,7 @@ def main(argv):
 	# site, as it always has, and the other two exist so that all three can
 	# be built and compared. See Finding 46.
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
-	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE
+	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE, TEB_SCRATCH
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -12787,6 +12875,37 @@ def main(argv):
 				      f"not {want!r}", file=sys.stderr)
 				return 2
 			SHADOW_REGS_RULE = want
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--teb-scratch="):
+			want = item.split("=", 1)[1]
+			try:
+				offset = int(want, 0)
+			except ValueError:
+				print(f"detour.py: --teb-scratch wants a number, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			# **No default and a named offset, because the bytes belong to
+			# somebody.** The checks below refuse the two fields this tool
+			# knows are in use and nothing else -- they cannot establish
+			# that an offset is free, only that it is not obviously taken.
+			# Whose the rest are is the open half of Finding 280.
+			if offset <= 0 or offset % 8:
+				print("detour.py: --teb-scratch wants a positive multiple "
+				      "of 8", file=sys.stderr)
+				return 2
+			if offset + TEB_SCRATCH_BYTES > 0x1800:
+				print("detour.py: --teb-scratch would run past the TEB",
+				      file=sys.stderr)
+				return 2
+			for low, name in ((0x30, "the TEB self-pointer"),
+			                  (TEB_TLS_POINTER, "ThreadLocalStoragePointer")):
+				if offset < low + 8 and low < offset + TEB_SCRATCH_BYTES:
+					print(f"detour.py: --teb-scratch 0x{offset:x} overlaps "
+					      f"{name} at 0x{low:x}", file=sys.stderr)
+					return 2
+			TEB_SCRATCH = offset
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
@@ -12943,6 +13062,7 @@ SABOTAGE = {
 	"staleupper": "the repair withholds what would ship a stale upper half",
 	"conservative": "a conservative candidate keeps its VEX form",
 	"switchbase": "a recognised switch dispatch resolves its table",
+	"teb": "a block borrows the callee home space, not the TEB",
 	"backtarget": "a window widened backwards never buries a branch target",
 }
 
@@ -14770,6 +14890,44 @@ def verify(original, patched, listing=None):
 		problems += 1
 	else:
 		print("verify: every instruction in the stub section decodes")
+
+	# **A TEB bracket is not reentrant, and the property that keeps it safe
+	# was asserted rather than checked.** Mode "teb" saves the block's two
+	# borrows at a FIXED address shared by every stub in the image, where
+	# mode "home" uses the caller's own frame. So a stub that swallowed a
+	# `call` whose callee contains another teb stub would have its saved
+	# registers overwritten and restore rubbish -- silently, since nothing
+	# faults.
+	#
+	# `window_escape`'s docstring says no borrow window can contain a call
+	# and says in as many words that this rests "on a property asserted in
+	# two docstrings rather than enforced by a check". For the home space
+	# that is second-order; for a fixed global it is the whole safety
+	# argument, so it is enforced here instead. Measured zero on the first
+	# build that produced any. Finding 280.
+	if TEB_SCRATCH is not None:
+		opened, reentrant, brackets = None, [], 0
+		save = f",%gs:0x{TEB_SCRATCH:x}"
+		load = f"%gs:0x{TEB_SCRATCH:x},%"
+		for line in done.stdout.splitlines():
+			if save in line:
+				opened, brackets = line.split(":")[0].strip(), brackets + 1
+			elif load in line:
+				opened = None
+			elif opened is not None and "\tcall" in line.expandtabs(1):
+				reentrant.append((opened, line.strip()))
+				opened = None
+		if reentrant:
+			print(f"verify: FAILED -- {len(reentrant):,} stub(s) hold a call "
+			      f"inside a TEB save bracket, which is not reentrant",
+			      file=sys.stderr)
+			for at, line in reentrant[:8]:
+				print(f"    bracket at {at}: {line}", file=sys.stderr)
+			problems += 1
+		else:
+			print(f"verify: no call inside any of {brackets:,} TEB save "
+			      f"bracket(s), which is what makes a fixed save location "
+			      f"safe")
 	# **The register class, which nothing else here reads.** See
 	# `stub_gpr_problems`: every other check in this file is blind to a
 	# general-purpose register, and Finding 264 shipped through all of them.

@@ -593,6 +593,61 @@ detour: $(DETOURED)
 #
 # Termination: two bounded invocations over a fixed input, each under a
 # timeout. Roughly an hour, so it is not part of `check`.
+# Mode "teb" stands the block pointer up with two segment-prefixed absolute
+# saves instead of the callee home space, so it needs nothing from the
+# caller and moves no `rsp`. It is reached on Starfield where `lent is
+# None`, a frame state Finding 268 established cannot be built by hand --
+# so the path is FORCED here, on a fixture that would otherwise take mode
+# "home", and the emission is asserted before the answer is believed.
+#
+# **The assertion is the point.** A fixture that answers 77 through mode
+# "home" answers 77 either way, so without reading the stub this target
+# would be a control for nothing. Finding 280.
+check-teb: $(BUILD_DIR)/pe-nogpr-320.exe
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-teb: wine is not installed"; exit 1; }
+	@set -e; \
+	mkdir -p $(PE_PREFIX); \
+	objdump -d -j .text $(BUILD_DIR)/pe-nogpr-320.exe \
+		> $(BUILD_DIR)/pe-nogpr-320.asm; \
+	$(PYTHON) tool/detour.py --shadow-regs=all apply \
+		$(BUILD_DIR)/pe-nogpr-320.exe $(BUILD_DIR)/pe-nogpr-320.asm \
+		$(BUILD_DIR)/sse-nogpr-home.exe > /dev/null; \
+	ANTI_AVX_SABOTAGE=teb $(PYTHON) tool/detour.py --shadow-regs=all \
+		--teb-scratch=$(TEB_SCRATCH) apply \
+		$(BUILD_DIR)/pe-nogpr-320.exe $(BUILD_DIR)/pe-nogpr-320.asm \
+		$(BUILD_DIR)/sse-nogpr-teb.exe > /dev/null; \
+	if cmp -s $(BUILD_DIR)/sse-nogpr-home.exe \
+		  $(BUILD_DIR)/sse-nogpr-teb.exe; then \
+		echo "check-teb: forcing the TEB path produced a byte-identical"; \
+		echo "           image, so it was never taken"; \
+		exit 1; \
+	fi; \
+	saves=`objdump -d -j .avxsse $(BUILD_DIR)/sse-nogpr-teb.exe | \
+	       grep -cE "mov +%r[a-z0-9]+,%gs:0x"`; \
+	if [ "$$saves" -lt 2 ]; then \
+		echo "check-teb: the stub holds $$saves segment-prefixed save(s),"; \
+		echo "           wanting 2 -- so the block did not stand up"; \
+		echo "           through the TEB and a 77 below means nothing"; \
+		exit 1; \
+	fi; \
+	if objdump -d -j .avxsse $(BUILD_DIR)/sse-nogpr-teb.exe | \
+	   grep -qE "(sub|add) +\$$0x[0-9a-f]+,%rsp"; then \
+		echo "check-teb: a stub moves rsp, which is the thing mode"; \
+		echo "           \"frame\" was reverted for -- Findings 67, 68, 270"; \
+		exit 1; \
+	fi; \
+	got=0; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-nogpr-teb.exe \
+		> /dev/null 2>&1 || got=$$?; \
+	pkill -x wineserver >/dev/null 2>&1 || true; \
+	if [ "$$got" != "77" ]; then \
+		echo "check-teb: the forced build returned $$got, want 77"; \
+		exit 1; \
+	fi; \
+	echo "check-teb: a block stood up on two segment-prefixed absolute"; \
+	echo "           saves, moved no rsp, and the answer survived"
+
 check-liveness: $(LISTING)
 	@set -e; \
 	echo "check-liveness: building a deliberately broken image"; \
@@ -774,6 +829,11 @@ PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
 # Wine wants an absolute prefix, and it is kept under BUILD_DIR so that it is
 # this build's to remove rather than something in the user's home.
 PE_PREFIX  = $(abspath $(BUILD_DIR))/wineprefix
+# The TEB offset `check-teb` measures with. There is no default in the
+# tool on purpose -- whose bytes these are is unsettled -- so the gate
+# names one rather than inheriting it. TlsSlots 62 and 63, which TlsAlloc
+# reaches last. Finding 280.
+TEB_SCRATCH = 0x1670
 # **Every target that runs wine asks whether wine runs first.** A wine that
 # will not start returns 1 for every binary, and 1 is not any fixture's
 # expected answer -- so a target without this reports a startup failure as

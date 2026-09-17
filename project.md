@@ -13779,6 +13779,104 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 280 -- the third register-free place, and 439 sites
+
+Finding 270 closed the largest refusal class in the binary with an enumeration: a slot needs
+the block pointer that a slot cannot hold, `(%rsp)` needs no register but cannot be described
+in a chained fragment, **and those are the only two places that need no register.** The first
+two clauses are right. The third is an enumeration, and nobody had checked it.
+
+**`%gs:disp32` is a whole effective address.** Mod 00 with rm 100 selects a SIB, and a SIB of
+0x25 is base 101 index 100: no base, no index, disp32. It is per-thread by construction, it
+does not move `rsp`, and there is nothing in it for an unwinder to describe -- which is
+precisely what mode "frame" was reverted for. Measured under wine before any of it was built,
+three runs each:
+
+    65 48 89 04 25 28 00 00 00   mov %rax,%gs:0x28     write, read back  -> 77 77 77
+    65 48 89 04 25 c8 07 00 00   mov %rax,%gs:0x7c8    write, read back  -> 77 77 77
+
+Nine bytes either way: an absolute address has no shorter form, so a far offset costs what a
+near one does.
+
+**Mode "teb" is mode "home" with the eight bytes somewhere else.** It borrows two live
+unnamed registers and gives them back, exactly as "home" does, and the sequence between is
+the same `encode_tls_base`. It needs no TLS callback, no load-time patching and no assumption
+about the TLS index, because with both registers free the existing two-dereference chain
+runs unchanged:
+
+    mov %r11,%gs:0x1670          save, no register needed to address it
+    mov %r10,%gs:0x1678          save
+    mov %gs:0x58,%r11            the thread's TLS array
+    mov tls_index(%rip),%r10d
+    mov (%r11,%r10,8),%r11       this module's block
+    mov %gs:0x1678,%r10          the index register, back before the body
+        ... the members ...
+    mov %gs:0x1670,%r11          the block pointer, at the single exit
+
+Measured on Starfield, `--shadow-regs=all`, against 3,172:
+
+    VEX in .text            805,131 -> 2,733        was 3,172      -439
+    unconditional lowering  35,428 built, 814 refused, of 36,242
+                                                    was 33,845 / 3,408 of 37,253
+    sites through a slot    33,997                  was 33,173     +824
+    windows not placed       1,318                  was   645
+    stub section         4,669,539 bytes            was 4,623,702
+
+**439 against a predicted 260.** The prediction came from Finding 268, which served the same
+population by the unsound route and took 260 -- honest to quote, and stale, because the tree
+has gained the immediate form and backward widening since. Refusals fell by 2,594 where the
+two named classes total 2,155: dissolving the register wall also lets sites through that were
+being refused behind it.
+
+The withheld windows doubled again, 645 to 1,318, which is the same pull every lever here
+meets and is now much the largest single class in the census.
+
+**There is no default, and that is the finding's other half.** A stub cannot preserve what it
+borrows in the TEB: preserving it means reading it first, into the register it has not got.
+So the bytes have to be genuinely unowned rather than merely quiet, and every offset in the
+TEB belongs to somebody -- `TlsSlots` is `TlsAlloc`'s to hand out, `ArbitraryUserPointer` is
+read by some `NtCreateFile` paths, and the OpenGL reserved block is free only in a process
+that never loads legacy GL. Starfield's own `.text` touches `gs:0x58` 12,887 times and
+`gs:0x30` six times and nothing else, but that is the image and not the system DLLs it calls.
+
+So `--teb-scratch=<offset>` has no default and the tool emits nothing without it, which is
+what `--spill=stack` does for the stack borrow it is not allowed to take. The flag refuses an
+offset overlapping the two fields this tool knows are in use and nothing more -- it cannot
+establish that an offset is free, only that it is not obviously taken. **Settling ownership
+for a real process is the work this does not do**, and until it is done the 439 are a
+measurement rather than a shipped gain.
+
+**The fixture had to be forced, for the reason Finding 268 recorded.** `lent is None` comes
+from frame states that cannot be built by hand -- a leaf entered by the loader still has the
+caller's home space above `rsp` -- so `ANTI_AVX_SABOTAGE=teb` takes the path on `nogpr`,
+which would otherwise use mode "home". `check-teb` asserts the two images DIFFER, that the
+stub really holds two segment-prefixed saves, and that no stub moves `rsp`, before believing
+the 77. Without the middle assertion the target would be a control for nothing: a fixture
+that answers 77 through mode "home" answers 77 either way.
+
+**The liveness gate of Finding 266 needed no change and that was luck worth checking.** It
+keys a save by the TEXT of its target and a restore by the text of its source, so
+`%gs:0x1670` matches itself in both directions and the pair reads as preserved. It was
+written for `offset(%rsp)` and an xmm stash, and happens to be general.
+
+#### A fixed save location is not reentrant, and the thing that made it safe was a docstring
+
+Mode "home" puts the block's two borrows in the CALLER's frame, so two stubs nested on one
+thread cannot collide. Mode "teb" puts them at one address shared by every stub in the image.
+A stub that swallowed a `call` whose callee held another teb stub would have its saves
+overwritten and would restore rubbish -- silently, because nothing faults.
+
+What rules that out is that a borrow window cannot contain a call, and `window_escape`'s
+docstring says so while saying, in as many words, that it rests **"on a property asserted in
+two docstrings rather than enforced by a check"**. For the home space that is second-order.
+For a fixed global it is the entire safety argument, and `verify` reports 384 re-emitted calls
+in the stub section, so the population is not empty.
+
+So it is enforced rather than asserted: `verify` walks the stub disassembly and refuses a call
+between a TEB save and its restore. **365 brackets on Starfield, zero calls inside any of
+them** -- the property holds, and now something watches it. The check was made to fail before
+being believed, by pointing its trigger at an instruction the fixture's bracket does contain.
+
 ### Finding 279 -- the guard that could not be watched, and a check the padding defeats
 
 `unit_candidate` refuses to widen back over a site that is a branch target, because a
@@ -14217,9 +14315,15 @@ gate asserting the mechanism is broken had been passing beside mode "frame" the 
 existed.
 
 **And the 2,006 sites stay blocked for the reason Finding 267 named**: a slot is addressed
-off the block pointer and cannot hold the registers that stand it up, `(%rsp)` can but cannot
-be described in a fragment, and those are the only two places that need no register. That is
-a floor, not a gap.
+off the block pointer and cannot hold the registers that stand it up, and `(%rsp)` can but
+cannot be described in a fragment.
+
+~~Those are the only two places that need no register. That is a floor, not a gap.~~
+**Wrong, and wrong in the direction that stops somebody looking.** There is a third:
+`%gs:disp32` is a complete effective address with no base and no index. Finding 280 measures
+it and takes 439 frontier sites with it. The two facts above are both true; the sentence that
+turned them into a floor was an enumeration nobody had checked, written in the same breath as
+the correction of a different over-claim.
 
 ### Finding 269 -- two decisions in the wrong order, and the refactor that cost 531
 
