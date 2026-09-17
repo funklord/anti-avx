@@ -6094,10 +6094,20 @@ def unit_shortening(instructions, plain, index, blocked, home,
 		if lone is not None:
 			UNIT_REFUSED, UNIT_EXAMPLES = before
 			return lone
-		last = snapshot()
-	# The SHORTEST window's reason is the one kept: it says why the site
-	# itself cannot be lowered, independent of how much a window around it
-	# was trying to carry.
+		if last is None:
+			last = snapshot()
+	# **The FIRST rung's reason is kept, not the last.** Keeping the
+	# shortest looked like keeping the most fundamental answer and is the
+	# opposite: at `limit=1` the widening loop never iterates -- the
+	# condition is `last - index < limit` with `last` already `index + 1`
+	# -- so a site under five bytes refuses "nothing follows"
+	# unconditionally, whatever was really wrong with it. That reason
+	# reached 866 in one census and is an artifact of the ladder rather
+	# than a property of the binary.
+	#
+	# The longest window's reason is what the census said before the ladder
+	# existed, which also keeps every earlier measurement comparable.
+	# Finding 277.
 	UNIT_REFUSED, UNIT_EXAMPLES = last
 	return None
 

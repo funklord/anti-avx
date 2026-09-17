@@ -13779,6 +13779,59 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 277 -- the census row that was mine, and 795 sites behind a bookkeeping wall
+
+**Two instrument faults in one change, and the second chose the next item.** Finding 276's
+ladder recorded a failing site's reason from the SHORTEST rung, on the reasoning that it was
+the most fundamental. It is the most degenerate: the widening condition is
+`last - index < limit` with `last` already `index + 1`, so at `limit=1` the loop never
+iterates and any site under five bytes refuses `too short to place, nothing follows`
+unconditionally. That row reached **866** and was about to be picked as the second-largest
+class in the binary. It is an artifact of the ladder.
+
+The first rung's reason is kept now, which is also what the census said before the ladder
+existed, so every earlier measurement stays comparable. `cmp` confirms the image is
+byte-identical -- a reason-keeping change must be bookkeeping only, and that is cheaper to
+check than to argue. The honest census:
+
+    no dead GPR and no home space to save one    1,785
+    mode True has no xmm to stash the index in     370
+    no non-volatile xmm this function saves        285
+    vfmadd231ps has no legacy encoding             186
+    shape a register second source, src2 is D      162
+    shape a register-to-register move              148
+    no volatile xmm and scratch slot                108
+
+#### Backward widening: 795 sites, and why it is not in the tree
+
+`unit_candidate` widens only forward; the plain path has used both directions since the
+beginning. Measured at the refusal:
+
+    too short, forward blocked            837
+      BACKWARD would reach five           795
+      the SITE is a branch target          30
+      previous transfers control           12
+
+**95% of them.** The window starts on the instruction before the site and swallows the site
+itself, which needs only that the site is not a branch target -- an address strictly inside a
+window is one nothing may branch to.
+
+It was built twice and reverted twice. `nonvol` and `unwindsave` both returned 5 instead of
+77 with `verify` naming **four boundaries lost that were not swallowed on purpose** and **a
+`call` inside a placed window that no stub re-emitted**. Putting the swallowed neighbour in
+the members emits it correctly and accounts it nowhere; moving it to `preceding`, which
+`place_stubs` reads for exactly that bookkeeping and `build_stub` emits before the span,
+did not fix it either.
+
+**What the two fixtures have in common is a `call` between the loads and the site**, and that
+is where the next attempt should start rather than in the emission, which is correct in both
+versions -- the wrong answer is 5, not rubbish, and the stub decodes.
+
+The finding is that **the 795 are behind a bookkeeping wall rather than a semantic one**. No
+part of the placer's swallow accounting has a case for a window that begins before its own
+site: it reads `preceding` and `displaced`, and the unit strategy populates neither. That is
+a real piece of work and it is not one to do blind at the end of a session.
+
 ### Finding 276 -- a shorter window finds a helper, and the trade pays
 
 Finding 275 measured the xmm shortage as register pressure and named one untried idea with
