@@ -133,19 +133,9 @@ rewritten one must work" is a real experiment rather than a wish. Every
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
+Covers this rewriter and its tooling, not the binary it rewrites.
 `python3 tool/detour.py --version` prints the same line.
-
-**It covers this rewriter and its tooling, and nothing else.** anti-avx exists
-to modify somebody else's binary; naming the holder here says who wrote the
-tool, and says nothing about the artifact the tool emits, in which this project
-holds no copyright and claims none.
 
 ## Licence
 
-**None chosen.** All rights reserved by the copyright holder.
-
-That is deliberate rather than an oversight, and it is the state to leave it
-in until the copyright holder decides. A licence is a grant of rights to other
-people; an absent one leaves every option open, while a published grant cannot
-be taken back from anyone who has already relied on it. It is not to be copied
-from another project or inferred from a template.
+None yet.
