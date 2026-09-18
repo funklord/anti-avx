@@ -231,7 +231,7 @@ check-shadow-pe:
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
 	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove nonvol unwindsave \
-	            backward backtarget; do \
+	            backward backtarget commute; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -341,6 +341,13 @@ check-shadow-pe:
 	@echo "                 starts on the instruction BEFORE it and"
 	@echo "                 re-emits it; carrying it without re-emitting"
 	@echo "                 gives 7 rather than 77"
+	@echo "check-shadow-pe: commute -- op %ymmD,%ymmS,%ymmD, where the"
+	@echo "                 destination is the OTHER source. Dropping the"
+	@echo "                 VEX prefix throws vvvv away and doubles"
+	@echo "                 instead of adding, so the operands have to be"
+	@echo "                 exchanged; 30+40 and 3+4 give 77 where the"
+	@echo "                 doubling gives 66, which is what makes the"
+	@echo "                 answer separate the two emissions"
 	@echo "check-shadow-pe: backtarget -- the same shape with the site"
 	@echo "                 named by a never-taken jne, so widening back"
 	@echo "                 would bury a branch target. The guard refuses"

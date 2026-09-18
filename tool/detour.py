@@ -2987,6 +2987,30 @@ NO_LEGACY_FORM = frozenset((
 )) | FMA_FORMS
 
 
+def commuted_piece(vex, tail):
+	"""The SSE form of `op %ymmD,%ymmS,%ymmD`, sources exchanged, or None.
+
+	`narrow_piece` drops the VEX prefix and keeps the ModRM, which is right
+	exactly when VEX.vvvv already names the destination -- the SSE form has
+	no place to put a second source, so the one in `vvvv` is thrown away.
+	Where the destination is the OTHER source, throwing it away turns
+	`vmulps %ymm1,%ymm0,%ymm1` into `mulps %xmm1,%xmm1`, which squares.
+
+	So the source in `vvvv` is written into ModRM.rm instead, and REX.B
+	follows it. Only valid where exchanging the sources does not change the
+	result: see `COMMUTATIVE_YMM`, which is what the caller gates on.
+
+	Register to register only. A memory source cannot be in `vvvv`, so the
+	shape this serves never has one. Finding 284.
+	"""
+	if len(tail) < 2 or (tail[1] & 0xC0) != 0xC0:
+		return None
+	source = vex["vvvv"]
+	modrm = (tail[1] & 0xF8) | (source & 7)
+	narrow = dict(vex, L=0, B=1 if source >= 8 else 0)
+	return inplace.sse_encoding(narrow, tail[:1] + bytes([modrm]) + tail[2:])
+
+
 def narrow_piece(vex, tail, delta, address, length, at):
 	"""One 128-bit half of a 256-bit memory operand, `delta` bytes along.
 
@@ -4106,6 +4130,33 @@ SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2",
 # general-purpose one. Finding 253.
 YMM_REGISTER_MOVES = frozenset(("vmovups", "vmovaps", "vmovdqu", "vmovdqa"))
 
+# **Operations whose operands may be exchanged with no change to the bytes
+# produced.** `op %ymmD,%ymmS,%ymmD` computes `D = S op D`, and SSE's
+# two-operand form computes `dst = dst op src` -- so for these the SSE form
+# IS the wanted value with the sources read the other way round, needing no
+# scratch and no extra move. For everything else it is a different value.
+#
+# **Floating-point add and multiply are deliberately absent.** They are
+# commutative in arithmetic and not in x86: with two NaN operands the result
+# carries the FIRST source's payload, so exchanging them changes the bytes.
+# That is 30 of the 72 sites this set could otherwise reach -- see Finding
+# 284 -- and it is the copyright holder's call rather than one to take while
+# in the file, because this project is bit-exact by rule (Finding 4).
+#
+# FP min and max are absent for a stronger reason: they are defined
+# asymmetrically on NaN and on signed zero, so they are not commutative at
+# all. Integer min and max have neither hazard.
+COMMUTATIVE_YMM = frozenset((
+	"vpaddb", "vpaddw", "vpaddd", "vpaddq",
+	"vpmullw", "vpmulld", "vpmulhw", "vpmulhuw", "vpmuludq", "vpmuldq",
+	"vpand", "vpor", "vpxor",
+	"vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
+	"vpcmpeqb", "vpcmpeqw", "vpcmpeqd", "vpcmpeqq",
+	"vpminsb", "vpminsw", "vpminsd", "vpminub", "vpminuw", "vpminud",
+	"vpmaxsb", "vpmaxsw", "vpmaxsd", "vpmaxub", "vpmaxuw", "vpmaxud",
+	"vpavgb", "vpavgw",
+))
+
 # **Member kinds that put no value in a vector register.** A `load` moves an
 # upper half through one and a `lanereg3` needs two; these four move a half
 # straight between a machine register and its slot, or emit a constant, and
@@ -4622,6 +4673,16 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 		# it there. That is `slot_tail`'s reason for existing. Finding 152.
 		return ("lanereg", canonical_ymm(fields[2]),
 		        canonical_ymm(fields[0]))
+	if len(fields) == 3 and len(wide) == 3 and fields[0] == fields[2] \
+			and mnemonic in COMMUTATIVE_YMM:
+		# **`op %ymmD,%ymmS,%ymmD` -- the destination is the OTHER
+		# source.** `lower_vex` needs a scratch for this and the slot path
+		# refused it outright, which was 82 sites. Where the operation
+		# commutes it needs neither: the same `lanereg` emission serves,
+		# with the source taken from `vvvv` rather than from ModRM.rm, and
+		# `commuted_piece` writes the low half. Finding 284.
+		return ("lanereg", canonical_ymm(fields[2]),
+		        canonical_ymm(fields[1]))
 	if len(fields) == 3 and len(wide) == 3 and fields[0] != fields[2]:
 		# `op %ymmS2,%ymmS1,%ymmD` with a destination of its own, which is
 		# the largest shape Finding 150 counted and the one the region
@@ -5534,8 +5595,20 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# operation is register to register.
 			if second_helper is None:
 				return refuse("lanereg wants a second helper")
-			low = narrow_piece(vex, tail, 0, address, len(encoding),
-			                   at + len(body))
+			# **Which narrowing is decided by the encoding, not by the
+			# shape.** `vvvv` names the source SSE has no room for, so
+			# dropping the prefix is right exactly when `vvvv` already
+			# names the destination. Where it does not, the destination is
+			# the other source and the operands have to be exchanged --
+			# which the classifier only allows for an operation that
+			# commutes. Reading it back off the bytes keeps the two from
+			# disagreeing. Finding 284.
+			if len(tail) > 1 and vex["vvvv"] != (
+					((tail[1] >> 3) & 7) | (vex["R"] << 3)):
+				low = commuted_piece(vex, tail)
+			else:
+				low = narrow_piece(vex, tail, 0, address, len(encoding),
+				                   at + len(body))
 			if low is None:
 				return refuse("lanereg low half cannot be narrowed")
 			body += low

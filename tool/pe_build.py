@@ -3254,6 +3254,63 @@ tls_directory:
 	.long	0, 0
 """)
 
+# **The aliasing shape that commutes**: `op %ymmD,%ymmS,%ymmD`, where the
+# destination is the OTHER source. SSE has no room for a second source, so
+# dropping the VEX prefix throws away `vvvv` and turns this into
+# `op %xmmD,%xmmD` -- which for `vpaddd` doubles instead of adding. The
+# lowering has to exchange the operands, which is only sound because the
+# operation commutes. Finding 284.
+#
+# **The numbers separate the two emissions rather than merely passing.**
+# ymm1 holds 30 low and 3 upper, ymm0 holds 40 and 4, so the answer is
+# 70 + 7 = 77 and the doubling bug gives 60 + 6 = 66. A fixture whose two
+# operands were equal would pass either way.
+PROGRAMS["commute"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	vmovups	(%rsi), %ymm1
+	vmovups	0x20(%rsi), %ymm0
+	xorl	%edx, %edx
+	testl	%edx, %edx
+	jne	here			/* never taken; forces permanent slots */
+here:
+	vpaddd	%ymm1, %ymm0, %ymm1	/* ymm1 = ymm0 + ymm1, src2 is D */
+	vmovups	%ymm1, (%rdi)
+	movl	(%rdi), %eax		/* 30 + 40 = 70 */
+	movl	16(%rdi), %edx		/* 3 + 4 = 7, through the slot */
+	addl	%edx, %eax		/* 77 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 30, 0, 0, 0
+	.long 3, 0, 0, 0
+	.long 40, 0, 0, 0
+	.long 4, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
 PROGRAMS["immreg"] = (77, """
 	.text
 	.globl _start

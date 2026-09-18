@@ -13779,6 +13779,69 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 284 -- the aliasing shape, where the operation commutes
+
+`op %ymmD,%ymmS,%ymmD` computes `D = S op D`: the destination is the OTHER source.
+`SPAN_EMITTABLE` excluded it with the note that it is "the aliasing case `lower_vex` needs a
+scratch for and this does not build", so the slot path refused a shape its in-place sibling
+already emits.
+
+**Where the operation commutes it needs no scratch at all.** SSE's two-operand form computes
+`dst = dst op src`, so `op %xmmS,%xmmD` IS the wanted value with the sources read the other
+way round. The same `lanereg` emission serves; only the low half changes, and only in which
+register ModRM.rm names.
+
+    refusals                     814 ->  730
+    shape ... src2 is D          162 ->   78
+    sites built               35,428 -> 35,470      +42
+    VEX in .text               2,623 -> 2,587       36 sites
+
+**162 was refusals, not sites**, and I quoted it as a site count twice before measuring it.
+Classifying the listing directly with the tool's own `span_shape_name` gives **82 sites** --
+a site is refused about twice, once per strategy that asks. Of the 82: 72 commute, 10 do not.
+
+#### What is deliberately left, and why it is not mine to take
+
+**Floating-point add and multiply are excluded** -- 30 of the 72, and the largest single
+group (21 `vmulps`). They are commutative in arithmetic and not in x86: with two NaN operands
+the result carries the FIRST source's payload, so exchanging them changes the bytes. This
+project is bit-exact by rule, Finding 4 having made FMA's inexactness a finding rather than a
+detail, so taking 30 sites on a NaN-payload argument is a decision for the copyright holder
+and not one to make while in the file. Recorded here rather than done.
+
+**FP min and max are excluded for a stronger reason** and are not a decision at all: they are
+defined asymmetrically on NaN and on signed zero, so they do not commute. My first
+commutativity list had them in it, which is the kind of error a list gets when it is written
+from the word "commutative" rather than from the manual.
+
+The remaining 10 need the scratch `lower_vex` already uses, which is a different piece of
+work: an emission that wants a register, not a reclassification.
+
+#### The encoder, and an instrument that lied twice
+
+`narrow_piece` drops the VEX prefix and keeps the ModRM, which is right exactly when `vvvv`
+already names the destination -- SSE has no room for a second source, so the one in `vvvv` is
+thrown away. Where the destination is the other source, throwing it away turns
+`vmulps %ymm1,%ymm0,%ymm1` into `mulps %xmm1,%xmm1`, which SQUARES. `commuted_piece` writes
+`vvvv` into ModRM.rm instead and carries REX.B with it.
+
+**Which of the two is used is read back off the bytes**, not passed down from the classifier:
+`vvvv != ModRM.reg` is exactly the condition, and deriving it at the emission site is what
+keeps the classifier and the emitter from disagreeing about a shape -- the drift
+`SPAN_EMITTABLE` exists to prevent, met from the other side.
+
+**My probe was wrong twice and the second one would have shipped.** The first version treated
+`tail[0]` as the ModRM byte; it is the OPCODE, because `sse_encoding` supplies only the map
+escape. So it overwrote the opcode and `vpaddd` came back as `psubq`. What caught it was
+disassembling the emitted bytes with objdump rather than checking my own arithmetic -- and
+the same check is what confirmed the fix, `vpaddd %ymm8,%ymm11,%ymm8` reading back as
+`paddd %xmm11,%xmm8` with both REX bits right.
+
+**The fixture separates the two emissions rather than merely passing.** `commute` holds 30
+low and 3 upper against 40 and 4, so the answer is 70 + 7 = 77 and the doubling bug gives
+60 + 6 = 66. A fixture whose two operands were equal would have passed either way, which is
+Finding 205's rule applied to an arithmetic shape instead of a strategy.
+
 ### Finding 283 -- the shapes are there and every one of them is guilty
 
 Finding 281's substitution allowed one attempt per window: an alternative that was itself
