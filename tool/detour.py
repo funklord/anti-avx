@@ -4829,13 +4829,28 @@ TLS_SLOTS = 4
 # stops being asked. Nothing has to be proved about where a value came
 # from, which is the whole purpose of the provenance walk.
 #
-# The price is real and is why this is a flag rather than the default:
-# sixteen ymm cannot be sixteen xmm pairs, so the upper halves live in
-# memory permanently, and the representation is only coherent if EVERY
-# writer maintains its slot. Finding 244.
+# The price is real: sixteen ymm cannot be sixteen xmm pairs, so the upper
+# halves live in memory permanently, and the representation is only
+# coherent if EVERY writer maintains its slot. Finding 244.
+#
+# **It is the default since 2026-09-18, on the copyright holder's
+# instruction and on this measurement**: the shipped build left 5,691 VEX
+# in `.text` and this leaves 3,114, for 894 KB more image on 112 MB --
+# 2,577 sites for eight tenths of a percent. 5,398 of the old default's
+# 5,691 refusals were a single class, "reads a ymm defined outside the
+# region", which a permanent slot dissolves by construction; nothing else
+# in that census was above 311.
+#
+# **What was NOT measured is runtime**, and for a game that is the number
+# that decides it: every lowered site reaches its upper half through
+# `gs:[0x58]`, an index and a load, where the old default kept more of
+# them in registers. This host has no AVX and nothing here runs the game,
+# so the trade was taken on size and correctness with that gap stated
+# rather than closed. `--shadow-regs=off` stays reachable as the A/B, the
+# same way `--spill=home` stays beside `--spill=tls`. Finding 287.
 SHADOW_REGS = 16
 SHADOW_REGS_OFF, SHADOW_REGS_ALL = "off", "all"
-SHADOW_REGS_RULE = SHADOW_REGS_OFF
+SHADOW_REGS_RULE = SHADOW_REGS_ALL
 
 
 def tls_block_slots():

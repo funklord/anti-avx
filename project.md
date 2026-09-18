@@ -5,10 +5,15 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **799,440 of 805,131 VEX
-sites -- 99.3%** -- through 202,836 detours, and every `make detour-verify` invariant
-holds on the result. 5,691 sites are left, and the rewritten binary loads 305 modules
-under Proton before the frontier at `0x1428D1492` stops it.
+**Status:** the rewriter works. `tool/detour.py` rewrites **802,062 of 805,131 VEX
+sites -- 99.6%** -- through 201,670 detours, and every `make detour-verify` invariant
+holds on the result. 3,069 sites are left.
+
+The default became `--shadow-regs=all` on 2026-09-18 (Finding 287), which is where the
+2,622-site fall from 5,691 comes from. **The Proton observation is older than that build**
+-- the previous default loaded 305 modules before the frontier at `0x1428D1492` stopped it,
+and nobody has run the new one, so that address belongs to a binary this tree no longer
+produces.
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
@@ -13778,6 +13783,68 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 287 -- the uniform slots become the default, and nine strategies stop firing
+
+Instructed by the copyright holder 2026-09-18. `--shadow-regs=all` had been a flag since
+Finding 244, and the record had said for some time that switching it was "worth more than
+everything left in the list above combined" -- at a gap of 2,460 when that was written.
+Measured on the day it was taken:
+
+    VEX in .text        5,691 -> 3,069        2,622 sites
+    stub section    3,778,502 -> 4,628,957    +850,455 bytes
+    image         111,600,640 -> 112,437,760  about +0.8%
+    detours           202,836 -> 201,670
+
+**Why the gap was that shape.** 5,398 of the old default's 5,691 refusals -- 95% -- were a
+single class: `reads a ymm defined outside the region`, split across after-a-call (3,385),
+after-a-jump (1,079) and at-a-branch-target (934). A permanent per-register slot dissolves
+the whole class by construction, because nothing has to be proved about where a value came
+from. Nothing else in that census was above 311.
+
+**What was not measured, and it is the number that would decide it for a game.** Every
+lowered site now reaches its upper half through `gs:[0x58]`, an index and a load, where the
+old default kept more of them in registers. This host has no AVX and nothing in this tree
+runs Starfield, so the trade was taken on size and correctness with the runtime gap stated
+rather than closed. `--shadow-regs=off` stays reachable as the A/B, the way `--spill=home`
+stays beside `--spill=tls`.
+
+#### Nine strategies stop placing anything, and a gate said so within the hour
+
+The collector offers `unit` first under this mode and it takes what it can, so the placer
+table is now three rows:
+
+    plain   179,506      was 179,097
+    unit     18,920      was 0
+    spill     3,406      was 3,395
+
+`zero` (10,018), `pair` (7,232), `run` (2,045), `region` (16), `span` (27), `zerorun`,
+`splat`, `splatop`, `splatrun`, `longload`, `longstore` and `conststore` place **nothing**.
+
+That is construction rather than regression: the uniform representation is coherent only if
+EVERY writer maintains its slot, and `unit` is the strategy that does. Those twelve are the
+`off` mode's path and are reachable there; none is dead code.
+
+**`check-pe` caught the consequence immediately**, which is the part worth recording.
+`regioncarry` exists to prove the region lowering actually runs, because four earlier shapes
+of it silently became spans -- Finding 205. Under the new default `unit` took it, the fixture
+went on answering 77, and the strategy assertion failed exactly as written. It runs under
+`--shadow-regs=off` now, which is where the region strategy lives.
+
+A fixture that asserts WHICH strategy answered is the only kind that could have noticed. The
+exit code was 77 either way.
+
+#### Two claims that had to be scoped rather than carried over
+
+`project.md` and the README both said the rewritten binary loads 305 modules under Proton
+before the frontier at `0x1428D1492` stops it. That was measured on the previous default and
+nobody has run this one, so the module count and the address describe a binary this tree no
+longer produces. Both now say so.
+
+**A status line is the most-quoted sentence in a project and the least re-measured.** Ours
+had been carried through this whole session as "the shipped build is unchanged at 5,691",
+correctly as it turned out -- but I had been repeating it from a summary rather than from a
+measurement, and only checked on the day it stopped being true.
 
 ### Finding 286 -- the window cannot be split, and that closes the largest class
 

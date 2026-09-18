@@ -1183,8 +1183,21 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 	@# tried first, so anything it can carry it does. `regionlive` is the
 	@# standing example: it reads as region coverage and places a `spill`.
 	@# So assert the strategy row, not just the exit code. Finding 205.
+	@# **Asserted under `--shadow-regs=off`, which is where the region
+	@# strategy now lives.** Since the default became `all` the collector
+	@# offers `unit` first and it takes anything it can, so the placer
+	@# table in that mode is `plain`, `unit` and `spill` and nothing else
+	@# -- `zero`, `pair`, `run`, `region`, `span`, the splats and the
+	@# constants place nothing at all. That is by construction rather than
+	@# regression: the uniform representation is only coherent if every
+	@# writer maintains its slot, and `unit` is the strategy that does.
+	@#
+	@# So this fixture went on answering 77 while covering nothing, which
+	@# is exactly the failure Finding 205 wrote it against, and the gate
+	@# caught it the hour the default changed. Finding 287.
 	@set -e; \
-	$(PYTHON) tool/detour.py apply $(BUILD_DIR)/pe-regioncarry.exe \
+	$(PYTHON) tool/detour.py --shadow-regs=off apply \
+		$(BUILD_DIR)/pe-regioncarry.exe \
 		$(BUILD_DIR)/pe-regioncarry.asm \
 		$(BUILD_DIR)/sse-regioncarry.exe > $(BUILD_DIR)/regioncarry.log; \
 	if grep -qE '^apply:   region +[0-9]' $(BUILD_DIR)/regioncarry.log; then \
