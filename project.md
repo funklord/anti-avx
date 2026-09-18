@@ -11876,6 +11876,94 @@ already built and tested for the case.
 Everything below is what a fresh start needs and none of it is derivable from the
 code quickly.
 
+### Where it stands, 2026-09-18
+
+    default build (--shadow-regs=all)     3,069 VEX left      99.62%
+    with --teb-scratch=<offset>           2,526               99.69%
+    previous default (--shadow-regs=off)  5,691               99.29%
+
+**The default changed on 2026-09-18** (Finding 287), on the copyright holder's
+instruction: 2,622 sites for about +0.8% of image. `--shadow-regs=off` stays
+reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
+splats, the long loads and stores and `conststore` still place -- under the new
+default the placer table is `plain`, `unit` and `spill` and nothing else.
+
+Every remaining class is a measured floor or derivative of one:
+
+    in a window the repair dropped     1,177   closed on all three routes, Finding 286
+    declined by the collector            955   85% FMA, which has no SSE encoding
+    refused, stub not buildable          190   128 of it the same FMA floor once removed
+    undecodable, never classified        180   Finding 8's bytes, refused by rule
+    skipped for overlap                   13
+    in-place patch reverted               11
+    unaccounted                            0
+
+The census reconciles exactly; `unaccounted` is a real zero and was 85 until
+Finding 282.
+
+### The next item, and what to measure before starting it
+
+**Reserve TLS slots at load time rather than squatting on a TEB offset.**
+`--teb-scratch` is worth 543 sites and has no default because nothing in the TEB
+is ours: `TlsSlots` belongs to `TlsAlloc`, `ArbitraryUserPointer` is read by some
+`NtCreateFile` paths, and a stub cannot preserve what it borrows there -- doing so
+means reading it first, into the register it has not got.
+
+`TlsAlloc` is the documented way to own one, and slot `k` is then `%gs:0x1480+8k`:
+no base, no index, no register. **Starfield's TLS directory already has a callback
+array with two entries at `0x143a86ea0`**, so the tool can relocate it into the
+stub section with a third and the existing two keep their addresses.
+
+**The scope is larger than 543 sites.** Every stub today rebuilds the block pointer
+per execution -- `%gs:0x58`, the index, the block -- three instructions and two
+dependent loads. A thread-attach callback writing that pointer into a reserved slot
+makes every stub's prologue one load, on roughly 200,000 stubs, which is what
+Finding 288 measured at 2 to 3 ns apiece.
+
+Measure these two first, on the pattern that paid three times on 2026-09-18:
+
+  * **How many stubs need patching.** The narrow scope is about 400 (the teb-mode
+    brackets); the wide one is every stub that stands a block pointer up. The
+    difference decides whether the patch table is a nicety or a design constraint.
+  * **When the two existing callbacks run** -- process attach or thread attach.
+    Relocating the array must not change when they are called.
+
+The cost is a day and it is the first thing here that runs code at load time rather
+than only rewriting it: the callback must resolve `TlsAlloc` (an added import
+descriptor, or a PEB walk to kernel32's exports, about eighty bytes), `.avxsse`
+must be writable at load time, and the tool must emit the patch table.
+
+### Decisions waiting on the copyright holder
+
+  * **The 30 FP add/mul sites in `src2 is D`** (Finding 284). They commute in
+    arithmetic and not in x86: with two NaN operands the result carries the FIRST
+    source's payload, so exchanging them changes the bytes. This tool is bit-exact
+    by rule (Finding 4). The other 42 of that class are taken; these are not.
+  * **Whether the runtime evidence is enough for the new default** (Finding 288).
+    A lowered site costs 2 to 3 ns on this host under wine, the two modes emit
+    identical stubs on ground both can lower, and the comparison on HOT code could
+    not be built at all -- `--shadow-regs=off` will not lower a loop body whose head
+    is a branch target. Settling it needs the game, which nothing in this tree runs.
+
+### Two claims that are scoped, not current
+
+`project.md` and the README both used to say the rewritten binary loads 305 modules
+under Proton before the frontier at `0x1428D1492`. **That was the previous default
+and nobody has run this one**, so both now say which binary they describe. Anyone
+re-running it should replace the address as well as the count.
+
+### Working notes for this machine
+
+  * `build/wineprefix` is owned by `funk`; wine refuses a prefix it does not own, so
+    a session running as another user must pass `PE_PREFIX=<own path>` to
+    `check-pe`, `check-shadow-pe` and `check-teb`.
+  * An apply is about ten minutes and a verify about twenty when the box is quiet.
+    At load 40 or more, which happens, both take three times that. The numbers are
+    unaffected; the wall-clock is not.
+  * `tool/style_gate.py` and `tool/test_style_gate.py` were behind
+    `~/.claude/tool/` on 2026-09-18 and another session was mid-sync on them. Do not
+    stage either without checking whose work it is.
+
 ### The two decisions that are not the implementer's
 
 1. ~~**May a stub spill?**~~ **Answered: no, and it was never a decision.** Finding 46
