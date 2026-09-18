@@ -13779,6 +13779,66 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 286 -- the window cannot be split, and that closes the largest class
+
+The repair's dropped windows are 1,177 of 2,526 survivors, and Finding 283 shut the reshaping
+route: shapes are not scarce, but nearly every one the ladder can build still covers the
+instruction the window was blamed for. The one mechanism left was a window with a HOLE in it
+-- two windows abutting the producer, leaving it in place -- which the strategy has no
+representation for.
+
+**Measured before building any of it, and it reaches zero sites:**
+
+    1,136 dropped window(s)
+      1 blamed                       439
+      2 blamed                       287
+      3 or more blamed               410
+
+    of the 439 with exactly one blamed producer:
+      neither side reaches 5 bytes   337
+      only after is placeable         78
+      only before is placeable        24
+      five bytes on both sides         0
+
+A split needs a five-byte jump on EACH side. Not one window of 439 has the room, and 337 do
+not have it on either side. A unit window is as long as one jump and a member or two, which
+is the point of the strategy; two jumps and a producer between them was never going to fit,
+and the arithmetic says so in one run.
+
+The 78 and the 24 are not a consolation. Those are windows one shorter or offset window could
+take, which is exactly what the ladder already tries at four lengths in two directions and
+what Finding 283 measured failing.
+
+**So the class is closed on all three routes**, and they are worth keeping together because
+the next person will think of them in this order:
+
+  * **Lower the surviving reader.** The repair iterates for this already; what is left is
+    readers nothing can lower, which is the declined class under another name.
+  * **Zero the upper half from inside the stub.** Legacy SSE cannot touch bits 255:128 --
+    that is why the zeroing is lost -- and a stub may hold no VEX because the host has no AVX.
+    Impossible by construction rather than unbuilt.
+  * **Split the window.** Zero sites, measured above.
+
+#### Where that leaves the frontier
+
+    in a window the repair dropped     1,177    closed, this finding
+    declined by the collector            955    85% FMA, which has no SSE encoding
+    refused, stub not buildable          190    128 of it the same FMA floor once removed
+    undecodable, never classified        180    Finding 8's bytes; refused by rule since 223
+    skipped for overlap                   13
+    in-place patch reverted               11
+
+**Every class is now a measured floor or derivative of one.** That is a different statement
+from "the work is finished" -- it says the remaining 2,526 are not reachable by the mechanisms
+this tool has, not that no mechanism exists. What would change it is a new representation
+rather than a new shape: something that can lower a site whose upper half a surviving 256-bit
+reader still needs, which is the one thing every route above runs into.
+
+**The cost of learning this was one instrumented run**, against a mechanism that would have
+taken a day and delivered nothing. That is the whole argument for pricing an item before
+building it, and it is the third time this session the measurement disagreed with a prediction
+I would otherwise have acted on.
+
 ### Finding 285 -- the per-lane conversions, and a bucket re-derived three times
 
 `shape a register-to-register move` was the largest reachable refusal class after the FMA
