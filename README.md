@@ -135,7 +135,3 @@ rewritten one must work" is a real experiment rather than a wish. Every
 
 Covers this rewriter and its tooling, not the binary it rewrites.
 `python3 tool/detour.py --version` prints the same line.
-
-## Licence
-
-None yet.
