@@ -6142,6 +6142,15 @@ UNIT_EXAMPLES = {}
 UNIT_ALTERNATIVES = {}
 REPAIR_SUBSTITUTED = 0
 
+# **The candidate list the repair actually placed**, substitutions applied.
+# Anything reconstructing a window's extent from an address must read this
+# rather than `candidates`: a substituted window is refused or overlapped
+# under its SUBSTITUTE's start, which appears in no original candidate, so
+# a lookup there silently contributes nothing. That is what put 79
+# survivors in the census's `unaccounted` bucket -- the one its own output
+# says should be zero. Finding 282.
+REPAIR_FINAL = []
+
 
 WIDE_SITES = Counter()
 
@@ -12805,10 +12814,19 @@ def census(binary, listing, patched):
 	# What the repair cost, as a set rather than as a count: a window it
 	# withheld is a window whose sites are still VEX, and they belong in a
 	# bucket that says so instead of falling out as unaccounted.
+	# **From the candidates, not from a placement.** This read `unrepaired`
+	# -- the placement taken with the repair switched off -- and a window
+	# the repair later dropped is not necessarily IN that placement: if
+	# something overlapped it there, it contributes no range at all and its
+	# sites fall out as unaccounted. 85 of them did, every one flagged as
+	# both inside a candidate span and dropped.
+	#
+	# A dropped window's extent is a property of the candidate, which is
+	# where it is now read from. Finding 282.
 	withheld = set()
-	for address, window, *_rest in unrepaired:
-		if address in dropped:
-			withheld.update(range(address, address + window))
+	for start, _e, _o, _m, window, *_r in candidates:
+		if start in dropped:
+			withheld.update(range(start, start + window))
 
 	# **`apply` also REVERTS, and this did not model that either.** A
 	# patch whose zeroing a surviving 256-bit instruction still reads is
@@ -12841,9 +12859,14 @@ def census(binary, listing, patched):
 	# whether a surviving instruction is in that set misses every site whose
 	# window began on the instruction before it -- which is what made 1,102
 	# of these look unaccounted when they were plainly refused.
+	# **Read what was placed, not what was collected.** `REPAIR_FINAL` is
+	# the list the repair handed to `place_stubs`, so a window the repair
+	# rebuilt is found under the start it was actually refused at. Reading
+	# `candidates` here missed every substituted one. Finding 282.
 	def spread(starts):
 		out = set()
-		for start, _e, _o, _m, window, _d, _s, _p, _strategy in candidates:
+		for start, _e, _o, _m, window, _d, _s, _p, _strategy in (
+				REPAIR_FINAL or candidates):
 			if start in starts:
 				out.update(range(start, start + window))
 		return out
@@ -13439,6 +13462,7 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 		if item[0] in dropped:
 			continue
 		final.append(swapped.get(item[0], item))
+	REPAIR_FINAL[:] = final
 	placed, blob, swallowed, overlapped, refused = place_stubs(
 		final, stub_base, spill_base, stub_reasons, home=home, tls=tls)
 	return placed, blob, overlapped, refused, dropped, swallowed

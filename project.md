@@ -13779,6 +13779,61 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 282 -- the census could not explain 85 of its own survivors
+
+The census reconciles every surviving VEX instruction against a reason, and prints
+`unaccounted` with a note saying it should be zero. After Finding 281's substitution it read
+88, then 85. **Two bugs, and the first diagnosis was wrong**, which is the part worth keeping:
+
+*The one I guessed.* `spread()` reconstructs a refused or overlapped window's extent by
+looking its address up in `candidates` -- and a substituted window is refused under its
+SUBSTITUTE's start, which appears in no original candidate, so the lookup silently
+contributed nothing. Real, and it moved about eighty sites between buckets. It took
+`unaccounted` from 88 to 85.
+
+*The one that mattered.* `withheld` was built by walking `unrepaired` -- the placement taken
+with the repair switched off -- and keeping the windows whose start is in `dropped`. A window
+the repair drops need not be IN that placement at all: if something overlapped it there, it
+contributes no range, and every site it covers falls through every bucket. A dropped window's
+extent is a property of the CANDIDATE, not of some other placement of it.
+
+    declined by the collector          1,059
+    refused, stub not buildable          162
+    in a window the repair dropped     1,207
+    in-place patch reverted               13
+    skipped for overlap                    9
+    undecodable, never classified        180
+    unaccounted                            0
+
+**What found it was reading the addresses, not thinking harder.** Fifteen of the eighty-five,
+printed with their flags, were `cand-span,dropped` to a row -- the survivor's own address was
+a dropped window's start. That is one 12-minute run against two rounds of theorising that had
+already produced one wrong answer.
+
+**And the wrong answer was a plausible mechanism that fixed a real bug.** `spread()` WAS
+broken, the fix WAS needed, and believing it had settled the question would have left 85
+survivors unexplained behind a correction that looked like a diagnosis. A fix that moves the
+number in the right direction is not thereby the explanation -- what settled it was that 85
+is not 0.
+
+#### What the substitution actually cost, which I reported wrongly
+
+Finding 281's change was reported here as delivering sites while putting 148 into
+`refused, stub not buildable` and 79 into `unaccounted`, as though those were its price. The
+arithmetic says otherwise:
+
+    in a window the repair dropped   -337
+    refused, stub not buildable      +148
+    unaccounted                       +79
+    skipped for overlap                +7
+                                     ----
+                                     -103   = the frontier's fall, 2,733 -> 2,630
+
+A window that is dropped loses its sites; a window that is substituted and then refused loses
+the same sites. **Those 148 changed bucket, they were not newly lost**, and only the
+`unaccounted` was a fault rather than a re-labelling. A price has two halves and I had given
+the second one without checking whether it was a cost at all.
+
 ### Finding 281 -- the check that printed FAILED and returned success
 
 **The item was the repair's dropped windows and the finding is the gate.** The census put
