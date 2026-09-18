@@ -6118,6 +6118,31 @@ UNIT_LIMITS = (12, 6, 3, 1)
 
 UNIT_REFUSED = Counter()
 UNIT_EXAMPLES = {}
+
+# **The rungs the ladder did not take, for the windows that can be
+# dropped.** The stale-read repair withholds a whole window because of one
+# instruction it swallowed, and at 1,318 windows for 1,364 survivors each
+# drop costs about a site. 1,310 of those 1,318 are `unit` -- the one
+# strategy that already knows how to build a shorter window and one in the
+# other direction -- so the losing rungs are worth keeping, and the repair
+# substitutes one rather than losing the site.
+#
+# **Keyed by the winning candidate's start**, which is what `dropped`
+# holds, and NOT by the site: a window widened backwards starts on the
+# instruction before its site, so the two differ exactly where it matters.
+#
+# **A callable, not a list**, so the ladder is re-walked only for the
+# windows that are actually dropped. See `unit_shortening` for what the
+# first version cost by deciding that up front with a predicate.
+#
+# A module-level map because `place_stubs` unpacks a candidate as a strict
+# nine-tuple and a tenth field would break it. `apply` and `verify` run the
+# same collection and so fill this identically, which is the property
+# Finding 197 needs and the reason it is not a parameter. Finding 281.
+UNIT_ALTERNATIVES = {}
+REPAIR_SUBSTITUTED = 0
+
+
 WIDE_SITES = Counter()
 
 
@@ -6161,8 +6186,9 @@ def unit_shortening(instructions, plain, index, blocked, home,
 	# the direction the strategy was measured with, so it keeps first
 	# refusal on every site it can serve, and backward is asked only for
 	# what it leaves. Finding 277.
-	for cap, back in [(cap, False) for cap in UNIT_LIMITS] \
-			+ [(cap, True) for cap in UNIT_LIMITS]:
+	rungs = [(cap, False) for cap in UNIT_LIMITS] \
+		+ [(cap, True) for cap in UNIT_LIMITS]
+	for rung, (cap, back) in enumerate(rungs):
 		# **Each attempt starts from the snapshot**, so a site leaves ONE
 		# refusal behind rather than one per rung. Without this a failing
 		# site recorded all four, and the census every measurement here is
@@ -6174,6 +6200,36 @@ def unit_shortening(instructions, plain, index, blocked, home,
 		lone = unit_candidate(instructions, plain, index, blocked, home,
 		                      ranges, scope, tls, limit=cap, back=back)
 		if lone is not None:
+			# **Walked on demand, not now.** The ladder is eight rungs and
+			# there are 35,428 unit windows, so building every rung at
+			# every site is eight times the collection for an answer only
+			# the dropped windows will ever read -- 1,318 of them.
+			#
+			# A closure rather than a filter, because the first version
+			# WAS a filter -- "does this window hold a VEX.128 write" --
+			# and it excluded 34,367 of 35,428 windows including 1,306 of
+			# the 1,319 the repair went on to blame. A cheap predicate
+			# standing in for the repair's own question got it wrong in
+			# the direction that reports success: the substitution ran on
+			# 13 windows, found an answer for one, and looked like a
+			# mechanism that does not pay. Finding 281.
+			def rebuild(taken=lone, at=index):
+				spare = []
+				for other_cap, other_back in rungs:
+					other = unit_candidate(instructions, plain, at,
+					                       blocked, home, ranges, scope,
+					                       tls, limit=other_cap,
+					                       back=other_back)
+					if other is None:
+						continue
+					if (other[0], other[4]) == (taken[0], taken[4]):
+						continue	# the window that was already dropped
+					if any((item[0], item[4]) == (other[0], other[4])
+					       for item in spare):
+						continue
+					spare.append(other)
+				return spare
+			UNIT_ALTERNATIVES[lone[0]] = rebuild
 			UNIT_REFUSED, UNIT_EXAMPLES = before
 			return lone
 		if last is None:
@@ -13258,10 +13314,25 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 	"the same call apply makes, so the two cannot drift apart". A promise
 	in a comment is not a mechanism. Finding 197.
 	"""
-	dropped = set()
+	global REPAIR_SUBSTITUTED
+	dropped, swapped, tried = set(), {}, set()
+	REPAIR_SUBSTITUTED = 0
 	settled = False
 	for _round in range(REPAIR_ROUNDS):
-		keep = [item for item in candidates if item[0] not in dropped]
+		# **Everything is keyed by the ORIGINAL candidate's start.** A
+		# substitute is a different window with a different start, so
+		# keying on the current one lets a substitute's start collide
+		# with some other candidate's -- and then `dropped` filters out
+		# the wrong window, or a guilty one reads as already handled and
+		# the loop settles with it still placed. The first version did
+		# exactly that and shipped 186 stale reads. Finding 281.
+		keep, origin = [], {}
+		for item in candidates:
+			if item[0] in dropped:
+				continue
+			use = swapped.get(item[0], item)
+			origin[use[0]] = item[0]
+			keep.append(use)
 		placed, _blob, _swallowed, _over, _refused = place_stubs(
 			keep, stub_base, spill_base, Counter(), home=home, tls=tls)
 		stale, _unresolved, unsure = stale_upper_reads(
@@ -13281,14 +13352,54 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 		# %ymm7 shipped that way, all from one `vmovss` that was both
 		# patched and swallowed. A producer inside a window is guilty
 		# whatever else is true of it. Finding 197.
-		guilty = {covers[producer] for _reader, _field, producer in stale
+		guilty = {origin[covers[producer]]
+		          for _reader, _field, producer in stale
 		          if producer in covers}
 		if CODE_SABOTAGE == "staleupper":
 			guilty = set()		# the repair keeps nothing: see CODE_SABOTAGE
-		if not guilty - dropped:
+		# **`guilty`, not `guilty - dropped`.** A guilty window is by
+		# construction one that is PLACED, so subtracting the dropped set
+		# was always a no-op -- until substitution made a start able to
+		# appear in both, at which point it silently declared the repair
+		# settled with a guilty window in the image.
+		if not guilty:
 			settled = True
 			break
-		dropped |= guilty
+		fresh = guilty
+		# **A window is dropped for ONE instruction it swallowed, and the
+		# ladder can usually build a window that does not swallow it.**
+		# Before this the whole candidate was lost, which on Starfield was
+		# 1,318 windows and 1,364 surviving sites -- half the frontier and
+		# larger than every refusal put together.
+		#
+		# Substitution is tried once per window and the alternative must
+		# cover NONE of the producers this round blamed it for. Where none
+		# fits, it is dropped exactly as before, so the correctness
+		# argument is unchanged: what ships is still a window nothing
+		# blames. What changes is how much is thrown away to get there.
+		#
+		# **Once, so the loop still terminates.** A substitute's start
+		# differs from the original's and `UNIT_ALTERNATIVES` is keyed by
+		# the original, so a substitute that is itself blamed finds
+		# nothing and is dropped. Both sets only grow. Finding 281.
+		for start in sorted(fresh):
+			blamed = {producer for _reader, _field, producer in stale
+			          if producer in covers
+			          and origin[covers[producer]] == start}
+			other = None
+			if start not in tried:
+				tried.add(start)
+				make = UNIT_ALTERNATIVES.get(start)
+				for item in (make() if make is not None else ()):
+					if not any(item[0] <= producer < item[0] + item[4]
+					           for producer in blamed):
+						other = item
+						break
+			if other is None:
+				dropped.add(start)
+			else:
+				swapped[start] = other
+				REPAIR_SUBSTITUTED += 1
 	# **Not settling means the windows below are known-guilty.** The
 	# previous version placed them and left a wrong image for `verify` to
 	# find. Refusing is the only honest end: there is no partial repair
@@ -13300,9 +13411,22 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 			f"{REPAIR_ROUNDS} rounds, having dropped {len(dropped):,} "
 			f"window(s). Placing what is left would ship a surviving "
 			f"256-bit read of an upper half no longer in its register.")
+	# **The same list the loop settled on, substitutions included.** This
+	# rebuilt it from `candidates` alone, so every window the loop had
+	# rebuilt was placed here in its ORIGINAL form -- the shape the loop
+	# had just proved guilty. `apply` reported 459 windows rebuilt and
+	# emitted none of them, and the image shipped 166 stale reads.
+	#
+	# It survived because the loop and the return computed the same thing
+	# two ways, which was true until one of them learned about
+	# substitution. Finding 281.
+	final = []
+	for item in candidates:
+		if item[0] in dropped:
+			continue
+		final.append(swapped.get(item[0], item))
 	placed, blob, swallowed, overlapped, refused = place_stubs(
-		[item for item in candidates if item[0] not in dropped], stub_base,
-		spill_base, stub_reasons, home=home, tls=tls)
+		final, stub_base, spill_base, stub_reasons, home=home, tls=tls)
 	return placed, blob, overlapped, refused, dropped, swallowed
 
 
@@ -14229,6 +14353,10 @@ def apply_all(binary, listing, output):
 	             binary)
 	report_placement(candidates, placed, overlapped, refused)
 	report_cost(candidates, placed, home)
+	if REPAIR_SUBSTITUTED:
+		print(f"apply: the stale-read repair rebuilt {REPAIR_SUBSTITUTED:,} "
+		      f"window(s) to exclude what it blamed them for, rather than "
+		      f"dropping them")
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "
 	      f"{len(blob):,} bytes")
 	print(f"apply: {len(pdata) // 12:,} function table entries "
@@ -14792,11 +14920,24 @@ def verify(original, patched, listing=None):
 		problems += 1
 	if stale:
 		readers = len({reader for reader, _field, _producer in stale})
-		print(f"verify: {readers:,} surviving 256-bit read(s) take an "
-		      f"upper half this rewrite left stale", file=sys.stderr)
+		print(f"verify: FAILED -- {readers:,} surviving 256-bit read(s) take "
+		      f"an upper half this rewrite left stale", file=sys.stderr)
 		for address, field, producer in sorted(stale)[:8]:
 			print(f"    0x{address:x} reads {field}, decided at "
 			      f"0x{producer:x}", file=sys.stderr)
+		# **This did not count, and it is the check the repair exists
+		# for.** Every other branch in this function adds to `problems`;
+		# this one printed its finding to stderr and returned success, so
+		# an image shipping the exact defect Findings 187 and 197 were
+		# written about passed `verify` with the evidence on screen.
+		#
+		# Found by breaking the repair: a substitution bug placed 186
+		# guilty windows, `verify` printed all 186 and exited 0, and the
+		# only reason anybody looked was that the number matched the fall
+		# in dropped windows. A gate that prints a failure and returns
+		# success is worse than one that says nothing, because it is
+		# quoted afterwards as having passed. Finding 281.
+		problems += 1
 	else:
 		print("verify: no surviving 256-bit read takes an upper half this "
 		      "rewrite left stale")

@@ -13779,6 +13779,70 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 281 -- the check that printed FAILED and returned success
+
+**The item was the repair's dropped windows and the finding is the gate.** The census put
+1,364 of 2,733 survivors in windows the stale-read repair withheld -- half the frontier, and
+more than every refusal together. A window is dropped whole because of one instruction it
+swallowed, 1,310 of the 1,318 are `unit`, and `unit` is the strategy that already knows how
+to build a shorter window and one in the other direction. So the repair substitutes a rung
+the ladder did not take, and drops only where none fits.
+
+    default --shadow-regs=all     3,172 -> 3,114      58 sites
+    with --teb-scratch            2,733 -> 2,630     103 sites
+    windows not placed            1,318 -> 1,157     459 rebuilt
+
+**Three of my own bugs on the way, and every one of them measured well.**
+
+*A predicate standing in for the repair's question.* The first version decided up front which
+windows were worth keeping alternatives for -- "does this window hold a VEX.128 write" -- to
+avoid walking eight rungs at 35,428 sites. It excluded 34,367 of them **including 1,306 of the
+1,319 the repair went on to blame**, so the substitution ran on 13 windows, found an answer
+for one, and read as a mechanism that does not pay. A cheap predicate cannot stand in for a
+question that depends on which windows are placed, which is the whole reason the repair
+iterates. It is a closure now, walked only for the windows actually dropped: no predicate, no
+wasted work.
+
+*Keyed by the wrong start.* A substitute is a different window with a different start, so
+keying `dropped` on the current start let a substitute's start collide with another
+candidate's -- and `guilty - dropped` then read a guilty window as already handled and
+settled the loop with it in the image. Everything is keyed by the original candidate's start
+now, and the test is `not guilty`: a guilty window is by construction a PLACED one, so
+subtracting the dropped set was always a no-op and only ever hid this.
+
+*The loop validated one placement and the function returned another.* The final `place_stubs`
+rebuilt its list from `candidates` alone and never applied the substitutions. `apply` reported
+459 windows rebuilt and emitted none of them. **It survived because the loop and the return
+computed the same list two ways**, which was true until one of them learned about
+substitution.
+
+#### And the check that would have caught all three on the first run
+
+`verify`'s stale-read check -- the one guarding the exact defect Findings 187 and 197 are
+about -- printed its finding to stderr and **never incremented `problems`**. Every other
+branch in that function does. So an image shipping 186 stale upper-half reads passed `verify`,
+with all 186 listed on screen and the exit code saying success.
+
+    verify: 186 surviving 256-bit read(s) take an upper half this rewrite left stale
+    verify exit=0
+
+Nothing in the tree could have told me. `make check` was green, every fixture passed, and the
+only reason anybody looked is that 186 happened to equal the fall in dropped windows and the
+coincidence was too neat. **A gate that prints a failure and returns success is worse than one
+that says nothing**, because it is quoted afterwards as having passed -- and this one had been
+quoted, in every run of this session, as "no surviving 256-bit read takes an upper half this
+rewrite left stale".
+
+It counts now, and the broken image is kept as the proof: built by the unfixed repair, it
+exits 1 through three checks at once -- 46 boundaries lost, 166 stale reads, 309 stubs
+clobbering a register. Before the one-line fix that image was green.
+
+**The lesson is not about this branch.** It is that a check's failure path is code nobody has
+run. The pass path runs on every build and the failure path runs the day something breaks, by
+which time it is load-bearing and unexamined -- so the sabotage discipline this file already
+applies to `check-verify`'s fourteen controls is the thing that was missing here, and the
+stale-read check had no control at all.
+
 ### Finding 280 -- the third register-free place, and 439 sites
 
 Finding 270 closed the largest refusal class in the binary with an enumeration: a slot needs
