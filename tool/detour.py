@@ -13352,7 +13352,11 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 	in a comment is not a mechanism. Finding 197.
 	"""
 	global REPAIR_SUBSTITUTED
-	dropped, swapped, tried = set(), {}, set()
+	dropped, swapped = set(), {}
+	# Per window: the rungs already spent on it, the blame it has
+	# accumulated, and the ladder's answers cached so it is walked once.
+	spent, seen_blame = defaultdict(set), defaultdict(set)
+	offers = {}
 	REPAIR_SUBSTITUTED = 0
 	settled = False
 	for _round in range(REPAIR_ROUNDS):
@@ -13423,20 +13427,34 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 			blamed = {producer for _reader, _field, producer in stale
 			          if producer in covers
 			          and origin[covers[producer]] == start}
-			other = None
-			if start not in tried:
-				tried.add(start)
+			# **Every rung, not one.** The first version allowed a single
+			# attempt per window: a substitute that was itself blamed
+			# meant the window was dropped, with the rest of the ladder
+			# untouched. The blame accumulates across rounds, so an
+			# alternative must avoid everything this window has ever been
+			# blamed for and not merely this round's -- conservative in
+			# the safe direction, since blame is relative to a placement
+			# and a producer that was guilty once may be guilty again in
+			# a shape nobody has tried yet. Finding 283.
+			seen_blame[start] |= blamed
+			if start not in offers:
 				make = UNIT_ALTERNATIVES.get(start)
-				for item in (make() if make is not None else ()):
-					if not any(item[0] <= producer < item[0] + item[4]
-					           for producer in blamed):
-						other = item
-						break
+				offers[start] = list(make()) if make is not None else []
+			other = None
+			for rung, item in enumerate(offers[start]):
+				if rung in spent[start]:
+					continue
+				if any(item[0] <= producer < item[0] + item[4]
+				       for producer in seen_blame[start]):
+					continue
+				spent[start].add(rung)
+				other = item
+				break
 			if other is None:
 				dropped.add(start)
+				swapped.pop(start, None)
 			else:
 				swapped[start] = other
-				REPAIR_SUBSTITUTED += 1
 	# **Not settling means the windows below are known-guilty.** The
 	# previous version placed them and left a wrong image for `verify` to
 	# find. Refusing is the only honest end: there is no partial repair
@@ -13462,6 +13480,9 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 		if item[0] in dropped:
 			continue
 		final.append(swapped.get(item[0], item))
+	# Distinct windows rebuilt, not attempts: a window offered three rungs
+	# before one fitted is one rebuilt window.
+	REPAIR_SUBSTITUTED = len(swapped)
 	REPAIR_FINAL[:] = final
 	placed, blob, swallowed, overlapped, refused = place_stubs(
 		final, stub_base, spill_base, stub_reasons, home=home, tls=tls)

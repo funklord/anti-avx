@@ -13779,6 +13779,56 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 283 -- the shapes are there and every one of them is guilty
+
+Finding 281's substitution allowed one attempt per window: an alternative that was itself
+blamed meant the window was dropped with the rest of the ladder untouched. Lifting that --
+offering every rung, against blame accumulated across rounds rather than this round's alone
+-- is worth **7 sites**, 2,630 to 2,623.
+
+**The seven are not the finding. The reason is, and it is the opposite of what I predicted.**
+I expected the ladder to be producing one or two shapes per site, which would have made "try
+them all" the same as "try one". Measured over the 1,276 windows that asked:
+
+    0 alternative(s)      97
+    1 alternative(s)     390
+    2 alternative(s)      84
+    3 alternative(s)     355
+    4 alternative(s)      52
+    5 alternative(s)     162
+    6 or more            136
+
+    ended dropped      1,136
+    ended substituted    140
+    rungs spent total    554
+
+Shapes are not scarce: only 97 windows of 1,276 have none, and over half have three or more.
+**554 rungs were spent across 1,276 windows**, so the overwhelming majority spent none -- not
+because there was nothing to try, but because nothing on offer passed. Nearly every window the
+ladder can build for a site still covers the instruction that site was blamed for.
+
+That closes the line rather than continuing it. The 1,207 survivors in dropped windows are
+**not a shape problem**, and no amount of further ladder work reaches them: a window built for
+a site must contain that site, and the blame is on or beside it -- which the earlier position
+probe already said, with 782 of 2,338 guilty producers sitting at the window start.
+
+What remains is a different mechanism, and the options are worth naming because the shape
+route is now measured shut:
+
+  * **Lower the surviving reader.** The repair already iterates for this, so what is left is
+    the readers nothing can lower -- which makes this the 1,059 declined class wearing another
+    hat, not a separate item.
+  * **Zero the upper half from inside the stub.** Impossible by construction: legacy SSE
+    cannot touch bits 255:128, which is the whole reason the zeroing is lost, and a stub may
+    hold no VEX because the host has no AVX.
+  * **Split the window around the producer** -- lower the other members and leave the guilty
+    one alone. The ladder cannot express this: it builds contiguous windows, and a window with
+    a hole in it is a shape the strategy has no representation for. This is the only one of
+    the three that is a piece of work rather than a floor.
+
+The change is kept because it is correct and the "one attempt" limit was arbitrary, not
+because 7 sites earned it.
+
 ### Finding 282 -- the census could not explain 85 of its own survivors
 
 The census reconciles every surviving VEX instruction against a reason, and prints
