@@ -13784,6 +13784,67 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 288 -- what a lowered site costs, and why the comparison could not be made
+
+Finding 287 took the uniform slots as the default and said runtime was not measured. It is
+now, as far as this host allows, and the result has two halves: a number, and a reason the
+number is not the one that was wanted.
+
+**The number.** `bench` runs a lowered 256-bit zero-and-store fifty million times;
+`benchempty` is the same program with those two instructions removed. Under wine on this
+Westmere, six runs each:
+
+    benchempty   0.075 0.085 0.086 0.087
+    bench        0.209 0.230 0.259 0.289
+
+About **2 to 3 ns per lowered site executed**, six or seven cycles at 3.06 GHz. That is
+throughput and it flatters the figure: the iterations are independent so the processor
+overlaps them, and a dependent chain would pay the latency of the three-load TLS walk
+instead.
+
+**The count had to be fifty million.** At two million the difference was about 15 ms against
+a start-up spread of 46 to 90 ms, so it did not resolve -- the first version of this measured
+noise, and reporting it would have been worse than reporting nothing.
+
+**What the stub does every iteration is worth reading:**
+
+    mov %gs:0x58,%r11          the thread's TLS array
+    mov tls_index(%rip),%r10d
+    mov (%r11,%r10,8),%r11     this module's block
+    xorps %xmm3,%xmm3
+    ... the slot traffic ...
+    jmp back
+
+The block pointer is stood up **per execution**. A compiler would hoist it out of a loop;
+this cannot, because each stub is entered fresh from its own site and knows nothing about
+being in one. In hot code that is three instructions and two dependent loads repeated for
+every iteration, and it is the obvious thing to attack if the runtime ever matters.
+
+#### The comparison against the old default could not be built, twice
+
+The measurement that was wanted is `--shadow-regs=off` against `--shadow-regs=all` on the
+same hot loop. Two fixtures were written for it and neither worked:
+
+  * **The first** loaded both operands before the loop. `off` left the body in VEX and the
+    build could not run at all on a host without AVX.
+  * **The second** defined everything inside the loop. `off` lowered the two sites AFTER the
+    loop and left the body in VEX again.
+
+Both failed the same way: **`--shadow-regs=off` will not lower a loop body whose head is a
+branch target**, which is exactly the class that is 95% of its refusals. A benchmark needs
+ground both modes lower, and that excludes hot loops.
+
+**On the ground they do share, the two modes emit instruction-for-instruction identical
+stubs** -- only the slot offsets differ, 0x10/0x20 against 0x60/0x70. So the slot cost is not
+a property of the new default at all; it is the cost of using a slot, which both modes pay
+whenever they use one. What the default changed is how many sites take that path.
+
+**Which makes the size-based worry about the new default weaker than it looked**, though not
+disposed of. The old default's cheap strategies -- `zero` at 9.5 bytes a site against `unit`
+at 31 -- were placing 10,018 and 7,232 sites; whether those sites are hot is exactly what
+this could not measure, and two hand-written loops are evidence about two hand-written loops.
+What would settle it is running the game, which nothing in this tree can do.
+
 ### Finding 287 -- the uniform slots become the default, and nine strategies stop firing
 
 Instructed by the copyright holder 2026-09-18. `--shadow-regs=all` had been a flag since

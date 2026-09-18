@@ -3364,6 +3364,123 @@ tls_directory:
 	.long	0, 0
 """)
 
+# **Two benchmarks rather than gates**, and the only fixtures here that
+# are. Finding 287 took the uniform slots as the default on size and
+# correctness and said plainly that runtime was not measured; these are
+# what measure it, and they are a pair because a loop's cost is only
+# readable against the same loop with the work removed.
+#
+# `bench` runs a lowered 256-bit zero-and-store fifty million times;
+# `benchempty` is the identical program with those two instructions gone,
+# so the difference is the lowered site and nothing else. Both terminate on
+# `decl`/`jne` after exactly the count in `%ecx` and have no other exit.
+# No gate runs them.
+#
+# **The count is fifty million because two were not enough.** At two
+# million the difference was about 15 ms against a wine start-up spread of
+# 46 to 90 ms, so it did not resolve at all -- the first version of this
+# measured noise and would have reported it.
+#
+# Measured on this host under wine, six runs each, load about 44:
+#
+#     benchempty   0.075 0.085 0.086 0.087
+#     bench        0.209 0.230 0.259 0.289
+#
+# discarding a cold first run of each and two outliers at 1.7 s and 3.1 s,
+# which are the machine at load 44 and not the program --
+#
+# about 2 ns per lowered site executed, six or seven cycles at 3.06 GHz.
+# That is THROUGHPUT and flatters the figure: the iterations are
+# independent, so the processor overlaps them, and a dependent chain would
+# pay the latency of the three-load TLS walk instead. Finding 288.
+PROGRAMS["bench"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movl	$50000000, %ecx
+spin:
+	vxorps	%ymm3, %ymm3, %ymm3
+	vmovups	%ymm3, (%rdi)
+	decl	%ecx
+	jne	spin
+	vmovups	(%rsi), %ymm1
+	vmovups	%ymm1, (%rdi)
+	movl	(%rdi), %eax		/* 70 */
+	movl	16(%rdi), %edx		/* 7, through the slot */
+	addl	%edx, %eax		/* 77 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 70, 0, 0, 0
+	.long 7, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+PROGRAMS["benchempty"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movl	$50000000, %ecx
+spin:
+	decl	%ecx
+	jne	spin
+	vmovups	(%rsi), %ymm1
+	vmovups	%ymm1, (%rdi)
+	movl	(%rdi), %eax		/* 70 */
+	movl	16(%rdi), %edx		/* 7, through the slot */
+	addl	%edx, %eax		/* 77 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 70, 0, 0, 0
+	.long 7, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 PROGRAMS["immreg"] = (77, """
 	.text
 	.globl _start
