@@ -3311,6 +3311,59 @@ tls_directory:
 	.long	0, 0
 """)
 
+# **A per-lane conversion, which splits by half because every element is
+# decided by itself.** `vcvtdq2ps` and `vcvtps2dq` keep their element count
+# and width, so the upper four go through the destination's slot exactly as
+# the lower four go through the register. A width-changing conversion could
+# not be done this way and is excluded by `LANE_UNARY`.
+#
+# The round trip int -> float -> int is what makes the answer readable: 70
+# in the low half and 7 in the upper give 77, and an upper half left stale
+# or zeroed gives 70. Finding 285.
+PROGRAMS["laneconv"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	xorl	%edx, %edx
+	testl	%edx, %edx
+	jne	here			/* never taken; forces permanent slots */
+here:
+	vmovups	(%rsi), %ymm0		/* inside the region, so ymm0 has a slot */
+	vcvtdq2ps %ymm0, %ymm1		/* eight ints to eight floats */
+	vcvtps2dq %ymm1, %ymm2		/* and back again */
+	vmovups	%ymm2, (%rdi)
+	movl	(%rdi), %eax		/* 70, the low half */
+	movl	16(%rdi), %edx		/* 7, through the slot */
+	addl	%edx, %eax		/* 77 */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 70, 0, 0, 0
+	.long 7, 0, 0, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
 PROGRAMS["immreg"] = (77, """
 	.text
 	.globl _start

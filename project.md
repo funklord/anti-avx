@@ -13779,6 +13779,69 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 285 -- the per-lane conversions, and a bucket re-derived three times
+
+`shape a register-to-register move` was the largest reachable refusal class after the FMA
+floor. Finding 253 had dissected it once; re-derived rather than quoted, because a scope
+number ages:
+
+    emittable today : 108    vmovups 53, vbroadcastss 18, vpbroadcastd 18,
+                             vmovdqu 12, vmovaps 6, vmovdqa 1
+    refused         :  74    vcvtdq2ps 45, vcvtps2dq 12, vpmovmskb 7,
+                             vmovapd 3, vrcpps 2, vmovmskpd 2,
+                             vmovmskps 2, vptest 1
+
+**A per-lane conversion splits by half because every element is decided by itself.** The low
+half is the same instruction one width down -- a prefix drop `narrow_piece` already does --
+and the upper half is the source's slot through a helper into the destination's. One helper,
+not two: unlike `lanereg` the destination's upper half is wholly overwritten, so there is
+nothing to load first.
+
+    refusals                     730 ->  606
+    shape ... register move      148 ->   24
+    sites built               35,470 -> 35,532      +62
+    VEX in .text               2,587 -> 2,526       61 sites
+
+**62 predicted, 61 delivered** -- the closest this project has come, and the reason is that
+the shape refusal really was the only wall for these: a conversion needs one helper and
+nothing else, where Finding 271's immediate form needed registers it could not get.
+
+**Width-changing conversions are the hazard and are excluded by construction.**
+`vcvtps2pd` reads four floats from an xmm and writes four doubles to a ymm; the halves do not
+correspond and splitting by half is meaningless. None occurs in Starfield in this shape, so
+the data would not have caught the mistake -- `LANE_UNARY` excludes them by listing what is
+safe rather than by filtering what is seen. `vptest` is out for a different reason: it writes
+FLAGS, which a stub may not, and that is the constraint `encode_tls_base` is built around.
+
+**And `vmovapd` was simply missing from `YMM_REGISTER_MOVES`**, which held `vmovups`,
+`vmovaps`, `vmovdqu` and `vmovdqa` and neither `vmovapd` nor `vmovupd`. Three sites, one word,
+and no argument for its absence -- a set written from the four spellings somebody met.
+
+#### Three wrong measurements of one bucket, and the middle one was the dangerous one
+
+I measured this population three times. The first mislabelled `vbroadcastss %xmm0,%ymm1` as
+writing a general-purpose register, because it has one ymm operand and I tested the count
+rather than the kind. The second reported **all 182 sites refused** -- including the
+`vmovups` the tool plainly lowers -- and the cause was that my script never set
+`SHADOW_REGS_RULE`, which the `regmove` branch is gated on.
+
+**A probe that does not run the code under the mode the apply runs it in is measuring a
+different program.** That one was dangerous rather than merely wrong: it said the tool refuses
+what it handles, which would have sent the next piece of work at a gap that does not exist.
+What caught it was the result being absurd, not any check of mine.
+
+#### The fixture found the half of the change I had not made
+
+`regmove` is handled in three places -- the classifier, the slot resolution in `span_entries`,
+and the emission -- and I edited two. The third fills in `second`, the source's slot, from a
+LIST of shape names that the new one was not in, so the emission refused `lanemove source is
+in no slot` on every site. Nothing in the classifier or the emitter is wrong, and neither
+reading them nor the type of the tuple would have shown it.
+
+That is `evidence.md`'s least-wired-method rule met from the inside: a shape is not a shape
+until every list that enumerates shapes has heard of it, and the only thing that knows how
+many such lists there are is a fixture that fails.
+
 ### Finding 284 -- the aliasing shape, where the operation commutes
 
 `op %ymmD,%ymmS,%ymmD` computes `D = S op D`: the destination is the OTHER source.

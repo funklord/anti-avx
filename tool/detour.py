@@ -4120,7 +4120,7 @@ def ymm_alias(field):
 # and the shapes cannot drift apart.
 SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2",
                "bcastmem", "bcastreg", "permmem", "permil", "regmove",
-               "lanemem")
+               "lanemove", "lanemem")
 
 # **A 256-bit register-to-register move, which is not arithmetic.** The
 # refusal bucket called "a register-to-register move" holds three different
@@ -4128,7 +4128,31 @@ SLOT_SHAPES = ("extract", "extractmem", "insert", "insertmem", "perm2",
 # `vmovaps`. The other 57 are `vcvtdq2ps` and `vcvtps2dq`, which CONVERT and
 # so need a vector register, and 7 are `vpmovmskb`, which writes a
 # general-purpose one. Finding 253.
-YMM_REGISTER_MOVES = frozenset(("vmovups", "vmovaps", "vmovdqu", "vmovdqa"))
+# `vmovapd` and `vmovupd` were missing and are the same instruction with a
+# different operand-size prefix; three sites were refused for it.
+YMM_REGISTER_MOVES = frozenset(("vmovups", "vmovaps", "vmovupd", "vmovapd",
+                                "vmovdqu", "vmovdqa"))
+
+# **One source, one destination, and every element decided by itself.** An
+# operation like this splits by half exactly the way the slot
+# representation wants: the low half is the same instruction one width
+# down, and the upper half is the source's slot run through a helper into
+# the destination's. The destination's upper half is wholly overwritten, so
+# unlike `lanereg` there is nothing to load first and one helper is enough.
+#
+# **Width-changing conversions are excluded and that is the whole risk
+# here.** `vcvtps2pd` reads four floats from an xmm and writes four doubles
+# to a ymm, `vcvtpd2ps` the reverse: the halves do not correspond and
+# splitting by half is meaningless. Every member below keeps its element
+# count and width, so half the elements are half the work.
+#
+# Of these, `vcvtdq2ps` (45), `vcvtps2dq` (12) and `vrcpps` (2) occur in
+# Starfield; the rest are here because the same argument covers them
+# exactly. `vptest` is deliberately absent -- it writes FLAGS, and a stub
+# may not, which is the constraint `encode_tls_base` is built around.
+# Finding 285.
+LANE_UNARY = frozenset(("vcvtdq2ps", "vcvtps2dq", "vcvttps2dq",
+                        "vrcpps", "vrsqrtps", "vsqrtps", "vsqrtpd"))
 
 # **Operations whose operands may be exchanged with no change to the bytes
 # produced.** `op %ymmD,%ymmS,%ymmD` computes `D = S op D`, and SSE's
@@ -4604,6 +4628,15 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 			and len(wide) == 2:
 		return ("regmove", canonical_ymm(fields[1]),
 		        canonical_ymm(fields[0]))
+	# **The same shape with the bytes transformed on the way.** See
+	# `LANE_UNARY`: one source, one destination, every element decided by
+	# itself, so the upper half is the source's slot through a helper.
+	# Finding 285.
+	if SHADOW_REGS_RULE == SHADOW_REGS_ALL \
+			and mnemonic in LANE_UNARY and len(fields) == 2 \
+			and len(wide) == 2:
+		return ("lanemove", canonical_ymm(fields[1]),
+		        canonical_ymm(fields[0]))
 	if len(fields) == 2 and len(wide) == 1:
 		if "(" in fields[0] and wide[0] == fields[1]:
 			return ("load", canonical_ymm(fields[1]))
@@ -4754,8 +4787,8 @@ def span_entries(members, instructions, slots, scope, plain):
 			if shape is not None and shape[0] in ("lanereg", "lanereg3",
 			                                      "extract", "perm2",
 			                                      "permil", "regmove",
-			                                      "lanemem", "immreg",
-			                                      "immreg3"):
+			                                      "lanemove", "lanemem",
+			                                      "immreg", "immreg3"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
@@ -5578,6 +5611,42 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
+		if what == "lanemove":
+			# **One source, and the destination's upper half is wholly
+			# overwritten** -- so unlike `lanereg` there is nothing to
+			# load into a second helper first. The source's slot goes
+			# into the helper, the operation runs on it in place, and the
+			# result goes to the destination's slot.
+			#
+			# `narrow_piece` is right for the low half without a
+			# commuted form: with one source there is no `vvvv` to throw
+			# away, so dropping the prefix names the same two registers
+			# the program named. Finding 285.
+			if second is None:
+				return refuse("lanemove source is in no slot")
+			if helper is None:
+				return refuse("lanemove wants a helper")
+			low = narrow_piece(vex, tail, 0, address, len(encoding),
+			                   at + len(body))
+			if low is None:
+				return refuse("lanemove low half cannot be narrowed")
+			body += low
+			body += span_slot_move(helper, False, base, second, block,
+			                       at + len(body))
+			# Register to register, reg and rm both the helper: the
+			# operation reads its source and writes its destination, and
+			# here they are the same sixteen bytes. The opcode byte is the
+			# original tail's first, as in `lanereg`.
+			operation = inplace.sse_encoding(
+				dict(vex, L=0, R=helper >> 3, X=0, B=helper >> 3),
+				tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
+				                  | (helper & 7)]))
+			if operation is None:
+				return refuse("lanemove operation has no SSE form")
+			body += operation
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
 		if what == "lanereg":
 			# **TWO helpers, because a slot cannot be an operand.** The
 			# obvious emission is `op slot(%base),%xmmH` -- one helper, the
@@ -5882,10 +5951,10 @@ def region_members(instructions, first, last, reasons=None):
 				                   and shadow_index(register) is not None
 				                   else len(slots))
 			defined.add(register)
-		elif what == "regmove":
+		elif what in ("regmove", "lanemove"):
 			# Reads the source's upper half and defines the destination's.
 			if shape[2] not in defined:
-				return refuse("regmove source from outside the region")
+				return refuse(f"{what} source from outside the region")
 			if register not in slots:
 				slots[register] = (shadow_index(register)
 				                   if SHADOW_REGS_RULE == SHADOW_REGS_ALL

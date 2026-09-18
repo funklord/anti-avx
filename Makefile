@@ -231,7 +231,7 @@ check-shadow-pe:
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
 	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove nonvol unwindsave \
-	            backward backtarget commute; do \
+	            backward backtarget commute laneconv; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -341,6 +341,12 @@ check-shadow-pe:
 	@echo "                 starts on the instruction BEFORE it and"
 	@echo "                 re-emits it; carrying it without re-emitting"
 	@echo "                 gives 7 rather than 77"
+	@echo "check-shadow-pe: laneconv -- a per-lane conversion, which splits"
+	@echo "                 by half because every element is decided by"
+	@echo "                 itself: the upper four go through the slot as"
+	@echo "                 the lower four go through the register. The"
+	@echo "                 round trip int -> float -> int reads back as 70"
+	@echo "                 plus 7, so a stale or zeroed upper half gives 70"
 	@echo "check-shadow-pe: commute -- op %ymmD,%ymmS,%ymmD, where the"
 	@echo "                 destination is the OTHER source. Dropping the"
 	@echo "                 VEX prefix throws vvvv away and doubles"
