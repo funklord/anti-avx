@@ -6214,6 +6214,19 @@ def unit_shortening(instructions, plain, index, blocked, home,
 			# 13 windows, found an answer for one, and looked like a
 			# mechanism that does not pay. Finding 281.
 			def rebuild(taken=lone, at=index):
+				# **Put the counters back.** This walks rungs that were
+				# never taken, and `unit_candidate` records a refusal for
+				# each -- so without the snapshot the census gains a
+				# reason for every rung explored on behalf of a window
+				# that was dropped. Measured in that state: refusals rose
+				# 814 -> 2,457 and `too short to place, nothing follows`
+				# came back at 264, which Finding 277 identified as an
+				# artifact of the ladder rather than a property of the
+				# binary. The image is unaffected either way, which is
+				# exactly what makes it a measurement bug rather than a
+				# wrong one. Findings 277 and 281.
+				global UNIT_REFUSED, UNIT_EXAMPLES
+				held = snapshot()
 				spare = []
 				for other_cap, other_back in rungs:
 					other = unit_candidate(instructions, plain, at,
@@ -6228,6 +6241,7 @@ def unit_shortening(instructions, plain, index, blocked, home,
 					       for item in spare):
 						continue
 					spare.append(other)
+				UNIT_REFUSED, UNIT_EXAMPLES = held
 				return spare
 			UNIT_ALTERNATIVES[lone[0]] = rebuild
 			UNIT_REFUSED, UNIT_EXAMPLES = before
