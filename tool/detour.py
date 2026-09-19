@@ -698,6 +698,32 @@ TEB_TLS_POINTER = 0x58
 TEB_SCRATCH = None
 TEB_SCRATCH_BYTES = 16
 
+# **The TLS index as a constant, written in at load time.** The block
+# pointer needs two registers only because the index lives in memory, and
+# mode True exists solely to park that second register in an xmm. With the
+# index folded into a displacement the chain is one register and two
+# instructions:
+#
+#     movq %gs:0x58,%block
+#     movq <index * 8>(%block),%block
+#
+# The loader assigns the index, so the displacement cannot be known when
+# the image is written. It is emitted as `INDEX_PLACEHOLDER` and a TLS
+# callback fills it in at DLL_PROCESS_ATTACH, which is sound because the
+# loader writes `*AddressOfIndex` before calling one -- measured, Finding
+# 291, with a sentinel that would have shown the opposite.
+#
+# **The placeholder is found by scanning the finished blob**, rather than
+# by threading an offset up through every caller of `encode_tls_base`. That
+# is only safe with a count to check it against: `INDEX_CONST_SITES` is
+# incremented per emission and the scan must find exactly that many, or the
+# build refuses. A marker search with no denominator is how a patch table
+# ends up short. Finding 293.
+INDEX_CONST = False
+INDEX_PLACEHOLDER = 0x5A5A5A5A
+INDEX_CONST_SITES = 0
+INDEX_CONST_CALLBACK = False
+
 # rax, rcx, rdx and r8-r11 by number, which is what an encoding wants.
 GPR_NUMBERS = {"rax": 0, "rcx": 1, "rdx": 2,
                "r8": 8, "r9": 9, "r10": 10, "r11": 11}
@@ -747,6 +773,26 @@ def encode_tls_base(block, index, index_va, at, stash=None):
 	later, before the body begins, so the caller passes a helper it is about
 	to use anyway. Finding 247.
 	"""
+	if INDEX_CONST and stash is None:
+		# **Two instructions and one register.** `mov disp32(%block),%block`
+		# is REX.W with mod 10, and no block register can be `rsp` or
+		# `r12` -- the two that would need a SIB byte -- because they are
+		# drawn from VOLATILE_GPRS. Finding 293.
+		global INDEX_CONST_SITES
+		INDEX_CONST_SITES += 1
+		out = bytearray()
+		out.append(0x65)					# %gs
+		out.append(0x48 | (0x04 if block >= 8 else 0))
+		out += b"\x8b"
+		out.append(((block & 7) << 3) | 4)			# mod 00, rm 100
+		out.append(0x25)					# no base/index
+		out += struct.pack("<I", TEB_TLS_POINTER)
+		out.append(0x48 | (0x04 if block >= 8 else 0)
+		           | (0x01 if block >= 8 else 0))	# REX.W, R, B
+		out += b"\x8b"
+		out.append(0x80 | ((block & 7) << 3) | (block & 7))	# mod 10
+		out += struct.pack("<I", INDEX_PLACEHOLDER)
+		return bytes(out)
 	out = bytearray()
 	if stash is not None:
 		# movq %index,%stash -- 66 REX.W 0F 6E /r, reg is the xmm.
@@ -6673,6 +6719,14 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	home_used = 0
 	if len(free) >= 2:
 		base, block = tls[1], (free[0], free[1], tls[0], False, None)
+	elif free and INDEX_CONST:
+		# **One dead register is enough when the index is a constant.**
+		# Mode True exists only to park a borrowed index register in an
+		# xmm for three instructions; with the index folded into a
+		# displacement there is no index register to park, so the site
+		# needs neither the borrow nor the xmm. That is what dissolves
+		# `mode True has no xmm to stash the index in`. Finding 293.
+		base, block = tls[1], (free[0], None, tls[0], False, None)
 	elif free:
 		borrowed = next((n for n in sorted(GPR_NUMBERS[name]
 		                                   for name in VOLATILE_GPRS)
@@ -13106,6 +13160,7 @@ def main(argv):
 	# be built and compared. See Finding 46.
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
 	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE, TEB_SCRATCH
+	global INDEX_CONST
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -13133,6 +13188,11 @@ def main(argv):
 				      f"not {want!r}", file=sys.stderr)
 				return 2
 			SHADOW_REGS_RULE = want
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item == "--index-const":
+			INDEX_CONST = True
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
@@ -14581,6 +14641,46 @@ def apply_all(binary, listing, output):
 		print(f"apply: the stale-read repair rebuilt {REPAIR_SUBSTITUTED:,} "
 		      f"window(s) to exclude what it blamed them for, rather than "
 		      f"dropping them")
+	# **An unpatched placeholder is a wrong image that verifies clean.**
+	# `verify` re-derives the placement and checks structure; it has no
+	# opinion about the value of a displacement, so an image emitted with
+	# `INDEX_CONST` and no callback to fill the placeholders in would pass
+	# every check and address whatever `0x5a5a5a5a` happens to reach.
+	# Until the callback is emitted, this refuses rather than writes.
+	# Finding 293.
+	if INDEX_CONST:
+		# **Count the artifact, not the calls.** `INDEX_CONST_SITES`
+		# counts every call to `encode_tls_base`, and the collector calls
+		# it for candidates it never places and for every rung of the
+		# ladder -- 1,163,501 of them against 19,174 stubs that actually
+		# stand a block pointer up. A patch table built from that number
+		# would be meaningless. What matters is how many placeholders are
+		# in the blob that ships, which is what gets patched, so the blob
+		# is what is counted.
+		#
+		# The search is anchored on the instruction and not on the value:
+		# `8b`, a modrm with mod 10 and reg equal to rm, then the
+		# placeholder. `0x5a5a5a5a` alone occurs in the constant pool.
+		# Finding 293.
+		wanted = set()
+		for number in sorted(GPR_NUMBERS.values()):
+			wanted.add(bytes([0x8B, 0x80 | ((number & 7) << 3) | (number & 7)])
+			           + struct.pack("<I", INDEX_PLACEHOLDER))
+		found = 0
+		for pattern in wanted:
+			start = 0
+			while True:
+				start = blob.find(pattern, start)
+				if start < 0:
+					break
+				found += 1
+				start += 1
+		if found and not INDEX_CONST_CALLBACK:
+			raise SystemExit(
+				f"apply: {found:,} stub(s) in the blob carry an unfilled "
+				f"TLS index placeholder and no callback was emitted to "
+				f"fill them. Refusing to write an image whose block "
+				f"pointers would address 0x{INDEX_PLACEHOLDER:x}.")
 	print(f"apply: stub section .avxsse at 0x{stub_base:x}, "
 	      f"{len(blob):,} bytes")
 	print(f"apply: {len(pdata) // 12:,} function table entries "

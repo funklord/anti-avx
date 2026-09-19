@@ -13890,6 +13890,56 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 293 -- the constant index dissolves three refusal classes
+
+`--index-const` emits the block pointer as two instructions and one register:
+
+    movq %gs:0x58,%block                 9 bytes
+    movq <index * 8>(%block),%block      7 bytes, filled in at load time
+
+against the three instructions and two registers it replaces. Disassembled for each
+of the seven registers the collector can pick, all sixteen bytes, no SIB needed --
+`rsp` and `r12` are the two that would want one and neither is in `VOLATILE_GPRS`.
+
+**Measured on Starfield, and it beats the estimate:**
+
+    refusals                              3,322 -> 2,521      -801
+      mode True has no xmm to stash         360 ->     0      gone
+      no non-volatile xmm this function     263 ->     0      gone
+      no volatile xmm and scratch slot      154 ->     4
+      no dead GPR and no home space       1,878 -> 1,878      untouched
+    sites built                          33,888 -> 34,382      +494
+
+I predicted "well under 360" and three whole classes went instead. The reason is
+that mode True's xmm stash was competing for the same helpers the members wanted, so
+removing the stash frees registers the other two classes were failing for. The 1,878
+are untouched exactly as predicted: they have ZERO dead registers, so a chain needing
+one still cannot run, and that is the TEB question rather than this one.
+
+**No frontier number yet, and that is the point of the write guard.** The
+displacement is a placeholder until a TLS callback fills it in, and `verify` has no
+opinion about the value of a displacement -- it re-derives the placement and checks
+structure. An image emitted with `--index-const` and no callback would pass every
+check in this tree and address `0x5a5a5a5a` at run time. So `apply` refuses to write
+one, and the flag cannot produce a usable image until the callback exists.
+
+#### The guard's first counter was wrong by sixty times
+
+It reported **1,163,501** stubs carrying a placeholder against 19,174 that stand a
+block pointer up, because it counted calls to `encode_tls_base` -- which the
+collector makes for candidates it never places and at every rung of the ladder.
+
+A patch table built from that number would have been meaningless, and the number was
+printed in a refusal message where it looked like a fact about the image. It counts
+the blob now: the bytes that ship are what gets patched, so the bytes that ship are
+what is counted. The search is anchored on the instruction rather than the value --
+`8b`, a modrm with mod 10 and reg equal to rm, then the placeholder -- because
+`0x5a5a5a5a` alone occurs in the constant pool.
+
+**Same shape as Finding 290 one layer up**: a count taken from the process rather
+than from the artifact. There it was the frontier counting rows that never decoded;
+here it was a patch count counting work the collector threw away.
+
 ### Finding 292 -- the image is relocated, so chain the callback rather than add one
 
 Both load-time routes -- Finding 289's reserved TLS slots and Finding 291's constant
