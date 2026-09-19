@@ -13381,6 +13381,7 @@ SABOTAGE = {
 	"conservative": "a conservative candidate keeps its VEX form",
 	"switchbase": "a recognised switch dispatch resolves its table",
 	"teb": "a block borrows the callee home space, not the TEB",
+	"indexconst": "the index callback fills every placeholder in",
 	"backtarget": "a window widened backwards never buries a branch target",
 }
 
@@ -13979,6 +13980,146 @@ def source_census(binary, listing):
 	return 0
 
 
+INDEX_CALLBACK_FLAGS = 0xE0000020	# read, write, execute, code
+INDEX_NAME = b".avxidx\0"
+INDEX_FLAGS = 0x60000020		# read, execute, code
+
+
+def index_callback(index_rva, table_rel, orig_rva):
+	"""The TLS callback that writes the index into every stub. 48 bytes.
+
+	    tls_cb(rcx = module base, rdx = reason, r8 = reserved)
+	        cmp   $1,%edx                  DLL_PROCESS_ATTACH
+	        jne   chain
+	        mov   <index>(%rcx),%eax       the index the loader wrote
+	        shl   $3,%eax                  a slot is eight bytes
+	        lea   <table>(%rip),%r9        the table is in this payload
+	    loop:
+	        mov   (%r9),%r10d              an RVA, zero ends the table
+	        test  %r10d,%r10d
+	        je    chain
+	        mov   %eax,(%rcx,%r10)         fill one displacement
+	        add   $4,%r9
+	        jmp   loop
+	    chain:
+	        lea   <orig>(%rcx),%rax
+	        jmp   *%rax                    the original, arguments intact
+
+	**Everything is base-plus-RVA and nothing is absolute**, because the
+	image is `DYNAMIC_BASE` and nothing relocates bytes this tool writes.
+	The base arrives in `rcx` as the loader's `DllHandle`. Finding 292.
+
+	**Only volatile registers are touched** -- rax, r9, r10 -- so `rcx`,
+	`rdx` and `r8` reach the original unchanged, and a jump rather than a
+	call leaves the stack as the loader arranged it.
+	"""
+	out = bytearray()
+	out += b"\x83\xfa\x01"				# cmp $1,%edx
+	jne_at = len(out)
+	out += b"\x75\x00"					# jne chain
+	out += b"\x8b\x81" + struct.pack("<i", index_rva)
+	out += b"\xc1\xe0\x03"				# shl $3,%eax
+	# **rip-relative, not base-relative.** The table sits in the same
+	# payload as this code, so reaching it needs no knowledge of where
+	# the loader put the section -- which is what lets the payload be
+	# built before it has an address. `table_rel` is measured from the
+	# end of this instruction.
+	out += b"\x4c\x8d\x0d" + struct.pack("<i", table_rel)
+	loop = len(out)
+	out += b"\x45\x8b\x11"				# mov (%r9),%r10d
+	out += b"\x45\x85\xd2"				# test %r10d,%r10d
+	je_at = len(out)
+	out += b"\x74\x00"					# je chain
+	out += b"\x42\x89\x04\x11"			# mov %eax,(%rcx,%r10)
+	out += b"\x49\x83\xc1\x04"			# add $4,%r9
+	out += b"\xeb" + bytes([(loop - (len(out) + 2)) & 0xFF])
+	chain = len(out)
+	out[jne_at + 1] = (chain - (jne_at + 2)) & 0xFF
+	out[je_at + 1] = (chain - (je_at + 2)) & 0xFF
+	if orig_rva is None:
+		# An empty callback array -- a fixture's -- has nothing to chain
+		# to, so the callback simply returns.
+		out += b"\xc3"					# ret
+		return bytes(out)
+	out += b"\x48\x8d\x81" + struct.pack("<i", orig_rva)
+	out += b"\xff\xe0"					# jmp *%rax
+	return bytes(out)
+
+
+def index_payload(data, blob, stub_base):
+	"""`(bytes, offset of the callback)` for the index section, or None.
+
+	**A section of its own, because `.avxsse` is verified as pure code.**
+	The first attempt appended the table to the stub blob and `verify`
+	produced four failures for it: 98,261 bytes of stub outside every
+	function table entry, 3,891 sequences that decode to nothing, 52
+	phantom calls, all of them the table being disassembled -- and the
+	array write besides. The checks were right and the placement was
+	wrong. Finding 294.
+
+	The payload is self-contained: the callback reaches its table
+	rip-relative, so this can be built before the loader or `add_section`
+	has given it an address.
+	"""
+	found = tls_directory(data)
+	if found is None:
+		raise SystemExit("apply: --index-const needs a TLS directory")
+	_at, fields = found
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	image_base = struct.unpack_from("<Q", data, pe + 24 + 24)[0]
+	slot = rva_to_offset(data, fields[3] - image_base)
+	if slot is None:
+		raise SystemExit("apply: the TLS callback array is in no section")
+	original = struct.unpack_from("<Q", data, slot)[0]
+
+	spots = index_placeholders(blob)
+	if CODE_SABOTAGE == "indexconst":
+		spots = []		# the callback runs and patches nothing
+	stub_rva = stub_base - image_base
+	table = b"".join(struct.pack("<I", stub_rva + off) for off in spots)
+	table += b"\x00\x00\x00\x00"
+
+	# The callback is measured against the table's position, so it is
+	# built once at a known offset: table first, code after it.
+	code_off = (len(table) + 15) // 16 * 16
+	probe = index_callback(fields[2] - image_base, 0,
+	                       (original - image_base) if original else None)
+	# `lea` reaches the table from the end of that instruction, which is
+	# nine bytes into the callback plus seven for the lea itself.
+	lea_end = code_off + 3 + 2 + 6 + 3 + 7
+	code = index_callback(fields[2] - image_base, -lea_end,
+	                      (original - image_base) if original else None)
+	assert len(code) == len(probe), "the callback changed length"
+	payload = bytearray(table)
+	payload += b"\xcc" * (code_off - len(table))
+	payload += code
+	print(f"apply: {len(spots):,} stub(s) take the TLS index from a "
+	      f"constant, filled in by a callback chained ahead of "
+	      f"{'the original' if original else 'nothing'}")
+	return bytes(payload), code_off, slot, original
+
+
+def index_placeholders(blob):
+	"""Offsets of every unfilled TLS-index displacement in `blob`.
+
+	Anchored on the instruction rather than the value: `8b`, a modrm with
+	mod 10 and reg equal to rm, then the placeholder. `0x5a5a5a5a` on its
+	own occurs in the constant pool. Finding 293.
+	"""
+	out = []
+	for number in sorted(GPR_NUMBERS.values()):
+		head = bytes([0x8B, 0x80 | ((number & 7) << 3) | (number & 7)]) \
+			+ struct.pack("<I", INDEX_PLACEHOLDER)
+		start = 0
+		while True:
+			start = blob.find(head, start)
+			if start < 0:
+				break
+			out.append(start + 2)		# the displacement, not the opcode
+			start += 1
+	return sorted(out)
+
+
 def tls_pair_of(found):
 	"""The `(index VA, slot offset)` a stub needs, from `tls_for`'s answer."""
 	return None if found is None else (found[0], found[1])
@@ -14565,14 +14706,21 @@ def apply_all(binary, listing, output):
 		pad = window - 5
 		data[offset:offset + window] = jump + inplace.nop_padding(pad)
 
+	# **Before the section is made, because both change the blob.** The
+	# table names every placeholder by RVA and the callback is appended
+	# after it, so neither can be written until the stub bytes are final
+	# and the section's base is known. Finding 293.
 	staged = bytes(data)
 	pe = struct.unpack_from("<I", staged, 0x3C)[0]
 	image_base = struct.unpack_from("<Q", staged, pe + 24 + 24)[0]
 	if SPILL == SPILL_POOL:
 		staged, data_va = add_section(staged, DATA_NAME, bytes(16), DATA_FLAGS)
 		assert data_va == spill_base - image_base, "spill section moved"
+	# The callback writes into this section at load time, so it has to be
+	# writable when `--index-const` is on and not otherwise.
 	image, section_va = add_section(staged, SECTION_NAME, bytes(blob),
-	                                SECTION_FLAGS)
+	                                INDEX_CALLBACK_FLAGS if INDEX_CONST
+	                                else SECTION_FLAGS)
 	assert section_va == stub_base - image_base, "stub section moved"
 
 	# **Unwind data for the stubs.** Without it an exception raised inside
@@ -14598,6 +14746,25 @@ def apply_all(binary, listing, output):
 	assert got == xdata_rva, "unwind section moved"
 	pdata_rva = next_section_rva(image)
 	image, got = add_section(image, PDATA_NAME, pdata, UNWIND_FLAGS)
+	# **The index section, last, and in a section of its own.** It holds
+	# the patch table and the callback; `.avxsse` is verified as pure code
+	# and this is data plus one 48-byte routine, so putting it there
+	# produced four failures. Finding 294.
+	if INDEX_CONST:
+		global INDEX_CONST_CALLBACK
+		payload, code_off, slot, was = index_payload(image, blob, stub_base)
+		image, index_va = add_section(image, INDEX_NAME, payload,
+		                              INDEX_FLAGS)
+		image = bytearray(image)
+		base = struct.unpack_from("<Q", bytes(image),
+		                          struct.unpack_from("<I", bytes(image),
+		                                             0x3C)[0] + 24 + 24)[0]
+		struct.pack_into("<Q", image, slot, base + index_va + code_off)
+		image = bytes(image)
+		INDEX_CONST_CALLBACK = True
+		print(f"apply: index section {INDEX_NAME.decode().rstrip(chr(0))} "
+		      f"at 0x{base + index_va:x}, {len(payload):,} bytes; the TLS "
+		      f"callback array's first slot was 0x{was:x}")
 	assert got == pdata_rva, "function table moved"
 	image = bytearray(image)
 	pe = struct.unpack_from("<I", bytes(image), 0x3C)[0]
@@ -14933,21 +15100,54 @@ def verify(original, patched, listing=None):
 		# and the directory holds four pointers this must never move.
 		raised = None
 		found = tls_directory(bytes(a))
-		if found is not None:
+		if found is not None and len(tail_a) == len(tail_b):
+			restored = bytearray(tail_a)
 			at = found[0] + 32 - (raddr + size)
-			if 0 <= at and at + 4 <= len(tail_a) and len(tail_a) == len(tail_b):
-				restored = bytearray(tail_a)
+			ok = 0 <= at and at + 4 <= len(tail_a)
+			if ok:
 				restored[at:at + 4] = tail_b[at:at + 4]
-				if bytes(restored) == bytes(tail_b):
-					raised = struct.unpack_from("<I", bytes(tail_b), at)[0]
+			# **And the one callback slot, when `--index-const` is on.**
+			# A load-time callback has to be reachable from the image's
+			# TLS callback array, and that array is after `.text` in any
+			# real binary -- so is the directory that points at it. There
+			# is no version of this that touches nothing out here.
+			#
+			# Written the same way as the field above: put the rewritten
+			# eight bytes back and the rest must be equal again. A skip
+			# would tolerate a difference anywhere in the array, and the
+			# array is a list of function pointers the loader calls.
+			# Finding 294.
+			if ok and INDEX_CONST:
+				pe_a = struct.unpack_from("<I", bytes(a), 0x3C)[0]
+				base_a = struct.unpack_from("<Q", bytes(a),
+				                            pe_a + 24 + 24)[0]
+				slot = rva_to_offset(bytes(a), found[1][3] - base_a)
+				spot = None if slot is None else slot - (raddr + size)
+				if spot is None or not (0 <= spot and
+				                        spot + 8 <= len(tail_a)):
+					ok = False
+				else:
+					restored[spot:spot + 8] = tail_b[spot:spot + 8]
+			if ok and bytes(restored) == bytes(tail_b):
+				raised = struct.unpack_from("<I", bytes(tail_b), at)[0]
 		if raised is None:
 			print("verify: FAILED -- sections after .text changed",
 			      file=sys.stderr)
 			problems += 1
 		else:
+			# **Name every exemption, not the first one.** This said
+			# "except SizeOfZeroFill" while two fields were being
+			# restored, so the line understated what it had allowed --
+			# in the one check whose whole job is to say that nothing
+			# outside `.text` moved. Finding 294.
+			allowed = [f"SizeOfZeroFill, raised to {raised} so the loader "
+			           f"allocates the per-thread slot"]
+			if INDEX_CONST:
+				allowed.append("the TLS callback array's first slot, which "
+				               "now names the index callback and tail-jumps "
+				               "to what it replaced")
 			print(f"verify: every section after .text is byte-identical "
-			      f"except SizeOfZeroFill, raised to {raised} so the "
-			      f"loader allocates the per-thread slot")
+			      f"except {' and '.join(allowed)}")
 
 	# **The feature tests, which decide what the CPU is asked to run.** 179
 	# EVEX instructions in this image are unreachable only because a runtime

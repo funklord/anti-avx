@@ -13890,6 +13890,63 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 294 -- the callback runs, and the checks were right about where it went
+
+`--index-const` produces a working image. The TLS callback is emitted, the loader
+calls it, it walks a table of RVAs and writes the index into 24,551 stubs, and then
+tail-jumps to the callback it replaced.
+
+    VEX in .text        2,889 -> 2,687        202 sites
+    stubs patched      24,551
+    index section     .avxidx, 98,256 bytes
+    callback array     first slot was 0x14365d420, now the tool's
+
+`verify` passes every check, including the two that had to learn something.
+
+**Proven by making it fail.** `ANTI_AVX_SABOTAGE=indexconst` emits the callback and
+an empty table, so it runs and patches nothing: the fixture answers **5** where the
+real build answers **77**, three runs each, and the two images differ. The 77
+depends on the patching rather than coinciding with it.
+
+#### The first placement was wrong and four checks said so at once
+
+The table went into `.avxsse` beside the stubs, and `verify` produced:
+
+    98,261 bytes of stub outside every function table entry
+    3,891 byte sequences in the stub section decode to nothing
+    436 call instructions against 384 inside a placed window
+    sections after .text changed
+
+Three of those are one mistake: **the stub section is verified as pure code and the
+table is data.** Every byte of it was being disassembled, which manufactured
+instructions that decoded to nothing and calls that were never calls. The checks
+were right and the placement was wrong; the table and the callback live in a section
+of their own now, and the callback reaches its table rip-relative so the payload can
+be built before it has an address.
+
+#### Both remaining exemptions are written as identities
+
+The fourth failure is not avoidable by any placement. **A load-time callback must be
+reachable from the image's TLS callback array, and that array is after `.text` in any
+real binary** -- so is the directory that points at it. The check now restores the
+callback slot as well as `SizeOfZeroFill` and requires the rest to be equal again,
+which is the form Finding 196 chose for the same reason: a skip would tolerate a
+difference anywhere in an array of function pointers the loader calls.
+
+**And the message understated what it allowed.** It read "byte-identical except
+SizeOfZeroFill" while two fields were being restored -- in the one check whose whole
+job is to say that nothing outside `.text` moved. It names both now. A gate that
+permits more than it reports is the same defect as one that reports a failure and
+returns success (Finding 281), one turn quieter.
+
+#### What the image does not yet prove
+
+Starfield has not been run. What is established is that the image builds, that every
+structural check passes, and that the mechanism works end to end on a fixture under
+wine with a sabotage control either side of it. The chain itself -- our callback
+tail-jumping into Starfield's at `0x14365d420` -- has been assembled and verified as
+bytes, never executed.
+
 ### Finding 293 -- the constant index dissolves three refusal classes
 
 `--index-const` emits the block pointer as two instructions and one register:
