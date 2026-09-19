@@ -12998,8 +12998,14 @@ def census(binary, listing, patched):
 	reverted = {producer for _reader, _field, producer in stale + unsure
 	            if producer in undone and producer not in covered}
 
-	survivors = {a for a, e, _m, _o in lines
-	             if e[:1] in (b"\xc4", b"\xc5")}
+	# **One definition of a surviving VEX, shared with `verify`.** This
+	# selected on the first byte, so 180 sequences that decode to nothing
+	# counted as survivors here and in the frontier both. They are reported
+	# below rather than dropped. Finding 290.
+	survivors = {a for a, e, m, _o in lines
+	             if e[:1] in (b"\xc4", b"\xc5") and m != "(bad)"}
+	undecoded_now = {a for a, e, m, _o in lines
+	                 if e[:1] in (b"\xc4", b"\xc5") and m == "(bad)"}
 
 	print(f"declined by the collector      {len(declined):>10,}")
 	print(f"  of those, swallowed anyway   "
@@ -13046,8 +13052,7 @@ def census(binary, listing, patched):
 	           ("inside a committed window", covered),
 	           ("in a window the repair dropped", withheld),
 	           ("in-place patch reverted", reverted),
-	           ("skipped for overlap", spread(overlapped)),
-	           ("undecodable, never classified", undecodable))
+	           ("skipped for overlap", spread(overlapped)))
 	accounted = set()
 	for label, group in buckets:
 		hit = (survivors & group) - accounted
@@ -13055,6 +13060,9 @@ def census(binary, listing, patched):
 		print(f"  {label:<30}{len(hit):>10,}")
 	rest = survivors - accounted
 	print(f"  {'unaccounted':<30}{len(rest):>10,}")
+	print(f"and {len(undecoded_now):,} VEX-prefixed sequence(s) that decode to "
+	      f"nothing, which are not instructions and are not counted above "
+	      f"({len(undecodable):,} of them in the original)")
 	if rest:
 		print("  -- unaccounted, and that should be zero. Every survivor was")
 		print("     an instruction boundary and a VEX site in the original,")
@@ -13792,7 +13800,7 @@ def frontier_census(original, patched, listing):
 		stub_base_of(open(original, "rb").read()), 0, Counter(), home,
 		tls_pair_of(tls_for(original)))
 
-	_bounds, surviving = inplace.disassemble(patched)
+	_bounds, surviving, _bad = inplace.disassemble(patched)
 	surviving = set(surviving)
 	vaddr, raddr, _size = inplace.text_mapping(original)
 	image = open(patched, "rb").read()
@@ -14855,11 +14863,21 @@ def verify(original, patched, listing=None):
 	else:
 		problems += isa_guard.check(original, patched, listing)
 
-	before_bounds, before_vex = inplace.disassemble(original)
-	after_bounds, after_vex = inplace.disassemble(patched)
+	before_bounds, before_vex, before_bad = inplace.disassemble(original)
+	after_bounds, after_vex, after_bad = inplace.disassemble(patched)
 	print(f"verify: VEX in .text {len(before_vex):,} -> {len(after_vex):,}"
 	      f"  ({len(before_vex) - len(after_vex):,} removed, "
 	      f"{100.0 * (len(before_vex) - len(after_vex)) / len(before_vex):.1f}%)")
+	# **Counted apart from the frontier, and still counted.** These begin
+	# with a VEX prefix byte and decode to nothing, so they are not
+	# surviving instructions and were inflating the number this project
+	# quotes by 5.9%. They are reported rather than dropped because
+	# objdump is wrong about this image at least twice already, and a
+	# silent discard could hide a real survivor. Finding 290.
+	if before_bad or after_bad:
+		print(f"verify: and {len(after_bad):,} VEX-prefixed byte sequence(s) "
+		      f"that decode to nothing, which are not instructions "
+		      f"(was {len(before_bad):,})")
 	# Boundaries. A widened window deliberately swallows the instruction
 	# after the site, so that address stops being a boundary -- which is
 	# intended, and is exactly the thing that has to be justified rather

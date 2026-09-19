@@ -5,9 +5,10 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **802,062 of 805,131 VEX
+**Status:** the rewriter works. `tool/detour.py` rewrites **802,062 of 804,951 VEX
 sites -- 99.6%** -- through 201,670 detours, and every `make detour-verify` invariant
-holds on the result. 3,069 sites are left.
+holds on the result. 2,889 sites are left, and 180 further VEX-prefixed byte sequences
+decode to nothing and are not instructions (Finding 290).
 
 The default became `--shadow-regs=all` on 2026-09-18 (Finding 287), which is where the
 2,622-site fall from 5,691 comes from. **The Proton observation is older than that build**
@@ -11878,9 +11879,15 @@ code quickly.
 
 ### Where it stands, 2026-09-18
 
-    default build (--shadow-regs=all)     3,069 VEX left      99.62%
-    with --teb-scratch=<offset>           2,526               99.69%
-    previous default (--shadow-regs=off)  5,691               99.29%
+    default build (--shadow-regs=all)     2,889 VEX left      99.64%
+    with --teb-scratch=<offset>           2,526 as measured   (see below)
+    previous default (--shadow-regs=off)  5,691 as measured   (see below)
+
+**Only the default has been re-measured since Finding 290.** The other two are
+the totals as they were reported, which still include the 180 sequences that
+decode to nothing; subtracting 180 from each would be arithmetic rather than a
+measurement, and the count is only known to be 180 for the default. Re-measure
+before quoting either.
 
 **The default changed on 2026-09-18** (Finding 287), on the copyright holder's
 instruction: 2,622 sites for about +0.8% of image. `--shadow-regs=off` stays
@@ -13859,6 +13866,46 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 290 -- 180 of the frontier were never instructions
+
+The frontier is the number this project exists to drive down and the one both
+documents quote. It counted **180 byte sequences that do not decode to an
+instruction**, because `disassemble` selected a survivor on the first byte of the
+encoding being `c4` or `c5` and an objdump `(bad)` row has three tab-separated
+fields like any other.
+
+    VEX in .text  805,131 -> 3,069      as it read
+    VEX in .text  804,951 -> 2,889      decoded instructions only
+                                        and 180 that decode to nothing
+
+**They are not instructions.** `c5 32 00` is a two-byte VEX whose opcode is `00`,
+which is not a VEX form in any map; one is a lone `c4`. Asked where they sit: 28
+are outside every `RUNTIME_FUNCTION`, and of the 152 inside one, 136 are reached
+by a disassembly starting at that function's own entry. That last figure is weaker
+evidence than it looks -- a sweep desynchronises after inline data and then
+"reaches" whatever follows -- but it does not matter which cause holds. **Real
+compiled code does not contain an invalid instruction on a path anything reaches**,
+so either the sweep walked into data, which is the hazard Finding 8 named, or they
+are unreachable padding.
+
+**They are reported rather than dropped**, and that is deliberate: `isa_guard`
+already carries two known objdump misdecodes in this image, so silently discarding
+every `(bad)` row could hide a real survivor. Both `verify` and `census` now count
+the decoded ones and print the rest on their own line, which is one definition of a
+surviving VEX instead of two.
+
+**The removed count does not move** -- 802,062 either way, because the baseline
+counted them too. What changes is the number that says how much work is left, which
+was overstated by 5.9%, and the 180 phantom entries any future session would have
+found on a list of things still to lower. The collector has refused them by rule
+since Finding 223; nothing else had been told.
+
+**Why it survived this long is the ordinary reason.** The frontier is computed by
+one small function nobody had cause to read, it agreed with the census exactly --
+both being wrong the same way, which is the corroboration failure `evidence.md`
+opens with -- and every check around it passed. It surfaced only from asking what
+the 180 in a census bucket named "undecodable, never classified" actually were.
 
 ### Finding 289 -- the TLS slot route is cheap, sound, and blocked on one number
 

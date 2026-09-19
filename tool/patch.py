@@ -647,8 +647,8 @@ def verify(original, patched):
 	else:
 		print(f"verify: headers byte-identical ({raddr:,} bytes)")
 
-	before_bounds, before_vex = disassemble(original)
-	after_bounds, after_vex = disassemble(patched)
+	before_bounds, before_vex, _before_bad = disassemble(original)
+	after_bounds, after_vex, _after_bad = disassemble(patched)
 	print(f"verify: VEX-encoded instructions {len(before_vex):,} -> "
 	      f"{len(after_vex):,}  ({len(before_vex) - len(after_vex):,} removed, "
 	      f"{100.0*(len(before_vex)-len(after_vex))/len(before_vex):.1f}%)")
@@ -676,10 +676,31 @@ def verify(original, patched):
 
 
 def disassemble(path):
-	"""(instruction start addresses, VEX start addresses) for .text."""
+	"""(instruction start addresses, VEX start addresses) for .text.
+
+	**A VEX start address is one that DECODES**, and until 2026-09-19 it was
+	any row whose first byte is `c4` or `c5`. A `(bad)` row has three
+	tab-separated fields like any other, so 180 byte sequences in Starfield
+	that objdump cannot decode were being counted as surviving VEX
+	instructions -- 5.9% of the frontier, in the number the README and
+	`project.md` both quote.
+
+	They are not instructions. `c5 32 00` is a two-byte VEX whose opcode is
+	`00`, which is not a VEX form in any map, and one of them is a lone
+	`c4`. Either a linear sweep desynchronised into data and landed there,
+	which is the hazard Finding 8 named, or they are unreachable padding;
+	real compiled code does not hold an invalid instruction on a path
+	anything reaches.
+
+	**They are returned rather than dropped**, because objdump is wrong
+	about this image at least twice already -- `isa_guard` carries two known
+	misdecodes -- so silently discarding every `(bad)` row could hide a real
+	survivor. The caller reports both and the frontier counts the decoded
+	ones. Finding 290.
+	"""
 	done = subprocess.run(["objdump", "-d", "-j", ".text", path],
 	                      capture_output=True, text=True, errors="replace")
-	bounds, vex = set(), set()
+	bounds, vex, undecoded = set(), set(), set()
 	for line in done.stdout.splitlines():
 		parts = line.split("\t")
 		if len(parts) < 3:
@@ -695,8 +716,11 @@ def disassemble(path):
 		bounds.add(address)
 		encoding = parts[1].split()
 		if encoding and encoding[0] in ("c4", "c5"):
-			vex.add(address)
-	return bounds, vex
+			if parts[2].strip().startswith("(bad)"):
+				undecoded.add(address)
+			else:
+				vex.add(address)
+	return bounds, vex, undecoded
 
 
 if __name__ == "__main__":
