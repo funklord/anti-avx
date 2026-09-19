@@ -11901,37 +11901,25 @@ Every remaining class is a measured floor or derivative of one:
 The census reconciles exactly; `unaccounted` is a real zero and was 85 until
 Finding 282.
 
-### The next item, and what to measure before starting it
+### The next item is blocked, and on one number somebody with the game can get
 
-**Reserve TLS slots at load time rather than squatting on a TEB offset.**
-`--teb-scratch` is worth 543 sites and has no default because nothing in the TEB
-is ours: `TlsSlots` belongs to `TlsAlloc`, `ArbitraryUserPointer` is read by some
-`NtCreateFile` paths, and a stub cannot preserve what it borrows there -- doing so
-means reading it first, into the register it has not got.
+**Reserve TLS slots at load time rather than squatting on a TEB offset**, worth 543
+sites and a shorter prologue on 19,174 stubs. Finding 289 measured it: `TlsAlloc`
+is already imported (IAT VA `0x143a3f3a8`), the callback array can be relocated
+safely, and the patch scope is 19,174 rather than the 200,000 first guessed.
 
-`TlsAlloc` is the documented way to own one, and slot `k` is then `%gs:0x1480+8k`:
-no base, no index, no register. **Starfield's TLS directory already has a callback
-array with two entries at `0x143a86ea0`**, so the tool can relocate it into the
-stub section with a third and the existing two keep their addresses.
+**It is blocked on whether `TlsAlloc`'s first index is below 64**, because only the
+64-entry `TlsSlots` array at `gs:0x1480` is addressable with no register, and the
+EXE's callbacks run after all 66 imported DLLs have had their `DllMain`. There is
+no retry, no ordering fix and no fallback -- Finding 289 has why for each.
 
-**The scope is larger than 543 sites.** Every stub today rebuilds the block pointer
-per execution -- `%gs:0x58`, the index, the block -- three instructions and two
-dependent loads. A thread-attach callback writing that pointer into a reserved slot
-makes every stub's prologue one load, on roughly 200,000 stubs, which is what
-Finding 288 measured at 2 to 3 ns apiece.
+**The number that unblocks it:** what `TlsAlloc` returns when called from
+Starfield's own TLS callback, on a machine with the game. Under 64 with room and
+this is a day's work; at or near 64 and the route is closed.
 
-Measure these two first, on the pattern that paid three times on 2026-09-18:
-
-  * **How many stubs need patching.** The narrow scope is about 400 (the teb-mode
-    brackets); the wide one is every stub that stands a block pointer up. The
-    difference decides whether the patch table is a nicety or a design constraint.
-  * **When the two existing callbacks run** -- process attach or thread attach.
-    Relocating the array must not change when they are called.
-
-The cost is a day and it is the first thing here that runs code at load time rather
-than only rewriting it: the callback must resolve `TlsAlloc` (an added import
-descriptor, or a PEB walk to kernel32's exports, about eighty bytes), `.avxsse`
-must be writable at load time, and the tool must emit the patch table.
+Everything else in the default build is a measured floor -- see the census above --
+so if that number comes back bad, the frontier is where this architecture leaves it
+and the next move is a different representation rather than another shape.
 
 ### Decisions waiting on the copyright holder
 
@@ -13871,6 +13859,63 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 289 -- the TLS slot route is cheap, sound, and blocked on one number
+
+`--teb-scratch` is worth 543 sites and has no default because nothing in the TEB is ours.
+`TlsAlloc` is the documented way to own a slot, and four measurements were taken before
+building anything. Three of them removed work:
+
+  * **`TlsAlloc` is already imported.** `KERNEL32.dll`, IAT at VA `0x143a3f3a8`, beside
+    `TlsGetValue`, `TlsSetValue` and `TlsFree`. No import-table surgery and no PEB walk to
+    kernel32's exports -- the callback is `call *0x143a3f3a8(%rip)`. That was the one part
+    of this with consequences outside the tree, since a PEB walk in a game binary is the
+    shape anti-cheat and antivirus are written to notice.
+  * **The callback array can be relocated safely.** Its VA `0x143a86ea0` occurs exactly
+    once in the image, at file offset `0x4f06a98`, which is the TLS directory's own
+    `AddressOfCallBacks` field. Nothing else holds the address. The two existing callbacks
+    dispatch on the Reason argument as normal -- the first opens `cmp $0x2,%edx; jne` --
+    so preserving order and content preserves behaviour.
+  * **The patch scope is 19,174 stubs, not 200,000.** That is how many stand a block
+    pointer up in the current default build; the rest of the 201,670 detours are `plain`
+    and never touch the TLS block. A 77 KB table and 19,174 word writes at load time. The
+    narrow scope -- only the teb-mode stubs -- is about 400.
+
+#### The fourth measurement is the one that blocks it
+
+**A TLS slot is addressable with no register only while its index is below 64.**
+`gs:0x1480` is the 64-entry `TlsSlots` array; past that a value lives behind
+`TlsExpansionSlots`, a pointer at `gs:0x1780`, which is another dereference and another
+register -- the exact problem this exists to solve. `TlsAlloc` returns the lowest free
+index, and the EXE's TLS callbacks run **after** every statically-imported DLL has had its
+`DllMain`. Starfield imports 66 of them.
+
+**Whether the lowest free index is under 64 at that moment cannot be measured here**, and
+this is not a case where the risk can be engineered away:
+
+  * There is no retry. `TlsAlloc` hands out the lowest free index; if that is 64 or more,
+    asking again cannot do better.
+  * There is no ordering fix. Putting our callback first in the array does not help,
+    because DLL initialisation precedes the array entirely.
+  * **There is no fallback once the stubs are emitted.** The sites that would use these
+    slots are exactly the ones with no dead GPR and no home space -- that is why they are
+    teb-mode -- so there is no cheaper form to patch them to. Restoring the original bytes
+    is not a fallback either: it puts VEX back, which on the target host is a SIGILL.
+
+So the honest failure mode is a process that refuses to start, and the honest risk
+assessment is "probably fine, unmeasurable from here, severe if wrong". That is the shape
+of Finding 268, which measured well and rested on an assumption about runtime behaviour
+nobody in this tree could check, and which Finding 270 then had to revert.
+
+**What would settle it is one number** and it needs a machine with the game: the value
+`TlsAlloc` returns when called from the EXE's own TLS callback, with Starfield's 66 imports
+loaded. Under 64 with room to spare and this is a day's work with the risk retired; at or
+near 64 and the route is closed and the 543 sites stay where they are.
+
+**A fixture cannot answer it.** These PEs have no import table by design -- "No imports and
+no relocations", the first thing `pe_build.py` says about them -- so proving the mechanism
+here would mean giving them one, and even then a two-import fixture's answer says nothing
+about a 66-import game.
 
 ### Finding 288 -- what a lowered site costs, and why the comparison could not be made
 
