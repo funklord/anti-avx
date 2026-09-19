@@ -109,8 +109,15 @@ no build file and nothing beyond the Python standard library:
 
     python3 ~/src/fmake/fmake test    # the five C tests, and they pass
 
-**Not `/usr/bin/fmake`**, which is older than the assembly support this
-needs. `fmake.toml` carries the ISA flags, because here they are semantics
+**Check which one you have**, because the packaged fmake may predate the
+assembly support this needs, and no tree can answer that about your
+machine:
+
+    fmake --version                         # prints a content hash
+    python3 ~/src/fmake/fmake --version     # compare them
+
+Differing hashes mean the source tree is the newer one and is what to
+run. `fmake.toml` carries the ISA flags, because here they are semantics
 rather than preference -- `-msse4.1` is the baseline these helpers are
 written against and `-mno-avx -mno-f16c` keep it there -- and one
 `[generate]` stanza for the case table, whose two halves come out of one
