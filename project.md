@@ -11908,7 +11908,26 @@ Every remaining class is a measured floor or derivative of one:
 The census reconciles exactly; `unaccounted` is a real zero and was 85 until
 Finding 282.
 
-### The next item is blocked, and on one number somebody with the game can get
+### The next item: bake the TLS index as a constant (Finding 291)
+
+The block pointer wants two registers only because the index is in memory. A TLS
+callback can read it at process attach and patch it into each stub as a
+displacement, leaving a one-register chain that is also four bytes shorter and one
+dependent load cheaper. **The precondition is proved** -- the loader writes the
+index before a callback runs, `tlscallback` is the fixture -- and a fixture
+declaring `tls_cb` now gets a working callback.
+
+It should dissolve the 360 refusals where mode True has one dead GPR and no xmm to
+park the index in, plus part of the 263 and 154 xmm classes; expect well under 360
+sites delivered, on Finding 271's lesson. What is left to build: the one-register
+chain with a placeholder displacement, the callback and patch table emitted into
+the stub section, `.avxsse` marked writable, and Starfield's two-entry callback
+array relocated to take a third.
+
+**Prefer this to the TEB route below**, which wants the same machinery and is
+blocked on something this one does not need.
+
+### The TEB route, and the number that would unblock it
 
 **Reserve TLS slots at load time rather than squatting on a TEB offset**, worth 543
 sites and a shorter prologue on 19,174 stubs. Finding 289 measured it: `TlsAlloc`
@@ -13866,6 +13885,57 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 291 -- the loader writes the TLS index before a callback runs
+
+The block pointer needs two registers only because the index is in memory:
+
+    mov %gs:0x58,%r11          9 bytes
+    mov tls_index(%rip),%r10d  7 bytes   <- the whole reason for a second
+    mov (%r11,%r10,8),%r11     4 bytes
+
+Mode True exists solely to free that second register -- `encode_tls_base`'s `stash`
+parks the index in an xmm for three instructions and puts it back -- and 360 of the
+default build's refusals are sites with one dead GPR and no xmm to park it in.
+
+**If the index were a constant the second register would not be needed**, and a TLS
+callback can supply it: read `*AddressOfIndex` at process attach and patch it into
+each stub as a displacement.
+
+    mov %gs:0x58,%r11          9 bytes
+    mov <disp32>(%r11),%r11    7 bytes, disp32 = index * 8
+
+One register, one fewer dependent load, four bytes shorter, and a single disp32 per
+stub so nothing changes length at load time.
+
+**The precondition is that the loader has written the index by the time a callback
+runs, and it has.** Measured under wine, three runs, exit code 100.
+
+**The first version of that probe was vacuous and it is the part worth keeping.** It
+left `tls_index` at 0 and read 0 back -- which cannot tell "the loader wrote 0" from
+"the loader wrote nothing", the two answers being identical in the output. The
+sentinel is what separates them: the field starts at 55, so 155 would mean untouched.
+It reads 100, so the loader overwrote it. `tlscallback` in `pe_build.py` is the
+method, kept rather than described.
+
+It also establishes the mechanism that Finding 289 needed and could not test: a
+fixture declaring `tls_cb` now gets a real TLS callback, the loader calls it, and
+pe_build fills the callbacks array with its absolute VA -- `objcopy -O binary` on an
+unlinked object cannot resolve one, which is why the directory is packed in Python
+and now the array is too.
+
+**Why this route rather than Finding 289's.** Both want a load-time callback and the
+same patch table over the same 19,174 stubs. This one needs no `TlsAlloc`, so there
+is no lowest-free-index question and no 64-slot ceiling, and no TEB byte belongs to
+anybody else -- the index is this module's own. The thing that blocked 289 does not
+arise.
+
+**What is left to build**, and it is a session's work rather than a measurement:
+emitting the one-register chain with a placeholder displacement, emitting the
+callback and the patch table into the stub section, marking `.avxsse` writable, and
+relocating Starfield's two-entry callback array to make room for a third. Finding 289
+established the last of those is safe -- the array's VA occurs once in the image, in
+the TLS directory's own field.
 
 ### Finding 290 -- 180 of the frontier were never instructions
 

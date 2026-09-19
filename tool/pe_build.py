@@ -3481,6 +3481,50 @@ tls_directory:
 """)
 
 
+# **Proof that the loader writes the TLS index before a callback runs**,
+# which is the precondition for baking that index into a stub as a
+# constant (Finding 291). Not a gate: it answers a question about the
+# loader rather than about the rewriter, and its exit code carries the
+# answer rather than 77.
+#
+# **The sentinel is the whole experiment.** The first version left
+# `tls_index` at 0 and read 0 back, which cannot tell "the loader wrote
+# 0" from "the loader wrote nothing" -- a vacuous pass. It starts at 55
+# now, so 155 would mean the field was never touched and anything else is
+# what the loader put there. Measured under wine: 100, three runs.
+PROGRAMS["tlscallback"] = (100, """
+	.text
+	.globl _start
+_start:
+	movl	seen(%rip), %eax
+	ret
+func_end:
+tls_cb:
+	cmpl	$1, %edx		/* DLL_PROCESS_ATTACH */
+	jne	9f
+	movl	tls_index(%rip), %eax
+	addl	$100, %eax
+	movl	%eax, seen(%rip)
+9:	ret
+	.p2align 4
+seen:	.long	200, 0, 0, 0		/* 200 if the callback never ran */
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	55			/* the sentinel: 155 means untouched */
+	.long	0
+tls_callbacks:
+	.quad	0
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
 PROGRAMS["immreg"] = (77, """
 	.text
 	.globl _start
@@ -4009,6 +4053,16 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 		                 base + symbols["tls_callbacks"],
 		                 TLS_ZERO_FILL,
 		                 0x00100000)		# ALIGN_16BYTES
+		# **A sample that defines `tls_cb` gets a TLS callback.** The
+		# array is a null-terminated list of absolute VAs, and `objcopy
+		# -O binary` on an unlinked object cannot resolve one -- the
+		# same reason the directory above is packed here rather than
+		# written in the assembly. A sample wanting one declares two
+		# quads at `tls_callbacks` and the first is filled in.
+		if "tls_cb" in symbols:
+			struct.pack_into("<Q", text, symbols["tls_callbacks"],
+			                 base + symbols["tls_cb"])
+			text = bytes(text)
 		text = bytes(text)
 		sections[0] = sections[0][:3] + (text,) + sections[0][4:]
 		tls_directory = (sections[0][1] + at, 40)
