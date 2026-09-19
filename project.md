@@ -11920,9 +11920,13 @@ declaring `tls_cb` now gets a working callback.
 It should dissolve the 360 refusals where mode True has one dead GPR and no xmm to
 park the index in, plus part of the 263 and 154 xmm classes; expect well under 360
 sites delivered, on Finding 271's lesson. What is left to build: the one-register
-chain with a placeholder displacement, the callback and patch table emitted into
-the stub section, `.avxsse` marked writable, and Starfield's two-entry callback
-array relocated to take a third.
+chain with a placeholder displacement, the callback and its RVA table emitted into
+the stub section, and `.avxsse` marked writable.
+
+**The callback is CHAINED, not added** -- Finding 292. The image is `DYNAMIC_BASE`,
+so a new array would need relocations its entries do not have; overwriting the
+first existing slot reuses the relocation already on it, and the tool's callback
+tail-jumps to the original at base-plus-RVA. No new array, no relocation surgery.
 
 **Prefer this to the TEB route below**, which wants the same machinery and is
 blocked on something this one does not need.
@@ -13885,6 +13889,54 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 292 -- the image is relocated, so chain the callback rather than add one
+
+Both load-time routes -- Finding 289's reserved TLS slots and Finding 291's constant
+index -- want a callback of the tool's own in the image's callback array. Neither
+plan had accounted for the image being relocated, and that omission would have
+shipped a pointer that is wrong the moment the loader moves the image:
+
+    DllCharacteristics 0x8160   DYNAMIC_BASE set, HIGH_ENTROPY_VA set
+    base relocations            rva 0x889f000, 953,060 bytes
+    RELOCS_STRIPPED             no
+
+A TLS callback array holds absolute VAs. Changing `AddressOfCallBacks` in place is
+safe, because the relocation already covering that field applies to whatever value
+is in it. **A new array in the stub section is not**: nothing relocates its entries,
+so under ASLR the loader would call an address that has moved.
+
+**The measurement offered one answer and the mechanism offered a better one.** There
+are 284 raw bytes of slack after the relocation directory, all zero, so a block of
+three DIR64 entries could be appended -- 8 bytes of header and 2 per entry, padded
+to a multiple of four -- with the directory's size and the section's `VirtualSize`
+grown to cover it. That works and it is surgery on a 953 KB structure in an image
+that must still load.
+
+**Chaining needs none of it.** Overwrite the FIRST entry of the existing two-entry
+array with the tool's callback: that slot already carries a relocation, so the
+loader fixes the new value exactly as it would have fixed the old one. The tool's
+callback then tail-jumps to the original, which it locates as an RVA added to the
+base the loader passes in `rcx` -- no absolute address anywhere, and the original
+receives `rcx`, `rdx` and `r8` unchanged because a jump does not disturb them.
+
+    tls_cb(rcx = module base, rdx = reason, r8 = reserved)
+        cmp   $1,%edx            DLL_PROCESS_ATTACH
+        jne   chain
+        ...   patch, addressing everything as base + RVA ...
+    chain:
+        lea   <orig_rva>(%rcx),%rax
+        jmp   *%rax              the original, arguments untouched
+
+So the array is not relocated, not extended, and not moved; one slot changes value,
+and the relocation that was already there does the rest. What remains for either
+route is emitting the callback and its RVA table into the stub section and marking
+that section writable.
+
+**This is the second time on this item that measuring the environment produced a
+better design rather than a number.** Reading the import table removed the need for
+a PEB walk; reading `DllCharacteristics` removed the need for relocation surgery.
+Neither was the question being asked at the time.
 
 ### Finding 291 -- the loader writes the TLS index before a callback runs
 
