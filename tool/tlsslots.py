@@ -81,118 +81,124 @@ def starfield_imports(path):
 			i += 1
 	return out
 
-SP = sys.argv[1]
-IMAGE = sys.argv[2] if len(sys.argv) > 2 else "Starfield-unpacked.exe"
-pairs = starfield_imports(IMAGE)
-# TlsAlloc is what the callback calls; put it first in KERNEL32's list.
-by_dll = {}
-for dll, fn in pairs:
-	by_dll.setdefault(dll, [])
-	if fn not in by_dll[dll]:
-		by_dll[dll].append(fn)
-by_dll.setdefault("KERNEL32.dll", [])
-if "TlsAlloc" in by_dll["KERNEL32.dll"]:
-	by_dll["KERNEL32.dll"].remove("TlsAlloc")
-by_dll["KERNEL32.dll"].insert(0, "TlsAlloc")
-dlls = list(by_dll.items())
+def main(argv):
+	"""Build the probe. `argv` is (scratch dir[, image])."""
+	SP = argv[0]
+	IMAGE = argv[1] if len(argv) > 1 else "Starfield-unpacked.exe"
+	pairs = starfield_imports(IMAGE)
+	# TlsAlloc is what the callback calls; put it first in KERNEL32's list.
+	by_dll = {}
+	for dll, fn in pairs:
+		by_dll.setdefault(dll, [])
+		if fn not in by_dll[dll]:
+			by_dll[dll].append(fn)
+	by_dll.setdefault("KERNEL32.dll", [])
+	if "TlsAlloc" in by_dll["KERNEL32.dll"]:
+		by_dll["KERNEL32.dll"].remove("TlsAlloc")
+	by_dll["KERNEL32.dll"].insert(0, "TlsAlloc")
+	dlls = list(by_dll.items())
 
-CALL_MARK = 0x5B5B5B5B
+	CALL_MARK = 0x5B5B5B5B
 
-pe_build.PROGRAMS["tlsslots"] = (0, """
-	.text
-	.globl _start
-_start:
-	movl	seen(%rip), %eax
-	ret
-func_end:
-tls_cb:
-	cmpl	$1, %edx
-	jne	9f
-	subq	$40, %rsp
-	call	*0x5b5b5b5b(%rip)
-	addq	$40, %rsp
-	cmpl	$-1, %eax
-	jne	1f
-	movl	$250, %eax
-	jmp	2f
-1:	addl	$1, %eax
-2:	movl	%eax, seen(%rip)
-9:	ret
-	.p2align 4
-seen:	.long	0, 0, 0, 0
-	.p2align 4
-tls_raw:
-	.long	0x55667788, 0x11223344
-	.long	0, 0
-tls_raw_end:
-tls_index:
-	.long	0
-	.long	0
-tls_callbacks:
-	.quad	0
-	.quad	0
-	.p2align 3
-tls_directory:
-	.quad	0, 0, 0, 0
-	.long	0, 0
-""")
-pe_build.main(["sample", "tlsslots", SP + "/tlsslots.exe"])
-image = bytearray(open(SP + "/tlsslots.exe", "rb").read())
+	pe_build.PROGRAMS["tlsslots"] = (0, """
+		.text
+		.globl _start
+	_start:
+		movl	seen(%rip), %eax
+		ret
+	func_end:
+	tls_cb:
+		cmpl	$1, %edx
+		jne	9f
+		subq	$40, %rsp
+		call	*0x5b5b5b5b(%rip)
+		addq	$40, %rsp
+		cmpl	$-1, %eax
+		jne	1f
+		movl	$250, %eax
+		jmp	2f
+	1:	addl	$1, %eax
+	2:	movl	%eax, seen(%rip)
+	9:	ret
+		.p2align 4
+	seen:	.long	0, 0, 0, 0
+		.p2align 4
+	tls_raw:
+		.long	0x55667788, 0x11223344
+		.long	0, 0
+	tls_raw_end:
+	tls_index:
+		.long	0
+		.long	0
+	tls_callbacks:
+		.quad	0
+		.quad	0
+		.p2align 3
+	tls_directory:
+		.quad	0, 0, 0, 0
+		.long	0, 0
+	""")
+	pe_build.main(["sample", "tlsslots", SP + "/tlsslots.exe"])
+	image = bytearray(open(SP + "/tlsslots.exe", "rb").read())
 
-def layout(base_rva):
-	"""(payload, IAT rva of TlsAlloc) for the import section at base_rva."""
-	ndesc = (len(dlls) + 1) * 20
-	thunks, strings = ndesc, 0
-	# reserve: per dll, ILT then IAT, each (n+1) qwords
-	off = ndesc
-	spots = {}
-	for dll, fns in dlls:
-		spots[dll] = (off, off + (len(fns) + 1) * 8)
-		off += (len(fns) + 1) * 8 * 2
-	names_at = off
-	blob = bytearray(off)
-	names = bytearray()
-	def emit(b):
-		at = names_at + len(names)
-		names.extend(b)
-		while len(names) % 2:
-			names.append(0)
-		return at
-	tls_iat = None
-	for i, (dll, fns) in enumerate(dlls):
-		ilt, iat = spots[dll]
-		name_rva = emit(dll.encode() + b"\0")
-		struct.pack_into("<IIIII", blob, i * 20,
-		                 base_rva + ilt, 0, 0, base_rva + name_rva,
-		                 base_rva + iat)
-		for j, fn in enumerate(fns):
-			hn = emit(struct.pack("<H", 0) + fn.encode() + b"\0")
-			struct.pack_into("<Q", blob, ilt + j * 8, base_rva + hn)
-			struct.pack_into("<Q", blob, iat + j * 8, base_rva + hn)
-			if dll == "KERNEL32.dll" and fn == "TlsAlloc":
-				tls_iat = base_rva + iat + j * 8
-	return bytes(blob) + bytes(names), tls_iat
+	def layout(base_rva):
+		"""(payload, IAT rva of TlsAlloc) for the import section at base_rva."""
+		ndesc = (len(dlls) + 1) * 20
+		thunks, strings = ndesc, 0
+		# reserve: per dll, ILT then IAT, each (n+1) qwords
+		off = ndesc
+		spots = {}
+		for dll, fns in dlls:
+			spots[dll] = (off, off + (len(fns) + 1) * 8)
+			off += (len(fns) + 1) * 8 * 2
+		names_at = off
+		blob = bytearray(off)
+		names = bytearray()
+		def emit(b):
+			at = names_at + len(names)
+			names.extend(b)
+			while len(names) % 2:
+				names.append(0)
+			return at
+		tls_iat = None
+		for i, (dll, fns) in enumerate(dlls):
+			ilt, iat = spots[dll]
+			name_rva = emit(dll.encode() + b"\0")
+			struct.pack_into("<IIIII", blob, i * 20,
+			                 base_rva + ilt, 0, 0, base_rva + name_rva,
+			                 base_rva + iat)
+			for j, fn in enumerate(fns):
+				hn = emit(struct.pack("<H", 0) + fn.encode() + b"\0")
+				struct.pack_into("<Q", blob, ilt + j * 8, base_rva + hn)
+				struct.pack_into("<Q", blob, iat + j * 8, base_rva + hn)
+				if dll == "KERNEL32.dll" and fn == "TlsAlloc":
+					tls_iat = base_rva + iat + j * 8
+		return bytes(blob) + bytes(names), tls_iat
 
-probe, _ = layout(0)
-_img, rva = detour.add_section(bytes(image), b".imports", probe, 0x40000040)
-payload, tls_iat = layout(rva)
-assert len(payload) == len(probe), "layout changed size"
-out, rva2 = detour.add_section(bytes(image), b".imports", payload, 0x40000040)
-assert rva2 == rva, "section moved"
-out = bytearray(out)
+	probe, _ = layout(0)
+	_img, rva = detour.add_section(bytes(image), b".imports", probe, 0x40000040)
+	payload, tls_iat = layout(rva)
+	assert len(payload) == len(probe), "layout changed size"
+	out, rva2 = detour.add_section(bytes(image), b".imports", payload, 0x40000040)
+	assert rva2 == rva, "section moved"
+	out = bytearray(out)
 
-pe = struct.unpack_from("<I", out, 0x3C)[0]
-opt = pe + 24
-struct.pack_into("<II", out, opt + 112 + 1 * 8, rva, (len(dlls) + 1) * 20)
+	pe = struct.unpack_from("<I", out, 0x3C)[0]
+	opt = pe + 24
+	struct.pack_into("<II", out, opt + 112 + 1 * 8, rva, (len(dlls) + 1) * 20)
 
-# patch the call displacement: rip-relative from the end of the instruction
-where = out.find(struct.pack("<I", CALL_MARK))
-assert where > 0 and out.find(struct.pack("<I", CALL_MARK), where + 1) < 0
-for vaddr, vsize, raddr, rsize in detour.sections_of(bytes(out)):
-	if raddr <= where < raddr + rsize:
-		call_rva = vaddr + (where - raddr) + 4
-		break
-struct.pack_into("<i", out, where, tls_iat - call_rva)
-open(SP + "/tlsslots.exe", "wb").write(bytes(out))
-print(f"{len(dlls)} DLLs imported, import table at rva 0x{rva:x}, "
-      f"{len(payload):,} bytes; TlsAlloc IAT at rva 0x{tls_iat:x}")
+	# patch the call displacement: rip-relative from the end of the instruction
+	where = out.find(struct.pack("<I", CALL_MARK))
+	assert where > 0 and out.find(struct.pack("<I", CALL_MARK), where + 1) < 0
+	for vaddr, vsize, raddr, rsize in detour.sections_of(bytes(out)):
+		if raddr <= where < raddr + rsize:
+			call_rva = vaddr + (where - raddr) + 4
+			break
+	struct.pack_into("<i", out, where, tls_iat - call_rva)
+	open(SP + "/tlsslots.exe", "wb").write(bytes(out))
+	print(f"{len(dlls)} DLLs imported, import table at rva 0x{rva:x}, "
+	      f"{len(payload):,} bytes; TlsAlloc IAT at rva 0x{tls_iat:x}")
+
+
+if __name__ == "__main__":
+	sys.exit(main(sys.argv[1:]) or 0)
