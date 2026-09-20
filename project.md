@@ -10,6 +10,10 @@ sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` inva
 holds on the result. 2,687 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
+**`--teb-scratch=auto` takes it to 2,346** (Finding 297), which is not the default: it
+asks the loader for two TLS slots and patches the stubs from a callback, and whether
+that becomes the default is the copyright holder's call rather than this document's.
+
 The default became `--shadow-regs=all` on 2026-09-18 (Finding 287), which is where the
 2,622-site fall from 5,691 comes from. **The Proton observation is older than that build**
 -- the previous default loaded 305 modules before the frontier at `0x1428D1492` stopped it,
@@ -11880,14 +11884,23 @@ code quickly.
 ### Where it stands, 2026-09-18
 
     default build                         2,687 VEX left      99.67%
+    with --teb-scratch=auto               2,346 re-measured   (Finding 297)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**Only the default has been re-measured since Finding 290.** The other two are
-the totals as they were reported, which still include the 180 sequences that
-decode to nothing; subtracting 180 from each would be arithmetic rather than a
-measurement, and the count is only known to be 180 for the default. Re-measure
+**The first two were re-measured on 2026-09-20, against each other, on the same
+tool.** The default reproduced 2,687 exactly, which is what says the callback and
+emitter changes Finding 297 made are inert unless the flag is passed. The other
+two are the totals as they were reported, which still include the 180 sequences
+that decode to nothing; subtracting 180 from each would be arithmetic rather than
+a measurement, and the count is only known to be 180 for the default. Re-measure
 before quoting either.
+
+**The fixed-offset row is the one to distrust**, not because the number is wrong
+but because `--teb-scratch=<offset>` names bytes in somebody else's TEB and
+nothing establishes they are free -- the open half of Finding 280, which `auto`
+exists to close. It is kept for the comparison and not as a route anyone should
+take.
 
 **The default changed on 2026-09-18** (Finding 287), on the copyright holder's
 instruction: 2,622 sites for about +0.8% of image. `--shadow-regs=off` stays
@@ -13913,6 +13926,124 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 297 -- the TEB route is built, and the wall it was written against is gone
+
+Finding 296 measured away the precondition; this is the route itself. `--teb-scratch=auto`
+asks the process for its scratch bytes instead of naming an offset in somebody else's TEB,
+which is the open half Finding 280 left. The same TLS callback that fills the index in calls
+`TlsAlloc` twice through the image's own IAT and patches two more tables of displacements.
+
+    unconditional lowering              base       auto
+    sites asked about                 36,903     36,138
+    built                             34,382     35,532
+    refused                            2,521        606
+      no dead GPR and no home space    1,878          -
+
+The 1,878 were served by **279 stubs** -- 1,116 displacements, four per stub, being the save
+and the restore of each of two borrowed registers. Regions improved with them: not
+representable 44 -> 9, refused after the walk said yes 45 -> 4. `verify` passes on the
+result, and the check that matters saw its subject rather than sleeping through it: *no call
+inside any of 279 TEB save bracket(s)*, the same 279 the apply reported.
+
+    VEX in the rewritten .text        2,687     2,346
+      declined by the collector       1,825       955      -870
+      refused, stub not buildable       122       190       +68
+      in a window the repair dropped    694     1,177      +483
+      in-place patch reverted            37        11       -26
+      skipped for overlap                 9        13        +4
+      unaccounted                         0         0
+
+**The frontier is 2,346, and half of what is left is now one class.** 870 sites came out of
+`declined` and 483 went straight into `dropped`, because serving a site builds a window and a
+window that swallows a VEX.128 write whose zeroing is still read does not get placed. The net
+is 341. What the route actually did was move the largest remaining class from one the tool
+refuses outright to one the stale-read repair might yet recover, and the repair is now the
+whole game: 1,177 of 2,346.
+
+**The first census of this said 679 and it was measured wrong.** It was run without
+`--teb-scratch=auto`, so its collector-side accounting described the baseline -- `detoured
+201,733, refused 93` against the auto build's 201,833 and 149 -- and every attribution line
+under the headline was the base model's verdict on the auto image's residue. The headline
+itself is a direct count of the rewritten `.text` and was right either way, which is exactly
+what made the wrong half quotable. `unaccounted 0` held under the mismatched model too, so
+the reconciliation that normally catches this could not: it reconciles the residue against
+whatever model it was given. What separates the two runs is that the corrected one's
+`detoured` and `refused` match the apply log and the first one's do not -- the artifact,
+not the tally.
+
+**Slot k is `%gs:0x1480+8k`**, which is what makes this worth doing at all: still a complete
+effective address with no base and no index, so the property that made mode "teb" the answer
+for a site with no dead GPR survives being allocated rather than chosen. Both indices are
+bounds-checked against 64 at load time and the callback refuses through
+`GetCurrentProcess`/`TerminateProcess` above it, because past 64 a slot sits behind
+`TlsExpansionSlots` and that is the dereference this exists to avoid.
+
+#### A short jump that reached backwards out of the callback
+
+The entry branch was `jne` in its two-byte form. With the TEB half the callback is 241 bytes
+and `chain` sits at 0xe8, so the displacement wrapped: `75 df`, a jump to -33, taken on every
+reason except `DLL_PROCESS_ATTACH` -- which is every thread attach. The 52-byte form without
+the TEB half puts `chain` at 0x2b and hides it completely, so no build before this one could
+have shown it. It is `0f 85` with a rel32 now.
+
+**Widening it broke something four bytes away that nothing would have reported.**
+`index_payload` reached the patch table with a displacement it computed by counting
+instruction lengths in a comment, `code_off + 3 + 2 + 6 + 3 + 7`, and that `2` was the short
+jne. The callback would have read its table from four bytes early -- inside the padding,
+decoding as a plausible RVA. The fix is not a corrected constant: the caller now says WHERE
+each table is and the emitter measures its own `lea`s. A hand-counted offset in a comment is
+a second copy of the instruction stream, and it went stale the moment the first copy moved.
+
+#### The control that made the 77 mean something, and the one that did not
+
+`tebauto` is `nogpr` with an import table. The good build returns 77; the build whose callback
+patches nothing returns **5**, because the stub then writes eight bytes at `%gs:0x5b5b5b00`
+and that faults. `make check-teb-auto` runs both and refuses if the second also returns 77.
+
+**The first version of that control returned 77 as well, and it was not a finding about the
+TEB.** `ANTI_AVX_SABOTAGE=tebconst` emptied the patch tables and left the forcing condition
+naming `teb` alone -- so the sabotaged build chose the callee home space and contained no TEB
+write at all. Read as a passing control it would have said `%gs:0x5b5b5b00` was harmless. Both
+names force the path now, and the gate asserts four `gs:0x5b5b5b` references in each build
+before believing either exit code.
+
+**The fixture builds its own import section rather than calling `detour.add_section`**, which
+exists and works. A fixture assembled by the tool under test cannot detect a fault in that
+tool: the image and the thing reading the image would agree because one produced the other.
+
+#### A call counter is not a denominator, met a second time in the same file
+
+The patch table was first checked against a counter incremented in `encode_gpr_teb`. It
+reported 16 against the 4 that ship, because the collector emits for candidates it never
+places and for every rung of the ladder. That is exactly what `INDEX_CONST_SITES` was measured
+doing at 60 to 1 in Finding 293, and the remedy there -- count the artifact -- was in a comment
+forty lines from where the counter was written.
+
+What replaces it is structural rather than a tally: a TEB block saves exactly two registers,
+one at the slot and one eight bytes above it, so the two tables must be the same length
+whatever the collector did. Beside it is the refusal Finding 293 already carries, extended:
+no image ships with an unfilled placeholder of either kind. The scratch one is the worse of
+the two -- an unfilled index makes a stub READ the wrong block, an unfilled scratch makes it
+WRITE eight bytes far outside the TEB.
+
+#### The second borrowed register is dead, and is being left alone deliberately
+
+Under the constant index `encode_tls_base` never touches the index register, so every TEB stub
+saves and restores one for nothing:
+
+    mov %r11,%gs:0x5b5b5b00
+    mov %r10,%gs:0x5b5b5b08      <- saved
+    mov %gs:0x58,%r11
+    mov 0x5a5a5a5a(%r11),%r11
+    mov %gs:0x5b5b5b08,%r10      <- restored, never read between
+
+It is worth about 5 KB of the 4.57 MB stub section and one TLS slot per process. It unlocks
+nothing: the collector's own `fewer than two dead GPRs for the block` class is 15 sites, and
+the whole 1,878 wall was served WITH two registers, so those sites had two to give. Against
+that, `window_borrow` is the function Findings 265, 268 and 269 were all about, all three
+turning on `mover` having been chosen against the old block's registers. A size change to it
+does not ride along with the pass being measured.
+
 ### Finding 296 -- the number that blocked the TEB route is 5, and it was measurable here
 
 Finding 289 blocked the TEB route -- 1,878 refusals, the largest class left -- on
@@ -13943,22 +14074,22 @@ game's own -- `bink2w64`, `libxess`, `sl.interposer`, `steam_api64` -- and are
 dropped, so each could take slots this does not see. Five plus four libraries'
 worth is still nowhere near sixty-four.
 
-#### What this unblocks
+#### What this unblocked -- built, and the numbers are in Finding 297
 
-The TEB route now has its precondition, and everything else it needs is already
-built and proven: the chained callback (Finding 294), the patch table, and the
-24,551 stubs that take a patched displacement. What it adds is two `TlsAlloc` calls
-in the callback and a second patched field per teb-mode stub.
-
-**It is worth the 1,878** -- sites with no dead register and no home space, which is
-the one class the constant index could not reach because a chain still needs one
-register and they have none to give.
+The route was written the same day and the 1,878 it was worth are gone: 279 stubs
+take two allocated slots, and the frontier is 2,346 with the flag against 2,687
+without it. The callback does check both indices against 64 and refuses through
+`TerminateProcess` above it, which is the one thing this entry left as a
+requirement rather than a fact.
 
 **The risk Finding 289 named is retired rather than accepted.** It was "probably
-fine, unmeasurable from here, severe if wrong"; the middle clause was false. What
-remains is that the callback must check the index it gets and refuse to patch if it
-is 64 or more, because a floor is not a guarantee -- and refusing to patch there
-means refusing to start, which is a decision rather than an oversight.
+fine, unmeasurable from here, severe if wrong"; the middle clause was false.
+
+**What the route did NOT do is shrink the frontier by 1,878**, and Finding 297 has
+the reason: 870 sites left `declined` and 483 arrived in `dropped`, because serving
+a site builds a window and a window can swallow a stale-read hazard. The net is 341.
+A class the tool refused outright became a class the stale-read repair might yet
+recover, which is a better place for it to be and is not the same as recovering it.
 
 ### Finding 295 -- the constant index becomes the default, and two gates had to learn it
 

@@ -2708,6 +2708,21 @@ tls_directory:
 # separately visible and neither is one away from passing: what a missing
 # index restore leaves behind is the small TLS index, and a missing block
 # restore leaves a whole pointer.
+# **`nogpr` again, with an import table.** `--teb-scratch=auto` asks the
+# process for its scratch bytes rather than naming an offset, so the
+# callback that fills the displacements in calls `TlsAlloc` -- and calls
+# it through the image's own IAT, because a TLS callback runs after the
+# loader has resolved imports and an entry the image already has is a
+# pointer that is already correct. `GetCurrentProcess` and
+# `TerminateProcess` are the refusal path, taken when a slot lands at 64
+# or above where the register-free range ends.
+#
+# Nothing in the assembly below references any of them. The rewriter
+# finds the IAT by reading the import table, so what the fixture owes is
+# a valid table and not a call site. Finding 297.
+IMPORTS = {"tebauto": [("KERNEL32.dll", ["TlsAlloc", "GetCurrentProcess",
+                                         "TerminateProcess"])]}
+
 PROGRAMS["nogpr"] = (77, """
 	.text
 	.globl _start
@@ -2758,6 +2773,14 @@ tls_directory:
 	.quad	0, 0, 0, 0
 	.long	0, 0
 """)
+
+
+# **The same program, and deliberately the same text.** `tebauto` exists
+# to be `nogpr` with an import table, so it takes `nogpr`'s source rather
+# than carrying a copy of it: two assembly listings kept in step by hand
+# is how a fixture stops testing what its neighbour tests. What differs
+# is `IMPORTS`, which is the whole point of the fixture.
+PROGRAMS["tebauto"] = PROGRAMS["nogpr"]
 
 
 # NO free vector register, which is 1,455 of the sites the unconditional
@@ -3939,8 +3962,48 @@ def align(value, to):
 	return (value + to - 1) // to * to
 
 
+def import_table(dlls, base_rva):
+	"""Bytes of an import section placed at `base_rva`.
+
+	`dlls` is `[(name, [function, ...])]`. The layout is the ordinary
+	one: an array of descriptors terminated by a zero entry, then per
+	DLL a lookup table and an address table that are identical until
+	the loader overwrites the second, then the hint/name strings.
+
+	**Written here rather than taken from `detour.add_section`, even
+	though that function exists and works.** A fixture that used the
+	rewriter's own file-format code could not detect a fault in it:
+	the image and the thing reading the image would agree because one
+	produced the other, which is the one-witness failure. The point of
+	a fixture is to be a second hand. Finding 297.
+	"""
+	descriptors = (len(dlls) + 1) * 20
+	spots, off = {}, descriptors
+	for name, functions in dlls:
+		spots[name] = (off, off + (len(functions) + 1) * 8)
+		off += (len(functions) + 1) * 8 * 2
+	names_at, blob, names = off, bytearray(off), bytearray()
+
+	def emit(raw):
+		at = names_at + len(names)
+		names.extend(raw)
+		if len(names) % 2:			# hint/name entries are even
+			names.append(0)
+		return base_rva + at
+
+	for i, (name, functions) in enumerate(dlls):
+		lookup, address = spots[name]
+		struct.pack_into("<IIIII", blob, i * 20, base_rva + lookup, 0, 0,
+		                 emit(name.encode() + b"\0"), base_rva + address)
+		for j, function in enumerate(functions):
+			hint = emit(struct.pack("<H", 0) + function.encode() + b"\0")
+			struct.pack_into("<Q", blob, lookup + j * 8, hint)
+			struct.pack_into("<Q", blob, address + j * 8, hint)
+	return bytes(blob) + bytes(names)
+
+
 def build(path, text, code_size, handler=None, frame=0, readonly=False,
-          symbols=None, saves=(), saves_end=0):
+          symbols=None, saves=(), saves_end=0, imports=None):
 	"""Write a PE whose entry point is the start of `text`.
 
 	`saves` is `[(xmm register, byte offset from rsp)]` for a sample whose
@@ -4011,16 +4074,28 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 	# is not a constant pool and the strategy would decline the very thing
 	# the program exists to exercise. Those samples say so in `READONLY` and
 	# keep their scratch on the stack.
-	for name, body, flags in ((b".text", text,
-	                           CODE_READONLY if readonly else CODE),
-	                          (b".xdata", xdata, DATA),
-	                          (b".pdata", None, DATA)):
+	wanted = [(b".text", text, CODE_READONLY if readonly else CODE),
+	          (b".xdata", xdata, DATA),
+	          (b".pdata", None, DATA)]
+	if imports:
+		# **Sized before it is placed, then built again in place.** The
+		# descriptors hold RVAs into the section's own body, so the
+		# payload cannot be written until its address is known and the
+		# address cannot be known until its length is. A first pass at
+		# rva 0 gives the length, which does not depend on the base;
+		# the assertion below is what says so rather than assuming it.
+		wanted.append((b".idata", import_table(imports, 0), DATA))
+	for name, body, flags in wanted:
 		if name == b".pdata":
 			# RUNTIME_FUNCTION: begin, end, unwind info -- all RVAs.
 			text_rva = sections[0][1]
 			xdata_rva = sections[1][1]
 			body = struct.pack("<III", text_rva, text_rva + code_size,
 			                   xdata_rva)
+		if name == b".idata":
+			body = import_table(imports, rva)
+			if len(body) != len(wanted[-1][1]):
+				raise SystemExit("pe_build: the import table moved size")
 		sections.append((name, rva, offset, body, flags))
 		rva = align(rva + len(body), SECTION_ALIGNMENT)
 		offset += align(len(body), FILE_ALIGNMENT)
@@ -4104,6 +4179,12 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 	# Data directory 9 is the TLS directory.
 	if tls_directory is not None:
 		struct.pack_into("<II", image, opt + 112 + 9 * 8, *tls_directory)
+	# Data directory 1 is the import table. Its size field is the
+	# descriptor array only, terminator included -- not the whole
+	# section, which also holds the thunks and the strings.
+	if imports:
+		struct.pack_into("<II", image, opt + 112 + 1 * 8,
+		                 sections[3][1], (len(imports) + 1) * 20)
 
 	table = opt + 240
 	for i, (name, section_rva, section_offset, body, flags) in \
@@ -4154,7 +4235,8 @@ def main(argv):
 	code_size = symbols["func_end"]
 	sections = build(output, text, code_size, symbols.get("handler"),
 	                 FRAMES.get(name, 0), name in READONLY, symbols,
-	                 SAVES.get(name, ()), symbols.get("prologue_end", 0))
+	                 SAVES.get(name, ()), symbols.get("prologue_end", 0),
+	                 IMPORTS.get(name))
 	print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
 	      f"function is {code_size} of them, expected exit code {expected}")
 	return 0

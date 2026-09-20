@@ -661,6 +661,60 @@ check-teb: $(BUILD_DIR)/pe-nogpr-320.exe
 	echo "check-teb: a block stood up on two segment-prefixed absolute"; \
 	echo "           saves, moved no rsp, and the answer survived"
 
+# **`--teb-scratch=auto` end to end, with the control that makes the 77
+# mean something.** The good image returns 77; the same build with the
+# callback patching nothing returns 5, because a stub then writes eight
+# bytes at %gs:0x5b5b5b00 and that address faults. Without the second
+# run the first is a green light with no shown ability to be red --
+# and the first version of this control forgot to force the TEB path,
+# so it built a home-space stub and returned 77 as well. Finding 297.
+check-teb-auto: tool/pe_build.py tool/detour.py | $(BUILD_DIR)
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-teb-auto: wine is not installed"; exit 1; }
+	@set -e; \
+	mkdir -p $(PE_PREFIX); \
+	$(PYTHON) tool/pe_build.py sample tebauto \
+		$(BUILD_DIR)/pe-tebauto.exe 320 >/dev/null; \
+	objdump -d -j .text $(BUILD_DIR)/pe-tebauto.exe \
+		> $(BUILD_DIR)/pe-tebauto.asm; \
+	for kind in teb tebconst; do \
+		ANTI_AVX_SABOTAGE=$$kind $(PYTHON) tool/detour.py \
+			--shadow-regs=all --teb-scratch=auto apply \
+			$(BUILD_DIR)/pe-tebauto.exe $(BUILD_DIR)/pe-tebauto.asm \
+			$(BUILD_DIR)/sse-tebauto-$$kind.exe > /dev/null; \
+	done; \
+	for kind in teb tebconst; do \
+		n=`objdump -d -j .avxsse $(BUILD_DIR)/sse-tebauto-$$kind.exe | \
+		   grep -c "gs:0x5b5b5b" || true`; \
+		if [ "$$n" -ne 4 ]; then \
+			echo "check-teb-auto: the $$kind build holds $$n TEB"; \
+			echo "                scratch reference(s), wanting 4 --"; \
+			echo "                so it is not the path under test"; \
+			exit 1; \
+		fi; \
+	done; \
+	good=0; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-tebauto-teb.exe \
+		> /dev/null 2>&1 || good=$$?; \
+	pkill -x wineserver >/dev/null 2>&1 || true; \
+	bad=0; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-tebauto-tebconst.exe \
+		> /dev/null 2>&1 || bad=$$?; \
+	pkill -x wineserver >/dev/null 2>&1 || true; \
+	if [ "$$good" != "77" ]; then \
+		echo "check-teb-auto: the allocated-slot build returned $$good,"; \
+		echo "                want 77"; \
+		exit 1; \
+	fi; \
+	if [ "$$bad" = "77" ]; then \
+		echo "check-teb-auto: the build whose callback patches nothing"; \
+		echo "                also returned 77, so the patching is not"; \
+		echo "                what makes the good one work"; \
+		exit 1; \
+	fi; \
+	echo "check-teb-auto: two TlsAlloc slots carried a block pointer's"; \
+	echo "                borrow; unpatched, the same stub died with $$bad"
+
 check-liveness: $(LISTING)
 	@set -e; \
 	echo "check-liveness: building a deliberately broken image"; \
@@ -890,7 +944,7 @@ EXTRA_PES  = $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 # matches `pe-nogpr-320.exe` with a stem of `nogpr-320` and then asks for
 # a program of that name, which does not exist. Nothing noticed while the
 # artifact happened to be on disk from a `check-shadow` run: `check-teb`
-# named it as a prerequisite and make had nothing to do. Touching
+# named it as a prerequisite and make had nothing to do. Editing
 # `pe_build.py` invalidated it and the target failed with
 # `no program 'nogpr-320'` -- a dependency on another target's leftovers,
 # which is the same class of thing as a check that passes because it was
