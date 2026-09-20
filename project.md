@@ -11938,7 +11938,23 @@ tail-jumps to the original at base-plus-RVA. No new array, no relocation surgery
 **Prefer this to the TEB route below**, which wants the same machinery and is
 blocked on something this one does not need.
 
-### The TEB route, and the number that would unblock it
+### The TEB route is unblocked (Finding 296)
+
+`TlsAlloc` returns **5** when the EXE's callbacks run, with 59 of Starfield's 66
+DLLs loaded under wine -- the runtime Proton gives it. Against a ceiling of 64.
+`tool/tlsslots.py` reproduces it; the answer is a floor, four game-specific DLLs
+being absent here.
+
+So the route's precondition holds and everything else it needs exists: the chained
+callback, the patch table, and 24,551 stubs already taking a patched displacement.
+It wants two `TlsAlloc` calls in the callback and a second patched field per
+teb-mode stub, and it is worth the 1,878 refusals that are the largest class left.
+
+The callback must still check the index it is given and refuse if it is 64 or more.
+A floor is not a guarantee, and refusing there means refusing to start -- which is
+a decision to take deliberately rather than discover.
+
+### What the TEB route was blocked on, before it was measured
 
 **Reserve TLS slots at load time rather than squatting on a TEB offset**, worth 543
 sites and a shorter prologue on 19,174 stubs. Finding 289 measured it: `TlsAlloc`
@@ -13896,6 +13912,53 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 296 -- the number that blocked the TEB route is 5, and it was measurable here
+
+Finding 289 blocked the TEB route -- 1,878 refusals, the largest class left -- on
+whether `TlsAlloc` returns an index below 64 when the EXE's TLS callbacks run, and
+said that needed a machine with the game.
+
+**It did not, and the reason it did not was in the README.** The rewritten binary
+runs under Proton, which is wine, and wine is on this machine. Every slot gone at
+that moment was taken by the imported DLLs initialising; the EXE's own code has not
+executed. So the question is not about the game, it is about the game's IMPORTS
+under this runtime, and a PE importing the same DLLs answers it.
+
+    TlsAlloc at DLL_PROCESS_ATTACH, 59 of Starfield's 66 DLLs loaded:  5
+
+Three runs, and a second call in the same callback returns 6 -- consecutive indices
+being `TlsAlloc`'s contract, which is what shows the call reaches it rather than
+some other export. Two slots would be 5 and 6 against a ceiling of 64.
+`tool/tlsslots.py` is the method.
+
+**The first answer was 53 three times and it was not an answer.** It is wine's exit
+code for failing to load an image, which an absent file also produces, and the cause
+was `bink2w64.dll` -- Starfield's Bink video library, not on this machine. A
+load failure and a result are the same shape from outside; `WINEDEBUG=+loaddll`
+separated them in one run.
+
+**So the figure is a floor and is written that way.** Four of the 66 imports are the
+game's own -- `bink2w64`, `libxess`, `sl.interposer`, `steam_api64` -- and are
+dropped, so each could take slots this does not see. Five plus four libraries'
+worth is still nowhere near sixty-four.
+
+#### What this unblocks
+
+The TEB route now has its precondition, and everything else it needs is already
+built and proven: the chained callback (Finding 294), the patch table, and the
+24,551 stubs that take a patched displacement. What it adds is two `TlsAlloc` calls
+in the callback and a second patched field per teb-mode stub.
+
+**It is worth the 1,878** -- sites with no dead register and no home space, which is
+the one class the constant index could not reach because a chain still needs one
+register and they have none to give.
+
+**The risk Finding 289 named is retired rather than accepted.** It was "probably
+fine, unmeasurable from here, severe if wrong"; the middle clause was false. What
+remains is that the callback must check the index it gets and refuse to patch if it
+is 64 or more, because a floor is not a guarantee -- and refusing to patch there
+means refusing to start, which is a decision rather than an oversight.
 
 ### Finding 295 -- the constant index becomes the default, and two gates had to learn it
 
