@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **802,062 of 804,951 VEX
-sites -- 99.6%** -- through 201,670 detours, and every `make detour-verify` invariant
-holds on the result. 2,889 sites are left, and 180 further VEX-prefixed byte sequences
+**Status:** the rewriter works. `tool/detour.py` rewrites **802,264 of 804,951 VEX
+sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` invariant
+holds on the result. 2,687 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
 The default became `--shadow-regs=all` on 2026-09-18 (Finding 287), which is where the
@@ -11879,7 +11879,7 @@ code quickly.
 
 ### Where it stands, 2026-09-18
 
-    default build (--shadow-regs=all)     2,889 VEX left      99.64%
+    default build                         2,687 VEX left      99.67%
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -11908,7 +11908,14 @@ Every remaining class is a measured floor or derivative of one:
 The census reconciles exactly; `unaccounted` is a real zero and was 85 until
 Finding 282.
 
-### The next item: bake the TLS index as a constant (Finding 291)
+### Landed: the constant TLS index is the default (Findings 291 to 295)
+
+Worth 202 sites and a shorter prologue on 24,551 stubs, and the stub section is
+88,370 bytes smaller for it. `--index-const=off` is the A/B. The tool now runs code
+at load time, which no earlier default did: a chained TLS callback that patches the
+index into every stub. Starfield has not been run with it.
+
+### Superseded: what that item was, before it landed
 
 The block pointer wants two registers only because the index is in memory. A TLS
 callback can read it at process attach and patch it into each stub as a
@@ -13889,6 +13896,51 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 295 -- the constant index becomes the default, and two gates had to learn it
+
+Instructed by the copyright holder 2026-09-20.
+
+    VEX in .text        2,889 -> 2,687        202 sites
+    stub section    4,628,957 -> 4,540,587    88,370 bytes SMALLER
+    index section                 98,256      the table and the callback
+    stubs patched                 24,551
+
+**The stub section shrank**, which is the part worth noticing: each of 24,551 chains
+lost four bytes and an instruction, so the new section costs less than the old chain
+did. The image grows by the table, and the hot path of every slot-using stub loses a
+dependent load -- the thing Finding 288 measured at 2 to 3 ns per execution.
+
+#### Making it the default broke every fixture, twice, in two different ways
+
+**An image with no TLS directory has nothing to patch.** Most fixtures are like that:
+no directory, no per-thread block, no stub standing a pointer up, no placeholder. The
+installer raised "needs a TLS directory" and all forty-one failed to build. It is a
+no-op where there are no placeholders now, which is the honest condition -- the
+directory is not what it needs, the placeholders are.
+
+**And a fixture keeps its callback array in `.text`.** Writing the tool's callback
+into it changes eight bytes of `.text` that are not in any window, so the boundary
+sweep decodes them differently and reports two lost boundaries. A real image keeps
+that array in `.rdata`, which is why Starfield never showed it.
+
+The fix is the one Finding 196 already made for the TLS directory, which sits in
+`.text` in two fixtures for the same reason: name the structure from the PE header
+and exclude exactly it. **Both exclusions are now written the same way**, and both
+are about the same fact -- that a fixture is a smaller thing than a program, and the
+places a real image keeps its data are places a fixture keeps its code.
+
+#### What the default now does that no default here has done before
+
+It **runs code at load time**. The tool has only ever rewritten bytes the loader then
+executed; this emits a routine the loader calls before the entry point, and gives it
+a section of its own. It also makes `.avxsse` writable and overwrites one slot of the
+image's own TLS callback array, chaining ahead of the game's first callback.
+
+Every one of those is argued in Findings 292 and 294 and checked by `verify`, which
+now names both of its exemptions rather than one. **None of it has been executed by
+the loader it was written for.** What has been executed is the fixture, under wine,
+with a sabotage control either side: 77 with the patching and 5 without.
 
 ### Finding 294 -- the callback runs, and the checks were right about where it went
 

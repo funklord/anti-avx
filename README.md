@@ -15,11 +15,11 @@ measured instruction mix says a translated binary should cost about **+1.34%
 in instruction count** and run within a few percent of native -- the
 performance argument against this approach does not hold.
 
-**Status: it rewrites. 99.6% of 804,951 VEX sites, and that is not enough.**
+**Status: it rewrites. 99.7% of 804,951 VEX sites, and that is not enough.**
 
 A translated binary that is 99.99% correct is worthless: the remaining 0.01%
 is a crash at an unpredictable moment. So the number to watch is not how much
-is translated but how much is left, and 2,889 sites are left.
+is translated but how much is left, and 2,687 sites are left.
 
 **Starfield has now been run, under Proton, and each run names the next site
 to work on.** The original dies on the first AVX instruction it executes.
@@ -29,10 +29,11 @@ Finding 74. The rewritten binary loaded 305 modules before it stopped, and
 each run has named the next piece of work -- five in a row. That is a
 frontier moving, not a game starting.
 
-Those runs were made against the previous default, `--shadow-regs=off`,
-which left 5,691 sites where the current one leaves 3,069. Nobody has run
-the new build under Proton, so the module count and the frontier address
-above describe a binary this tree no longer produces.
+Those runs were made against an older default, `--shadow-regs=off`, which
+left 5,691 sites where the current one leaves 2,687. Nobody has run the
+new build under Proton, so the module count and the frontier address
+above describe a binary this tree no longer produces -- and the current
+one runs code of its own at load time, which that one did not.
 
 Nothing here is Starfield-specific except a Makefile default. The tools take
 the binary as an argument, read its PE headers, `.pdata` and relocations, and

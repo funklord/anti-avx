@@ -719,7 +719,11 @@ TEB_SCRATCH_BYTES = 16
 # incremented per emission and the scan must find exactly that many, or the
 # build refuses. A marker search with no denominator is how a patch table
 # ends up short. Finding 293.
-INDEX_CONST = False
+# **The default since 2026-09-20**, on the copyright holder's instruction:
+# 2,889 VEX left becomes 2,687, and 24,551 stubs lose an instruction and a
+# dependent load from their prologue. `--index-const=off` stays reachable
+# as the A/B, the way `--shadow-regs=off` does. Finding 295.
+INDEX_CONST = True
 INDEX_PLACEHOLDER = 0x5A5A5A5A
 INDEX_CONST_SITES = 0
 INDEX_CONST_CALLBACK = False
@@ -13191,8 +13195,13 @@ def main(argv):
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
-		if item == "--index-const":
-			INDEX_CONST = True
+		if item.startswith("--index-const="):
+			want = item.split("=", 1)[1]
+			if want not in ("on", "off"):
+				print(f"detour.py: --index-const wants on or off, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			INDEX_CONST = want == "on"
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
@@ -14719,7 +14728,9 @@ def apply_all(binary, listing, output):
 	# The callback writes into this section at load time, so it has to be
 	# writable when `--index-const` is on and not otherwise.
 	image, section_va = add_section(staged, SECTION_NAME, bytes(blob),
-	                                INDEX_CALLBACK_FLAGS if INDEX_CONST
+	                                INDEX_CALLBACK_FLAGS
+	                                if (INDEX_CONST and
+	                                    index_placeholders(blob))
 	                                else SECTION_FLAGS)
 	assert section_va == stub_base - image_base, "stub section moved"
 
@@ -14750,7 +14761,12 @@ def apply_all(binary, listing, output):
 	# the patch table and the callback; `.avxsse` is verified as pure code
 	# and this is data plus one 48-byte routine, so putting it there
 	# produced four failures. Finding 294.
-	if INDEX_CONST:
+	# **Nothing to patch means nothing to emit.** An image with no TLS
+	# directory has no per-thread block, so no stub stands a pointer up and
+	# no placeholder exists -- most fixtures are like that. Making the
+	# default `on` turned that into "needs a TLS directory" and every one
+	# of them failed to build. Finding 295.
+	if INDEX_CONST and index_placeholders(blob):
 		global INDEX_CONST_CALLBACK
 		payload, code_off, slot, was = index_payload(image, blob, stub_base)
 		image, index_va = add_section(image, INDEX_NAME, payload,
@@ -15289,6 +15305,26 @@ def verify(original, patched, listing=None):
 			      f"the TLS directory at 0x{low:x}, which is data this "
 			      f"rewrite edits on purpose")
 			unexplained = unexplained - inside_tls
+	# **And the callback array slot, for the same reason.** It is a list
+	# of function pointers, it sits in `.text` in a fixture (a real image
+	# keeps it in `.rdata`), and `--index-const` rewrites one entry of it
+	# on purpose -- so the sweep decodes those eight bytes differently and
+	# reports boundaries that were never instructions. Named from the
+	# directory the PE header carries, exactly as the span above is.
+	# Finding 295.
+	if INDEX_CONST and unexplained:
+		raw = open(original, "rb").read()
+		found = tls_directory(raw)
+		if found is not None:
+			pe_raw = struct.unpack_from("<I", raw, 0x3C)[0]
+			base_raw = struct.unpack_from("<Q", raw, pe_raw + 24 + 24)[0]
+			low = found[1][3]
+			inside_cb = {a for a in unexplained if low <= a < low + 8}
+			if inside_cb:
+				print(f"verify: {len(inside_cb):,} lost boundary/ies are "
+				      f"inside the TLS callback array at 0x{low:x}, whose "
+				      f"first entry this rewrite names on purpose")
+				unexplained = unexplained - inside_cb
 	if unexplained:
 		print(f"verify: FAILED -- {len(unexplained):,} boundaries lost that "
 		      f"were not swallowed on purpose", file=sys.stderr)
