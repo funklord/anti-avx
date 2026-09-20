@@ -886,6 +886,19 @@ EXTRA_PES  = $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
              $(BUILD_DIR)/pe-unwindspill.exe $(BUILD_DIR)/pe-unwindspill.asm
 .SECONDARY: $(PE_LISTINGS) $(EXTRA_PES)
 
+# **The 320-byte zero fill has a rule of its own**, because `pe-%.exe`
+# matches `pe-nogpr-320.exe` with a stem of `nogpr-320` and then asks for
+# a program of that name, which does not exist. Nothing noticed while the
+# artifact happened to be on disk from a `check-shadow` run: `check-teb`
+# named it as a prerequisite and make had nothing to do. Touching
+# `pe_build.py` invalidated it and the target failed with
+# `no program 'nogpr-320'` -- a dependency on another target's leftovers,
+# which is the same class of thing as a check that passes because it was
+# handed a stale binary. Make prefers the shorter stem, so this rule wins
+# for the suffixed names and the plain one still serves the rest.
+$(BUILD_DIR)/pe-%-320.exe: tool/pe_build.py | $(BUILD_DIR)
+	$(PYTHON) tool/pe_build.py sample $* $@ 320
+
 $(BUILD_DIR)/pe-%.exe: tool/pe_build.py | $(BUILD_DIR)
 	$(PYTHON) tool/pe_build.py sample $* $@
 
