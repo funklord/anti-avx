@@ -6372,6 +6372,38 @@ UNIT_EXAMPLES = {}
 UNIT_ALTERNATIVES = {}
 REPAIR_SUBSTITUTED = 0
 
+# **Why each dropped window was dropped**, keyed `(strategy, reason)`.
+# The drop count alone says how much is being lost and nothing about
+# where to push: a window with no ladder behind it and one that walked
+# every rung and found each blamed are the same number and want
+# opposite work. Finding 298.
+REPAIR_DROPPED_WHY = Counter()
+REPAIR_DROPPED_SITES = Counter()
+
+# **Where the blamed producer sits in the window it sank.** The split
+# above says the ladder is being exhausted rather than missing; this
+# says whether anything COULD have excluded the producer. A producer at
+# the window's own first instruction is the site being lowered, and no
+# shorter window that still lowers that site can leave it out -- those
+# are a floor. An interior one is a window that wants splitting rather
+# than shortening, which is a rung the ladder does not offer.
+# Finding 298.
+REPAIR_BLAME_WHERE = Counter()
+
+# **Whether a gap in the window still holds a site to lower.** The
+# position buckets are a proxy and a leaky one: they are measured
+# against the ORIGINAL candidate's extent while blame accrues against
+# whatever shape was placed that round, and "the window's own first
+# instruction" is the SITE only when the window was not widened
+# backwards -- which is exactly the case `unit` is built to exploit.
+#
+# This asks the question the proxy was standing in for. Cut the window
+# at every producer blamed on it; if any surviving piece still contains
+# a VEX site, a placement exists that lowers something and swallows
+# none of the blame, and the ladder cannot reach it because every rung
+# it offers is one contiguous run anchored at one end. Finding 298.
+REPAIR_SPLITTABLE = Counter()
+
 # **The candidate list the repair actually placed**, substitutions applied.
 # Anything reconstructing a window's extent from an address must read this
 # rather than `candidates`: a substituted window is refused or overlapped
@@ -6467,6 +6499,31 @@ def unit_shortening(instructions, plain, index, blocked, home,
 				global UNIT_REFUSED, UNIT_EXAMPLES
 				held = snapshot()
 				spare = []
+				# **One anchor, and splitting the window was measured
+				# and does not pay.** Every rung here is a contiguous
+				# run from `at`, so the ladder cannot express a window
+				# that starts past a producer in the middle -- which
+				# looked like the gap, because of 1,136 windows the
+				# repair dropped, 1,036 had walked every rung and found
+				# each blamed, and cutting those at the producers they
+				# were blamed for left a piece still holding a VEX site
+				# in 586.
+				#
+				# Anchoring the ladder at every site the window covers
+				# reaches those pieces and the frontier got WORSE:
+				# 2,346 -> 2,349. It recovered 130 sites from dropped
+				# windows and gave back 53 to stubs that would not
+				# build and 13 to overlap, the pieces being smaller and
+				# more numerous; the census could not attribute a
+				# further 67, the substituted-start blind spot of
+				# Finding 282 arriving by a new route. It also took the
+				# repair from 15 rounds to 103, because a substitution
+				# creates fresh blame and the decay is not monotone.
+				#
+				# The window count is not the thing to optimise. 134
+				# fewer windows were dropped and three more sites
+				# survived, which is the whole lesson: a window is not
+				# a unit of loss. Finding 298.
 				for other_cap, other_back in rungs:
 					other = unit_candidate(instructions, plain, at,
 					                       blocked, home, ranges, scope,
@@ -7400,7 +7457,15 @@ LOOP_ROUNDS = 6
 # set bounded by the candidate list -- so exceeding this means the
 # reasoning is wrong, and `repaired_placement` refuses rather than
 # shipping. Finding 259.
-REPAIR_ROUNDS = 64
+REPAIR_ROUNDS = int(os.environ.get("ANTI_AVX_REPAIR_ROUNDS", "64"))
+
+# The newly-guilty count per round, which is the evidence the paragraph
+# above rests on. It was quoted there from a measurement nobody could
+# re-take: the trace existed in a session and not in the tool, so the
+# next person to move a rung -- which is what Finding 298 did -- had no
+# way to see whether the loop was converging slowly or not at all.
+# A fact recorded without its method has a shelf life.
+REPAIR_DECAY = []
 
 # How many joins deep the stale-read walk may recurse. It was 4 because 4
 # was enough for the memset shape Finding 84 built it for, and a census of
@@ -13649,12 +13714,41 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 	"""
 	global REPAIR_SUBSTITUTED
 	dropped, swapped = set(), {}
+	# The strategy and the site count are properties of the ORIGINAL
+	# candidate, and `dropped` is keyed by its start, so both are read
+	# once here rather than from whatever shape the loop ended on.
+	# **`strategy[0]`, the way `build_stub` reads it.** The field is a
+	# tuple whose head names the kind, or None where the plain rules
+	# sufficed -- so the whole tuple is unhashable and cannot key a
+	# Counter. Taking `item[8]` whole worked on the one fixture that
+	# drops a window, whose strategy is None, and died on Starfield at
+	# the first candidate carrying a real one. A field's shape read off
+	# a single fixture is a sample of one. Finding 298.
+	strategy_of = {item[0]: (item[8][0] if item[8] is not None
+	                         else "(no strategy)") for item in candidates}
+	# Sites, not windows, because a window is not a unit of loss: the
+	# census counts what survives in .text and one dropped window can
+	# hold one site or a dozen. `bisect` over a sorted address list
+	# rather than a scan per window, which at this candidate count is
+	# the difference between seconds and minutes.
+	vex_at = sorted(row[0] for row in instructions
+	                if row[1][:1] in (b"\xc4", b"\xc5"))
+	def sites_in(start, window):
+		left = bisect.bisect_left(vex_at, start)
+		return bisect.bisect_left(vex_at, start + window) - left
+	sites_of = {item[0]: sites_in(item[0], item[4]) for item in candidates}
+	width_of = {item[0]: item[4] for item in candidates}
+	REPAIR_BLAME_WHERE.clear()
+	REPAIR_SPLITTABLE.clear()
+	REPAIR_DROPPED_WHY.clear()
+	REPAIR_DROPPED_SITES.clear()
 	# Per window: the rungs already spent on it, the blame it has
 	# accumulated, and the ladder's answers cached so it is walked once.
 	spent, seen_blame = defaultdict(set), defaultdict(set)
 	offers = {}
 	REPAIR_SUBSTITUTED = 0
 	settled = False
+	REPAIR_DECAY.clear()
 	for _round in range(REPAIR_ROUNDS):
 		# **Everything is keyed by the ORIGINAL candidate's start.** A
 		# substitute is a different window with a different start, so
@@ -13703,6 +13797,7 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 			settled = True
 			break
 		fresh = guilty
+		REPAIR_DECAY.append(len(fresh))
 		# **A window is dropped for ONE instruction it swallowed, and the
 		# ladder can usually build a window that does not swallow it.**
 		# Before this the whole candidate was lost, which on Starfield was
@@ -13747,6 +13842,34 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 				other = item
 				break
 			if other is None:
+				if start not in dropped:
+					kind = strategy_of.get(start, "?")
+					why = ("no alternative window exists"
+					       if not offers[start] else
+					       "every alternative covers a blamed producer")
+					REPAIR_DROPPED_WHY[(kind, why)] += 1
+					REPAIR_DROPPED_SITES[(kind, why)] += sites_of.get(
+						start, 0)
+					width = width_of.get(start, 0)
+					for producer in seen_blame[start]:
+						if producer == start:
+							where = "the window's own first instruction"
+						elif not (start < producer < start + width):
+							where = "outside the window it was blamed on"
+						elif producer >= start + width - 16:
+							where = "the last 16 bytes of the window"
+						else:
+							where = "interior: a window wanting a split"
+						REPAIR_BLAME_WHERE[(kind, where)] += 1
+					inside = sorted(p for p in seen_blame[start]
+					                if start <= p < start + width)
+					gained, edge = 0, start
+					for producer in inside + [start + width]:
+						if producer > edge:
+							gained = max(gained, sites_in(edge,
+							                             producer - edge))
+						edge = producer + 1
+					REPAIR_SPLITTABLE[(kind, bool(gained))] += 1
 				dropped.add(start)
 				swapped.pop(start, None)
 			else:
@@ -14898,6 +15021,39 @@ def apply_all(binary, listing, output):
 		print(f"apply: {len(dropped):,} window(s) not placed, each having "
 		      f"swallowed a VEX.128 write whose zeroing a surviving "
 		      f"256-bit instruction still reads")
+		print(f"apply:   the repair settled after {len(REPAIR_DECAY):,} "
+		      f"round(s); guilty per round "
+		      f"{', '.join(str(n) for n in REPAIR_DECAY)}")
+		# **Split by why, because the total cannot say where to push.**
+		# A window with no ladder behind it and one that walked every
+		# rung and found each of them blamed are the same number and
+		# want opposite work -- the first wants a ladder for that
+		# strategy, the second wants a different kind of alternative.
+		# Sites as well as windows, since a window is not a unit of
+		# loss and the census counts sites. Finding 298.
+		# `strategy` is None on a candidate the collector built
+		# without one, so it is named rather than formatted as a
+		# number would be -- the first version passed None straight to
+		# an f-string width and the apply died with a TypeError after
+		# printing the line above it. It was invisible because the run
+		# was read through a grep for the lines expected, which is the
+		# reduction `evidence.md` warns about doing before knowing a
+		# run passed.
+		for (kind, why), count in sorted(
+				REPAIR_DROPPED_WHY.items(), key=lambda row: -row[1]):
+			print(f"apply:   {str(kind):<10} {why:<44} "
+			      f"{count:>6,} window(s), "
+			      f"{REPAIR_DROPPED_SITES[(kind, why)]:>6,} site(s)")
+		for (kind, where), count in sorted(
+				REPAIR_BLAME_WHERE.items(), key=lambda row: -row[1]):
+			print(f"apply:     blamed on {str(kind):<8} "
+			      f"{where:<42} {count:>6,}")
+		for (kind, gained), count in sorted(
+				REPAIR_SPLITTABLE.items(), key=lambda row: -row[1]):
+			says = ("a gap still holds a site: splitting would place it"
+			        if gained else
+			        "no gap holds a site: nothing to place either side")
+			print(f"apply:     {str(kind):<10} {says:<52} {count:>6,}")
 
 	# **A VEX.128 write that stops zeroing, where somebody still looks.**
 	# Patching one in place turns it into legacy SSE, which leaves bits
