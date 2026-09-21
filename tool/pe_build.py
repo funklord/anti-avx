@@ -221,6 +221,169 @@ source:	.long 1, 2, 3, 4
 
 
 
+# **A 256-bit FMA whose second source is memory**, which is the shape
+# `lanemem` classifies and the one Finding 263 refuses. 205 of the 208
+# sites the frontier declines `no SSE form at any register` look exactly
+# like this -- `vfmadd213ps (%rdx),%ymm4,%ymm3` -- and there was no
+# fixture for any of them, only a scalar `vfmadd213ss`.
+#
+# 213 means `dst = src1 * dst + src2`, so ymm0 = ymm1 * ymm0 + mem. With
+# ymm1 = 2.0 in every lane, ymm0 = {1..8} and mem = {1,1,...}, the result
+# is {3,5,7,...,17} and three lanes are read back: lane 0 from the low
+# half, lanes 4 and 7 from the upper. 3 + 11 + 17 is 31, and the program
+# adds 46 to reach 77 -- an upper half left stale or zeroed misses it.
+#
+# **The addend is read from the upper half deliberately.** A fixture that
+# only checked lane 0 would pass on a lowering that narrowed the low half
+# correctly and dropped the high one, which is the failure this shape is
+# most likely to have. Finding 300.
+PROGRAMS["fma231"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	twos(%rip), %rdx
+	leaq	addend(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* 2.0 in every lane */
+	vfmadd231ps (%rax), %ymm1, %ymm0	/* ymm0 = ymm1*ymm0 + mem */
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0: 1*2+1 = 3 */
+	cvttss2si 16(%rdi), %ecx	/* lane 4: 5*2+1 = 11 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7: 8*2+1 = 17 */
+	addl	%ecx, %eax		/* 3 + 11 + 17 = 31 */
+	addl	$45, %eax		/* 31 + 46 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+twos:	.float 2.0, 2.0, 2.0, 2.0
+	.float 2.0, 2.0, 2.0, 2.0
+	.p2align 5
+addend:	.float 3.0, 3.0, 3.0, 3.0
+	.float 3.0, 3.0, 3.0, 3.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+PROGRAMS["fma132"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	twos(%rip), %rdx
+	leaq	addend(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* 2.0 in every lane */
+	vfmadd132ps (%rax), %ymm1, %ymm0	/* ymm0 = ymm1*ymm0 + mem */
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0: 1*2+1 = 3 */
+	cvttss2si 16(%rdi), %ecx	/* lane 4: 5*2+1 = 11 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7: 8*2+1 = 17 */
+	addl	%ecx, %eax		/* 3 + 11 + 17 = 31 */
+	addl	$29, %eax		/* 31 + 46 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+twos:	.float 2.0, 2.0, 2.0, 2.0
+	.float 2.0, 2.0, 2.0, 2.0
+	.p2align 5
+addend:	.float 3.0, 3.0, 3.0, 3.0
+	.float 3.0, 3.0, 3.0, 3.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+PROGRAMS["fmamem"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	twos(%rip), %rdx
+	leaq	addend(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* 2.0 in every lane */
+	vfmadd213ps (%rax), %ymm1, %ymm0	/* ymm0 = ymm1*ymm0 + mem */
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0: 1*2+1 = 3 */
+	cvttss2si 16(%rdi), %ecx	/* lane 4: 5*2+1 = 11 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7: 8*2+1 = 17 */
+	addl	%ecx, %eax		/* 3 + 11 + 17 = 31 */
+	addl	$46, %eax		/* 31 + 46 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+twos:	.float 2.0, 2.0, 2.0, 2.0
+	.float 2.0, 2.0, 2.0, 2.0
+	.p2align 5
+addend:	.float 1.0, 1.0, 1.0, 1.0
+	.float 1.0, 1.0, 1.0, 1.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # 5. A 256-bit store of a register a VEX.128 zeroing idiom emptied, over a
 # buffer poisoned first. `vpxor %xmm0,%xmm0,%xmm0` zeroes bits [255:128] of
 # ymm0 as well -- that is what VEX.128 does -- so the store writes 32 zero

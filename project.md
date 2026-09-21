@@ -10,9 +10,10 @@ sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` inva
 holds on the result. 2,687 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
-**`--teb-scratch=auto` takes it to 2,346** (Finding 297), which is not the default: it
-asks the loader for two TLS slots and patches the stubs from a callback, and whether
-that becomes the default is the copyright holder's call rather than this document's.
+**`--teb-scratch=auto` takes it to 2,279** (Findings 297 and 300), which is not the
+default: it asks the loader for two TLS slots and patches the stubs from a callback,
+and whether that becomes the default is the copyright holder's call rather than this
+document's.
 
 The default became `--shadow-regs=all` on 2026-09-18 (Finding 287), which is where the
 2,622-site fall from 5,691 comes from. **The Proton observation is older than that build**
@@ -11884,7 +11885,7 @@ code quickly.
 ### Where it stands, 2026-09-18
 
     default build                         2,687 VEX left      99.67%
-    with --teb-scratch=auto               2,346 re-measured   (Finding 297)
+    with --teb-scratch=auto               2,279 re-measured   (Finding 300)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -13925,6 +13926,116 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 300 -- the census buckets are a dependency graph, and FMA lowers in a span
+
+Findings 298 and 299 each ended by calling a class a floor, and the survey they
+produced treats the buckets as independent. They are not.
+
+    903 distinct surviving readers blame the 1,136 withheld windows:
+      553  kept: its window was withheld          61%
+      197  declined: no SSE form at any register  22%   -- the FMA class
+       71  256-bit: arithmetic rather than a copy
+       41  lost to an overlap or a refused stub
+       29  never a candidate
+       10  not in the frontier at all
+
+A window is withheld because a surviving 256-bit instruction still reads an upper
+half it would stop zeroing -- and every surviving instruction is itself a frontier
+site with its own reason. **61% of the class blames itself**, so it is a feedback
+structure rather than 1,227 independent losses. And the FMA floor is not a 208-site
+floor: it holds windows hostage too.
+
+That is why this item was picked. 208 was written off twice on its size, and size
+was the wrong measure.
+
+#### The leverage claim, and how far it held
+
+Recording which reader blamed which window: of 1,136 dropped windows carrying 2,889
+edges, **283 are blamed ONLY by FMA-class readers** and would have no blamer left
+if that class lowered. Against the 113-site item this displaced -- worth forty to
+sixty -- 208 plus 283 was an order of magnitude better.
+
+**The realised figure is 67 sites and zero windows.**
+
+    frontier                                  2,346 -> 2,279
+      declined: no SSE form at any register     208 -> 158
+      never a candidate                          54 ->  44
+      kept: its window was withheld           1,227 -> 1,224
+
+Not one window was released. Releasing one needs EVERY reader blaming it lowered,
+and only the memory-source FMAs do; the 71 register-only sites remain and are
+evidently spread across those windows rather than concentrated. **A class-level
+count cannot support a claim that needs a per-window conjunction**, which is the
+same error as counting refusals and calling them sites -- and it survived being
+written down as an edge list, because the edges were right and the inference over
+them was not.
+
+#### What was built
+
+`vfmadd{132,213,231}{ps,pd}` with a memory source now lowers in the span path, as a
+multiply and an add per half. NOT bit-exact -- two roundings replace one -- which
+extends Finding 4's recorded deviation rather than making a new one.
+`vfmaddsub`/`vfmsubadd` stay refused, and that is not an oversight: Finding 4
+measured that a plain multiply-add sequence computes the WRONG THING for half the
+lanes, a correctness bug rather than a precision one.
+
+Finding 263 refuses every FMA whatever its shape, and that argument is about
+NARROWING: `lanemem` is emitted as `movaps` then the opcode, which for an FMA is
+`66 0f 38 a8` and decodes to nothing. A sequence is not a narrowing, so the door
+opens for exactly the population that has an emitter. **Both guard sites had to
+open together** -- 263 says so in as many words -- or the collector builds a window
+the emitter then refuses.
+
+#### Two wrong turns, both mine, both found by reading the tool's own output
+
+**A second helper that cost more than the emitter won.** The first version loaded
+the destination's upper half AND the first source's into registers, and refused 66
+windows for `FMA member wants a second helper` -- more than it lowered. A slot is
+memory and an SSE arithmetic instruction takes memory as its source; only a MOVE
+needs a register. Reading the other slot by address costs one register instead of
+two and the refusal went to zero.
+
+    movups 0x50(%r11),%xmm4      h = D's slot
+    mulps  0x60(%r11),%xmm4      h *= S1's slot -- read, not loaded
+    addps  0x10(%rax),%xmm4      + mem[16:32]
+    movups %xmm4,0x50(%r11)
+
+**And "fix the routing" was a wrong diagnosis.** The first Starfield run gained 25
+sites, and the reading was that the sites never reach the span path because the
+collector declines them. They do reach it: `needs_sequence` has exempted FMA from
+the collector's 256-bit decline since Finding 90. What was actually happening is
+the 66 above, in code twenty minutes old. **The refusal table naming my own string
+beside the tool's is the only reason it was visible.**
+
+#### The fixtures, and what they are built to fail
+
+There was no 256-bit FMA fixture at all -- only a scalar `vfmadd213ss`. `fmamem`,
+`fma231` and `fma132` are one per ordering, each reading back lane 0 from the low
+half and lanes 4 and 7 from the upper, because a fixture checking only lane 0 would
+pass a lowering that narrows the low half and drops the high one, which is how this
+shape is likeliest to break.
+
+They sit in `check-shadow-pe`, which runs each with `--shadow-regs=off` as well and
+requires it NOT to answer 77: a fixture that is right without permanent slots never
+needed them. All three give 29 without and 77 with.
+
+**Testing 231 was not box-ticking.** It is the largest group at 93 sites and the one
+ordering whose low half has the destination as the ADDEND, so the product needs
+somewhere to live and borrows `helper`; 213 and 132 multiply in place and need no
+scratch. A fixture for 213 alone would have left the biggest case untested.
+
+`verify` passes: the stub decodes -- the check Finding 263 exists for -- and no
+surviving 256-bit read takes a stale upper half, which is the one that would catch a
+wrong slot address in the new arithmetic.
+
+#### What is left of the class
+
+71 register-only sites, `vfmadd231ps %ymm3,%ymm2,%ymm4`. Three ymm operands means
+the upper half wants D's slot, S1's slot and S2's slot at once -- and with the
+slot-as-memory form, two of the three are addresses, so it may want no more
+registers than the memory form does. Until those lower, the 283 leverage claim
+cannot be tested.
 
 ### Finding 299 -- the frontier's last big classes are floors, and a table with two denominators
 

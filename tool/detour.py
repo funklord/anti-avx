@@ -336,6 +336,50 @@ def encode_mem(prefix, opcode, reg, vex, tail, address, encoding, at):
 	return bytes(out)
 
 
+# The orderings this emits a SPAN sequence for: plain packed multiply-add,
+# no negation and no lane alternation. 139 of the 205 declined 256-bit FMA
+# sites are these. `maddsub`/`msubadd` are deliberately excluded and are
+# not an oversight -- Finding 4 measured that lowering them with a plain
+# multiply-add sequence is a CORRECTNESS bug rather than a precision one,
+# because they alternate add and subtract across the lanes, and
+# `test/fmaddsub_test.c` exists to demonstrate exactly that. Finding 300.
+FMA_SPAN_FORMS = frozenset(f"vfmadd{order}{width}"
+                           for order in ("132", "213", "231")
+                           for width in ("ps", "pd"))
+
+
+def fma_mem_piece(vex, tail, prefix, opcode, reg, delta, address, encoding,
+                  at):
+	"""`opcode <the original memory operand, plus delta>,%xmm<reg>`.
+
+	`encode_mem` already reuses the operand bytes and repairs a RIP
+	displacement for the move into the stub; the only thing it does not do
+	is step the operand along by `delta`, which is what reaches the upper
+	half of a 256-bit memory source.
+
+	The two operand kinds take that step differently, which is
+	`narrow_piece`'s distinction and not a new one: an ordinary
+	displacement is adjusted in the bytes before encoding, while a RIP one
+	is measured from the end of the instruction and so is adjusted after,
+	on the displacement `encode_mem` has already corrected. Adding `delta`
+	to a corrected displacement is right because both are measured to the
+	same point. Finding 300.
+	"""
+	if rip_relative(tail):
+		out = encode_mem(prefix, opcode, reg, vex, tail, address, encoding,
+		                 at)
+		if out is None:
+			return None
+		old = struct.unpack_from("<i", out, len(out) - 4)[0]
+		if not -(1 << 31) <= old + delta < (1 << 31):
+			return None
+		return out[:-4] + struct.pack("<i", old + delta)
+	moved = tail if delta == 0 else inplace.offset_operand(tail, delta)
+	if moved is None:
+		return None
+	return encode_mem(prefix, opcode, reg, vex, moved, address, encoding, at)
+
+
 def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0):
 	"""The fused multiply-adds. NOT bit-exact: two roundings replace one.
 
@@ -5069,6 +5113,39 @@ def span_slot_zero(base, slot, block):
 	return bytes(out)
 
 
+def span_slot_op(prefix, opcode, reg, base, slot, block):
+	"""`opcode <slot>,%xmm<reg>` -- arithmetic straight out of a slot.
+
+	**A slot is memory, and an SSE arithmetic instruction takes memory as
+	its source.** `span_slot_move` loads one into a register because a
+	MOVE has to; an operand does not, and going through a register costs
+	a register the span usually has not got. The first FMA emission
+	loaded both halves and refused 66 windows for want of a second
+	helper -- more than it lowered.
+
+	Only the per-thread block, which addresses a slot as `disp32(%reg)`.
+	The stack backing store reaches the same bytes three ways depending
+	on `SPILL`, one of them RIP-relative, and an emitter that got that
+	wrong would write arithmetic into a caller's frame; the caller
+	refuses rather than guessing. A block register is never `rsp` or
+	`r12`, so no SIB is needed -- they are drawn from VOLATILE_GPRS, the
+	same property `encode_tls_base` relies on. Finding 300.
+	"""
+	if block is None:
+		return None
+	register = block[0]
+	out = bytearray()
+	if prefix is not None:
+		out.append(prefix)
+	rex = 0x40 | (0x04 if reg >= 8 else 0) | (0x01 if register >= 8 else 0)
+	if rex != 0x40:
+		out.append(rex)
+	out += opcode
+	out.append(0x80 | ((reg & 7) << 3) | (register & 7))	# mod 10, disp32
+	out += struct.pack("<i", base + slot * SLOT)
+	return bytes(out)
+
+
 def span_slot_move(helper, save, base, slot, block, at):
 	"""Move `helper` to or from slot `slot`, wherever the slots live.
 
@@ -5269,9 +5346,21 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		# NO_LEGACY_FORM, which is what makes this that fix's own hole rather
 		# than an old one: before it, no member of the set could produce a
 		# `lanemem`. Finding 263.
+		# **The exemption stays shut for the FMA family, with one door.**
+		# Finding 263 refuses every FMA whatever its shape, because
+		# `lanemem` is narrowed and narrowing an FMA emits `66 0f 38 a8`,
+		# which decodes to nothing. That is an argument about NARROWING,
+		# not about the instruction: a plain packed multiply-add has a
+		# two-instruction SSE sequence and the branch below emits it for
+		# both halves. Everything else in the family -- the negated
+		# forms, the lane-alternating ones, the scalars -- still refuses,
+		# so the population this exempts is exactly the one that has an
+		# emitter. Finding 300.
 		if mnemonic in NO_LEGACY_FORM and (
 				shape[0] not in SLOT_SHAPES
-				or mnemonic in FMA_FORMS):
+				or (mnemonic in FMA_FORMS
+				    and not (mnemonic in FMA_SPAN_FORMS
+				             and shape[0] == "lanemem"))):
 			# Narrowing this would emit bytes that decode to nothing. See
 			# NO_LEGACY_FORM. Finding 205. The two lane shapes are the
 			# exception and are not narrowed at all: they are emitted as
@@ -5785,6 +5874,91 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if operation is None:
 				return refuse("lanereg operation has no SSE form")
 			body += operation
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
+		if what == "lanemem" and mnemonic in FMA_SPAN_FORMS:
+			# **A multiply and an add, per half, rather than a narrowing.**
+			# The suffix says which operand is the addend, from the SDM:
+			# 132 is `D = D*S2 + S1`, 213 is `D = S1*D + S2`, 231 is
+			# `D = S1*S2 + D`, and here S2 is the memory operand.
+			#
+			# NOT bit-exact -- two roundings replace one -- which is the
+			# deviation Finding 4 recorded for the plain path and this
+			# extends rather than introduces.
+			#
+			# The low half needs no scratch for 213 and 132, because the
+			# destination is itself a factor and can be multiplied in
+			# place; 231 has the destination as the ADDEND, so the
+			# product needs somewhere to live and borrows `helper`, which
+			# the upper half reloads from a slot immediately afterwards.
+			# Finding 300.
+			if second is None:
+				return refuse("lanemem source is in no slot")
+			if block is None:
+				return refuse("FMA member wants a per-thread block")
+			order = FMA_PATTERN.match(mnemonic).group(3)
+			kind = mnemonic[-2:]
+			prefix = FMA_PREFIX[kind]
+			mul, add = b"\x0f\x59", b"\x0f\x58"
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			low_s1 = scratch_finder.xmm_numbers(shape[2])[0]
+
+			def at_mem(opcode, reg, delta):
+				return fma_mem_piece(vex, tail, prefix, opcode, reg,
+				                     delta, address, encoding,
+				                     at + len(body))
+
+			if order == "213":		# D = S1 * D + mem
+				body += encode_rr(prefix, mul, low_dst, low_s1)
+				piece = at_mem(add, low_dst, 0)
+			elif order == "132":		# D = D * mem + S1
+				piece = at_mem(mul, low_dst, 0)
+				if piece is None:
+					return refuse("FMA low half cannot reach its operand")
+				body += piece
+				piece = encode_rr(prefix, add, low_dst, low_s1)
+			else:				# 231: D = S1 * mem + D
+				body += encode_rr(None, MOVAPS, helper, low_s1)
+				piece = at_mem(mul, helper, 0)
+				if piece is None:
+					return refuse("FMA low half cannot reach its operand")
+				body += piece
+				piece = encode_rr(prefix, add, low_dst, helper)
+			if piece is None:
+				return refuse("FMA low half cannot reach its operand")
+			body += piece
+
+			# The upper half, in ONE register. Whichever slot is not
+			# the accumulator is read as a memory operand rather than
+			# loaded, so each ordering starts by loading the slot it
+			# needs to accumulate into and then names the other by
+			# address. 231 accumulates in the SOURCE's copy and adds
+			# the destination's slot, which is why its load differs.
+			load = second if order == "231" else slot
+			body += span_slot_move(helper, False, base, load, block,
+			                       at + len(body))
+			if order == "213":		# h = S1h * h + mem16
+				piece = span_slot_op(prefix, mul, helper, base, second,
+				                     block)
+			elif order == "132":		# h = h * mem16 + S1h
+				piece = at_mem(mul, helper, SLOT)
+			else:				# 231: h = S1h * mem16 + Dh
+				piece = at_mem(mul, helper, SLOT)
+			if piece is None:
+				return refuse("FMA high half cannot reach its operand")
+			body += piece
+			if order == "213":
+				piece = at_mem(add, helper, SLOT)
+			elif order == "132":
+				piece = span_slot_op(prefix, add, helper, base, second,
+				                     block)
+			else:
+				piece = span_slot_op(prefix, add, helper, base, slot,
+				                     block)
+			if piece is None:
+				return refuse("FMA high half cannot reach its operand")
+			body += piece
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
@@ -6399,6 +6573,8 @@ REPAIR_SUBSTITUTED = 0
 # where to push: a window with no ladder behind it and one that walked
 # every rung and found each blamed are the same number and want
 # opposite work. Finding 298.
+REPAIR_READERS = set()
+REPAIR_BLAMED_BY = defaultdict(set)
 REPAIR_DROPPED_WHY = Counter()
 REPAIR_DROPPED_SITES = Counter()
 
@@ -6652,9 +6828,16 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# See the note in `lower_ymm_span`: an FMA classifies as `lanemem`
 	# and that shape is narrowed, so it must not take the
 	# SLOT_SHAPES exemption. Finding 263.
+	# The same door as the member guard, and it has to be the same door:
+	# Finding 263 says "both guard sites now refuse an FMA whatever its
+	# shape", so relaxing one and not the other would let the collector
+	# build a window the emitter then refuses -- a candidate nobody can
+	# place. Finding 300.
 	if mnemonic in NO_LEGACY_FORM and (
 			shape[0] not in SLOT_SHAPES
-			or mnemonic in FMA_FORMS):
+			or (mnemonic in FMA_FORMS
+			    and not (mnemonic in FMA_SPAN_FORMS
+			             and shape[0] == "lanemem"))):
 		return refuse(f"{mnemonic} has no legacy encoding")
 	what, register = shape[0], shape[1]
 	if shadow_index(register) is None:
@@ -13847,6 +14030,8 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 	width_of = {item[0]: item[4] for item in candidates}
 	REPAIR_BLAME_WHERE.clear()
 	REPAIR_SPLITTABLE.clear()
+	REPAIR_READERS.clear()
+	REPAIR_BLAMED_BY.clear()
 	REPAIR_DROPPED_WHY.clear()
 	REPAIR_DROPPED_SITES.clear()
 	# Per window: the rungs already spent on it, the blame it has
@@ -13890,6 +14075,26 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 		# %ymm7 shipped that way, all from one `vmovss` that was both
 		# patched and swallowed. A producer inside a window is guilty
 		# whatever else is true of it. Finding 197.
+		# **Who is doing the blaming.** A window is withheld because a
+		# surviving 256-bit instruction still reads an upper half it
+		# would zero -- and every surviving instruction is itself a
+		# frontier site, with its own reason for being one. If those
+		# readers are concentrated in a class already called a floor,
+		# that floor is not costing only its own sites: it is holding
+		# windows hostage too, and the classes are not independent the
+		# way the census's buckets make them look. Finding 300.
+		REPAIR_READERS.update(reader for reader, _f, producer in stale
+		                      if producer in covers)
+		# **And WHICH window each one blamed**, because the reader set
+		# alone cannot say what releasing a class would buy. 553 of the
+		# 903 readers are themselves sites in withheld windows and 197
+		# are the FMA class, so the buckets are a dependency graph
+		# rather than a partition -- and the question a leverage
+		# argument needs is how many windows are blamed ONLY by a class,
+		# which needs the edges. Finding 300.
+		for reader, _f, producer in stale:
+			if producer in covers:
+				REPAIR_BLAMED_BY[origin[covers[producer]]].add(reader)
 		guilty = {origin[covers[producer]]
 		          for _reader, _field, producer in stale
 		          if producer in covers}
@@ -15128,6 +15333,26 @@ def apply_all(binary, listing, output):
 		print(f"apply: {len(dropped):,} window(s) not placed, each having "
 		      f"swallowed a VEX.128 write whose zeroing a surviving "
 		      f"256-bit instruction still reads")
+		from pathlib import Path	# imported here as elsewhere in this file
+		roll = Path("build") / "repair-readers.txt"
+		if roll.parent.is_dir():
+			with roll.open("w", encoding="utf-8") as out:
+				out.write(f"# {len(REPAIR_READERS)} distinct reader(s)\n")
+				for at in sorted(REPAIR_READERS):
+					out.write(f"{at:#x}\n")
+			print(f"apply:   {len(REPAIR_READERS):,} distinct surviving "
+			      f"reader(s) did the blaming, written to {roll}")
+		edges = Path("build") / "repair-blame.txt"
+		if edges.parent.is_dir():
+			with edges.open("w", encoding="utf-8") as out:
+				out.write("# window\treader\n")
+				for window in sorted(REPAIR_BLAMED_BY):
+					if window not in dropped:
+						continue
+					for reader in sorted(REPAIR_BLAMED_BY[window]):
+						out.write(f"{window:#x}\t{reader:#x}\n")
+			print(f"apply:   the blame edges for dropped windows "
+			      f"written to {edges}")
 		print(f"apply:   the repair settled after {len(REPAIR_DECAY):,} "
 		      f"of {REPAIR_ROUNDS:,} round(s); guilty per round "
 		      f"{', '.join(str(n) for n in REPAIR_DECAY)}")

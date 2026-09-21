@@ -231,7 +231,8 @@ check-shadow-pe:
 	@set -e; \
 	mkdir -p $(PE_PREFIX); \
 	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove nonvol unwindsave \
-	            backward backtarget commute laneconv; do \
+	            backward backtarget commute laneconv \
+	            fmamem fma231 fma132; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -260,6 +261,15 @@ check-shadow-pe:
 			fi; \
 		done; \
 	done; \
+	echo "check-shadow-pe: fmamem, fma231, fma132 -- a 256-bit FMA whose"; \
+	echo "                 second source is memory, one per ordering. 205"; \
+	echo "                 of the 208 sites the frontier declined for"; \
+	echo "                 having no SSE form look exactly like this and"; \
+	echo "                 none had a fixture. Each reads back lane 0 from"; \
+	echo "                 the low half and lanes 4 and 7 from the upper,"; \
+	echo "                 so a lowering that narrows the low half and"; \
+	echo "                 drops the high one misses -- which is the way"; \
+	echo "                 this shape is likeliest to break"; \
 	echo "check-shadow-pe: crossregion -- a ymm defined outside the region"; \
 	echo "                 reads 77 from its permanent slot, 29 without"; \
 	echo "check-shadow-pe: laneswap -- vextractf128 and vinsertf128 routed"; \
