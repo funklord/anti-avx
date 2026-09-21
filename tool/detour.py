@@ -7445,19 +7445,38 @@ LOOP_ROUNDS = 6
 # message is why the class read as an irreducible floor rather than as a
 # cap set too low.
 #
-# Measured under `--shadow-regs=all`, where the uniform representation
-# puts far more producers inside windows: the repair settles after 15
-# rounds having dropped 277 windows, and the newly-guilty count decays
-# 136, 52, 25, 13, 11, 11, 6, 5, 2, 3, 3, 3, 3, 2, 2, 0. At 6 it stopped
-# at 248 dropped, leaving 29 guilty windows in the image and 12 surviving
-# 256-bit reads of an upper half that was no longer in its register.
+# ~~Measured under `--shadow-regs=all` ... the repair settles after 15
+# rounds ... 64 is headroom over a measured 15.~~ **It is 56, and 64 was
+# eight rounds away from refusing to build anything.** Re-measured
+# 2026-09-21 on both configurations:
 #
-# 64 is headroom over a measured 15, not a second guess. The loop
-# terminates without any cap -- each round adds at least one window to a
-# set bounded by the candidate list -- so exceeding this means the
-# reasoning is wrong, and `repaired_placement` refuses rather than
-# shipping. Finding 259.
-REPAIR_ROUNDS = int(os.environ.get("ANTI_AVX_REPAIR_ROUNDS", "64"))
+#     default build          56 rounds,   693 windows dropped
+#     --teb-scratch=auto     56 rounds, 1,136 windows dropped
+#
+# The 15 was taken when `--shadow-regs=all` was new and did not survive
+# the two default flips after it, which is the shelf life of a fact
+# recorded without a way to re-take it: the decay it quoted lived in a
+# session and not in the tool, so nothing could show the margin closing.
+# `REPAIR_DECAY` is that trace, and it prints.
+#
+# **The round count is a property of the binary, not of the flags.** The
+# two runs above share their last 41 rounds value for value -- the same
+# stubborn windows in both -- so turning a flag off does not buy margin.
+# And the decay is NOT monotone: it rises 17 times on the way down, as
+# each substitution creates fresh blame, so no safe bound can be
+# extrapolated from the early rounds.
+#
+# 256 is roughly the same multiple over 56 that 64 was meant to be over
+# 15. A higher cap costs nothing when the loop settles, because it
+# breaks as soon as nothing is guilty; it costs about three seconds a
+# round only in the case it exists for, which is a reasoning error.
+#
+# The loop terminates without any cap -- `spent` and `dropped` only
+# grow and a substitute inherits no ladder of its own -- so exceeding
+# this means the reasoning is wrong, and `repaired_placement` refuses
+# rather than shipping. Measured deliberately at a cap of 8: it refuses,
+# naming 440 dropped. Findings 259 and 298.
+REPAIR_ROUNDS = int(os.environ.get("ANTI_AVX_REPAIR_ROUNDS", "256"))
 
 # The newly-guilty count per round, which is the evidence the paragraph
 # above rests on. It was quoted there from a measurement nobody could
@@ -15022,8 +15041,18 @@ def apply_all(binary, listing, output):
 		      f"swallowed a VEX.128 write whose zeroing a surviving "
 		      f"256-bit instruction still reads")
 		print(f"apply:   the repair settled after {len(REPAIR_DECAY):,} "
-		      f"round(s); guilty per round "
+		      f"of {REPAIR_ROUNDS:,} round(s); guilty per round "
 		      f"{', '.join(str(n) for n in REPAIR_DECAY)}")
+		# **Say so while there is still room, because the other side of
+		# this bound is not a worse image but no image at all.** The
+		# cap was found at 56 of 64 having been documented as 15, and
+		# nothing reported the margin closing over two default flips.
+		# Finding 298.
+		if len(REPAIR_DECAY) * 2 > REPAIR_ROUNDS:
+			print(f"apply:   WARNING: that is more than half of "
+			      f"ANTI_AVX_REPAIR_ROUNDS={REPAIR_ROUNDS:,}. Exceeding "
+			      f"it is a refusal to build, not a worse image -- "
+			      f"re-measure the bound before it is reached.")
 		# **Split by why, because the total cannot say where to push.**
 		# A window with no ladder behind it and one that walked every
 		# rung and found each of them blamed are the same number and

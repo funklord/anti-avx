@@ -13926,6 +13926,91 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 298 -- splitting a dropped window recovers windows and loses sites
+
+Finding 297 left the stale-read repair holding half the frontier: 1,177 of 2,346
+surviving sites sat in windows the repair withheld. The drop total is the wrong
+number to work from, because it cannot tell a window with no ladder behind it from
+one that walked every rung and found each blamed. Those want opposite work.
+
+    unit           every alternative covers a blamed producer   1,036 win   4,215 sites
+    unit           no alternative window exists                    97 win     184
+    (no strategy)  no alternative window exists                     3 win       3
+
+**91% of the loss is an exhausted ladder, not a missing one**, and the baseline is
+the same shape at 90% -- 623 of 693 -- so this is the binary rather than anything
+Finding 297 introduced. Giving the other strategies a ladder is worth 100 windows
+of 1,136.
+
+**The site column is exposure and not loss.** It counts every VEX instruction lying
+inside a dropped extent; the census attributes 1,177 surviving sites to this class,
+the difference being sites another window or an in-place patch picks up anyway.
+
+#### What the ladder could not say, and what it cost to find out
+
+Every rung `unit_shortening` offers is a contiguous run anchored at one site, so it
+can shorten a window and widen it backwards and cannot express one that starts past
+a producer in the middle. Cutting each dropped window at the producers it was blamed
+for leaves a piece still holding a VEX site in **586 of 1,136**.
+
+Anchoring the ladder at every site the window covers reaches those pieces. The
+frontier got **worse**:
+
+    VEX in the rewritten .text        2,346      2,349
+      refused, stub not buildable       190        243     +53
+      in a window the repair dropped  1,177      1,047    -130
+      skipped for overlap                13         26     +13
+      unaccounted                         0         67     +67
+
+134 fewer windows were dropped and three more sites survived. It recovered 130 sites
+and gave back 53 to stubs that would not build and 13 to overlap -- the pieces being
+smaller and more numerous -- with 67 the census could no longer attribute, which is
+Finding 282's substituted-start blind spot arriving by a new route. `verify` passed
+throughout: the image was correct and worse.
+
+**A window is not a unit of loss, and this item was picked off a window count.** The
+586 was also an upper bound measured against round-one blame; by the time the loop
+settled, `no gap holds a site` had risen 547 -> 750, so two thirds of the opportunity
+was eaten by the repair's own cascade rather than by unbuildable stubs.
+
+Reverted, and the revert is proved rather than asserted: byte-identical image, 1,136
+dropped, every split restored.
+
+#### The revert control found the real defect
+
+    default build          56 rounds,   693 windows dropped
+    --teb-scratch=auto     56 rounds, 1,136 windows dropped
+    REPAIR_ROUNDS = 64
+
+`REPAIR_ROUNDS` was documented as "headroom over a measured 15, not a second guess".
+**It is 56.** The 15 was taken when `--shadow-regs=all` was new and did not survive
+the two default flips after it, so the shipping default was eight rounds from the
+bound -- and the far side of that bound is not a worse image but a refusal to build
+anything, which this session tripped for real at 103 rounds.
+
+Nothing could have shown the margin closing, because the decay the comment quoted
+lived in a session and not in the tool. `REPAIR_DECAY` is that trace and it prints.
+
+Two facts the old number lacked. **The round count belongs to the binary, not the
+flags**: the two runs above share their last 41 rounds value for value, the same
+stubborn windows in both, so turning a flag off buys no margin. And **the decay is
+not monotone** -- it rises 17 times on the way down as each substitution creates
+fresh blame -- so no safe bound is extrapolable from the early rounds.
+
+256 now, and the tool warns when the rounds used pass half of it. Both halves were
+made to fire: a cap of 8 refuses naming 440 dropped, a cap of 1 refuses on the
+fixture, and a cap of 100 prints the warning, exits 0, and writes an image
+byte-identical to the one built at 256 -- so the guard guards without changing
+output. The warning is unreachable from `pe-repairdrop`, which settles in one round:
+firing it needs the rounds used above half the cap while still settling, and one
+round cannot satisfy both.
+
+#### What is left, measured
+
+550 of the 1,136 dropped windows are a floor: cut them at every producer they were
+blamed for and no surviving piece holds a VEX site at all, so there is nothing to
+place either side. That is measured now rather than assumed.
+
 ### Finding 297 -- the TEB route is built, and the wall it was written against is gone
 
 Finding 296 measured away the precondition; this is the route itself. `--teb-scratch=auto`
