@@ -13926,6 +13926,104 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 299 -- the frontier's last big classes are floors, and a table with two denominators
+
+Finding 298 closed the repair. This is the survey of what was under it, and the
+answer is that nothing above a hundred sites is open.
+
+    2,346 surviving VEX
+      kept: its window was withheld                  1,227   Finding 298: 550 a floor,
+                                                             586 a measured negative
+      declined: outside .pdata                         319   documented trade
+      declined: next instruction is a branch target    228   sandwiched, see below
+      declined: no SSE form at any register            208   the FMA family, Finding 263
+      declined: next instruction will not move         106
+      declined: 256-bit: arithmetic rather than a copy  84
+      lost to an overlap or a refused stub              83
+      never a candidate                                 54
+      kept: a repair left it in VEX form                27
+
+**`outside .pdata` is not the 16,256 its own tool's docstring records.**
+`outside.leaf_ranges` has been wired in since it was written and took the class to
+319; what is left contains `(bad)` or runs off the end, and `outside.py` keeps those
+refused on purpose -- "being slightly less effective is the right price for not
+corrupting data". A floor by decision, not by omission.
+
+#### A bucket named for the first blocker
+
+A site under five bytes cannot carry a `jmp rel32`, so its window widens forward over
+the next instruction and, failing that, backward over the previous one. The backward
+fallback's six refusals were all bare `pass`, so the reason reaching `declined` was
+always the forward one. Counting the pair:
+
+    next instruction is a branch target  then the site itself is one   206
+    next instruction will not move       then previous will not move   113
+    next instruction is a branch target  then previous will not move    14
+    next instruction is a branch target  then previous falls through    13
+    next instruction will not move       then the site itself is one     5
+
+It reconciles against a count taken in another pass: the forward halves are 233 and
+118 where the census reports 228 and 106 surviving, and the difference of 17 is the
+census's own `of those, swallowed anyway 17`.
+
+**206 are sandwiched** -- the next instruction is branched to so widening forward
+buries it, the site is branched to so widening backward buries that. Scalar
+three-operand arithmetic whose destination differs from its first source, so the SSE
+form wants an extra `movaps` and does not fit in place either.
+
+**The trampoline was measured rather than built.** A 2-byte `jmp rel8` over the site
+into inter-function `int3` padding holding a `jmp rel32` is the standard escape.
+Starfield has 160,084 padding runs of five or more bytes and 1.6 MB of them -- and
+only **28 of 228 (12%)** have any within `rel8` reach. A mechanism for 28 sites is
+not a mechanism. One measurement, no implementation, which is Finding 298's lesson
+applied a step earlier.
+
+#### A table whose two halves counted different populations
+
+`moved_instruction` has taken a `reasons` Counter since Finding 88 and `build_stub`
+has passed one all along; the two widening call sites passed nothing. Wiring them up
+is an interface only as wired as its least-used method -- and the unused caller was
+the one covering the class in question.
+
+The first version counted forward reasons at the attempt and backward reasons at the
+decline, and printed them adjacent under one heading:
+
+    forward   the aliased form has no usable scratch    289      <- attempts
+    backward  no direct SSE form and not a sequence      49      <- outcomes
+
+Forward widening is tried at EVERY short site and most go on to succeed backward, so
+the forward rows described a population an order of magnitude larger. Held in a local
+and folded in at the decline, both halves are about declined sites:
+
+    over 118 declined site(s) whose forward move was refused, and 127 whose backward was
+      backward  no direct SSE form and not a sequence     49
+      forward   256-bit, no Y strategy took it            46
+      forward   no direct SSE form and not a sequence     46
+      backward  256-bit, no Y strategy took it            40
+      backward  the aliased form has no usable scratch    38
+      forward   the aliased form has no usable scratch    26
+
+46+46+26 = 118 and 49+40+38 = 127, to the unit.
+
+**The correction is eleven-fold on the largest row** -- `the aliased form has no
+usable scratch` was 289 and is 26 -- and `vblendv would not lower`, at 107, is
+**absent**: every one of those sites succeeded backward. The four biggest rows were
+almost entirely sites the tool went on to handle.
+
+**What caught it was not that 647 looked wrong.** It looked like a plausible large
+number. It was that the backward half reconciled to the unit and the forward half did
+not, against a count taken elsewhere. A bare total with no stated population is what
+let it hide, so the denominator is printed now, with the note that one refusal may
+give several reasons -- rows summing past the site count is then correct rather than
+an error, and a reader can tell the two apart.
+
+#### Where this leaves the frontier
+
+Every class above a hundred is a floor. The largest that is not is the 113, whose
+three reasons are `no direct SSE form and not a sequence`, `256-bit, no Y strategy
+took it`, and `the aliased form has no usable scratch`. Solving it entirely is worth
+on the order of forty to sixty sites against 2,346.
+
 ### Finding 298 -- splitting a dropped window recovers windows and loses sites
 
 Finding 297 left the stale-read repair holding half the frontier: 1,177 of 2,346

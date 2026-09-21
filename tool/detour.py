@@ -6348,6 +6348,21 @@ OVERLAP_REFUSED = Counter()
 # want different work. Finding 299.
 BACKWARD_REFUSED = Counter()
 
+# **Why the neighbour would not move**, keyed `(direction, reason)`.
+# `moved_instruction` has taken a `reasons` Counter since Finding 88 and
+# `build_stub` has passed one all along; the two widening call sites in
+# the candidate loop passed nothing, so 113 sites whose real blocker is
+# a passenger that will not lower were recorded only as "will not move".
+# The mechanism existed and was wired at one of its three callers --
+# an interface is only as wired as its least-used method. Finding 299.
+WIDEN_REFUSED = Counter()
+
+# The denominator for the table above, so a reader can see whether the
+# rows sum past it -- one refused move can report more than one reason,
+# and a row total above the site count means exactly that rather than an
+# error. Finding 299.
+WIDEN_SITES = Counter()
+
 # How many instructions a unit window may absorb, longest first. 12 is what
 # the strategy was built with; the rest are what it retries at when the long
 # window cannot find a helper. Finding 276.
@@ -7186,6 +7201,16 @@ def report_units(candidates, placed, home, wide=0, original=None):
 		      f"the forward widening and then the backward fallback:")
 		for (ahead, behind), count in BACKWARD_REFUSED.most_common():
 			print(f"apply:   {ahead:<38} then {behind:<34} {count:>6,}")
+	if WIDEN_REFUSED:
+		# The half of the pair above that is not geometry: a neighbour
+		# that COULD be swallowed and will not lower as a passenger.
+		print(f"apply: and why a neighbour would not move, over "
+		      f"{WIDEN_SITES['forward']:,} declined site(s) whose forward "
+		      f"move was refused and {WIDEN_SITES['backward']:,} whose "
+		      f"backward move was (a refusal may give more than one "
+		      f"reason):")
+		for (way, why), count in WIDEN_REFUSED.most_common():
+			print(f"apply:   {way:<9} {why:<58} {count:>6,}")
 	# **The figure that answers whether the representation is whole.**
 	# Counted from the windows actually PLACED, not from candidates built:
 	# a candidate the placer dropped maintains nothing.
@@ -10308,6 +10333,7 @@ def collect(binary, listing, context=None):
 			# up in the middle of the window, and the one in the middle is
 			# the one nothing may branch to.
 			reason = None
+			ahead_told = behind_told = None
 			if index + 1 >= len(instructions):
 				reason = "nothing follows"
 			else:
@@ -10357,7 +10383,20 @@ def collect(binary, listing, context=None):
 					# displacement correction is smallest there, so this
 					# errs toward accepting and never refuses a passenger
 					# that a real stub address would have taken.
-					if moved_instruction(passenger, address, address) is None:
+					told = Counter()
+					if moved_instruction(passenger, address, address,
+					                     reasons=told) is None:
+						# **Held, not counted.** Forward widening is
+						# attempted at EVERY short site and most of
+						# those go on to succeed backward, so counting
+						# here described attempts while the backward
+						# counter described outcomes -- 647 against
+						# 118, two denominators under one heading.
+						# Folded in at the decline below, where both
+						# halves are about the same sites. Caught by
+						# the backward half reconciling to the unit
+						# and the forward half not. Finding 299.
+						ahead_told = told
 						reason = "next instruction will not move"
 					else:
 						displaced.append(passenger)
@@ -10425,19 +10464,31 @@ def collect(binary, listing, context=None):
 					# that will not move means the site is declined with a
 					# reason rather than given a window whose stub cannot
 					# be built.
+					told = Counter()
 					if moved_instruction(passenger, previous[0],
-					                     previous[0]) is not None:
+					                     previous[0],
+					                     reasons=told) is not None:
 						preceding.append(passenger)
 						start = previous[0]
 						window = len(previous[1]) + len(encoding)
 						reason = None
 					else:
+						behind_told = told
 						back = "previous will not move"
 
 			if reason is not None:
 				skipped[reason] += 1
 				declined[address] = reason
 				BACKWARD_REFUSED[(reason, back or "?")] += 1
+				for way, seen in (("forward", ahead_told),
+				                  ("backward", behind_told)):
+					if seen is None:
+						continue
+					WIDEN_SITES[way] += 1
+					for why, count in seen.items():
+						WIDEN_REFUSED[(way, why)] += count
+					if not seen:
+						WIDEN_REFUSED[(way, "no reason given")] += 1
 				continue
 
 		if not inplace.covered_by(ranges, start, window):
