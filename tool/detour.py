@@ -347,6 +347,12 @@ FMA_SPAN_FORMS = frozenset(f"vfmadd{order}{width}"
                            for order in ("132", "213", "231")
                            for width in ("ps", "pd"))
 
+# The two shapes a span can emit one for: the second source in memory,
+# and all three operands in registers. They differ only in where the
+# multiplicand comes from -- an address either way, since the register
+# form's sources are slots. Finding 301.
+FMA_SPAN_SHAPES = frozenset(("lanemem", "lanereg3"))
+
 
 def fma_mem_piece(vex, tail, prefix, opcode, reg, delta, address, encoding,
                   at):
@@ -5356,11 +5362,11 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		# forms, the lane-alternating ones, the scalars -- still refuses,
 		# so the population this exempts is exactly the one that has an
 		# emitter. Finding 300.
-		if mnemonic in NO_LEGACY_FORM and (
+		fma_span = (mnemonic in FMA_SPAN_FORMS
+		            and shape[0] in FMA_SPAN_SHAPES)
+		if mnemonic in NO_LEGACY_FORM and not fma_span and (
 				shape[0] not in SLOT_SHAPES
-				or (mnemonic in FMA_FORMS
-				    and not (mnemonic in FMA_SPAN_FORMS
-				             and shape[0] == "lanemem"))):
+				or mnemonic in FMA_FORMS):
 			# Narrowing this would emit bytes that decode to nothing. See
 			# NO_LEGACY_FORM. Finding 205. The two lane shapes are the
 			# exception and are not narrowed at all: they are emitted as
@@ -5744,6 +5750,60 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if high is None:
 				return refuse("immreg high operation has no SSE form")
 			body += high
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
+		if what == "lanereg3" and mnemonic in FMA_SPAN_FORMS:
+			# **The same sequence with a third slot instead of a memory
+			# operand.** `lanereg3` is `op S2,S1,D` with every operand a
+			# ymm, so the upper half has three slots in play -- and two
+			# of them are read as addresses rather than loaded, which is
+			# why this wants one helper where the shape's ordinary
+			# emission wants two.
+			#
+			# `slot` is D's, `second` is S2's and `third` is S1's, which
+			# is the mapping the shape's own branch below relies on.
+			# Finding 301.
+			if second is None or third is None:
+				return refuse("lanereg3 source is in no slot")
+			if block is None:
+				return refuse("FMA member wants a per-thread block")
+			order = FMA_PATTERN.match(mnemonic).group(3)
+			prefix = FMA_PREFIX[mnemonic[-2:]]
+			mul, add = b"\x0f\x59", b"\x0f\x58"
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			low_s2 = scratch_finder.xmm_numbers(shape[2])[0]
+			low_s1 = scratch_finder.xmm_numbers(shape[3])[0]
+			if order == "213":		# D = S1 * D + S2
+				body += encode_rr(prefix, mul, low_dst, low_s1)
+				body += encode_rr(prefix, add, low_dst, low_s2)
+			elif order == "132":		# D = D * S2 + S1
+				body += encode_rr(prefix, mul, low_dst, low_s2)
+				body += encode_rr(prefix, add, low_dst, low_s1)
+			else:				# 231: D = S1 * S2 + D
+				# The only ordering whose destination is the ADDEND, so
+				# the product needs somewhere to live. `helper` is free
+				# here -- the upper half reloads it from a slot on the
+				# next line but one.
+				body += encode_rr(None, MOVAPS, helper, low_s1)
+				body += encode_rr(prefix, mul, helper, low_s2)
+				body += encode_rr(prefix, add, low_dst, helper)
+
+			# The upper half accumulates in `helper` and names the other
+			# two slots by address.
+			load, first, then = {
+				"213": (slot, third, second),
+				"132": (slot, second, third),
+				"231": (third, second, slot),
+			}[order]
+			body += span_slot_move(helper, False, base, load, block,
+			                       at + len(body))
+			for opcode, which in ((mul, first), (add, then)):
+				piece = span_slot_op(prefix, opcode, helper, base, which,
+				                     block)
+				if piece is None:
+					return refuse("FMA high half cannot reach a slot")
+				body += piece
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
@@ -6833,11 +6893,11 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# shape", so relaxing one and not the other would let the collector
 	# build a window the emitter then refuses -- a candidate nobody can
 	# place. Finding 300.
-	if mnemonic in NO_LEGACY_FORM and (
+	fma_span = (mnemonic in FMA_SPAN_FORMS
+	            and shape[0] in FMA_SPAN_SHAPES)
+	if mnemonic in NO_LEGACY_FORM and not fma_span and (
 			shape[0] not in SLOT_SHAPES
-			or (mnemonic in FMA_FORMS
-			    and not (mnemonic in FMA_SPAN_FORMS
-			             and shape[0] == "lanemem"))):
+			or mnemonic in FMA_FORMS):
 		return refuse(f"{mnemonic} has no legacy encoding")
 	what, register = shape[0], shape[1]
 	if shadow_index(register) is None:
@@ -7157,7 +7217,18 @@ def unit_candidate(instructions, plain, index, blocked, home,
 			touched |= set(scratch_finder.xmm_numbers(
 				instructions[position][3] or ""))
 		usable = set(saved) - touched
-		need = 2 if any(kind in TWO_HELPERS for kind, _p, _r in members) \
+		# **An FMA `lanereg3` wants one, not two.** `TWO_HELPERS` is
+		# keyed by shape, and the shape is right for every other
+		# mnemonic that wears it: two sources loaded into two helpers.
+		# An FMA reads both of its slot sources as memory operands and
+		# accumulates in one register. Asking for two anyway is what
+		# cost the memory form 66 windows before `span_slot_op`
+		# existed. Finding 301.
+		need = 2 if any(kind in TWO_HELPERS
+		                and not (kind == "lanereg3"
+		                         and instructions[position][2]
+		                         in FMA_SPAN_FORMS)
+		                for kind, position, _r in members) \
 			else 1
 		taken = []
 		for register in sorted(usable):

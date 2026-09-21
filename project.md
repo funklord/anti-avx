@@ -10,8 +10,8 @@ sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` inva
 holds on the result. 2,687 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
-**`--teb-scratch=auto` takes it to 2,279** (Findings 297 and 300), which is not the
-default: it asks the loader for two TLS slots and patches the stubs from a callback,
+**`--teb-scratch=auto` takes it to 2,014** (Findings 297, 300 and 301), which is not
+the default: it asks the loader for two TLS slots and patches the stubs from a callback,
 and whether that becomes the default is the copyright holder's call rather than this
 document's.
 
@@ -11885,7 +11885,7 @@ code quickly.
 ### Where it stands, 2026-09-18
 
     default build                         2,687 VEX left      99.67%
-    with --teb-scratch=auto               2,279 re-measured   (Finding 300)
+    with --teb-scratch=auto               2,014 re-measured   (Finding 301)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -13926,6 +13926,83 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 301 -- the register-only FMA, and a class that was waiting on another class
+
+Finding 300 lowered the memory-source FMA and released nothing. The reason was in
+its own text: releasing a withheld window needs EVERY reader blaming it lowered, and
+71 register-only sites were still blaming. This lowers those, and the windows came.
+
+    frontier                                  2,346 -> 2,014     (Finding 300: 2,279)
+      declined: no SSE form at any register     208 ->    69
+      kept: its window was withheld           1,227 -> 1,085
+      lost to an overlap or a refused stub       83 ->    53
+      never a candidate                          54 ->    37
+    windows not placed                        1,136 ->   994
+    unconditional lowering refusals             606 ->   324
+
+`verify` passes, including the two this change had to clear: every instruction in
+the stub decodes, and no surviving 256-bit read takes a stale upper half.
+
+**The 142 that came out of the withheld class is the result, not the 332.** Those
+are not FMA sites. They are ordinary instructions in windows that could not be
+placed because an FMA reader downstream still needed the zeroing a swallowed
+VEX.128 write would have done. **That class was called a floor twice, on two
+separate measurements, and it was not closed -- it was waiting on a different
+class.** Nothing in the census's own layout could show that; only the blame edges
+could.
+
+Realised release is 144 windows against a predicted 283, which the edge data had
+already implied: 506 windows carried at least one FMA blamer and only 283 carried
+nothing else, and some of that 283 acquired other blamers as the repair re-settled
+over 60 rounds.
+
+#### `lanereg3`, and one helper where the shape says two
+
+`vfmadd231ps %ymm3,%ymm2,%ymm4` classifies as `('lanereg3', D, S2, S1)`, which is
+not in `SLOT_SHAPES` at all -- so it was refused by the FIRST condition, before the
+FMA clause Finding 300 opened. Its upper half has three slots in play where the
+memory form had two.
+
+It still wants **one** helper, because two of the three are read as addresses:
+
+    movaps %xmm1,%xmm4          low:  helper = S1
+    mulps  %xmm2,%xmm4                helper *= S2
+    addps  %xmm4,%xmm0                D += helper
+    mulps  0x70(%r11),%xmm4     high: *= S2's slot   -- memory
+    addps  0x50(%r11),%xmm4           += D's slot    -- memory
+
+`TWO_HELPERS` is keyed by shape and forces two for every `lanereg3`, which is right
+for every other mnemonic wearing it -- two sources loaded into two registers. The
+FMA case is carved out there, because asking for a second helper is exactly what
+cost the memory form 66 windows before `span_slot_op` existed.
+
+231 is again the ordering that needs a scratch for its low half, the destination
+being the ADDEND; 213 and 132 multiply in place.
+
+#### The fixture caught what every counter called a success
+
+First run of the register form: **5 built, 0 refused, 0 VEX left in `.text`, and
+the program returned 29.** The stub held `66 0f 38 b8 (bad)` -- Finding 263's exact
+failure -- because the new branch sat AFTER the ordinary `lanereg3` branch in the
+if-chain and never ran.
+
+Every number the tool printed said success. The refusal table said zero, the VEX
+count said zero, and the image was broken. **Only running it found this**, and it
+is the second time in one pass: Finding 300's own emitter refused 66 windows while
+reporting a clean build.
+
+`check-shadow-pe` now gates six FMA fixtures -- `fmamem`, `fma231`, `fma132`,
+`fmareg`, `fmareg213`, `fmareg132` -- one per ordering per shape, each reading lane
+0 from the low half and lanes 4 and 7 from the upper, and each required to answer
+29 with `--shadow-regs=off` so that a fixture which never needed permanent slots
+cannot pass for the wrong reason.
+
+#### What is left of the family
+
+69 sites: `vfmaddsub`/`vfmsubadd`, where Finding 4 measured that a plain
+multiply-add computes the WRONG THING for half the lanes -- a correctness bug, not
+a precision one -- and the four-operand shapes. Those stay refused deliberately.
 
 ### Finding 300 -- the census buckets are a dependency graph, and FMA lowers in a span
 

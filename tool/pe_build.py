@@ -335,6 +335,168 @@ tls_directory:
 """)
 
 
+# **The register-only FMA**, which is the other 71 of the 205 and a
+# different shape: `lanereg3`, three ymm operands and no memory at all.
+# Its upper half has three slots in play where the memory form had two,
+# and two of the three are read as addresses rather than loaded -- so it
+# wants ONE helper, not the two its shape ordinarily forces.
+#
+# 231 is `D = S1*S2 + D`, so ymm0 = ymm1*ymm2 + ymm0 with ymm1 = 2.0,
+# ymm2 = 3.0 and ymm0 = {1..8} gives {7,8,9,...,14}. Lanes 0, 4 and 7
+# are 7, 11 and 14 -- 32, and the program adds 45. The upper lanes are
+# read for the reason the memory fixtures read them: a lowering that
+# gets the low half right and drops the high one must miss.
+# Finding 301.
+PROGRAMS["fmareg213"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	twos(%rip), %rdx
+	leaq	addend(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* 2.0 in every lane */
+	vmovups	(%rax), %ymm2		/* 3.0 in every lane */
+	vfmadd213ps %ymm2, %ymm1, %ymm0	/* ymm0 = ymm1*ymm2 + ymm0 */
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0: 2*3+1 = 7 */
+	cvttss2si 16(%rdi), %ecx	/* lane 4: 2*3+5 = 11 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7: 2*3+8 = 14 */
+	addl	%ecx, %eax		/* 7 + 11 + 14 = 32 */
+	addl	$40, %eax		/* 32 + 45 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+twos:	.float 2.0, 2.0, 2.0, 2.0
+	.float 2.0, 2.0, 2.0, 2.0
+	.p2align 5
+addend:	.float 3.0, 3.0, 3.0, 3.0
+	.float 3.0, 3.0, 3.0, 3.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+PROGRAMS["fmareg132"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	twos(%rip), %rdx
+	leaq	addend(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* 2.0 in every lane */
+	vmovups	(%rax), %ymm2		/* 3.0 in every lane */
+	vfmadd132ps %ymm2, %ymm1, %ymm0	/* ymm0 = ymm1*ymm2 + ymm0 */
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0: 2*3+1 = 7 */
+	cvttss2si 16(%rdi), %ecx	/* lane 4: 2*3+5 = 11 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7: 2*3+8 = 14 */
+	addl	%ecx, %eax		/* 7 + 11 + 14 = 32 */
+	addl	$29, %eax		/* 32 + 45 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+twos:	.float 2.0, 2.0, 2.0, 2.0
+	.float 2.0, 2.0, 2.0, 2.0
+	.p2align 5
+addend:	.float 3.0, 3.0, 3.0, 3.0
+	.float 3.0, 3.0, 3.0, 3.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+PROGRAMS["fmareg"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	twos(%rip), %rdx
+	leaq	addend(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* 2.0 in every lane */
+	vmovups	(%rax), %ymm2		/* 3.0 in every lane */
+	vfmadd231ps %ymm2, %ymm1, %ymm0	/* ymm0 = ymm1*ymm2 + ymm0 */
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0: 2*3+1 = 7 */
+	cvttss2si 16(%rdi), %ecx	/* lane 4: 2*3+5 = 11 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7: 2*3+8 = 14 */
+	addl	%ecx, %eax		/* 7 + 11 + 14 = 32 */
+	addl	$45, %eax		/* 32 + 45 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+twos:	.float 2.0, 2.0, 2.0, 2.0
+	.float 2.0, 2.0, 2.0, 2.0
+	.p2align 5
+addend:	.float 3.0, 3.0, 3.0, 3.0
+	.float 3.0, 3.0, 3.0, 3.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 PROGRAMS["fmamem"] = (77, """
 	.text
 	.globl _start
