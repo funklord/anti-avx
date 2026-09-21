@@ -6341,6 +6341,13 @@ SAVED_XMM = {}
 # non-volatile borrow depends on. Finding 256.
 OVERLAP_REFUSED = Counter()
 
+# **Why the backward fallback did not save a site the forward widening
+# could not.** Keyed `(forward reason, backward reason)`, because the
+# pair is the finding: a bucket named for the first blocker cannot say
+# whether the second was the same wall or a different one, and those
+# want different work. Finding 299.
+BACKWARD_REFUSED = Counter()
+
 # How many instructions a unit window may absorb, longest first. 12 is what
 # the strategy was built with; the rest are what it retries at when the long
 # window cannot find a helper. Finding 276.
@@ -7165,6 +7172,20 @@ def report_units(candidates, placed, home, wide=0, original=None):
 				for site in rows:
 					out.write(f"{why}\t{site:#x}\n")
 		print(f"apply: every refused site written to {roll}")
+	if BACKWARD_REFUSED:
+		# **The pair, because neither half is the finding on its own.**
+		# A site too short to detour tries forward and then backward,
+		# and only the forward reason reaches `declined` -- so the
+		# frontier census reports 228 under `next instruction is a
+		# branch target` without saying whether the fallback met the
+		# same wall or a different one. Same shape as the repair's
+		# drop total in Finding 298: a bucket named for the first
+		# blocker cannot say which blocker operated. Finding 299.
+		total = sum(BACKWARD_REFUSED.values())
+		print(f"apply: {total:,} short site(s) declined, by what stopped "
+		      f"the forward widening and then the backward fallback:")
+		for (ahead, behind), count in BACKWARD_REFUSED.most_common():
+			print(f"apply:   {ahead:<38} then {behind:<34} {count:>6,}")
 	# **The figure that answers whether the representation is whole.**
 	# Counted from the windows actually PLACED, not from candidates built:
 	# a candidate the placer dropped maintains nothing.
@@ -10359,20 +10380,33 @@ def collect(binary, listing, context=None):
 				#
 				# Worth 3,237 sites that forward widening cannot reach,
 				# measured before it was written.
+				#
+				# **Each `no` is named, because the reason this site
+				# ends up declined under is the FORWARD one.** Every
+				# branch here used to be a bare `pass`, so a site that
+				# failed forward for one cause and backward for a
+				# quite different one was filed under the first, and
+				# the operative half was never recorded anywhere.
+				# Measured before this: 228 sites read `next
+				# instruction is a branch target` and 106 read `next
+				# instruction will not move`, and neither string says
+				# why the fallback that exists for exactly those cases
+				# did not fire. Finding 299.
 				previous = instructions[index - 1] if index else None
+				back = None
 				if previous is None:
-					pass
+					back = "nothing precedes"
 				elif previous[0] + len(previous[1]) != address:
-					pass		# not adjacent; something lies between
+					back = "previous not adjacent"
 				elif address in blocked:
-					pass		# the site is branched to; it cannot vanish
+					back = "the site itself is a branch target"
 				elif previous[2].startswith(CONTROL_PREFIXES) \
 						and not swallowable_transfer(
 							previous[1], previous[2], previous[3],
 							previous[4], previous[0]):
-					pass		# does not fall through into the site
+					back = "previous does not fall through"
 				elif len(previous[1]) + len(encoding) < 5:
-					pass
+					back = "the pair is still too short"
 				else:
 					taken = swallowed_scratch(
 						plain, index - 1, previous[0], previous[1],
@@ -10397,10 +10431,13 @@ def collect(binary, listing, context=None):
 						start = previous[0]
 						window = len(previous[1]) + len(encoding)
 						reason = None
+					else:
+						back = "previous will not move"
 
 			if reason is not None:
 				skipped[reason] += 1
 				declined[address] = reason
+				BACKWARD_REFUSED[(reason, back or "?")] += 1
 				continue
 
 		if not inplace.covered_by(ranges, start, window):
