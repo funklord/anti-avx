@@ -326,6 +326,13 @@ def encode_mem(prefix, opcode, reg, vex, tail, address, encoding, at):
 	out += opcode
 	out.append((tail[1] & 0xC7) | ((reg & 7) << 3))
 	out += tail[2:]
+	if rip_relative(tail) and len(tail) > 6:
+		# The repair below rewrites the LAST four bytes as the
+		# displacement, which is only the displacement when nothing
+		# follows it. Nothing reaches here with an immediate today --
+		# no FMA has one -- and a silent corruption is the wrong thing
+		# to leave waiting for the first caller that does. Finding 303.
+		return None
 	if rip_relative(tail):
 		old = struct.unpack_from("<i", out, len(out) - 4)[0]
 		target = address + len(encoding) + old
@@ -3059,8 +3066,22 @@ def rip_target(tail, address, length):
 	whole reason moving one is not the same problem as adjusting a
 	displacement in place.
 	"""
-	if not rip_operand(tail) or len(tail) != 6:
-		return None		# an immediate would follow the displacement
+	# **An immediate after the displacement changes nothing here.** This
+	# demanded a tail of exactly six bytes and refused anything longer,
+	# which reads as caution and is arithmetic that does not apply: the
+	# displacement is measured from the END of the instruction, and
+	# `length` is already the whole instruction including its immediate.
+	# `rip_operand` has established mod 00 with rm 101, so there is no
+	# SIB and the displacement is exactly `tail[2:6]` whatever follows
+	# it.
+	#
+	# What the refusal was actually protecting is the RECONSTRUCTION,
+	# which is `narrow_piece`'s and rebuilt the tail as opcode, modrm and
+	# a new displacement -- dropping the immediate. That is fixed where
+	# it lives. Ten `vcmpltps <rip>,%ymm,%ymm` sites were declined here,
+	# all of them holding a compare predicate in an imm8. Finding 303.
+	if not rip_operand(tail) or len(tail) < 6:
+		return None
 	return address + length + struct.unpack_from("<i", tail, 2)[0]
 
 
@@ -3184,7 +3205,11 @@ def narrow_piece(vex, tail, delta, address, length, at):
 	value = (target + delta) - (at + len(probe))
 	if not -(1 << 31) <= value < (1 << 31):
 		return None
-	return inplace.sse_encoding(narrow, tail[:2] + struct.pack("<i", value))
+	# Opcode, modrm, the corrected displacement -- and whatever followed
+	# it, which for a compare is the predicate byte. Rebuilding only the
+	# first six bytes silently produced `cmpps` with no predicate.
+	return inplace.sse_encoding(narrow, tail[:2] + struct.pack("<i", value)
+	                            + tail[6:])
 
 
 def splat_pair(site, following):

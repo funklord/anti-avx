@@ -547,6 +547,63 @@ tls_directory:
 """)
 
 
+# **A 256-bit compare against a RIP-relative constant**, which carries a
+# predicate in an imm8 after the displacement. `rip_target` refused any
+# tail longer than six bytes -- "an immediate would follow the
+# displacement" -- and that is arithmetic which does not apply: the
+# displacement is measured from the end of the instruction and `length`
+# already counts the immediate. What the refusal protected was
+# `narrow_piece`'s reconstruction, which rebuilt opcode, modrm and a new
+# displacement and DROPPED the immediate, turning `cmpps $1` into
+# `cmpps` with whatever byte followed.
+#
+# The mask is read back from three lanes, one of them in the upper half
+# and TRUE while its neighbours are false: the constant is
+# {5,5,5,5,0,0,0,9} against {1..8}, so lanes 0-3 and 7 compare less-than
+# and lanes 4-6 do not. A dropped predicate gives a different comparison
+# and a dropped upper half gives zero there, and each misses.
+# Finding 303.
+PROGRAMS["cmpconst"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vcmpltps bound(%rip), %ymm0, %ymm1
+	movq	%rsp, %rdi
+	vmovups	%ymm1, (%rdi)
+	movl	(%rdi), %eax		/* lane 0: 1 < 5  -> -1 */
+	addl	16(%rdi), %eax		/* lane 4: 5 < 0  ->  0 */
+	addl	28(%rdi), %eax		/* lane 7: 8 < 9  -> -1 */
+	addl	$79, %eax		/* -2 + 79 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+bound:	.float 5.0, 5.0, 5.0, 5.0
+	.float 0.0, 0.0, 0.0, 9.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 PROGRAMS["fmareg"] = (77, """
 	.text
 	.globl _start

@@ -10,7 +10,7 @@ sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` inva
 holds on the result. 2,687 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
-**`--teb-scratch=auto` takes it to 1,890** (Findings 297 and 300 to 302), which is
+**`--teb-scratch=auto` takes it to 1,886** (Findings 297 and 300 to 303), which is
 not the default: it asks the loader for two TLS slots and patches the stubs from a callback,
 and whether that becomes the default is the copyright holder's call rather than this
 document's.
@@ -11885,7 +11885,7 @@ code quickly.
 ### Where it stands, 2026-09-18
 
     default build                         2,687 VEX left      99.67%
-    with --teb-scratch=auto               1,890 re-measured   (Finding 302)
+    with --teb-scratch=auto               1,886 re-measured   (Finding 303)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -13926,6 +13926,80 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 303 -- a guard one function away from the bug it was written for
+
+`256-bit: arithmetic rather than a copy` had become the largest non-self class of
+blamers: 72 readers holding 94 withheld windows hostage. The label is the `run`
+strategy declining anything that is not a load/store copy, and it is not why those
+84 sites survive. Cross-referencing all 84 against the refusal roll:
+
+    39 sites  shape a register second source, src2 is D    -- the FP-commute decision
+    12 sites  shape a register-to-register move            -- vptest, vpmovmskb
+    10 sites  lanemem low half cannot be narrowed          -- this
+    12 sites  vcvtph2ps / vcvtps2ph                        -- F16C
+     3 sites  lanereg3 wants a second helper
+     3 sites  vpermd has no legacy encoding
+
+#### The guard and the bug were in different functions
+
+All ten are `vcmpltps <rip>,%ymm,%ymm`, which carries a compare predicate in an
+imm8 after the displacement. `rip_target` refused any tail longer than six bytes:
+
+    if not rip_operand(tail) or len(tail) != 6:
+            return None     # an immediate would follow the displacement
+
+**That comment describes arithmetic which does not apply.** The displacement is
+measured from the END of the instruction and `length` already counts the immediate,
+so a trailing byte changes the target not at all. `rip_operand` has established mod
+00 with rm 101, so there is no SIB and the displacement is exactly `tail[2:6]`
+whatever follows it.
+
+What the refusal was protecting is `narrow_piece`'s RECONSTRUCTION, which rebuilt
+the tail as opcode, modrm and a corrected displacement -- **dropping the
+immediate**, turning `cmpps $1` into `cmpps` with whatever byte happened to follow.
+That is a real bug and it is one function away. The guard declined a whole class of
+instructions to avoid it.
+
+    delta  0: 0f c2 25 58c210fb 01
+    delta 16: 0f c2 25 68c210fb 01     displacement +16, predicate intact
+
+`encode_mem` carries the same hazard from the other side -- it rewrites the LAST
+four bytes as the displacement, which is only the displacement when nothing follows
+it. Nothing reaches it with an immediate today, since no FMA has one, and a silent
+corruption is the wrong thing to leave waiting for the first caller that does. It
+refuses instead.
+
+#### What it was worth, which is less than the class it fixed
+
+    frontier                                    1,890 -> 1,886      net -4
+      declined: 256-bit: arithmetic                  84 ->    72    -12
+      kept: its window was withheld                 998 -> 1,007     +9
+    windows not placed                            911 ->   920      +9
+
+**Twelve sites lowered and nine came back as newly-withheld windows.** Placing more
+windows means more swallowed VEX.128 writes and more blame edges, so windows that
+previously placed no longer do. Findings 300 to 302 escaped this because they were
+REMOVING blamers; this item adds placed windows and removes no reader, so the
+cascade runs the other way. The item is worth four sites, not twelve, and quoting
+the -12 on the class it fixed would be quoting the wrong number.
+
+`cmpconst` reads three lanes, one of them in the upper half and true while its
+neighbours are false, so a dropped predicate and a dropped upper half each miss.
+Restoring the old `!= 6` gives 2 refused and exit 29; the fix gives 77.
+
+#### What remains in the class, and whose it is
+
+39 of the 84 are `src2 is D` on an FP add or multiply -- the decision the copyright
+holder already holds. `vmulps %ymm1,%ymm0,%ymm1` has its second source equal to its
+destination, and SSE's two-operand `mulps %ymm0,%ymm1` computes the same product,
+but **x86 returns the FIRST source's NaN payload**, so commuting changes which NaN
+propagates. `COMMUTATIVE_YMM` excludes FP add and multiply for exactly that reason.
+
+When last raised this was 30 sites. Measured with the blame edges it is 39 sites
+plus a share of the 94 windows they alone hold. It is a new semantic deviation
+rather than an extension of an accepted one -- the FMA rounding rule was already
+project policy, this would not be -- which is what keeps it the holder's.
 
 ### Finding 302 -- msub and maddsub in a span, and 71 sites that were never the problem
 
