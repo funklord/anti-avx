@@ -11890,7 +11890,7 @@ already built and tested for the case.
 Everything below is what a fresh start needs and none of it is derivable from the
 code quickly.
 
-### Where it stands, 2026-09-18
+### Where it stands, 2026-09-23
 
     default build                         2,478 re-measured   (Finding 305)
     with --teb-scratch=auto               1,838 re-measured   (Finding 304)
@@ -11900,10 +11900,8 @@ code quickly.
 **The first two were re-measured on 2026-09-22, against each other, on the same
 tool.** ~~The default reproduced 2,687 exactly.~~ **It is 2,478, and it had been
 2,687 in this table for two days while every finding from 300 to 304 moved it.**
-None of that work is gated on the flag, so the shipping configuration improved by
-209 while the document went on quoting a figure taken before it -- in the status
-line, in this table, and in the sentence that used to be here. The auto build was
-re-measured after every one of those items and the default after none of them.
+None of that work is gated on the flag. The auto build was re-measured after every
+one of those items and the default after none of them -- Finding 305.
 
 The other two are the totals as they were reported, which still include the 180
 sequences that decode to nothing; subtracting 180 from each would be arithmetic
@@ -11922,18 +11920,88 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-Every remaining class is a measured floor or derivative of one:
+### The frontier, with `--teb-scratch=auto` (Finding 304)
 
-    in a window the repair dropped     1,177   closed on all three routes, Finding 286
-    declined by the collector            955   85% FMA, which has no SSE encoding
-    refused, stub not buildable          190   128 of it the same FMA floor once removed
-    undecodable, never classified        180   Finding 8's bytes, refused by rule
-    skipped for overlap                   13
-    in-place patch reverted               11
-    unaccounted                            0
+    kept: its window was withheld                        981
+    declined: outside .pdata                             319
+    declined: next instruction is a branch target        228
+    declined: next instruction will not move             106
+    declined: 256-bit: arithmetic rather than a copy       72
+    lost to an overlap or a refused stub                  40
+    never a candidate                                     31
+    declined: no SSE form at any register                 30
+    kept: a repair left it in VEX form                    23
+    and 180 that are not instructions                    180
 
-The census reconciles exactly; `unaccounted` is a real zero and was 85 until
-Finding 282.
+**~~Every remaining class is a measured floor.~~ That was said twice, of the
+withheld class, and was wrong both times.** It fell 1,227 -> 981 across Findings
+300 to 304 without anything being done to it: it is hostage to other classes, and
+the census's own layout -- which presents the buckets as a partition -- is what
+hid that.
+
+#### The instrument that found it, and how to pick with it
+
+`apply` writes `build/repair-blame.txt`, an edge per (withheld window, blaming
+reader). Joining it against `build/frontier-sites.txt` says which class is holding
+the withheld class hostage. Both files name their image in the first line, which
+they did not until a `check-pe` run silently replaced Starfield's 2,889 edges with
+a fixture's one -- Finding 240's rule, re-learned in Finding 302.
+
+**Pick by the cascade's SIGN, not by class size.** Of the readers blaming a
+withheld window, only those NOT themselves withheld release anything:
+
+  * lowering a **root blamer** removes blame and releases windows. Findings 300 to
+    302 and 304 each gained more sites than they lowered.
+  * lowering anything else ADDS placed windows, which swallow more VEX.128 writes
+    and create more blame. Finding 303 lowered twelve sites and gained four.
+
+**81% of withheld windows are avalanche rather than root blame** (Finding 305's
+measurement, reported in the 0a8ad4e commit): round one places everything, so its
+173 guilty windows are the only ones blamed by genuinely unlowerable readers, and
+the other 719 follow from them over 63 rounds. Each root blamer removed is worth
+about five windows, which is why 14 `msubadd` sites released 28.
+
+**The avalanche has no cheap brake, and that is measured rather than assumed.**
+3,818 of the 3,919 sites inside dropped windows are candidates in their own right
+and place through the ordinary overlap machinery once the covering window is gone;
+only 101 are passengers. Giving those a second chance is worth at most 101 sites.
+
+#### What is left, and whose it is
+
+Root blamers still to lower, from the last join:
+
+    vblendv*           14 blamers,  31 windows blamed ONLY by them
+    vfnmadd*           13 blamers,  17 windows
+    vpermd/vpshufb      6 blamers,  12 windows
+    vptest/vpmovmskb    7 blamers,   7 windows
+    F16C                4 blamers,   4 windows
+
+`vblendv` is the largest and the hardest: four operands, and SSE4.1's `blendvps`
+reads its mask only from the implicit `%xmm0`, so both halves must marshal it there
+and preserve what `xmm0` held. Finding 100 is what that costs when got wrong --
+offering only `%xmm0` as the scratch refused 600 sites with a register they could
+never use. `lower_blendv` already solves the 128-bit case.
+
+`vfnmadd` is the cheap one: the sequence exists, and the only gap is that
+`D = addend - product` cannot accumulate in one helper, so the upper half wants
+two.
+
+**Two decisions are the copyright holder's and neither is mine to take.**
+
+  * **`--teb-scratch=auto` as the default: 640 sites**, and the gap has been
+    WIDENING -- 341 when Finding 297 raised it. Every item since depends on the
+    slot machinery the TEB route feeds. Larger than every remaining item put
+    together. It changes what the shipped binary does at load time.
+  * **FP add and multiply with `src2 == D`**: 64 of the releasing blamers.
+    `vmulps %ymm1,%ymm0,%ymm1` commutes mathematically and SSE's two-operand form
+    computes the same product, but x86 returns the FIRST source's NaN payload, so
+    commuting changes which NaN propagates. `COMMUTATIVE_YMM` excludes FP add and
+    multiply for exactly that reason. Unlike the FMA rounding rule, which was
+    already project policy, this would be a NEW semantic deviation.
+
+**Starfield has never been RUN with any build from this arc.** Every claim here is
+structural -- `verify` and the fixtures. The last end-to-end evidence predates the
+`--shadow-regs=all` default.
 
 ### Landed: the constant TLS index is the default (Findings 291 to 295)
 
@@ -11942,76 +12010,61 @@ Worth 202 sites and a shorter prologue on 24,551 stubs, and the stub section is
 at load time, which no earlier default did: a chained TLS callback that patches the
 index into every stub. Starfield has not been run with it.
 
-### Superseded: what that item was, before it landed
+### Landed: the TEB route, and both FMA shapes (Findings 296 to 304)
 
-The block pointer wants two registers only because the index is in memory. A TLS
-callback can read it at process attach and patch it into each stub as a
-displacement, leaving a one-register chain that is also four bytes shorter and one
-dependent load cheaper. **The precondition is proved** -- the loader writes the
-index before a callback runs, `tlscallback` is the fixture -- and a fixture
-declaring `tls_cb` now gets a working callback.
+`--teb-scratch=auto` asks the loader for two TLS slots with `TlsAlloc` and patches
+the stubs from the same callback that fills the index. `TlsAlloc` returns 5 when
+the EXE's callbacks run with 59 of Starfield's 66 DLLs loaded under wine, against a
+register-free ceiling of 64 -- a floor, four game DLLs being absent here, and the
+callback checks the index it is given and refuses above 64 rather than trusting it.
+It dissolved the 1,878 no-dead-GPR refusals entirely.
 
-It should dissolve the 360 refusals where mode True has one dead GPR and no xmm to
-park the index in, plus part of the 263 and 154 xmm classes; expect well under 360
-sites delivered, on Finding 271's lesson. What is left to build: the one-register
-chain with a placeholder displacement, the callback and its RVA table emitted into
-the stub section, and `.avxsse` marked writable.
+Then the FMA family, in four steps, on the leverage the blame edges showed:
+memory-source `vfmadd` (Finding 300), register-only (301), `msub` and `maddsub`
+(302), `msubadd` (304). Ten fixtures gate them -- three orderings across two shapes
+plus `fmasub`, `fmaas`, `fmasa` -- each required to answer 29 with
+`--shadow-regs=off` so a fixture that never needed permanent slots cannot pass for
+the wrong reason.
 
-**The callback is CHAINED, not added** -- Finding 292. The image is `DYNAMIC_BASE`,
-so a new array would need relocations its entries do not have; overwriting the
-first existing slot reuses the relocation already on it, and the tool's callback
-tail-jumps to the original at base-plus-RVA. No new array, no relocation surgery.
-
-**Prefer this to the TEB route below**, which wants the same machinery and is
-blocked on something this one does not need.
-
-### The TEB route is unblocked (Finding 296)
-
-`TlsAlloc` returns **5** when the EXE's callbacks run, with 59 of Starfield's 66
-DLLs loaded under wine -- the runtime Proton gives it. Against a ceiling of 64.
-`tool/tlsslots.py` reproduces it; the answer is a floor, four game-specific DLLs
-being absent here.
-
-So the route's precondition holds and everything else it needs exists: the chained
-callback, the patch table, and 24,551 stubs already taking a patched displacement.
-It wants two `TlsAlloc` calls in the callback and a second patched field per
-teb-mode stub, and it is worth the 1,878 refusals that are the largest class left.
-
-The callback must still check the index it is given and refuse if it is 64 or more.
-A floor is not a guarantee, and refusing there means refusing to start -- which is
-a decision to take deliberately rather than discover.
+**What stays refused is deliberate and recorded where it is emitted.** `vfnmadd`
+wants two helpers, `D = addend - product` not being accumulable in one. `msubadd`
+is NOT register pressure: negating the addend to reuse `addsubps` is wrong, the
+negation being a sign-bit flip and a NaN having a sign bit, which `lower.py`
+measured as 291 disagreeing vectors in a special-value sweep. It blends two results
+instead.
 
 ### What the TEB route was blocked on, before it was measured
 
-**Reserve TLS slots at load time rather than squatting on a TEB offset**, worth 543
-sites and a shorter prologue on 19,174 stubs. Finding 289 measured it: `TlsAlloc`
-is already imported (IAT VA `0x143a3f3a8`), the callback array can be relocated
-safely, and the patch scope is 19,174 rather than the 200,000 first guessed.
+Kept because the shape recurs, not because it is open. Finding 289 measured the
+route as worth 543 sites and blocked on one number: what `TlsAlloc` returns when
+called from Starfield's own TLS callback, because only the 64-entry `TlsSlots`
+array at `gs:0x1480` is addressable with no register. It said the number needed a
+machine with the game.
 
-**It is blocked on whether `TlsAlloc`'s first index is below 64**, because only the
-64-entry `TlsSlots` array at `gs:0x1480` is addressable with no register, and the
-EXE's callbacks run after all 66 imported DLLs have had their `DllMain`. There is
-no retry, no ordering fix and no fallback -- Finding 289 has why for each.
+**It did not.** The rewritten binary runs under Proton, Proton is wine, and wine is
+on this machine -- so the question was never about the game but about the game's
+IMPORTS under that runtime, and a PE importing the same DLLs answers it. The answer
+is 5 (Finding 296). The route is built and is `--teb-scratch=auto`.
 
-**The number that unblocks it:** what `TlsAlloc` returns when called from
-Starfield's own TLS callback, on a machine with the game. Under 64 with room and
-this is a day's work; at or near 64 and the route is closed.
-
-Everything else in the default build is a measured floor -- see the census above --
-so if that number comes back bad, the frontier is where this architecture leaves it
-and the next move is a different representation rather than another shape.
+**The lesson is the one worth keeping**: a blocker stated as "needs hardware we do
+not have" is worth re-reading before it is believed, because the thing it actually
+needed was in the README.
 
 ### Decisions waiting on the copyright holder
 
-  * **The 30 FP add/mul sites in `src2 is D`** (Finding 284). They commute in
-    arithmetic and not in x86: with two NaN operands the result carries the FIRST
-    source's payload, so exchanging them changes the bytes. This tool is bit-exact
-    by rule (Finding 4). The other 42 of that class are taken; these are not.
-  * **Whether the runtime evidence is enough for the new default** (Finding 288).
-    A lowered site costs 2 to 3 ns on this host under wine, the two modes emit
-    identical stubs on ground both can lower, and the comparison on HOT code could
-    not be built at all -- `--shadow-regs=off` will not lower a loop body whose head
-    is a branch target. Settling it needs the game, which nothing in this tree runs.
+  * **`--teb-scratch=auto` as the default -- 640 sites**, and the gap has been
+    WIDENING: 341 when Finding 297 raised it, 640 at Finding 305, because every
+    item since depends on the slot machinery the TEB route feeds. Larger than every
+    remaining item put together. It changes what the shipped binary does at load
+    time: two `TlsAlloc` calls in a chained TLS callback, which then patches the
+    stubs.
+  * **FP add and multiply with `src2 == D`** (Finding 284, re-sized at 303). They
+    commute in arithmetic and not in x86: with two NaN operands the result carries
+    the FIRST source's payload, so exchanging them changes the bytes, and
+    `COMMUTATIVE_YMM` excludes FP add and multiply for that reason. Raised as 30
+    sites; measured against the blame edges it is 64 of the releasing blamers, so
+    it also holds withheld windows. Unlike the FMA rounding rule, which was already
+    project policy since Finding 4, this would be a NEW semantic deviation.
 
 ### Two claims that are scoped, not current
 
@@ -12032,7 +12085,11 @@ re-running it should replace the address as well as the count.
     `~/.claude/tool/` on 2026-09-18 and another session was mid-sync on them. Do not
     stage either without checking whose work it is.
 
-### The two decisions that are not the implementer's
+### Two architecture questions, one answered and one open
+
+**Not the same list as *Decisions waiting on the copyright holder* above**, which
+holds what is live. This is the architecture history: the first was answered against
+its own recorded objection, and the second is a design question nobody has started.
 
 1. ~~**May a stub spill?**~~ **Answered: no, and it was never a decision.** Finding 46
    showed the recorded objection was misattributed, Finding 48 removed it, and Finding
@@ -12086,6 +12143,11 @@ re-running it should replace the address as well as the count.
    the 1,674 capacity figure -- that is room, not reach.
 
 ### Where the residue actually is
+
+**Superseded as a census -- read *The frontier* near the top of this section for the
+current one.** The buckets below are a 2026-09-01 measurement of a build three
+defaults ago, kept for the shape of the argument rather than the counts, every one of
+which has moved. Re-measure before quoting any figure from here.
 
 **Re-measured 2026-09-01, on the default build, which is `--spill=tls` since Finding
 142.** `make detour-plan` names every refusal and `make census` reconciles them against
