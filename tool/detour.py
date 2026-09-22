@@ -15582,6 +15582,29 @@ def apply_all(binary, listing, output):
 					out.write(f"{at:#x}\n")
 			print(f"apply:   {len(REPAIR_READERS):,} distinct surviving "
 			      f"reader(s) did the blaming, written to {roll}")
+		# **Do the sites inside a dropped window have candidates of
+		# their own?** 81% of the withheld windows are avalanche
+		# rather than root blame -- dropping one un-swallows its
+		# members, which become surviving 256-bit readers and blame
+		# further windows. If those members are candidates in their
+		# own right they should place once the window covering them
+		# is gone; if they are passengers with no candidate, they have
+		# no second chance and the avalanche has no brake.
+		# Finding 305.
+		starts = {item[0] for item in candidates}
+		widths = {item[0]: item[4] for item in candidates}
+		sites = sorted(row[0] for row in instructions
+		               if row[1][:1] in (b"\xc4", b"\xc5"))
+		inside, standalone = 0, 0
+		for window in dropped:
+			width = widths.get(window, 0)
+			for at in sites[bisect.bisect_left(sites, window):
+			                bisect.bisect_left(sites, window + width)]:
+				inside += 1
+				standalone += at in starts
+		print(f"apply:   {inside:,} VEX site(s) lie in dropped windows; "
+		      f"{standalone:,} are candidates in their own right and "
+		      f"{inside - standalone:,} are passengers with none")
 		edges = Path("build") / "repair-blame.txt"
 		if edges.parent.is_dir():
 			with edges.open("w", encoding="utf-8") as out:
