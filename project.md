@@ -7,13 +7,21 @@ Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 
 **Status:** the rewriter works. `tool/detour.py` rewrites **802,264 of 804,951 VEX
 sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` invariant
-holds on the result. 2,687 sites are left, and 180 further VEX-prefixed byte sequences
+holds on the result. 2,478 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
 **`--teb-scratch=auto` takes it to 1,838** (Findings 297 and 300 to 304), which is
-not the default: it asks the loader for two TLS slots and patches the stubs from a callback,
-and whether that becomes the default is the copyright holder's call rather than this
-document's.
+not the default: it asks the loader for two TLS slots and patches the stubs from a
+callback, and whether that becomes the default is the copyright holder's call rather
+than this document's.
+
+**That gap is 640 sites and it has been WIDENING.** Finding 297 measured it at 341.
+Every item since has depended on the slot machinery the TEB route feeds, so each one
+moved the auto build further than the default: without a block pointer that can stand
+up, `256-bit: arithmetic rather than a copy` is 632 in the default against 72 with the
+flag, `ymm value has no known upper half` 107 against 2, and `no store before 256-bit
+arithmetic` 59 against 2. The decision is larger than it was when it was raised, and
+larger than every remaining item put together. Finding 305.
 
 The default became `--shadow-regs=all` on 2026-09-18 (Finding 287), which is where the
 2,622-site fall from 5,691 comes from. **The Proton observation is older than that build**
@@ -11884,18 +11892,23 @@ code quickly.
 
 ### Where it stands, 2026-09-18
 
-    default build                         2,687 VEX left      99.67%
+    default build                         2,478 re-measured   (Finding 305)
     with --teb-scratch=auto               1,838 re-measured   (Finding 304)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**The first two were re-measured on 2026-09-20, against each other, on the same
-tool.** The default reproduced 2,687 exactly, which is what says the callback and
-emitter changes Finding 297 made are inert unless the flag is passed. The other
-two are the totals as they were reported, which still include the 180 sequences
-that decode to nothing; subtracting 180 from each would be arithmetic rather than
-a measurement, and the count is only known to be 180 for the default. Re-measure
-before quoting either.
+**The first two were re-measured on 2026-09-22, against each other, on the same
+tool.** ~~The default reproduced 2,687 exactly.~~ **It is 2,478, and it had been
+2,687 in this table for two days while every finding from 300 to 304 moved it.**
+None of that work is gated on the flag, so the shipping configuration improved by
+209 while the document went on quoting a figure taken before it -- in the status
+line, in this table, and in the sentence that used to be here. The auto build was
+re-measured after every one of those items and the default after none of them.
+
+The other two are the totals as they were reported, which still include the 180
+sequences that decode to nothing; subtracting 180 from each would be arithmetic
+rather than a measurement, and the count is only known to be 180 for the default.
+Re-measure before quoting either.
 
 **The fixed-offset row is the one to distrust**, not because the number is wrong
 but because `--teb-scratch=<offset>` names bytes in somebody else's TEB and
@@ -13926,6 +13939,47 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 305 -- the number that ships was the one nobody re-measured
+
+The auto build was re-measured after every item from Finding 300 to 304. The default
+was re-measured after none of them, and none of that work is gated on the flag.
+
+    default build          2,687 -> 2,478      the document said 2,687 throughout
+    --teb-scratch=auto     2,346 -> 1,838
+
+**209 sites, quoted wrong for two days**, in the status line at the top of this
+document, in the handover table, and in a sentence asserting the default "reproduced
+2,687 exactly". That sentence was true when written -- Finding 297 verified it as a
+control -- and it stopped being true four findings later, which is the shelf life of
+a countable present-tense claim in a document read by lookup.
+
+The tell is worth keeping: **every other number in this arc was re-derived after each
+change and this one was re-quoted.** A figure that is measured once and cited
+thereafter is indistinguishable from a figure that is measured continuously, right up
+until someone re-runs it.
+
+#### And the gap has been widening
+
+    that gap                Finding 297:  341      now:  640
+
+Every item since has depended on the slot machinery the TEB route feeds, so each moved
+the auto build further than the default:
+
+                                                  default    auto
+    256-bit: arithmetic rather than a copy            632      72
+    ymm value has no known upper half                 107       2
+    256-bit: no store before 256-bit arithmetic        59       2
+    the constant is read by something that will
+      not reload it                                    55       -
+
+Without a block pointer that can stand up, sites the slot representation would take
+fall back into classes that refuse them. So the standing question -- whether
+`--teb-scratch=auto` becomes the default -- is now worth more than every remaining
+item put together, and it was worth half this when it was raised.
+
+**It remains the copyright holder's**: it changes what the shipped binary does at load
+time, asking the loader for two TLS slots and patching stubs from a callback.
 
 ### Finding 304 -- picking by the cascade's SIGN, and msubadd's blend
 
