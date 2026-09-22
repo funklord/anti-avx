@@ -232,7 +232,8 @@ check-shadow-pe:
 	mkdir -p $(PE_PREFIX); \
 	for name in crossregion laneswap lanemem bcast permmem permil onegpr nogpr noxmm regmove nonvol unwindsave \
 	            backward backtarget commute laneconv \
-	            fmamem fma231 fma132 fmareg fmareg213 fmareg132; do \
+	            fmamem fma231 fma132 fmareg fmareg213 fmareg132 \
+	            fmasub fmaas; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \

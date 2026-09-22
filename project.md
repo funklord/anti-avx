@@ -10,8 +10,8 @@ sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` inva
 holds on the result. 2,687 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
-**`--teb-scratch=auto` takes it to 2,014** (Findings 297, 300 and 301), which is not
-the default: it asks the loader for two TLS slots and patches the stubs from a callback,
+**`--teb-scratch=auto` takes it to 1,890** (Findings 297 and 300 to 302), which is
+not the default: it asks the loader for two TLS slots and patches the stubs from a callback,
 and whether that becomes the default is the copyright holder's call rather than this
 document's.
 
@@ -11885,7 +11885,7 @@ code quickly.
 ### Where it stands, 2026-09-18
 
     default build                         2,687 VEX left      99.67%
-    with --teb-scratch=auto               2,014 re-measured   (Finding 301)
+    with --teb-scratch=auto               1,890 re-measured   (Finding 302)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -13926,6 +13926,81 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 302 -- msub and maddsub in a span, and 71 sites that were never the problem
+
+Finding 301 left 123 packed FMA sites in the frontier. Taken as a class that reads
+as the next item; broken down by FORM and by REASON it is two different problems:
+
+    madd     71 sites   ALL "kept: its window was withheld"  -- these already lower
+    maddsub  14 sites   "no SSE form at any register"
+    msubadd  14 sites   "no SSE form at any register"
+    nmadd    13 sites   "no SSE form at any register"
+    msub     11 sites   "no SSE form at any register"
+
+**71 of the 123 were never a lowering problem.** They lower; their windows do not
+place. Spending the item on "123 FMA sites" would have spent most of it on sites
+that needed nothing done to them.
+
+#### msub and maddsub
+
+    frontier                                  2,014 -> 1,890
+      declined: no SSE form at any register      69 ->    44
+      kept: its window was withheld           1,085 ->   998
+    windows not placed                          994 ->   911
+    unconditional lowering refusals             324 ->   274
+
+**The -25 is exactly msub 11 plus maddsub 14**, the first prediction in this arc to
+match to the unit. The other 87 came out of the withheld class: ordinary
+instructions in windows released because their last FMA blamer lowered. 83 windows
+went, each needing EVERY reader blaming it gone.
+
+`maddsub` is SSE3's `addsubps` -- subtract on the even lanes, add on the odd, which
+is VFMADDSUB exactly. `lower.py` has emitted it on the plain path all along and
+records having confirmed the lane pattern by RUNNING it rather than by reading the
+manual.
+
+#### A bug in code that was already shipped
+
+The 231 low half emitted `addps helper,D`, which is correct **only because addition
+commutes**. `subps` and `addsubps` do not. 231 accumulates in the helper and moves
+back now, for every operation rather than only the ones that need it: a form that
+is right for one operation and silently wrong for the next is worth three bytes to
+avoid. All six `madd` fixtures re-pass unchanged.
+
+#### What is declined, and why it is written down
+
+    28  vfmsubadd231ps    no subadd instruction exists
+    28  shape four operands
+    20  vfnmadd*          D = addend - product cannot accumulate in one helper
+
+**`msubadd` is not register pressure.** The obvious move is to negate the addend
+and reuse `addsubps`, since IEEE 754 makes `a - b` and `a + (-b)` the same
+operation. That is WRONG: the negation is a sign-bit flip across the register, a
+NaN has a sign bit, and x86 propagates a source NaN with its sign. `lower.py`
+blends two results instead, which needs a constant. **It records that the error was
+caught by `test/fmaddsub_test.c` rather than by reasoning** -- and reading that
+paragraph is the only reason this pass did not reimplement the same mistake in the
+span path.
+
+#### A roll file that lost its image
+
+`repair-blame.txt` was found at 40 bytes: a `check-pe` run had overwritten
+Starfield's 2,889 edges with a fixture's one, and nothing said so. That is Finding
+240's rule -- name the image, because the path is fixed -- which
+`frontier-sites.txt` has carried for months and which the two files added in
+Finding 300 did not. Both carry it now.
+
+**It was caught only because 40 bytes is obviously not an edge list.** A fixture
+with a few hundred rows would have read as plausible data, and the next item would
+have been picked from a fixture's blame graph.
+
+#### Where the arc ends
+
+2,346 to 1,890 over Findings 300 to 302, and roughly half of the 456 were never FMA
+instructions -- they were hostages in withheld windows. That class was called a
+floor twice, on two separate measurements, before the blame edges showed it was
+waiting on another class.
 
 ### Finding 301 -- the register-only FMA, and a class that was waiting on another class
 

@@ -343,7 +343,24 @@ def encode_mem(prefix, opcode, reg, vex, tail, address, encoding, at):
 # multiply-add sequence is a CORRECTNESS bug rather than a precision one,
 # because they alternate add and subtract across the lanes, and
 # `test/fmaddsub_test.c` exists to demonstrate exactly that. Finding 300.
-FMA_SPAN_FORMS = frozenset(f"vfmadd{order}{width}"
+# **Which operation each form applies to the product**, and the ones a
+# span can emit. `madd` and `msub` differ only in an opcode byte;
+# `maddsub` is SSE3's `addsubps`, which subtracts on the even lanes and
+# adds on the odd ones -- exactly VFMADDSUB, as `lower.py` records
+# having confirmed by running it rather than by reading the manual.
+#
+# `nmadd` is absent because `D = addend - product` cannot accumulate in
+# the helper: the product has to exist before the addend is read, so the
+# upper half wants two registers where these want one. `msubadd` is
+# absent for a reason that is not register pressure -- there is no
+# subadd instruction, and negating the addend to reuse `addsubps` is
+# WRONG, because the negation is a sign-bit flip and a NaN has a sign
+# bit. `lower.py` blends two results instead, which needs a constant.
+# Both are recorded rather than forgotten. Findings 4 and 302.
+FMA_SPAN_OPS = {"madd": b"\x0f\x58", "msub": b"\x0f\x5c",
+                "maddsub": b"\x0f\xd0"}
+FMA_SPAN_FORMS = frozenset(f"vf{operation}{order}{width}"
+                           for operation in ("madd", "msub", "maddsub")
                            for order in ("132", "213", "231")
                            for width in ("ps", "pd"))
 
@@ -5768,26 +5785,37 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 				return refuse("lanereg3 source is in no slot")
 			if block is None:
 				return refuse("FMA member wants a per-thread block")
-			order = FMA_PATTERN.match(mnemonic).group(3)
-			prefix = FMA_PREFIX[mnemonic[-2:]]
-			mul, add = b"\x0f\x59", b"\x0f\x58"
+			what_op, order = FMA_PATTERN.match(mnemonic).group(2, 3)
+			kind = mnemonic[-2:]
+			prefix = FMA_PREFIX[kind]
+			mul, combine = b"\x0f\x59", FMA_SPAN_OPS[what_op]
+			# **`addsubps` is F2-prefixed where `addps` has none**, so
+			# the combining opcode carries its own prefix rather than
+			# the multiply's. `addsubpd` is 66 like the rest of pd.
+			joint = (0xF2 if kind == "ps" else 0x66) \
+				if what_op == "maddsub" else prefix
 			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
 			low_s2 = scratch_finder.xmm_numbers(shape[2])[0]
 			low_s1 = scratch_finder.xmm_numbers(shape[3])[0]
-			if order == "213":		# D = S1 * D + S2
+			if order == "213":		# D = S1 op* D . S2
 				body += encode_rr(prefix, mul, low_dst, low_s1)
-				body += encode_rr(prefix, add, low_dst, low_s2)
-			elif order == "132":		# D = D * S2 + S1
+				body += encode_rr(joint, combine, low_dst, low_s2)
+			elif order == "132":		# D = D op* S2 . S1
 				body += encode_rr(prefix, mul, low_dst, low_s2)
-				body += encode_rr(prefix, add, low_dst, low_s1)
-			else:				# 231: D = S1 * S2 + D
-				# The only ordering whose destination is the ADDEND, so
-				# the product needs somewhere to live. `helper` is free
-				# here -- the upper half reloads it from a slot on the
-				# next line but one.
+				body += encode_rr(joint, combine, low_dst, low_s1)
+			else:
+				# **231 accumulates in the helper and moves back**, for
+				# every operation and not only the ones that need it.
+				# Its destination is the ADDEND, so the product needs
+				# somewhere to live -- and `addps h,D` would have been
+				# right only because addition commutes. `subps` and
+				# `addsubps` do not, and a form that is correct for one
+				# operation and silently wrong for the next is worth
+				# three bytes to avoid. Finding 302.
 				body += encode_rr(None, MOVAPS, helper, low_s1)
 				body += encode_rr(prefix, mul, helper, low_s2)
-				body += encode_rr(prefix, add, low_dst, helper)
+				body += encode_rr(joint, combine, helper, low_dst)
+				body += encode_rr(None, MOVAPS, low_dst, helper)
 
 			# The upper half accumulates in `helper` and names the other
 			# two slots by address.
@@ -5798,8 +5826,9 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			}[order]
 			body += span_slot_move(helper, False, base, load, block,
 			                       at + len(body))
-			for opcode, which in ((mul, first), (add, then)):
-				piece = span_slot_op(prefix, opcode, helper, base, which,
+			for opcode, pfx, which in ((mul, prefix, first),
+			                           (combine, joint, then)):
+				piece = span_slot_op(pfx, opcode, helper, base, which,
 				                     block)
 				if piece is None:
 					return refuse("FMA high half cannot reach a slot")
@@ -5957,34 +5986,39 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 				return refuse("lanemem source is in no slot")
 			if block is None:
 				return refuse("FMA member wants a per-thread block")
-			order = FMA_PATTERN.match(mnemonic).group(3)
+			what_op, order = FMA_PATTERN.match(mnemonic).group(2, 3)
 			kind = mnemonic[-2:]
 			prefix = FMA_PREFIX[kind]
-			mul, add = b"\x0f\x59", b"\x0f\x58"
+			mul, combine = b"\x0f\x59", FMA_SPAN_OPS[what_op]
+			joint = (0xF2 if kind == "ps" else 0x66) \
+				if what_op == "maddsub" else prefix
 			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
 			low_s1 = scratch_finder.xmm_numbers(shape[2])[0]
 
-			def at_mem(opcode, reg, delta):
-				return fma_mem_piece(vex, tail, prefix, opcode, reg,
+			def at_mem(opcode, pfx, reg, delta):
+				return fma_mem_piece(vex, tail, pfx, opcode, reg,
 				                     delta, address, encoding,
 				                     at + len(body))
 
-			if order == "213":		# D = S1 * D + mem
+			if order == "213":		# D = S1 op* D . mem
 				body += encode_rr(prefix, mul, low_dst, low_s1)
-				piece = at_mem(add, low_dst, 0)
-			elif order == "132":		# D = D * mem + S1
-				piece = at_mem(mul, low_dst, 0)
+				piece = at_mem(combine, joint, low_dst, 0)
+			elif order == "132":		# D = D op* mem . S1
+				piece = at_mem(mul, prefix, low_dst, 0)
 				if piece is None:
 					return refuse("FMA low half cannot reach its operand")
 				body += piece
-				piece = encode_rr(prefix, add, low_dst, low_s1)
-			else:				# 231: D = S1 * mem + D
+				piece = encode_rr(joint, combine, low_dst, low_s1)
+			else:
+				# 231, and the same move-back as `lanereg3`: the
+				# destination is the addend, and only addition commutes.
 				body += encode_rr(None, MOVAPS, helper, low_s1)
-				piece = at_mem(mul, helper, 0)
+				piece = at_mem(mul, prefix, helper, 0)
 				if piece is None:
 					return refuse("FMA low half cannot reach its operand")
 				body += piece
-				piece = encode_rr(prefix, add, low_dst, helper)
+				body += encode_rr(joint, combine, helper, low_dst)
+				piece = encode_rr(None, MOVAPS, low_dst, helper)
 			if piece is None:
 				return refuse("FMA low half cannot reach its operand")
 			body += piece
@@ -5998,23 +6032,21 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			load = second if order == "231" else slot
 			body += span_slot_move(helper, False, base, load, block,
 			                       at + len(body))
-			if order == "213":		# h = S1h * h + mem16
+			if order == "213":		# h = S1h op* h . mem16
 				piece = span_slot_op(prefix, mul, helper, base, second,
 				                     block)
-			elif order == "132":		# h = h * mem16 + S1h
-				piece = at_mem(mul, helper, SLOT)
-			else:				# 231: h = S1h * mem16 + Dh
-				piece = at_mem(mul, helper, SLOT)
+			else:				# 132 and 231 multiply by memory
+				piece = at_mem(mul, prefix, helper, SLOT)
 			if piece is None:
 				return refuse("FMA high half cannot reach its operand")
 			body += piece
 			if order == "213":
-				piece = at_mem(add, helper, SLOT)
+				piece = at_mem(combine, joint, helper, SLOT)
 			elif order == "132":
-				piece = span_slot_op(prefix, add, helper, base, second,
-				                     block)
+				piece = span_slot_op(joint, combine, helper, base,
+				                     second, block)
 			else:
-				piece = span_slot_op(prefix, add, helper, base, slot,
+				piece = span_slot_op(joint, combine, helper, base, slot,
 				                     block)
 			if piece is None:
 				return refuse("FMA high half cannot reach its operand")
@@ -15408,7 +15440,16 @@ def apply_all(binary, listing, output):
 		roll = Path("build") / "repair-readers.txt"
 		if roll.parent.is_dir():
 			with roll.open("w", encoding="utf-8") as out:
-				out.write(f"# {len(REPAIR_READERS)} distinct reader(s)\n")
+				# **Name the image, because the path is fixed.** Finding
+				# 240 wrote this rule for `frontier-sites.txt` and these
+				# two files were added without it: a `check-pe` run
+				# overwrote Starfield's 903 readers and 2,889 edges with
+				# a fixture's one and one, and nothing said so. It was
+				# caught only because 40 bytes is obviously not an
+				# edge list -- a fixture with more rows would have read
+				# as data. Finding 302.
+				out.write(f"# {binary}\t{len(REPAIR_READERS)} "
+				          f"distinct reader(s)\n")
 				for at in sorted(REPAIR_READERS):
 					out.write(f"{at:#x}\n")
 			print(f"apply:   {len(REPAIR_READERS):,} distinct surviving "
@@ -15416,7 +15457,7 @@ def apply_all(binary, listing, output):
 		edges = Path("build") / "repair-blame.txt"
 		if edges.parent.is_dir():
 			with edges.open("w", encoding="utf-8") as out:
-				out.write("# window\treader\n")
+				out.write(f"# {binary}\twindow\treader\n")
 				for window in sorted(REPAIR_BLAMED_BY):
 					if window not in dropped:
 						continue
