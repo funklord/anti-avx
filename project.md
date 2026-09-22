@@ -10,7 +10,7 @@ sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` inva
 holds on the result. 2,687 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
-**`--teb-scratch=auto` takes it to 1,886** (Findings 297 and 300 to 303), which is
+**`--teb-scratch=auto` takes it to 1,838** (Findings 297 and 300 to 304), which is
 not the default: it asks the loader for two TLS slots and patches the stubs from a callback,
 and whether that becomes the default is the copyright holder's call rather than this
 document's.
@@ -11885,7 +11885,7 @@ code quickly.
 ### Where it stands, 2026-09-18
 
     default build                         2,687 VEX left      99.67%
-    with --teb-scratch=auto               1,886 re-measured   (Finding 303)
+    with --teb-scratch=auto               1,838 re-measured   (Finding 304)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -13926,6 +13926,75 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 304 -- picking by the cascade's SIGN, and msubadd's blend
+
+Finding 303 lowered twelve sites and gained four: it added placed windows without
+removing any reader, so nine sites fell back into the withheld class. Findings 300
+to 302 gained more than they lowered, because they removed BLAMERS. The difference
+is not the size of a class, it is which direction the cascade runs -- and the blame
+edges say so in advance.
+
+Of 698 readers holding 920 withheld windows, only **151 are not themselves
+withheld**. Those are the sites whose lowering releases anything; a withheld blamer
+is circular and releases nothing until something upstream moves.
+
+    vfmsubadd*         14 blamers,  34 windows blamed ONLY by them
+    vblendv*           14 blamers,  31 windows
+    vfnmadd*           13 blamers,  17 windows
+    vptest/vpmovmskb    7 blamers,   7 windows
+    F16C                4 blamers,   4 windows
+    vmulps 28, vdivps 10, vaddps 8, vsubps 7, vpand 5, vmulpd 5
+                                             -- largely the FP-commute decision
+
+#### What it was worth
+
+    frontier                                  1,886 -> 1,838      -48
+      declined: no SSE form at any register      44 ->    30      -14
+      kept: its window was withheld           1,007 ->   981      -26
+      lost to an overlap or a refused stub       46 ->    40       -6
+    windows not placed                          920 ->   892      -28
+
+**14 lowered, 28 windows released, 48 net** against a prediction of 14 plus up to
+34. That is the closest any leverage estimate in this arc has come, and the reason
+is that the item was chosen for its sign rather than its size.
+
+#### The construction is `lower.py`'s, and the instinct was wrong
+
+There is no subadd instruction. The obvious move is to negate the addend and reuse
+`addsubps`, since IEEE 754 makes `a - b` and `a + (-b)` the same operation, signed
+zeros included. **That is wrong.** The negation is a sign-bit flip across the whole
+register, a NaN has a sign bit, and x86 propagates a source NaN with its sign
+preserved. `lower.py` records measuring **291 disagreeing vectors in a
+special-value sweep, every one a NaN**, the addend coming out `ffc00000` where the
+hardware gives `7fc00000`.
+
+Computing both results and blending performs the very add and subtract the hardware
+does, so NaN propagation matches by construction -- and it needs no sign-mask
+constant, so the rewriter still needs no read-only pool.
+
+    movaps %xmm1,%xmm4          low:  product
+    mulps  %xmm2,%xmm4
+    movaps %xmm4,%xmm5                copy
+    addps  %xmm0,%xmm4                P + D
+    subps  %xmm0,%xmm5                P - D
+    blendps $0xa,%xmm5,%xmm4          odd lanes from the subtract
+    mulps  0x70(%r11),%xmm4     high: the same between slots
+    addps  0x50(%r11),%xmm4
+    subps  0x50(%r11),%xmm5
+    blendps $0xa,%xmm5,%xmm4
+
+It is the one FMA form that does NOT take the one-helper carve-out: the blend needs
+both results live, which is the two `TWO_HELPERS` allocates for its shape anyway.
+
+#### Two guards that fired during the work rather than after
+
+`pe_build` refused a **duplicate `cmpconst`** that a copied slice had introduced --
+its own check, whose message says a second definition "would silently replace the
+first and every gate naming it would keep passing". And the `lanemem` branch would
+have matched `msubadd` with a `None` opcode; it refuses instead, because all 14 of
+Starfield's are register-only and an emitter with no fixture is what this file
+keeps being caught by.
 
 ### Finding 303 -- a guard one function away from the bug it was written for
 

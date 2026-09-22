@@ -365,9 +365,38 @@ def encode_mem(prefix, opcode, reg, vex, tail, address, encoding, at):
 # bit. `lower.py` blends two results instead, which needs a constant.
 # Both are recorded rather than forgotten. Findings 4 and 302.
 FMA_SPAN_OPS = {"madd": b"\x0f\x58", "msub": b"\x0f\x5c",
-                "maddsub": b"\x0f\xd0"}
+                "maddsub": b"\x0f\xd0", "msubadd": None}
+
+# **`msubadd` computes both results and blends**, which is `lower.py`'s
+# construction and not a choice. There is no subadd instruction, and the
+# obvious move -- negate the addend and reuse `addsubps`, since IEEE 754
+# makes `a - b` and `a + (-b)` the same operation -- is WRONG: the
+# negation is a sign-bit flip across the register, a NaN has a sign bit,
+# and x86 preserves it. `lower.py` measured 291 vectors disagreeing in a
+# special-value sweep, every one a NaN, with the addend coming out
+# `ffc00000` where the hardware gives `7fc00000`.
+#
+# Doing the add and the subtract the hardware does makes NaN propagation
+# match by construction, and it needs no sign-mask constant -- so the
+# rewriter needs no read-only pool for this rule. It costs a second
+# scratch, which `TWO_HELPERS` already allocates for `lanereg3`.
+#
+# `blendps $0xa` takes lanes 1 and 3 from the source: odd lanes from the
+# subtract, even from the add, which is VFMSUBADD. Finding 304.
+BLEND_OPCODE = {"ps": b"\x0f\x3a\x0c", "pd": b"\x0f\x3a\x0d"}
+BLEND_ODD = {"ps": 0x0A, "pd": 0x02}
+
+# The FMA forms a span emits with ONE helper. `msubadd` is not among
+# them: its blend needs both results live at once, so it wants the two
+# that `TWO_HELPERS` allocates for its shape anyway. Finding 304.
+FMA_ONE_HELPER = frozenset(f for f in
+                           (f"vf{op}{order}{width}"
+                            for op in ("madd", "msub", "maddsub")
+                            for order in ("132", "213", "231")
+                            for width in ("ps", "pd")))
 FMA_SPAN_FORMS = frozenset(f"vf{operation}{order}{width}"
-                           for operation in ("madd", "msub", "maddsub")
+                           for operation in ("madd", "msub", "maddsub",
+                                             "msubadd")
                            for order in ("132", "213", "231")
                            for width in ("ps", "pd"))
 
@@ -5795,6 +5824,72 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
+		if what == "lanereg3" and mnemonic in FMA_SPAN_FORMS \
+				and FMA_PATTERN.match(mnemonic).group(2) == "msubadd":
+			# **Both results, then a blend.** See FMA_SPAN_OPS: there
+			# is no subadd instruction and negating the addend to reuse
+			# `addsubps` flips a NaN's sign bit, which the hardware
+			# preserves. Doing the add and the subtract the hardware
+			# does makes NaN propagation match by construction.
+			#
+			# Uniform across the orderings rather than multiplying in
+			# place for two of them: the product has to survive into a
+			# copy, so there is nothing to gain by putting it in the
+			# destination. Finding 304.
+			if second is None or third is None:
+				return refuse("lanereg3 source is in no slot")
+			if block is None:
+				return refuse("FMA member wants a per-thread block")
+			if second_helper is None:
+				return refuse("msubadd wants a second helper")
+			order = FMA_PATTERN.match(mnemonic).group(3)
+			kind = mnemonic[-2:]
+			prefix = FMA_PREFIX[kind]
+			mul, add = b"\x0f\x59", b"\x0f\x58"
+			take = b"\x0f\x5c"
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			low_s2 = scratch_finder.xmm_numbers(shape[2])[0]
+			low_s1 = scratch_finder.xmm_numbers(shape[3])[0]
+			first, other, addend = {
+				"132": (low_dst, low_s2, low_s1),
+				"213": (low_s1, low_dst, low_s2),
+				"231": (low_s1, low_s2, low_dst),
+			}[order]
+			body += encode_rr(None, MOVAPS, helper, first)
+			body += encode_rr(prefix, mul, helper, other)
+			body += encode_rr(None, MOVAPS, second_helper, helper)
+			body += encode_rr(prefix, add, helper, addend)
+			body += encode_rr(prefix, take, second_helper, addend)
+			body += encode_rr(0x66, BLEND_OPCODE[kind], helper,
+			                  second_helper, BLEND_ODD[kind])
+			body += encode_rr(None, MOVAPS, low_dst, helper)
+
+			# The same shape between slots, the addend read twice as a
+			# memory operand because both results need it.
+			sf, so, sa = {
+				"132": (slot, second, third),
+				"213": (third, slot, second),
+				"231": (third, second, slot),
+			}[order]
+			body += span_slot_move(helper, False, base, sf, block,
+			                       at + len(body))
+			for opcode, into, which in ((mul, helper, so),):
+				piece = span_slot_op(prefix, opcode, into, base, which,
+				                     block)
+				if piece is None:
+					return refuse("msubadd cannot reach a slot")
+				body += piece
+			body += encode_rr(None, MOVAPS, second_helper, helper)
+			for opcode, into in ((add, helper), (take, second_helper)):
+				piece = span_slot_op(prefix, opcode, into, base, sa, block)
+				if piece is None:
+					return refuse("msubadd cannot reach a slot")
+				body += piece
+			body += encode_rr(0x66, BLEND_OPCODE[kind], helper,
+			                  second_helper, BLEND_ODD[kind])
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
 		if what == "lanereg3" and mnemonic in FMA_SPAN_FORMS:
 			# **The same sequence with a third slot instead of a memory
 			# operand.** `lanereg3` is `op S2,S1,D` with every operand a
@@ -6014,6 +6109,14 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			what_op, order = FMA_PATTERN.match(mnemonic).group(2, 3)
 			kind = mnemonic[-2:]
 			prefix = FMA_PREFIX[kind]
+			if FMA_SPAN_OPS[what_op] is None:
+				# `msubadd` needs both results and a blend, which the
+				# register form below emits and this one does not.
+				# Every one of Starfield's 14 is register-only, so the
+				# shape has no site to be written against -- and an
+				# emitter with no fixture is the thing this file keeps
+				# being caught by. Finding 304.
+				return refuse(f"member {mnemonic} wants the blend form")
 			mul, combine = b"\x0f\x59", FMA_SPAN_OPS[what_op]
 			joint = (0xF2 if kind == "ps" else 0x66) \
 				if what_op == "maddsub" else prefix
@@ -7284,7 +7387,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		need = 2 if any(kind in TWO_HELPERS
 		                and not (kind == "lanereg3"
 		                         and instructions[position][2]
-		                         in FMA_SPAN_FORMS)
+		                         in FMA_ONE_HELPER)
 		                for kind, position, _r in members) \
 			else 1
 		taken = []
