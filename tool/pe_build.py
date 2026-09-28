@@ -654,6 +654,105 @@ tls_directory:
 """)
 
 
+PROGRAMS["fnmreg"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	twos(%rip), %rdx
+	leaq	addend(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* 2.0 in every lane */
+	vmovups	(%rax), %ymm2		/* 3.0 in every lane */
+	vfnmadd231ps %ymm2, %ymm1, %ymm0	/* ymm0 = ymm1*ymm2 + ymm0 */
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0: 2*3+1 = 7 */
+	cvttss2si 16(%rdi), %ecx	/* lane 4: 2*3+5 = 11 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7: 2*3+8 = 14 */
+	addl	%ecx, %eax		/* 7 + 11 + 14 = 32 */
+	addl	$81, %eax		/* 32 + 45 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+twos:	.float 2.0, 2.0, 2.0, 2.0
+	.float 2.0, 2.0, 2.0, 2.0
+	.p2align 5
+addend:	.float 3.0, 3.0, 3.0, 3.0
+	.float 3.0, 3.0, 3.0, 3.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+PROGRAMS["fnmmem"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	twos(%rip), %rdx
+	leaq	addend(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* 2.0 in every lane */
+	vfnmadd231ps (%rax), %ymm1, %ymm0	/* ymm0 = ymm1*ymm0 + mem */
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0: 1*2+1 = 3 */
+	cvttss2si 16(%rdi), %ecx	/* lane 4: 5*2+1 = 11 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7: 8*2+1 = 17 */
+	addl	%ecx, %eax		/* 3 + 11 + 17 = 31 */
+	addl	$81, %eax		/* 31 + 46 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+twos:	.float 2.0, 2.0, 2.0, 2.0
+	.float 2.0, 2.0, 2.0, 2.0
+	.p2align 5
+addend:	.float 3.0, 3.0, 3.0, 3.0
+	.float 3.0, 3.0, 3.0, 3.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 PROGRAMS["fmareg"] = (77, """
 	.text
 	.globl _start

@@ -394,9 +394,12 @@ FMA_ONE_HELPER = frozenset(f for f in
                             for op in ("madd", "msub", "maddsub")
                             for order in ("132", "213", "231")
                             for width in ("ps", "pd")))
-FMA_SPAN_FORMS = frozenset(f"vf{operation}{order}{width}"
-                           for operation in ("madd", "msub", "maddsub",
-                                             "msubadd")
+FMA_SPAN_FORMS = frozenset(f"vf{negated}{operation}{order}{width}"
+                           for negated, operation in (("", "madd"),
+                                                      ("", "msub"),
+                                                      ("", "maddsub"),
+                                                      ("", "msubadd"),
+                                                      ("n", "madd"))
                            for order in ("132", "213", "231")
                            for width in ("ps", "pd"))
 
@@ -5822,6 +5825,102 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 				return refuse("immreg high operation has no SSE form")
 			body += high
 			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
+		if what in ("lanereg3", "lanemem") and mnemonic in FMA_SPAN_FORMS \
+				and FMA_PATTERN.match(mnemonic).group(1) == "n":
+			# **`D = addend - product`, which cannot accumulate in one
+			# register.** SSE has no reverse subtract, so the addend has
+			# to be the destination of the `subps` -- and in the upper
+			# half the addend is a slot, so it must be LOADED while the
+			# product occupies a register of its own. Two helpers, which
+			# is why these forms are outside `FMA_ONE_HELPER`.
+			#
+			# It must intercept ahead of the general branch, which reads
+			# the operation as `madd` -- `FMA_PATTERN` puts the negation
+			# in its own group -- and would emit the un-negated
+			# sequence. Finding 306.
+			if second is None:
+				return refuse("FMA source is in no slot")
+			if block is None:
+				return refuse("FMA member wants a per-thread block")
+			if second_helper is None:
+				return refuse("negated FMA wants a second helper")
+			order = FMA_PATTERN.match(mnemonic).group(3)
+			kind = mnemonic[-2:]
+			prefix = FMA_PREFIX[kind]
+			mul, take, load = b"\x0f\x59", b"\x0f\x5c", b"\x0f\x10"
+			mem = what == "lanemem"
+			if mem and third is not None:
+				pass
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			if mem:
+				low_s1 = scratch_finder.xmm_numbers(shape[2])[0]
+				low_s2 = MEMORY
+				s1_slot, s2_slot = second, MEMORY
+			else:
+				if third is None:
+					return refuse("lanereg3 source is in no slot")
+				low_s2 = scratch_finder.xmm_numbers(shape[2])[0]
+				low_s1 = scratch_finder.xmm_numbers(shape[3])[0]
+				s1_slot, s2_slot = third, second
+
+			def at_mem(opcode, pfx, reg, delta):
+				return fma_mem_piece(vex, tail, pfx, opcode, reg, delta,
+				                     address, encoding, at + len(body))
+
+			# factors and addend, per the SDM's suffix
+			pairs = {"132": ((low_dst, low_s2), low_s1),
+			         "213": ((low_s1, low_dst), low_s2),
+			         "231": ((low_s1, low_s2), low_dst)}
+			(f0, f1), addend = pairs[order]
+			if f0 is MEMORY:
+				return refuse("negated FMA cannot copy from memory")
+			body += encode_rr(None, MOVAPS, helper, f0)
+			if f1 is MEMORY:
+				piece = at_mem(mul, prefix, helper, 0)
+				if piece is None:
+					return refuse("negated FMA cannot reach its operand")
+				body += piece
+			else:
+				body += encode_rr(prefix, mul, helper, f1)
+			if addend is MEMORY:
+				piece = at_mem(load, None, low_dst, 0)
+				if piece is None:
+					return refuse("negated FMA cannot reach its addend")
+				body += piece
+			elif addend != low_dst:
+				body += encode_rr(None, MOVAPS, low_dst, addend)
+			body += encode_rr(prefix, take, low_dst, helper)
+
+			# The upper half, with the product in `helper` and the addend
+			# loaded into `second_helper` because it is the subtract's
+			# destination.
+			slots = {"132": ((slot, s2_slot), s1_slot),
+			         "213": ((s1_slot, slot), s2_slot),
+			         "231": ((s1_slot, s2_slot), slot)}
+			(g0, g1), gadd = slots[order]
+			if g0 is MEMORY:
+				return refuse("negated FMA cannot copy from memory")
+			body += span_slot_move(helper, False, base, g0, block,
+			                       at + len(body))
+			if g1 is MEMORY:
+				piece = at_mem(mul, prefix, helper, SLOT)
+			else:
+				piece = span_slot_op(prefix, mul, helper, base, g1, block)
+			if piece is None:
+				return refuse("negated FMA cannot reach a slot")
+			body += piece
+			if gadd is MEMORY:
+				piece = at_mem(load, None, second_helper, SLOT)
+				if piece is None:
+					return refuse("negated FMA cannot reach its addend")
+				body += piece
+			else:
+				body += span_slot_move(second_helper, False, base, gadd,
+				                       block, at + len(body))
+			body += encode_rr(prefix, take, second_helper, helper)
+			body += span_slot_move(second_helper, True, base, slot, block,
 			                       at + len(body))
 			continue
 		if what == "lanereg3" and mnemonic in FMA_SPAN_FORMS \

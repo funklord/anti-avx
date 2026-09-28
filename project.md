@@ -10,7 +10,7 @@ sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` inva
 holds on the result. 2,478 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
-**`--teb-scratch=auto` takes it to 1,838** (Findings 297 and 300 to 304), which is
+**`--teb-scratch=auto` takes it to 1,820** (Findings 297 and 300 to 306), which is
 not the default: it asks the loader for two TLS slots and patches the stubs from a
 callback, and whether that becomes the default is the copyright holder's call rather
 than this document's.
@@ -11893,7 +11893,7 @@ code quickly.
 ### Where it stands, 2026-09-23
 
     default build                         2,478 re-measured   (Finding 305)
-    with --teb-scratch=auto               1,838 re-measured   (Finding 304)
+    with --teb-scratch=auto               1,820 re-measured   (Finding 306)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -11920,17 +11920,17 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-### The frontier, with `--teb-scratch=auto` (Finding 304)
+### The frontier, with `--teb-scratch=auto` (Finding 306)
 
-    kept: its window was withheld                        981
+    kept: its window was withheld                        979
     declined: outside .pdata                             319
     declined: next instruction is a branch target        228
     declined: next instruction will not move             106
     declined: 256-bit: arithmetic rather than a copy       72
-    lost to an overlap or a refused stub                  40
+    lost to an overlap or a refused stub                  37
     never a candidate                                     31
-    declined: no SSE form at any register                 30
-    kept: a repair left it in VEX form                    23
+    kept: a repair left it in VEX form                    21
+    declined: no SSE form at any register                 19
     and 180 that are not instructions                    180
 
 **~~Every remaining class is a measured floor.~~ That was said twice, of the
@@ -11971,7 +11971,7 @@ only 101 are passengers. Giving those a second chance is worth at most 101 sites
 Root blamers still to lower, from the last join:
 
     vblendv*           14 blamers,  31 windows blamed ONLY by them
-    vfnmadd*           13 blamers,  17 windows
+    ~~vfnmadd*         13 blamers,  17 windows~~  landed, Finding 306: 18 sites
     vpermd/vpshufb      6 blamers,  12 windows
     vptest/vpmovmskb    7 blamers,   7 windows
     F16C                4 blamers,   4 windows
@@ -14001,6 +14001,64 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 306 -- the negated FMA, and what the leverage instrument is worth
+
+`vfnmadd` was the cheap root blamer: 13 blamers holding 17 windows nothing else
+blamed. The sequence existed; the gap was that `D = addend - product` cannot
+accumulate in one register.
+
+**SSE has no reverse subtract.** The addend must BE the subtract's destination, and
+in the upper half the addend is a slot -- so it has to be LOADED while the product
+occupies a register of its own. Two helpers, which is why these forms sit outside
+`FMA_ONE_HELPER` and take the two `TWO_HELPERS` already allocates for the shape.
+
+    frontier                                  1,838 -> 1,820      -18
+      declined: no SSE form at any register      30 ->    19      -11
+      kept: its window was withheld             981 ->   979       -2
+      lost to an overlap or a refused stub       40 ->    37       -3
+    windows not placed                          892 ->   889       -3
+
+`verify` passes. The check that matters for this emission is the stale upper half:
+it is the first form to load a slot into a register as the subtract's destination
+rather than accumulating in the helper and reading slots as memory, and a wrong slot
+address there does not show up as a decode failure.
+
+#### A silent wrong answer the pattern almost allowed
+
+`FMA_PATTERN` puts the negation in its **own capture group**, so the general branch
+reads `vfnmadd231ps` as operation `madd` and would have emitted the un-negated
+sequence -- correct-looking bytes computing `D + product`. The branch intercepts
+ahead of it, and the fixtures are built so the mistake cannot pass: the negated
+result has NEGATIVE lanes, `{1..8} - 6` giving `{-5,-4,-3,-2,-1,0,1,2}`, and an
+un-negated sequence scores 32 where the fixture wants -4.
+
+`vfnmsub` stays out of the form set: `D = -(product + addend)` needs a sign flip,
+which is the construction `lower.py` measured as wrong for NaN payloads.
+
+#### What the blame-edge instrument is actually worth
+
+Four uses, same instrument, three behaviours:
+
+    Finding 300  memory-source FMA    released   0 of 283 predicted
+    Finding 303  the RIP immediate    NEGATIVE: 12 lowered, 4 gained
+    Finding 304  msubadd              released  28 of  34 predicted
+    Finding 306  nmadd                released   3 of  17 predicted
+
+**The SIGN rule holds and the magnitude does not.** Lowering a root blamer has
+released windows every time; lowering something that only adds placed windows cost
+sites. That distinction is worth keeping and is what picks items.
+
+"Windows blamed ONLY by this class" is an upper bound, and the bound seems to hold
+when the class is large relative to the windows it touches and to collapse when it
+is small: 13 blamers spread over 17 windows leaves no redundancy, so a window that
+acquires any other blamer as the repair re-settles over 60 rounds is simply lost.
+Finding 300's zero had a different cause -- a precondition not met, the register-only
+half still blaming -- but the shape is the same, a bound quoted as a forecast.
+
+**So state it as a bound with the blamer-to-window ratio attached**, rather than
+being surprised by the shortfall each time. Twelve FMA fixtures gate the family now,
+one per ordering per shape per operation where a real site exists.
 
 ### Finding 305 -- the number that ships was the one nobody re-measured
 
