@@ -7,13 +7,13 @@ Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 
 **Status:** the rewriter works. `tool/detour.py` rewrites **802,264 of 804,951 VEX
 sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` invariant
-holds on the result. 2,478 sites are left, and 180 further VEX-prefixed byte sequences
-decode to nothing and are not instructions (Finding 290).
+holds on the result. **1,649 sites are left**, and 180 further VEX-prefixed byte
+sequences decode to nothing and are not instructions (Finding 290).
 
-**`--teb-scratch=auto` takes it to 1,649** (Findings 297 and 300 to 307), which is
-not the default: it asks the loader for two TLS slots and patches the stubs from a
-callback, and whether that becomes the default is the copyright holder's call rather
-than this document's.
+**`--teb-scratch=auto` became the default on 2026-09-29** (Finding 309), on the
+copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with. It
+asks the loader for two TLS slots and patches the stubs from a callback.
+`--teb-scratch=off` is the A/B.
 
 **That gap is 640 sites and it has been WIDENING.** Finding 297 measured it at 341.
 Every item since has depended on the slot machinery the TEB route feeds, so each one
@@ -11892,8 +11892,8 @@ code quickly.
 
 ### Where it stands, 2026-09-23
 
-    default build                         2,478 re-measured   (Finding 305)
-    with --teb-scratch=auto               1,649 re-measured   (Finding 307)
+    default build                         1,649 re-measured   (Finding 309)
+    with --teb-scratch=off                2,337 re-measured   (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -11920,7 +11920,7 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-### The frontier, with `--teb-scratch=auto` (Finding 307)
+### The frontier, on the default (Finding 309)
 
     kept: its window was withheld                        834
     declined: outside .pdata                             319
@@ -12052,12 +12052,9 @@ needed was in the README.
 
 ### Decisions waiting on the copyright holder
 
-  * **`--teb-scratch=auto` as the default -- 640 sites**, and the gap has been
-    WIDENING: 341 when Finding 297 raised it, 640 at Finding 305, because every
-    item since depends on the slot machinery the TEB route feeds. Larger than every
-    remaining item put together. It changes what the shipped binary does at load
-    time: two `TlsAlloc` calls in a chained TLS callback, which then patches the
-    stubs.
+  * ~~**`--teb-scratch=auto` as the default**~~ **Taken 2026-09-29, Finding 309:
+    688 sites, and the gap had widened from 341 when Finding 297 raised it.**
+    `--teb-scratch=off` is the A/B.
   * **FP add and multiply with `src2 == D`** (Finding 284, re-sized at 303). They
     commute in arithmetic and not in x86: with two NaN operands the result carries
     the FIRST source's payload, so exchanging them changes the bytes, and
@@ -14001,6 +13998,66 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 309 -- `--teb-scratch=auto` is the default
+
+Instructed by the copyright holder 2026-09-29. Worth **688 sites**: 2,337 without it
+against 1,649 with, both re-measured on the same tool the day the decision was taken
+rather than quoted from the table -- which is Finding 305's whole point, and which
+this document had already got wrong twice.
+
+    default build, before                     2,337
+    default build, after                      1,649
+    windows not placed                          752
+    repair settled after                    68 of 256 rounds
+    scratch displacements                     1,600 in 400 stub(s)
+
+`verify` passes with no flag on the command line, including `no call inside any of
+400 TEB save bracket(s)`. **The new default reproduces the flagged build exactly**,
+which is the control: a default that did not give what the flag gave would be a
+different thing wearing its number.
+
+The gap had been WIDENING -- 341 when Finding 297 raised it, 640 at Finding 305, 688
+now -- because every item since depends on the slot machinery the TEB route feeds.
+
+#### Two things a default flip owes, both learned from Finding 295
+
+**A default must be a no-op where the thing it enables is unused.** The auto path
+resolved `TlsAlloc`, `GetCurrentProcess` and `TerminateProcess` from the import table
+unconditionally, so with `auto` on by default EVERY image would have to import them
+to be rewritten at all -- including the dozens of fixtures that deliberately import
+nothing. The requirement is gated on there being placeholders to patch. `fmareg`,
+which imports nothing, rewrites and answers 77 under the bare default.
+
+**The A/B has to stay reachable.** `--teb-scratch=off` exists now. Every default this
+tool has taken kept its predecessor runnable -- `--index-const=off`,
+`--shadow-regs=off` -- because a default whose alternative cannot be run is a
+measurement nobody can repeat.
+
+`--teb-scratch=<offset>` is now the odd one out: it names bytes in somebody else's
+TEB with nothing establishing they are free, which is Finding 280's open half. It
+stays reachable and is on no path anyone should take.
+
+#### A stale fixture produced a FALSE FAILURE
+
+`check-verify` failed on `regioncarry` with 6 lost boundaries and a stub clobbering a
+register its site was using. It is not a defect: `build/sse-regioncarry.exe` was
+stale, `make` thought it current, and removing it and rebuilding gives an image
+byte-identical to a fresh apply which verifies with zero failures.
+
+**`build-and-commit.md` names this rule and names it for the other direction.** Never
+conclude a test passes from a binary the build step did not rebuild -- and the
+failure mode assumed is a false PASS. This was a false FAILURE, which is the cheaper
+half of the same defect only because somebody happened to chase it; a session with
+less patience reverts a correct change instead.
+
+**The mechanism is not established and is written down as unestablished.** The
+artifact's mtime was newer than `tool/detour.py`'s, so `make` was right by the rule
+it applies; what is not explained is how a build from that pair differs from a build
+from the same pair hours later. `regioncarry` is the only fixture affected, it is the
+only one that places a region, and Starfield emits no regions at all -- so nothing in
+the shipping path depends on the answer, and the honest record is the observation
+rather than a mechanism nobody measured.
 
 ### Finding 307 -- the variable blend, and the avalanche running forwards
 

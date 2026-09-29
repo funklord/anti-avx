@@ -801,7 +801,13 @@ TEB_TLS_POINTER = 0x58
 # merely quiet. Until that is settled for a real process this carries a
 # measurement and nothing else, exactly as `--spill=stack` does for the
 # stack borrow it is not allowed to take. Finding 280.
-TEB_SCRATCH = None
+# **`auto` is the default from 2026-09-29, on the copyright holder's
+# instruction.** Worth 688 sites: 2,337 without it against 1,649 with,
+# both re-measured on the same tool the day it was taken. The gap had
+# been widening -- 341 when Finding 297 raised it -- because every item
+# since depends on the slot machinery the TEB route feeds. `--teb-
+# scratch=off` is the A/B. Finding 309.
+TEB_SCRATCH = "auto"
 TEB_SCRATCH_BYTES = 16
 
 # **`auto` asks the process for the bytes instead of naming them.** The
@@ -853,6 +859,25 @@ def teb_scratch_offset():
 # dependent load from their prologue. `--index-const=off` stays reachable
 # as the A/B, the way `--shadow-regs=off` does. Finding 295.
 INDEX_CONST = True
+def run_configuration():
+	"""The flags a roll file's header must carry beside the image.
+
+	**Naming the image is not enough and Finding 240's rule said it was.**
+	The same binary measured with and without `--teb-scratch=auto`
+	produces frontiers of 2,337 and 1,649, and both files opened
+	`# Starfield-unpacked.exe`. A `frontier` run on the default silently
+	replaced the auto build's rows, and the two were then joined against
+	each other: 244 readers were reported in a class the auto build has
+	72 of. Nothing in either header could have said so -- only the count
+	gave it away, and only because the two happen to differ by enough to
+	notice. Finding 308.
+	"""
+	return (f"shadow-regs={SHADOW_REGS_RULE}"
+	        f" teb-scratch={TEB_SCRATCH}"
+	        f" index-const={'on' if INDEX_CONST else 'off'}"
+	        f" spill={SPILL}")
+
+
 INDEX_PLACEHOLDER = 0x5A5A5A5A
 INDEX_CONST_SITES = 0
 INDEX_CONST_CALLBACK = False
@@ -7794,7 +7819,8 @@ def report_units(candidates, placed, home, wide=0, original=None):
 			# overwrote Starfield's 3,216 rows with an empty file and
 			# nothing said so -- Finding 240's fault, met again by a roll
 			# written a day after that one was fixed.
-			out.write(f"# {original}\t{missed:,} refused\n")
+			out.write(f"# {original}\t{missed:,} refused\t"
+			          f"{run_configuration()}\n")
 			for why, rows in sorted(UNIT_EXAMPLES.items()):
 				for site in rows:
 					out.write(f"{why}\t{site:#x}\n")
@@ -14037,8 +14063,14 @@ def main(argv):
 	for i, item in enumerate(argv):
 		if item.startswith("--teb-scratch="):
 			want = item.split("=", 1)[1]
-			if want == "auto":
-				TEB_SCRATCH = "auto"
+			if want in ("auto", "off"):
+				# **`off` is the A/B and exists because `auto` is now
+				# the default.** Every default this tool has taken has
+				# kept the previous behaviour reachable -- `--index-
+				# const=off`, `--shadow-regs=off` -- because a default
+				# whose alternative cannot be run is a measurement
+				# nobody can repeat. Finding 309.
+				TEB_SCRATCH = None if want == "off" else "auto"
 				del argv[i]
 				break
 			try:
@@ -14862,7 +14894,8 @@ def frontier_census(original, patched, listing):
 			# leftovers and reported 304 lowered sites with no oracle case,
 			# where the real answer is 1. A reader -- or a script -- can now
 			# see which binary the rows describe. Finding 240.
-			out.write(f"# {original}\t{len(surviving)} surviving\n")
+			out.write(f"# {original}\t{len(surviving)} surviving\t"
+			          f"{run_configuration()}\n")
 			for address in sorted(surviving):
 				row = by_address.get(address)
 				out.write(f"{address:#x}\t{reason_of.get(address, '?')}\t"
@@ -15140,14 +15173,33 @@ def index_payload(data, blob, stub_base):
 			raise SystemExit(
 				f"apply: {len(low):,} low and {len(high):,} high TEB "
 				f"scratch displacements; they are saved in pairs.")
-		tables += [table_for(low), table_for(high)]
-		teb = tuple(iat_rva(data, name) for name in
-		            ("TlsAlloc", "GetCurrentProcess", "TerminateProcess"))
-		missing = [n for n, r in zip(("TlsAlloc", "GetCurrentProcess",
-		                              "TerminateProcess"), teb) if r is None]
-		if missing:
-			raise SystemExit("apply: --teb-scratch=auto needs the image to "
-			                 "import " + ", ".join(missing))
+		if not low:
+			# **No placeholder, no requirement.** With `auto` the
+			# default, every image reaches this -- and a fixture with
+			# no site that needs TEB scratch would otherwise be made
+			# to import `TlsAlloc` to be rewritten at all. That is
+			# Finding 295's lesson from the constant index, where
+			# making it the default broke every fixture twice: a
+			# default must be a no-op where the thing it enables is
+			# not used. Finding 309.
+			return_early = True
+		else:
+			return_early = False
+		if return_early:
+			tables = tables[:1]
+			teb = None
+		else:
+			tables += [table_for(low), table_for(high)]
+			teb = tuple(iat_rva(data, name) for name in
+			            ("TlsAlloc", "GetCurrentProcess",
+			             "TerminateProcess"))
+			missing = [n for n, r in zip(("TlsAlloc",
+			                              "GetCurrentProcess",
+			                              "TerminateProcess"), teb)
+			           if r is None]
+			if missing:
+				raise SystemExit("apply: --teb-scratch=auto needs the "
+				                 "image to import " + ", ".join(missing))
 
 	# The callback reaches each table with a rip-relative `lea` measured
 	# from its own first byte, so the tables are laid out first and the
@@ -15775,7 +15827,8 @@ def apply_all(binary, listing, output):
 				# edge list -- a fixture with more rows would have read
 				# as data. Finding 302.
 				out.write(f"# {binary}\t{len(REPAIR_READERS)} "
-				          f"distinct reader(s)\n")
+				          f"distinct reader(s)\t"
+				          f"{run_configuration()}\n")
 				for at in sorted(REPAIR_READERS):
 					out.write(f"{at:#x}\n")
 			print(f"apply:   {len(REPAIR_READERS):,} distinct surviving "
@@ -15806,7 +15859,8 @@ def apply_all(binary, listing, output):
 		edges = Path("build") / "repair-blame.txt"
 		if edges.parent.is_dir():
 			with edges.open("w", encoding="utf-8") as out:
-				out.write(f"# {binary}\twindow\treader\n")
+				out.write(f"# {binary}\t{run_configuration()}\t"
+				          f"window\treader\n")
 				for window in sorted(REPAIR_BLAMED_BY):
 					if window not in dropped:
 						continue
