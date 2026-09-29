@@ -5,17 +5,25 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **802,264 of 804,951 VEX
-sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` invariant
-holds on the result. **1,649 sites are left**, and 180 further VEX-prefixed byte
-sequences decode to nothing and are not instructions (Finding 290).
+**Status:** the rewriter works. `tool/detour.py` rewrites **803,323 of 804,951 VEX
+sites -- 99.80%** -- through 202,111 detours, and every `make detour-verify` invariant
+holds on the result. **1,628 sites are left** (Finding 311, 2026-09-29), and 180
+further VEX-prefixed byte sequences decode to nothing and are not instructions
+(Finding 290). All four figures come from the same run; the denominator and the 180
+are re-derived from `build/text.asm` rather than carried, because this line twice
+held a rewritten count from one configuration beside a frontier from another.
 
 **`--teb-scratch=auto` became the default on 2026-09-29** (Finding 309), on the
-copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with. It
-asks the loader for two TLS slots and patches the stubs from a callback.
-`--teb-scratch=off` is the A/B.
+copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, both
+measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
+from a callback. `--teb-scratch=off` is the A/B.
 
-**That gap is 640 sites and it has been WIDENING.** Finding 297 measured it at 341.
+**That pair is a dated pair and only the default has moved since** -- 1,628 after
+Finding 311. Subtracting 1,628 from a 2,337 measured a week earlier would be
+arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
+
+**The gap was 688 sites when last measured both ways, and it has been WIDENING.**
+Finding 297 measured it at 341.
 Every item since has depended on the slot machinery the TEB route feeds, so each one
 moved the auto build further than the default: without a block pointer that can stand
 up, `256-bit: arithmetic rather than a copy` is 632 in the default against 72 with the
@@ -11892,8 +11900,8 @@ code quickly.
 
 ### Where it stands, 2026-09-23
 
-    default build                         1,649 re-measured   (Finding 309)
-    with --teb-scratch=off                2,337 re-measured   (Finding 309)
+    default build                         1,628 re-measured   (Finding 311)
+    with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -13998,6 +14006,151 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 311 -- one mnemonic, two encodings, and a set keyed on the name
+
+`vpsllq` names two different instructions. `0F 73 /6` is the immediate group:
+ModRM.reg is an opcode extension, so the destination has nowhere to live but `vvvv`.
+`0F F3` is an ordinary NDS three-operand instruction whose shift count is a register,
+with the destination in ModRM.reg where it belongs. Nine mnemonics carry both forms.
+
+`DESTINATION_IN_VVVV` is a set of MNEMONICS. Every site of either encoding was routed
+to a lowering written for the first, and the second could only refuse.
+
+    c5 e1 f3 c8      vpsllq %xmm0,%xmm3,%xmm1   variable    refused
+    c5 f1 73 f1 02   vpsllq $0x2,%xmm1,%xmm1    immediate   lowered
+
+The routing reads the opcode byte now, which is the discriminator, and the ordinary
+three-operand path takes the variable form. Checked against `as` byte for byte:
+`0f28cb 660ff3c8`, `0f28e2 660ff3e1`, `660f73f102`.
+
+#### The comment beside the set said so
+
+    # ... the shift group mixes NDD immediate forms with NDS register forms
+    # under one mnemonic, so telling them apart needs the opcode rather
+    # than the name.
+
+That is in `patch.py`, three lines above the set, and it is right. It was written to
+explain why the in-place patcher excludes the group WHOLESALE -- a decision that is
+correct there, because the patcher only ever declines. The sentence describing the
+hazard travelled with the set into a consumer that does not decline, and nothing
+carried the instruction not to key on the name.
+
+**So the defect is not that nobody knew.** It is that a set's name says what its
+members ARE and cannot say what they must be looked up BY, and the one place that
+knew was a comment attached to the definition rather than a property of it.
+
+#### Four other consumers, and only one of them mattered
+
+The set has five readers. Keying on a mnemonic is wrong in all five; it costs
+something in two, and the cost differs.
+
+    detour.py:1382   the routing               the finding, fixed
+    detour.py:10922  the aliasing test         a lost site, fixed below
+    patch.py:373     the in-place patcher      right by its own length test
+    scratch.py:422   wants_scratch             unreachable, has_direct_sse_form first
+    scratch.py:498   a diagnostic census       unreachable, same guard
+
+`patch.py` separates the encodings without meaning to: it asks whether the operand
+list holds exactly two registers, which the immediate form satisfies and the variable
+form cannot. It reaches the right answer from the wrong premise, which is worth
+knowing rather than tidying -- a test that is accidentally coextensive with the one
+you want is a test that stops being so when either side moves.
+
+#### The aliasing test, and an empty cell
+
+The collector asks for a scratch register when a three-operand site's src2 IS the
+destination, because the `movaps` that sets up the destination would destroy src2
+first. It excluded this set wholesale. For the variable form that exclusion is pure
+loss: the count register can alias the destination exactly as any other src2 can, and
+the `len(registers) == 3` guard beside it already separates the encodings.
+
+`lower_vex` is right in both directions, which is what makes the cost a lost site
+rather than a wrong one:
+
+    scratch=None   ->  None                      refuses
+    scratch=xmm5   ->  movaps %xmm3,%xmm5        saves the count
+                       movaps %xmm1,%xmm3        then the destination
+                       psllq  %xmm5,%xmm3        shifts by the saved count
+
+**Starfield holds none of them.** All 22 of its variable-group sites are the
+all-distinct case, so this cell is empty and no measurement can speak for it. Per
+`evidence.md` the answer is to assert the partition rather than the cell: `varshift`
+carries all three aliasing cases, every one contributing to the sum, so a lowering
+that writes the wrong register changes the answer instead of merely assembling.
+
+    all distinct    xmm1 <- xmm3 << xmm0    movaps then shift
+    src == dst      xmm4 <- xmm4 << xmm5    patches in place
+    count == dst    xmm5 <- xmm3 << xmm5    needs a scratch
+
+#### Both controls fail through their own check
+
+Not "the fixture goes red" -- which of the two changes it goes red for:
+
+    routing by the mnemonic alone      1 refused, exit 29
+    the aliasing exclusion restored    1 refused, exit 29, 1 fewer overlap
+
+Each was sabotaged in a COPY of `tool/`, because the Starfield pipeline was mid-run
+and would have imported the tree at its next stage. That is the third time this
+session a background run has constrained how a control could be taken.
+
+#### What the routing released
+
+    frontier                             1,649 -> 1,628    -21
+    lost to a refused stub                  43 ->    22    -21
+    lost to an overlap                      16 ->    16    unchanged
+    kept: its window was withheld          834 ->   834    unchanged
+    refused, the vvvv shift would not lower 22 ->     1
+
+**Exactly 21, and the withheld class did not move.** That was the prediction, written
+down before the run reported: 22 variable-group sites counted from `build/text.asm`,
+21 of them in the baseline frontier and every one of those as `lost to a refused
+stub`. The prediction allowed for less than 21, because these sites already have
+windows and placing a window can blame a neighbour into the withheld class. None did.
+
+The bucket lost exactly those 21 and gained nothing, which is the check worth stating
+separately from the total: a net of 21 could also have been 25 released and 4 arrived.
+
+    baseline 43, now 22; left 21, arrived 0
+
+`verify` passes, including `no call inside any of 400 TEB save bracket(s)` and `stub
+section has 0 VEX instructions`.
+
+**The measured image predated the aliasing fix, so it was re-made and compared.**
+`apply` imports at process start, and the run that produced these numbers had been
+going for twenty minutes when the exclusion came out of `collect`. The aliasing change
+can only reach a shift with three registers and `count == dst`, of which this binary
+has none -- but that is reasoning, and the point of the change was that reasoning about
+which cell is empty had already been wrong once. Re-run on the committed tool the image
+is byte-identical, 112,536,064 bytes, and `the aliased form has no usable scratch`
+stands at 1 in BOTH runs, which is what shows that refusal belongs to `vpsubd` rather
+than to this item.
+
+#### The one shift that still refuses is not one of them
+
+    0x142d8cf2e  vpsrad $0x10,%ymm1,%ymm2   the vvvv shift would not lower
+    0x142d8cf41  vpsubd %ymm2,%ymm1,%ymm2   the aliased form has no usable scratch
+
+Both are 256-bit and neither is the variable form. The first is the IMMEDIATE group at
+`ymm` width, which `lower_vvvv_shift` has never handled and which belongs to the Y
+strategies rather than here. The second is `vpsubd`, not in the set at all, and its
+refusal predates this item.
+
+**Neither appears in the refused-stub bucket**, in either run: the census gives them
+`kept: its window was withheld` and `declined: 256-bit: arithmetic rather than a copy`.
+A site can refuse a stub and be counted under a different verdict, so **the stub roll
+and the census are different denominators** -- 57 refusals against 22 sites -- and
+reading one as the other is how the remembered figure of 78 would have been quoted
+against a bucket of 43.
+
+#### How the item was found, which is the reusable part
+
+`place_stubs` took a `detail` parameter and nothing passed one. Wiring it to
+`build/stub-refused.txt` turned `lost to an overlap or a refused stub` -- itself only
+just separated, in Finding 310 -- into a named list, and the second-largest reason in
+it was a group of nine mnemonics nobody had looked at. **Three times this session the
+next item came from wiring a diagnostic that already existed rather than from
+measuring something new.**
 
 ### Finding 310 -- a fallback bucket that said the opposite of the truth
 

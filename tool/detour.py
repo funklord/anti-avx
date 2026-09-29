@@ -1380,10 +1380,30 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	# nothing at all and the disassembler desynchronises from there.
 	# Class D, F and H need real sequences and belong in their own tools.
 	if mnemonic in inplace.DESTINATION_IN_VVVV:
-		out = lower_vvvv_shift(vex, encoding, operands)
-		if out is None and reasons is not None:
-			reasons["lower: the vvvv shift would not lower"] += 1
-		return out
+		# **The opcode tells the two forms apart, and the name cannot.**
+		# `patch.py` says so where it excludes this group wholesale: "the
+		# shift group mixes NDD immediate forms with NDS register forms
+		# under one mnemonic, so telling them apart needs the opcode
+		# rather than the name". Routing on the mnemonic sent BOTH to a
+		# lowering written for one of them, and the variable form
+		# refused -- 22 sites in Starfield, every one an ordinary
+		# three-operand shape, and 21 of them surviving in the frontier.
+		# Routing on the opcode released exactly those 21.
+		#
+		#     c5 e1 f3 c8   vpsllq %xmm0,%xmm3,%xmm1   opcode f3, NDS
+		#     c5 f1 73 f1 02   vpsllq $0x2,%xmm1,%xmm1  opcode 73, NDD
+		#
+		# `0F 71/72/73` is the immediate group, where ModRM.reg is an
+		# opcode extension and `vvvv` carries the destination. Anything
+		# else in this set is the variable-count form, whose destination
+		# is where every other three-operand instruction keeps it, and
+		# it goes down the ordinary path. Finding 311.
+		shift_tail = encoding[vex["length"]:]
+		if shift_tail and shift_tail[0] in (0x71, 0x72, 0x73):
+			out = lower_vvvv_shift(vex, encoding, operands)
+			if out is None and reasons is not None:
+				reasons["lower: the vvvv shift would not lower"] += 1
+			return out
 	if not inplace.has_direct_sse_form(mnemonic):
 		if mnemonic in SEQUENCE_MNEMONICS or FMA_PATTERN.match(mnemonic):
 			tail = encoding[vex["length"]:]
@@ -7016,6 +7036,16 @@ REPAIR_SUBSTITUTED = 0
 # where to push: a window with no ladder behind it and one that walked
 # every rung and found each blamed are the same number and want
 # opposite work. Finding 298.
+# **Why each refused stub was refused, per site.** `place_stubs` has
+# taken a `detail` dict since it was written and nobody has ever passed
+# one, so `stub_reasons` tallied causes with no address to chase -- an
+# interface as wired as its least-used caller, for the third time in
+# this file. The frontier reported 43 sites `lost to a refused stub`
+# when this was wired and there was no way to ask which 43 or why; the
+# count is a measurement of that day, not a property of the tool.
+# Finding 311.
+STUB_DETAIL = {}
+
 REPAIR_READERS = set()
 REPAIR_BLAMED_BY = defaultdict(set)
 REPAIR_DROPPED_WHY = Counter()
@@ -10891,8 +10921,19 @@ def collect(binary, listing, context=None):
 		# A Class C site whose src2 IS the destination needs one too, for the
 		# reason spelled out in lower_vex: the movaps that sets up the
 		# destination would destroy src2 first.
+		#
+		# This used to exclude DESTINATION_IN_VVVV wholesale, which is the
+		# same mis-keying Finding 311 fixed one branch above: that set holds
+		# MNEMONICS, and the shift group's variable-count encoding is an
+		# ordinary three-operand instruction that can alias like any other.
+		# The `len(registers) == 3` test already separates the two encodings
+		# -- the immediate form renders two registers and an immediate -- so
+		# the exclusion only ever suppressed a scratch request the variable
+		# form was entitled to make. lower_vex refuses without one, so the
+		# cost was a lost site rather than a wrong lowering; Starfield has
+		# none, and the `varshift` fixture carries the case so the empty cell
+		# is asserted rather than assumed.
 		aliased = (not needs_sequence
-		           and mnemonic not in inplace.DESTINATION_IN_VVVV
 		           and len(registers) == 3
 		           and registers[-1] != registers[-2]
 		           and registers[0] == registers[-1])
@@ -14676,8 +14717,10 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 	# before one fitted is one rebuilt window.
 	REPAIR_SUBSTITUTED = len(swapped)
 	REPAIR_FINAL[:] = final
+	STUB_DETAIL.clear()
 	placed, blob, swallowed, overlapped, refused = place_stubs(
-		final, stub_base, spill_base, stub_reasons, home=home, tls=tls)
+		final, stub_base, spill_base, stub_reasons, detail=STUB_DETAIL,
+		home=home, tls=tls)
 	return placed, blob, overlapped, refused, dropped, swallowed
 
 
@@ -14821,11 +14864,12 @@ def frontier_census(original, patched, listing):
 	patches, candidates, _stats, _skipped, declined, home = collect(
 		original, listing, context)
 	instructions, _plain, blocked, sources, _tables, _seen = context
-	placed, _blob, _over, _refused, dropped, _swallowed = repaired_placement(
-		instructions, blocked, sources, candidates,
-		set(row[0] for row in patches),
-		stub_base_of(open(original, "rb").read()), 0, Counter(), home,
-		tls_pair_of(tls_for(original)))
+	placed, _blob, overlapped, refused, dropped, _swallowed = \
+		repaired_placement(
+			instructions, blocked, sources, candidates,
+			set(row[0] for row in patches),
+			stub_base_of(open(original, "rb").read()), 0, Counter(), home,
+			tls_pair_of(tls_for(original)))
 
 	_bounds, surviving, _bad = inplace.disassemble(patched)
 	surviving = set(surviving)
@@ -14856,6 +14900,12 @@ def frontier_census(original, patched, listing):
 	# zero; here it was silent, because the fallback bucket has no such
 	# assertion and a wrong label reads as data. Finding 310.
 	wanted, got = set(), set()
+	width = {start: window for start, _e, _o, _m, window, *_r
+	         in (REPAIR_FINAL or candidates)}
+	over_extent, refused_extent = set(), set()
+	for start, where in ((overlapped, over_extent), (refused, refused_extent)):
+		for one in start:
+			where.update(range(one, one + width.get(one, 1)))
 	for start, _e, _o, _m, window, *_rest in (REPAIR_FINAL or candidates):
 		wanted.update(range(start, start + window))
 	for site, window, _s, _z, _p in placed:
@@ -14880,7 +14930,18 @@ def frontier_census(original, patched, listing):
 		elif address in declined:
 			reason = f"declined: {declined[address]}"
 		elif address in wanted and address not in got:
-			reason = "lost to an overlap or a refused stub"
+			# **Which of the two, because they want opposite work.** A
+			# candidate a neighbour overlapped is a PLACEMENT question
+			# -- somebody else took the bytes -- while one whose stub
+			# would not build is a LOWERING question with a reason
+			# already recorded in the refusal roll. Merged, the bucket
+			# says only that the candidate existed and did not place,
+			# which is where it was before Finding 310 moved 27 sites
+			# into it. Finding 311.
+			reason = ("lost to an overlap" if address in over_extent
+			          else "lost to a refused stub"
+			          if address in refused_extent
+			          else "lost to an overlap or a refused stub")
 		elif address in wanted:
 			reason = "a placed window covered it (should not happen)"
 		else:
@@ -16117,6 +16178,17 @@ def apply_all(binary, listing, output):
 	      f"{len(overlapped):,} skipped for overlap, {len(refused):,} refused")
 	for why, count in stub_reasons.most_common():
 		print(f"apply:   refused, {why:<38} {count:>8,}")
+	if STUB_DETAIL:
+		from pathlib import Path	# imported here as elsewhere in this file
+		roll = Path("build") / "stub-refused.txt"
+		if roll.parent.is_dir():
+			with roll.open("w", encoding="utf-8") as out:
+				out.write(f"# {binary}\t{len(STUB_DETAIL):,} refused\t"
+				          f"{run_configuration()}\n")
+				for start in sorted(STUB_DETAIL):
+					why, window, _p, _d = STUB_DETAIL[start]
+					out.write(f"{why}\t{start:#x}\t{window}\n")
+			print(f"apply: every refused stub written to {roll}")
 	report_regions(candidates, binary)
 	report_units(candidates, placed, home, WIDE_SITES["256-bit"],
 	             binary)

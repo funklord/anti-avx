@@ -725,6 +725,91 @@ tls_directory:
 """)
 
 
+# **A variable-count shift, which is NOT the immediate form.** Both wear
+# the mnemonic `vpsllq` and they are different encodings: `0F 73 /6` is
+# the immediate group, where ModRM.reg is an opcode extension and `vvvv`
+# carries the destination, while `0F F3` is an ordinary NDS three-operand
+# instruction whose count is a register. `DESTINATION_IN_VVVV` is a set of
+# MNEMONICS, so both were routed to a lowering written for the first and
+# the second refused.
+#
+#     c5 e1 f3 c8      vpsllq %xmm0,%xmm3,%xmm1   variable
+#     c5 f1 73 f1 02   vpsllq $0x2,%xmm1,%xmm1    immediate
+#
+# Both are here: the variable form is the one that was broken and the
+# immediate form is the one that worked, because the risk in a routing
+# change is breaking the case that already passed.
+#
+# The variable form has three aliasing cases and the fixture carries all
+# three, because Starfield holds 22 of them and all 22 are the distinct
+# case -- so the other two cells are empty there, and an empty cell is
+# asserted rather than assumed:
+#
+#     all distinct       xmm1 <- xmm3 << xmm0   movaps then shift
+#     src == dst         xmm4 <- xmm4 << xmm5   patches in place
+#     count == dst       xmm5 <- xmm3 << xmm5   needs a scratch, because
+#                                               the movaps that sets up
+#                                               the destination would
+#                                               destroy the count first
+#
+# Every shift contributes to the sum, so a lowering that writes the wrong
+# register or shifts by the wrong count changes the answer rather than
+# merely assembling. {1,2} shifted left by 4 gives {16,32}, read back as
+# dwords 0 and 2 for 48; {3,0} left by 1 gives 6; the two shifts by one of
+# {1,2} give 2 each. 48 + 6 + 2 + 2 + 19 = 77. Finding 311.
+PROGRAMS["varshift"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$136, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	count(%rip), %rdx
+	vmovups	(%rsi), %xmm3		/* {1, 2} as quadwords */
+	vmovups	16(%rsi), %xmm4		/* {3, 0} */
+	vmovups	(%rdx), %xmm0		/* shift count 4 */
+	vmovups	16(%rdx), %xmm5		/* shift count 1 */
+	vpsllq	%xmm0, %xmm3, %xmm1	/* variable, all distinct */
+	vpsllq	%xmm5, %xmm4, %xmm4	/* variable, src == dst */
+	vpsllq	%xmm5, %xmm3, %xmm5	/* variable, count == dst */
+	vpsllq	$1, %xmm3, %xmm2	/* and the immediate form */
+	movq	%rsp, %rdi
+	vmovups	%xmm1, (%rdi)
+	vmovups	%xmm2, 16(%rdi)
+	vmovups	%xmm4, 32(%rdi)
+	vmovups	%xmm5, 48(%rdi)
+	movl	(%rdi), %eax		/* 1 << 4 = 16 */
+	addl	8(%rdi), %eax		/* 2 << 4 = 32 */
+	addl	32(%rdi), %eax		/* 3 << 1 = 6 */
+	addl	48(%rdi), %eax		/* 1 << 1 = 2 */
+	addl	16(%rdi), %eax		/* 1 << 1 = 2 */
+	addl	$19, %eax		/* 58 + 19 = 77 */
+	addq	$136, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.quad 1, 2
+	.quad 3, 0
+	.p2align 5
+count:	.quad 4, 0
+	.quad 1, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 PROGRAMS["blendv"] = (77, """
 	.text
 	.globl _start
