@@ -4398,7 +4398,7 @@ GPR_MOVABLE = frozenset(("load", "store", "regmove"))
 # non-volatile borrow has to find. `lanereg` and `lanereg3` move both
 # sources' upper halves into registers before operating; `perm2` and
 # `permil` do the same. Finding 255.
-TWO_HELPERS = frozenset(("lanereg", "lanereg3", "perm2", "permil",
+TWO_HELPERS = frozenset(("lanereg", "lanereg3", "perm2", "permil", "blendv",
                          "immreg3"))
 
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
@@ -4875,6 +4875,23 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 		# Finding 273.
 		return ("immreg3", canonical_ymm(fields[3]),
 		        canonical_ymm(fields[1]), canonical_ymm(fields[2]))
+	if len(fields) == 4 and len(wide) == 4:
+		# **`vblendvps %ymmM,%ymmS2,%ymmS1,%ymmD`** -- four ymm and no
+		# immediate, the case the note above held out. The mask is a
+		# REGISTER and SSE's `blendvps` reads it only from the implicit
+		# `xmm0`, so the lowering has to marshal it there and give back
+		# whatever `xmm0` held. That is the whole of the difficulty and
+		# it is why this waited: the sites are
+		# `%ymm4,%ymm1,%ymm0,%ymm1`, so `ymm0` is SRC1 -- refusing
+		# whenever `xmm0` is involved would refuse every one of them,
+		# and the save has to come first with the operands then read
+		# from the saved copy.
+		#
+		# Four slots, which is one more than any other shape: the
+		# destination's, both sources' and the mask's. Finding 307.
+		return ("blendv", canonical_ymm(fields[3]),
+		        canonical_ymm(fields[1]), canonical_ymm(fields[2]),
+		        canonical_ymm(fields[0]))
 	if len(fields) == 3 and len(wide) == 2 and fields[0].startswith("$"):
 		# **`op $imm,%ymmS,%ymmD` -- an in-lane operation with an
 		# immediate.** Every one of the 108 in Starfield operates within
@@ -4976,7 +4993,7 @@ def span_entries(members, instructions, slots, scope, plain):
 		# A register-second-source operation needs TWO slots: its
 		# destination's, and the one it reads from. The second is resolved
 		# here because `build_stub` has no operand text to look it up with.
-		second = third = None
+		second = third = fourth = None
 		vex = inplace.decode_vex(encoding)
 		if vex is not None and vex["L"]:
 			shape = span_operand_shape(vex, encoding[vex["length"]:],
@@ -4985,17 +5002,27 @@ def span_entries(members, instructions, slots, scope, plain):
 			                                      "extract", "perm2",
 			                                      "permil", "regmove",
 			                                      "lanemove", "lanemem",
-			                                      "immreg", "immreg3"):
+			                                      "immreg", "immreg3",
+			                                      "blendv"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
 			# text to look either of them up with. `perm2` is the same
 			# shape: it may read either half of either source.
 			if shape is not None and shape[0] in ("lanereg3", "perm2",
-			                                      "permil", "immreg3"):
+			                                      "permil", "immreg3",
+			                                      "blendv"):
 				third = slot_for(slots, shape[3])
+			# **A fourth, for `blendv` alone.** Every other shape reads
+			# at most two sources; a variable blend reads two and a
+			# mask. Threading one more field is two edits because the
+			# tuple has exactly one construction and one unpack.
+			# Finding 307.
+			if shape is not None and shape[0] == "blendv":
+				fourth = slot_for(slots, shape[4])
 		out.append((kind, address, encoding, mnemonic, operands,
-		            slot_for(slots, register), moved, second, third))
+		            slot_for(slots, register), moved, second, third,
+		            fourth))
 	return out
 
 
@@ -5381,7 +5408,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += encode_gpr_at(block[5], True, block[0],
 			                      base + block[9] * SLOT)
 	for kind, address, encoding, mnemonic, operands, slot, moved, second, \
-			third in entries:
+			third, fourth in entries:
 		if kind == "plain":
 			# **The whole entry, not its first five fields.** The sixth is
 			# the passenger's OWN scratch, which `span_entries` resolves
@@ -5826,6 +5853,78 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += high
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
+			continue
+		if what == "blendv":
+			# **The mask lives in `xmm0` and nowhere else.** SSE4.1's
+			# `blendvps` takes it implicitly, so each half saves `xmm0`,
+			# loads the mask over it, and gives it back.
+			#
+			# `xmm0` is SRC1 at every one of Starfield's sites, so the
+			# save has to come FIRST and every operand then read from
+			# the saved copy -- `spare` below. Refusing whenever `xmm0`
+			# is involved would refuse all of them, which is the trap
+			# Finding 100 already paid for from the other side: offering
+			# only `xmm0` as the scratch refused 600 sites with a
+			# register they could never use.
+			#
+			# `blendvps src,dst` keeps `dst` where the mask is clear and
+			# takes `src` where it is set, so the destination has to
+			# start as SRC1 -- which is why the accumulator is the
+			# helper rather than the destination register. Finding 307.
+			if second is None or third is None or fourth is None:
+				return refuse("blendv operand is in no slot")
+			if block is None:
+				return refuse("blendv wants a per-thread block")
+			if second_helper is None:
+				return refuse("blendv wants a second helper")
+			if 0 in (helper, second_helper):
+				return refuse("blendv cannot borrow xmm0 as a helper")
+			kind = mnemonic[-2:]
+			blend = b"\x0f\x38\x14" if kind == "ps" else b"\x0f\x38\x15"
+			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+			low_s2 = scratch_finder.xmm_numbers(shape[2])[0]
+			low_s1 = scratch_finder.xmm_numbers(shape[3])[0]
+			low_mask = scratch_finder.xmm_numbers(shape[4])[0]
+
+			def spare(register):
+				"""Where this operand is, once `xmm0` has been put away."""
+				return second_helper if register == 0 else register
+
+			body += encode_rr(None, MOVAPS, second_helper, 0)
+			if low_mask != 0:
+				body += encode_rr(None, MOVAPS, 0, spare(low_mask))
+			body += encode_rr(None, MOVAPS, helper, spare(low_s1))
+			body += encode_rr(0x66, blend, helper, spare(low_s2))
+			# **No restore where the destination IS `xmm0`.** Its old
+			# value is dead -- the destination is about to be written --
+			# so restoring it and then overwriting it is two wasted
+			# instructions, and doing them in the other order would
+			# discard the result. Four refusals on Starfield read
+			# `blendv destination is xmm0` before this, which was a
+			# guard standing in for an ordering question. Finding 307.
+			if low_dst == 0:
+				body += encode_rr(None, MOVAPS, 0, helper)
+			else:
+				body += encode_rr(None, MOVAPS, low_dst, helper)
+				body += encode_rr(None, MOVAPS, 0, second_helper)
+
+			# The upper half, every operand a slot. `xmm0` is saved into
+			# the second helper again rather than kept from the low
+			# half: the low half gave it back, and a stub that left it
+			# clobbered across the members would be wrong for whatever
+			# follows in the window.
+			body += encode_rr(None, MOVAPS, second_helper, 0)
+			body += span_slot_move(0, False, base, fourth, block,
+			                       at + len(body))
+			body += span_slot_move(helper, False, base, third, block,
+			                       at + len(body))
+			piece = span_slot_op(0x66, blend, helper, base, second, block)
+			if piece is None:
+				return refuse("blendv cannot reach the second source")
+			body += piece
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			body += encode_rr(None, MOVAPS, 0, second_helper)
 			continue
 		if what in ("lanereg3", "lanemem") and mnemonic in FMA_SPAN_FORMS \
 				and FMA_PATTERN.match(mnemonic).group(1) == "n":

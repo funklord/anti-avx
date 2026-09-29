@@ -654,6 +654,128 @@ tls_directory:
 """)
 
 
+# **A variable blend**, whose mask is a REGISTER and whose SSE form reads
+# that mask only from the implicit `xmm0`. Starfield's fourteen all look
+# like `%ymm4,%ymm1,%ymm0,%ymm1` -- mask, src2, src1, dst -- so `ymm0` is
+# SRC1 and refusing whenever `xmm0` is involved would refuse every one.
+# This fixture reproduces that aliasing deliberately: src1 is ymm0 and
+# the destination aliases src2. **The mask is ymm2 and not the sites' own
+# ymm4**, because with ymm4 taken the emitter is left one free helper and
+# refuses -- which is a fact about register pressure rather than about
+# the lowering, and is measured separately on the real sites.
+#
+# The mask is {-,+,-,+,...} by sign: lanes 0,2,4,6 negative and 1,3,5,7
+# positive. `blendvps` takes the source where the mask's sign bit is SET,
+# so the result is src2 on the even lanes and src1 on the odd. src1 is
+# {1..8} and src2 is 100.0 throughout, giving {100,2,100,4,100,6,100,8}.
+#
+# Lanes 0, 5 and 7 are read -- 100 + 6 + 8 = 114 -- and the program
+# subtracts 37. Reading one even and two odd lanes, with one of each in
+# the upper half, is the point: a blend that takes the wrong side scores
+# 1 + 100 + 100, a dropped upper half scores 100 + 0 + 0, and a mask left
+# in the wrong register scores neither. Finding 307.
+PROGRAMS["blendv0"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	hundred(%rip), %rdx
+	leaq	mask(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* src1 = {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* src2 = 100.0, and the dst */
+	vmovups	(%rax), %ymm2		/* mask, alternating by sign */
+	vblendvps %ymm2, %ymm1, %ymm0, %ymm0
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0, even: src2 = 100 */
+	cvttss2si 20(%rdi), %ecx	/* lane 5, odd:  src1 = 6 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7, odd:  src1 = 8 */
+	addl	%ecx, %eax		/* 100 + 6 + 8 = 114 */
+	subl	$37, %eax		/* 114 - 37 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+hundred:
+	.float 100.0, 100.0, 100.0, 100.0
+	.float 100.0, 100.0, 100.0, 100.0
+	.p2align 5
+mask:	.float -1.0, 1.0, -1.0, 1.0
+	.float -1.0, 1.0, -1.0, 1.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+PROGRAMS["blendv"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	leaq	hundred(%rip), %rdx
+	leaq	mask(%rip), %rax
+	vmovups	(%rsi), %ymm0		/* src1 = {1,2,3,4,5,6,7,8} */
+	vmovups	(%rdx), %ymm1		/* src2 = 100.0, and the dst */
+	vmovups	(%rax), %ymm2		/* mask, alternating by sign */
+	vblendvps %ymm2, %ymm1, %ymm0, %ymm1
+	movq	%rsp, %rdi
+	vmovups	%ymm1, (%rdi)
+	cvttss2si (%rdi), %eax		/* lane 0, even: src2 = 100 */
+	cvttss2si 20(%rdi), %ecx	/* lane 5, odd:  src1 = 6 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7, odd:  src1 = 8 */
+	addl	%ecx, %eax		/* 100 + 6 + 8 = 114 */
+	subl	$37, %eax		/* 114 - 37 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+hundred:
+	.float 100.0, 100.0, 100.0, 100.0
+	.float 100.0, 100.0, 100.0, 100.0
+	.p2align 5
+mask:	.float -1.0, 1.0, -1.0, 1.0
+	.float -1.0, 1.0, -1.0, 1.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 PROGRAMS["fnmreg"] = (77, """
 	.text
 	.globl _start

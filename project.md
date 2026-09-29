@@ -10,7 +10,7 @@ sites -- 99.7%** -- through 201,733 detours, and every `make detour-verify` inva
 holds on the result. 2,478 sites are left, and 180 further VEX-prefixed byte sequences
 decode to nothing and are not instructions (Finding 290).
 
-**`--teb-scratch=auto` takes it to 1,820** (Findings 297 and 300 to 306), which is
+**`--teb-scratch=auto` takes it to 1,649** (Findings 297 and 300 to 307), which is
 not the default: it asks the loader for two TLS slots and patches the stubs from a
 callback, and whether that becomes the default is the copyright holder's call rather
 than this document's.
@@ -11893,7 +11893,7 @@ code quickly.
 ### Where it stands, 2026-09-23
 
     default build                         2,478 re-measured   (Finding 305)
-    with --teb-scratch=auto               1,820 re-measured   (Finding 306)
+    with --teb-scratch=auto               1,649 re-measured   (Finding 307)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
@@ -11920,17 +11920,17 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-### The frontier, with `--teb-scratch=auto` (Finding 306)
+### The frontier, with `--teb-scratch=auto` (Finding 307)
 
-    kept: its window was withheld                        979
+    kept: its window was withheld                        834
     declined: outside .pdata                             319
     declined: next instruction is a branch target        228
     declined: next instruction will not move             106
     declined: 256-bit: arithmetic rather than a copy       72
-    lost to an overlap or a refused stub                  37
+    lost to an overlap or a refused stub                  32
     never a candidate                                     31
-    kept: a repair left it in VEX form                    21
-    declined: no SSE form at any register                 19
+    kept: a repair left it in VEX form                    13
+    declined: no SSE form at any register                  6
     and 180 that are not instructions                    180
 
 **~~Every remaining class is a measured floor.~~ That was said twice, of the
@@ -11970,7 +11970,7 @@ only 101 are passengers. Giving those a second chance is worth at most 101 sites
 
 Root blamers still to lower, from the last join:
 
-    vblendv*           14 blamers,  31 windows blamed ONLY by them
+    ~~vblendv*        14 blamers,  31 windows~~  landed, Finding 307: 171 sites
     ~~vfnmadd*         13 blamers,  17 windows~~  landed, Finding 306: 18 sites
     vpermd/vpshufb      6 blamers,  12 windows
     vptest/vpmovmskb    7 blamers,   7 windows
@@ -14001,6 +14001,82 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 307 -- the variable blend, and the avalanche running forwards
+
+`vblendvps` was the largest root blamer left: 14 blamers, 31 windows blamed only by
+them, every one of those windows a singleton. It had no shape at all -- four ymm
+operands, `span_operand_shape` returning None, the sites refusing as `shape four
+operands` -- and SSE4.1's `blendvps` reads its mask only from the implicit `xmm0`.
+
+    frontier                                  1,820 -> 1,649     -171
+      kept: its window was withheld             979 ->   834     -145
+      declined: no SSE form at any register      19 ->     6     -13
+      kept: a repair left it in VEX form         21 ->    13      -8
+    windows not placed                          889 ->   752     -137
+    four operands refusals                       28 ->     0
+    unconditional lowering refusals             274 ->   174
+
+`verify` passes, including the invariant this emission most needed: it writes `xmm0`
+and gives it back twice per member, and no stub clobbers a register its site was
+still using across 202,098 placed windows.
+
+**171 sites, and 137 windows released against a bound of 31.** The first time the
+realised release has EXCEEDED the bound rather than falling short of it. Those 31
+were windows blamed only by `vblendv`; freeing them evidently released readers whose
+own windows then placed, and so on -- the avalanche running forwards. Finding 305
+measured that 81% of withheld windows are collateral and each root blamer is worth
+about five windows; this is the first item to actually collect that, and it collected
+four times its bound.
+
+So the instrument's bound is not an upper bound at all. It bounds the FIRST-ORDER
+release and says nothing about the cascade, which can run either way: Finding 303
+lost nine windows to it and this gained a hundred.
+
+#### Four slots, and a fourth field
+
+The shape needs the destination's slot, both sources' and the mask's -- one more than
+anything else. Threading a fourth through the member tuple was two edits, the tuple
+having exactly one construction site and one unpack.
+
+#### `xmm0` is SRC1 at every site, so the save comes first
+
+    vblendvps %ymm4,%ymm1,%ymm0,%ymm1      all fourteen look like this
+
+Refusing whenever `xmm0` is involved would have refused every one. The save goes
+first and each operand then reads from the saved copy, which is what makes `ymm0`
+being a source harmless. Finding 100 paid for the other direction of this mistake:
+offering only `xmm0` as the scratch refused 600 `vblendv` sites with a register they
+could never use.
+
+`blendvps src,dst` keeps `dst` where the mask is clear and takes `src` where it is
+set, so the destination must START as SRC1 -- which is why the accumulator is the
+helper and not the destination register.
+
+#### Two things measured rather than reasoned
+
+**The fixture was the unrepresentative thing, not the sites.** With `ymm4` as the
+mask -- faithful to the real sites -- the emitter was left ONE free helper and
+refused; the probe said `helper=5 second=None`. That looked like the sites being
+register-starved. They are not: `blendv wants a second helper` never appears once in
+Starfield's refusals. The fixture's tiny function is what has no registers, and the
+mask was moved to `ymm2` with the reason written beside it.
+
+**`blendv destination is xmm0` was a guard standing in for an ordering question.**
+Four refusals. When D IS `xmm0` its old value is dead, so restoring it and then
+overwriting it is two wasted instructions and doing them the other way round
+discards the result. `blendv0` fixtures that case.
+
+What still refuses is `cannot borrow xmm0 as a helper`, 2 rows, where the helper
+allocation handed back `xmm0` itself.
+
+#### A running measurement broken by an edit
+
+`frontier` returned 1 with a `SyntaxError` at line 182 of a file that parses. The
+cause was entirely local: `detour.py` was rewritten while the background run's
+interpreter was reading it, so it saw a partial file. **A file rewrite is not
+atomic**, and this session routinely has a twenty-minute run in flight while the tool
+is edited. The image was rebuilt and the pipeline re-run without touching the tool.
 
 ### Finding 306 -- the negated FMA, and what the leverage instrument is worth
 
