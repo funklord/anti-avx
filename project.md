@@ -11927,10 +11927,10 @@ default the placer table is `plain`, `unit` and `spill` and nothing else.
     declined: next instruction is a branch target        228
     declined: next instruction will not move             106
     declined: 256-bit: arithmetic rather than a copy       72
-    lost to an overlap or a refused stub                  32
-    never a candidate                                     31
+    lost to an overlap or a refused stub                  59
     kept: a repair left it in VEX form                    13
     declined: no SSE form at any register                  6
+    never a candidate                                      4
     and 180 that are not instructions                    180
 
 **~~Every remaining class is a measured floor.~~ That was said twice, of the
@@ -13998,6 +13998,55 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 310 -- a fallback bucket that said the opposite of the truth
+
+`never a candidate` held 31 sites and the name is what made them worth an item: not
+"the lowering refuses this" but "the collector never reached a decision". The sites
+are ordinary 256-bit three-register arithmetic -- `vdivps %ymm1,%ymm2,%ymm4` ten
+times over, `vsubps`, `vaddps`, `vpand` -- shapes the span path lowers by the
+thousand.
+
+The collector had seen every one of them.
+
+    lost to an overlap or a refused stub    32 ->  59     +27
+    never a candidate                       31 ->   4     -27
+    frontier                             1,649 -> 1,649   unchanged
+
+**The total holding exactly is the check.** Nothing is lowered by this; had the
+figure moved, the rewriter would have been altered under cover of a relabelling.
+
+#### The defect
+
+The census attributes a survivor against `wanted`, which held candidate START
+addresses, while the `inside_dropped` bucket beside it is spread over window
+EXTENTS. A window widened backwards begins on the instruction BEFORE its site, so
+its site is never a start; it falls past every test into the fallback. Both sets are
+spread over their extents now.
+
+#### Why it survived, which is the part worth carrying
+
+**This is Finding 282's defect exactly** -- keying on a start where an extent is
+meant. There it put 79 survivors in `unaccounted`, and the census ASSERTS that
+bucket is zero, so it was caught at once and loudly. Here the same error landed in a
+fallback with no assertion attached, and **a wrong label reads as data**.
+
+So the lesson is not about addresses. It is that a bucket named for the absence of
+information -- `never a candidate`, `some other shape`, `no reason given` -- is where
+a mis-keyed lookup goes to be invisible, and the only thing that makes such a bucket
+honest is an assertion about what may land in it. `unaccounted` has one. This did
+not.
+
+An item's whole measurement went on hunting a reason the collector skips sites. It
+does not skip them. **Two plausible causes were ruled out before reaching this one**:
+the sites are not in the in-place patch set, tested at 0 of 31, and they are not
+`(bad)` rows or data-island residents, either of which records a decline.
+
+#### What it changes for picking
+
+`lost to an overlap or a refused stub` is 59, nearly twice what it appeared, and it
+is a different KIND of class from a floor: those candidates exist and were lost to
+placement rather than refused for want of a lowering.
 
 ### Finding 309 -- `--teb-scratch=auto` is the default
 

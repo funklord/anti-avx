@@ -14840,8 +14840,26 @@ def frontier_census(original, patched, listing):
 			stub_base_of(open(original, "rb").read()), 0, Counter(),
 			home=home, tls=tls_pair_of(tls_for(original)))[0]:
 		inside_dropped.update(range(site, site + window))
-	wanted = {item[0] for item in candidates}
-	got = {site for site, _w, _s, _z, _p in placed}
+	# **Spread over the extent, not the start.** `inside_dropped` above
+	# is spread and these were not, so a site that is inside a candidate
+	# without BEING its start fell past every bucket into `never a
+	# candidate` -- which reads as "the collector never saw it" and is
+	# the opposite of the truth. A window widened backwards starts on
+	# the instruction before its site, so its site is exactly such an
+	# address, and 31 of them were filed that way: ordinary 256-bit
+	# three-register arithmetic, `vdivps %ymm1,%ymm2,%ymm4` ten times
+	# over, in a bucket that said nothing had been tried.
+	#
+	# Same defect as Finding 282, which put 79 survivors in
+	# `unaccounted` by keying on a start that appears in no candidate.
+	# There it was loud, because the census asserts `unaccounted` is
+	# zero; here it was silent, because the fallback bucket has no such
+	# assertion and a wrong label reads as data. Finding 310.
+	wanted, got = set(), set()
+	for start, _e, _o, _m, window, *_rest in (REPAIR_FINAL or candidates):
+		wanted.update(range(start, start + window))
+	for site, window, _s, _z, _p in placed:
+		got.update(range(site, site + window))
 
 	counted, shapes = Counter(), Counter()
 	# **And the shape of each bucket, not only of the whole.** The
