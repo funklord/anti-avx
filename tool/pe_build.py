@@ -810,6 +810,89 @@ tls_directory:
 """)
 
 
+
+# **`op %ymmD,%ymmS,%ymmD` where the operation does not commute.** The
+# commuting route exchanges the sources, which `vpaddd` permits and `vpsubd`
+# does not; FP add and multiply are arithmetically commutable and still not
+# exchanged here, because exchanging them changes which NaN payload
+# propagates. So the order is kept and the destination's value is moved aside
+# into the helper the span already owns.
+#
+# Both families are here because they fail differently. `vpsubd` is exact, so
+# a commuted lowering shows up as a sign flip; `vsubps` is the shape 28 of
+# Starfield's 39 sites actually have, and its two lanes are checked against
+# the float bit patterns rather than a count, so a lowering that dropped the
+# upper half leaves the subtraction of the expected value non-zero.
+#
+#     30 - 10 = 20   lower lane, integer
+#     50 - 20 = 30   upper lane, integer          20 + 30 = 50
+#     10.0 - 1.0 = 9.0    = 0x41100000           contributes 0 when right
+#     20.0 - 2.0 = 18.0   = 0x41900000           contributes 0 when right
+#
+# 50 + 27 = 77. A commuted lowering gives -20 and -30 and cannot reach it; a
+# squared one (the prefix dropped with the ModRM kept) gives 0 and 0.
+#
+# **In `check-pe` rather than `check-shadow-pe`, and the gate said why.** That
+# gate requires a fixture to FAIL without permanent slots, which proves it
+# needed them; this one answers 77 either way, because with no slots the
+# 256-bit pair strategy splits it through home space and arrives at the same
+# number by another road. So the A/B proves nothing here and the gate refused
+# it, correctly. What discriminates is the shape's own control: with the
+# classifier branch removed the default build refuses the two sites and exits
+# 29, and with the low half commuted it exits 37 -- a wrong answer rather than
+# a refusal, which is the half that shows the fixture watches the operand
+# order and not merely the presence of a lowering. Finding 312.
+PROGRAMS["lanealias"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$96, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rdi
+	vmovups	0x00(%rsi), %ymm0	/* lo 30, hi 50 as dwords */
+	vmovups	0x20(%rsi), %ymm1	/* lo 10, hi 20 */
+	vpsubd	%ymm1, %ymm0, %ymm1	/* ymm1 = ymm0 - ymm1, dst == src2 */
+	vmovups	0x40(%rsi), %ymm2	/* lo 10.0, hi 20.0 */
+	vmovups	0x60(%rsi), %ymm3	/* lo 1.0, hi 2.0 */
+	vsubps	%ymm3, %ymm2, %ymm3	/* ymm3 = ymm2 - ymm3, dst == src2 */
+	vmovups	%ymm1, (%rdi)
+	vmovups	%ymm3, 0x20(%rdi)
+	movl	(%rdi), %eax		/* 20 */
+	addl	16(%rdi), %eax		/* + 30, the upper lane */
+	addl	32(%rdi), %eax		/* + 9.0f */
+	subl	$0x41100000, %eax
+	addl	48(%rdi), %eax		/* + 18.0f, the upper lane */
+	subl	$0x41900000, %eax
+	addl	$27, %eax		/* 50 + 27 = 77 */
+	addq	$96, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 30, 0, 0, 0
+	.long 50, 0, 0, 0
+	.long 10, 0, 0, 0
+	.long 20, 0, 0, 0
+	.long 0x41200000, 0, 0, 0	/* 10.0 */
+	.long 0x41A00000, 0, 0, 0	/* 20.0 */
+	.long 0x3F800000, 0, 0, 0	/* 1.0 */
+	.long 0x40000000, 0, 0, 0	/* 2.0 */
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
 PROGRAMS["blendv"] = (77, """
 	.text
 	.globl _start
@@ -4965,7 +5048,17 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 		                 base + symbols["tls_index"],
 		                 base + symbols["tls_callbacks"],
 		                 TLS_ZERO_FILL,
-		                 0x00100000)		# ALIGN_16BYTES
+		                 # **`IMAGE_SCN_ALIGN_16BYTES` is 0x00500000.** The
+		                 # field holds 2^(n-1) in bits 20-23, so 0x00100000
+		                 # -- which stood here under this same comment --
+		                 # declares ONE byte. It decides whether the loader
+		                 # gives the TLS block an aligned base, and a legacy
+		                 # SSE packed operation faults on an unaligned m128:
+		                 # every fixture reading a slot as an arithmetic
+		                 # operand was passing because the allocator happened
+		                 # to return aligned memory, not because anything
+		                 # required it. See `slot_arithmetic_safe`.
+		                 0x00500000)		# ALIGN_16BYTES
 		# **A sample that defines `tls_cb` gets a TLS callback.** The
 		# array is a null-terminated list of absolute VAs, and `objcopy
 		# -O binary` on an unlinked object cannot resolve one -- the

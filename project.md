@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **803,323 of 804,951 VEX
-sites -- 99.80%** -- through 202,111 detours, and every `make detour-verify` invariant
-holds on the result. **1,628 sites are left** (Finding 311, 2026-09-29), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **803,704 of 804,951 VEX
+sites -- 99.85%** -- through 202,180 detours, and every `make detour-verify` invariant
+holds on the result. **1,247 sites are left** (Finding 312, 2026-09-30), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 1,628 after
-Finding 311. Subtracting 1,628 from a 2,337 measured a week earlier would be
+**That pair is a dated pair and only the default has moved since** -- 1,247 after
+Finding 312. Subtracting 1,247 from a 2,337 measured a week earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -11900,7 +11900,7 @@ code quickly.
 
 ### Where it stands, 2026-09-23
 
-    default build                         1,628 re-measured   (Finding 311)
+    default build                         1,247 re-measured   (Finding 312)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
@@ -14006,6 +14006,148 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 312 -- the destination is the other source, and the order is kept
+
+`op %ymmD,%ymmS,%ymmD` is the shape where the destination is also the second
+source. SSE has no three-operand form, so something has to move first, and
+`lower_vex` wants a scratch REGISTER for it. Finding 284 found a way round that
+needs none -- exchange the sources and the destination becomes the operand SSE
+has room for -- and gated it on `COMMUTATIVE_YMM`, because an exchange is only
+sound where the operation commutes.
+
+That left 39 sites in Starfield declining as `256-bit: arithmetic rather than a
+copy`, and it left a decision standing with the copyright holder: whether to
+commute FP add and multiply, which commute arithmetically but change which NaN
+payload propagates.
+
+**The decision is retired rather than answered, and it could never have covered
+the class anyway.** Of the 39, only 28 are FP add or multiply. Six `vsub*`, one
+`vpsubd` and two `vcmpltps` do not commute at all, so whichever way the question
+went, nine sites needed a different lowering.
+
+#### The emission, and why it needs one helper where `lanereg` needs two
+
+    0f 28 e1           movaps %xmm1,%xmm4        save src2's low half
+    0f 28 c8           movaps %xmm0,%xmm1        D = src1
+    66 0f fa cc        psubd  %xmm4,%xmm1        D = src1 - src2, in that order
+    41 0f 10 a3 50 ..  movups 0x50(%r11),%xmm4   H = src1's upper half
+    66 41 0f fa a3 60  psubd  0x60(%r11),%xmm4   H = src1 - src2, upper
+    41 0f 11 a3 60 ..  movups %xmm4,0x60(%r11)
+
+The low half needs no slot: the helper the span already owns holds the value the
+destination is about to lose. The upper half reads the DESTINATION's slot as the
+OPERAND, which is the only arrangement available with one register -- the
+operation computes `reg OP mem`, so the register has to hold src1 and the memory
+operand has to be src2.
+
+`lanereg` spends its second helper on moving that operand into a register
+instead. Not spending it is the whole gain: **35 of the 39 sites have no free
+register at all**, measured with `find_scratch`, which is why `commuted_piece`
+was reached for in the first place.
+
+**The operand order is kept, so the lowering is exact.** No NaN-payload
+deviation, and nothing to ask for.
+
+#### It read as impossible, and the sentence that said so was right about the stack
+
+`lanereg`'s comment says this emission was tried and faults:
+
+    The obvious emission is `op slot(%base),%xmmH` ... It faults. A packed
+    SSE operation requires its memory operand to be 16-byte ALIGNED, and
+    nothing aligns a slot ... The first build of this segfaulted on its
+    first run.
+
+And `slot_tail`, which exists to build exactly that address, says it is not safe
+as an arithmetic operand and that **nothing uses it today**. Both were written
+when the slots lived in the stack, where Win64 guarantees `rsp` only at a call
+boundary.
+
+`span_slot_op` contradicts them: it emits packed arithmetic against
+`disp32(%block)`, the FMA path uses it, and 400 Starfield stubs carry it. What
+resolves the contradiction is that the per-thread block is not the stack -- its
+base is the loader's, bound by the alignment the TLS directory declares, and
+Starfield declares 16.
+
+So `slot_tail` has its first caller, and the impossibility claim was true of the
+backing store it was written against rather than of slots as such. This is
+`evidence.md`'s *sweep for claims of impossibility* paying out: the deterrent
+was the one with no remedy beside it.
+
+#### The fixtures were passing on the allocator's goodwill
+
+Establishing that alignment turned up a plain defect one layer down:
+
+    struct.pack_into(..., TLS_ZERO_FILL,
+                     0x00100000)		# ALIGN_16BYTES
+
+`IMAGE_SCN_ALIGN_16BYTES` is `0x00500000`. The field holds 2^(n-1) in bits
+20-23, so `0x00100000` declares ONE byte, under a comment naming sixteen. Every
+fixture reading a slot as an arithmetic operand -- the whole FMA family -- was
+executing only because wine's allocator happens to return aligned memory.
+
+**The thing meant to prove the mechanism could not fail for the reason the
+mechanism can fail.** Starfield declares 16 so the shipped stubs are sound, and
+nothing was enforcing that: `slot_arithmetic_safe` does now, `span_slot_op`
+consults it, and it **refuses on None** -- an emitter reached before any plan was
+made declines rather than emitting against an alignment nobody measured. Its
+control is the old one-byte image, which now gets zero slot-operand instructions
+and a refusal where the sixteen-byte one gets two and a lowering.
+
+#### What it released
+
+    frontier                                          1,628 -> 1,247    -381
+      kept: its window was withheld                     834 ->   502    -332
+      declined: 256-bit: arithmetic rather than a copy    72 ->    31     -41
+      lost to a refused stub                             22 ->    17      -5
+      lost to an overlap                                 16 ->    15      -1
+      kept: a repair left it in VEX form                  13 ->    11      -2
+    refused stubs                                        57 ->    39     -18
+      moved: 256-bit, no Y strategy took it              51 ->    36     -15
+    windows not placed                                  752 ->   443    -309
+
+By address: **382 left, 1 arrived.** The 41 that left the class audit to the 39
+aliased sites plus two memory-source `vmulps (%rax),%ymm7,%ymm3` that left the
+frontier entirely once their windows became placeable.
+
+**The prediction was 226 and the outcome was 381, which is worth recording as a
+method error rather than a happy surprise.** The forecast counted 39 sites plus
+the 187 blamed windows whose ONLY terminal blamer was this class, and said the
+other 295 would move only if their other terminals cleared too. They largely
+did, because those terminals were themselves in this class or reachable through
+it. **A single walk of a blame DAG gives a floor, not an estimate** -- the
+transitive closure has to be taken over the whole released set at once, not per
+window.
+
+#### The one site it cost
+
+`0x142dcb620 vaddps %ymm2,%ymm0,%ymm4` is all-distinct, was being lowered, and
+now declines. It is not in the refusal roll: it is a passenger inside a window
+starting four bytes earlier at `0x142dcb61c`, eight instructions wide, refusing
+for `moved: 256-bit, no Y strategy took it`. Window reshaping swept it in. That
+reason is now the largest stub refusal at 36 and is where the next item is.
+
+#### Both controls fail through their own check, and the second one numerically
+
+    classifier branch removed     4 sites refused, exit 29
+    low half commuted             exit 37
+
+37 is forty below 77, which is 20 minus -20: the fixture watches the operand
+ORDER rather than the presence of a lowering. A control that only proved "no
+lowering, no pass" would have said nothing about the thing this shape exists to
+get right.
+
+#### `check-shadow-pe` refused the fixture, correctly
+
+    check-shadow-pe: lanealias answers 77 without
+                     permanent slots, so it never
+                     needed them and proves nothing
+
+With no slots the pair strategy splits the fixture through home space and
+arrives at 77 by another road, so that gate's A/B cannot speak for this shape.
+It lives in `check-pe`, which runs the default, and the discriminating evidence
+is the control above. **A gate refusing a fixture for the right reason is the
+gate working**, and the note is in the fixture so nobody moves it back.
 
 ### Finding 311 -- one mnemonic, two encodings, and a set keyed on the name
 

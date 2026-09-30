@@ -1149,6 +1149,31 @@ def encode_spill(borrowed, save, at, spill_base, slot, base):
 # One saved register, and how many of them the home space holds.
 SLOT = 16
 
+# **What the image says its TLS block is aligned to, which decides whether a
+# slot may be an arithmetic OPERAND.** A legacy SSE packed operation faults on
+# an unaligned m128, so `mulps <slot>,%xmm` is safe only where the block base
+# and the slot offset are both multiples of `SLOT`. The offset is, by
+# construction -- `tls_slot` rounds to the directory's alignment and slots are
+# `SLOT` apart. The BASE is the loader's, and the only thing that binds it is
+# the alignment the TLS directory declares.
+#
+# Starfield declares 16 (`Characteristics 0x00500000`), so its 400 slot-operand
+# stubs are sound. The FIXTURES declared 1 and passed anyway, which is the part
+# worth the global: they were relying on the allocator returning aligned memory,
+# so the thing meant to prove the mechanism could not fail for the reason the
+# mechanism can. They declare 16 now.
+#
+# Set by `tls_slot`, the one place that reads the field. It starts as None and
+# the predicate refuses on None, so an emitter reached before any plan was made
+# declines rather than emitting arithmetic against an alignment nobody measured
+# -- the safe direction, and deliberate.
+TLS_BLOCK_ALIGNMENT = None
+
+
+def slot_arithmetic_safe():
+	"""True if a slot may be the memory operand of a packed operation."""
+	return TLS_BLOCK_ALIGNMENT is not None and TLS_BLOCK_ALIGNMENT >= SLOT
+
 # **Only a volatile register may be borrowed, and this used to be luck.**
 # Win64 makes xmm0-xmm5 volatile and xmm6-xmm15 the callee's to preserve. A
 # borrow saves and restores, so within the stub either kind is fine -- and a
@@ -4975,6 +5000,35 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 		# `commuted_piece` writes the low half. Finding 284.
 		return ("lanereg", canonical_ymm(fields[2]),
 		        canonical_ymm(fields[1]))
+	if len(fields) == 3 and len(wide) == 3 and fields[0] == fields[2] \
+			and inplace.has_direct_sse_form(mnemonic):
+		# **`op %ymmD,%ymmS,%ymmD` where the operation does NOT commute.**
+		# The branch above serves this shape by exchanging the sources, which
+		# only an operation like `vpaddd` or `vxorps` permits. `vsubps` may
+		# not be exchanged at all, and FP add and multiply may not either --
+		# not arithmetically, but because exchanging them changes which NaN
+		# payload propagates, which is a semantic deviation nobody asked for.
+		#
+		# So the operand order is KEPT and the destination's own value is
+		# moved aside first, which needs somewhere to put it. `lower_vex`
+		# wants a scratch REGISTER for this and 35 of Starfield's 39 sites
+		# have none; the emission below wants none, because the helper the
+		# span already owns serves as the temporary for the low half and is
+		# reloaded from a slot for the upper.
+		#
+		# ONE helper, so this is deliberately NOT in TWO_HELPERS: the upper
+		# half reads the destination's slot as an OPERAND rather than moving
+		# it into a second register, which is what `lanereg` spends its
+		# second helper on. That costs an alignment requirement the image has
+		# to declare -- see `slot_arithmetic_safe` -- and buys the shape a
+		# register budget `lanereg` cannot meet.
+		#
+		# Reached only after the two branches above, so `fields[1]` is a
+		# different register from `fields[2]` and the three-alike case
+		# `op %ymmD,%ymmD,%ymmD` has already gone to `lanereg`, where
+		# dropping the prefix is right. Finding 312.
+		return ("lanealias", canonical_ymm(fields[2]),
+		        canonical_ymm(fields[1]))
 	if len(fields) == 3 and len(wide) == 3 and fields[0] != fields[2]:
 		# `op %ymmS2,%ymmS1,%ymmD` with a destination of its own, which is
 		# the largest shape Finding 150 counted and the one the region
@@ -5048,7 +5102,7 @@ def span_entries(members, instructions, slots, scope, plain):
 			                                      "permil", "regmove",
 			                                      "lanemove", "lanemem",
 			                                      "immreg", "immreg3",
-			                                      "blendv"):
+			                                      "blendv", "lanealias"):
 				second = slot_for(slots, shape[2])
 			# `lanereg3` reads TWO slots and writes a third, so the first
 			# source's is resolved here too. `build_stub` has no operand
@@ -5284,6 +5338,13 @@ def span_slot_op(prefix, opcode, reg, base, slot, block):
 	same property `encode_tls_base` relies on. Finding 300.
 	"""
 	if block is None:
+		return None
+	# **The alignment is the image's to declare and this is where it binds.**
+	# A packed operation faults on an unaligned m128; the slot OFFSET is a
+	# multiple of SLOT by construction and the BASE is whatever the loader
+	# gave, bound only by the TLS directory. Refusing here costs a site and
+	# emitting without it costs a fault on somebody else's thread.
+	if not slot_arithmetic_safe():
 		return None
 	register = block[0]
 	out = bytearray()
@@ -6273,6 +6334,56 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if operation is None:
 				return refuse("lanemove operation has no SSE form")
 			body += operation
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
+		if what == "lanealias":
+			# **The destination is the other source, and the order is
+			# kept.** Six instructions and ONE helper:
+			#
+			#     movaps %xmmD,%xmmH      save src2's low half
+			#     movaps %xmmS,%xmmD      D = src1
+			#     op     %xmmH,%xmmD      D = src1 OP src2, in that order
+			#     movups slot(S),%xmmH    H = src1's upper half
+			#     op     slot(D),%xmmH    H = src1 OP src2, upper
+			#     movups %xmmH,slot(D)
+			#
+			# The low half needs no slot at all -- the helper holds the
+			# value the destination is about to lose. The upper half reads
+			# the DESTINATION's slot as the operand, which is the only way
+			# round with one register: the operation computes
+			# `reg OP mem`, so the register has to hold src1 and the
+			# memory operand has to be src2. Finding 312.
+			if second is None:
+				return refuse("lanealias source is in no slot")
+			if block is None:
+				return refuse("lanealias wants a per-thread block")
+			if not slot_arithmetic_safe():
+				return refuse("lanealias wants a 16-byte aligned block")
+			if len(tail) < 2 or (tail[1] & 0xC0) != 0xC0:
+				return refuse("lanealias is not register to register")
+			destination = ((tail[1] >> 3) & 7) | (vex["R"] << 3)
+			source = vex["vvvv"]
+			body += encode_movaps(helper, destination)
+			body += encode_movaps(destination, source)
+			low = inplace.sse_encoding(
+				dict(vex, L=0, R=destination >> 3, X=0, B=helper >> 3),
+				tail[:1] + bytes([0xC0 | ((destination & 7) << 3)
+				                  | (helper & 7)]))
+			if low is None:
+				return refuse("lanealias operation has no SSE form")
+			body += low
+			body += span_slot_move(helper, False, base, second, block,
+			                       at + len(body))
+			# `slot_tail` was written for exactly this and its docstring
+			# said nothing used it. Something does now, and the alignment
+			# it asks a caller to guarantee is guaranteed above.
+			upper = inplace.sse_encoding(
+				dict(vex, L=0, R=helper >> 3, X=0, B=block[0] >> 3),
+				tail[:1] + slot_tail(helper, base, slot, block[0]))
+			if upper is None:
+				return refuse("lanealias upper half has no SSE form")
+			body += upper
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
@@ -11503,6 +11614,10 @@ def tls_slot(data, want=SLOT):
 	# IMAGE_SCN_ALIGN_* lives in bits 20-23 and encodes 2^(n-1) bytes.
 	shift = (characteristics >> 20) & 0xF
 	alignment = 1 << (shift - 1) if shift else 1
+	# Recorded for `slot_arithmetic_safe`, because this is the only place the
+	# field is read and an emitter cannot see the image.
+	global TLS_BLOCK_ALIGNMENT
+	TLS_BLOCK_ALIGNMENT = alignment
 	template = end - start
 	slot = (template + alignment - 1) // alignment * alignment
 	return index_va, slot, max(zero_fill, slot - template + want)
