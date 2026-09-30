@@ -15865,8 +15865,19 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 				if reasons is not None:
 					reasons.update(per)
 				if body is None and per:
+					# **The strategy, because the reason alone does not say
+					# which lowering was asked.** `moved: 256-bit, no Y
+					# strategy took it` comes from `lower_vex`, the
+					# per-instruction fallback -- so it says the window held
+					# a 256-bit instruction and was built as something that
+					# lowers one instruction at a time. Which strategy that
+					# was is the whole question, and nothing recorded it:
+					# 33 of the 36 such windows have a span shape for every
+					# member, so the classifier is not the cause and the
+					# roll could not name what is. Finding 314.
 					detail[start] = (next(iter(per)), window,
-					                 list(preceding), list(displaced))
+					                 list(preceding), list(displaced),
+					                 strategy[0] if strategy else "plain")
 		if body is None:
 			refused.add(start)
 			continue
@@ -16052,14 +16063,41 @@ def apply_all(binary, listing, output):
 		      f"{inside - standalone:,} are passengers with none")
 		edges = Path("build") / "repair-blame.txt"
 		if edges.parent.is_dir():
+			# **The extent, because a reader is a SITE and a window is a
+			# RANGE.** The roll carried the window's first byte and the
+			# reader's address and nothing else, so a reader that is a
+			# mid-window passenger could not be attributed to the window
+			# holding it: a walk up the blame graph stopped at any reader
+			# that was not itself a window start. 437 of 443 starts are
+			# frontier sites and 65 of that class's sites are passengers,
+			# so the closure was wrong by exactly those and reported no
+			# cycles where it could not have found one.
+			#
+			# That is Finding 310's defect -- keying on a start where an
+			# extent is meant -- for the third time in this file, and here
+			# it was in the diagnostic rather than in the census. A roll
+			# that cannot answer the question it was written for reads
+			# exactly like a roll that answers it and finds nothing.
+			#
+			# `end` is a byte address rather than the instruction count,
+			# so a consumer can map a reader to its window without
+			# parsing the listing. Finding 314.
+			order = [row[0] for row in instructions]
+			place = {address: i for i, address in enumerate(order)}
 			with edges.open("w", encoding="utf-8") as out:
 				out.write(f"# {binary}\t{run_configuration()}\t"
-				          f"window\treader\n")
+				          f"window\treader\twidth\tend\n")
 				for window in sorted(REPAIR_BLAMED_BY):
 					if window not in dropped:
 						continue
+					width = widths.get(window, 0)
+					i = place.get(window)
+					end = (order[i + width]
+					       if i is not None and i + width < len(order)
+					       else window)
 					for reader in sorted(REPAIR_BLAMED_BY[window]):
-						out.write(f"{window:#x}\t{reader:#x}\n")
+						out.write(f"{window:#x}\t{reader:#x}\t"
+						          f"{width}\t{end:#x}\n")
 			print(f"apply:   the blame edges for dropped windows "
 			      f"written to {edges}")
 		print(f"apply:   the repair settled after {len(REPAIR_DECAY):,} "
@@ -16300,9 +16338,10 @@ def apply_all(binary, listing, output):
 			with roll.open("w", encoding="utf-8") as out:
 				out.write(f"# {binary}\t{len(STUB_DETAIL):,} refused\t"
 				          f"{run_configuration()}\n")
+				out.write("# reason\tsite\twindow\tstrategy\n")
 				for start in sorted(STUB_DETAIL):
-					why, window, _p, _d = STUB_DETAIL[start]
-					out.write(f"{why}\t{start:#x}\t{window}\n")
+					why, window, _p, _d, how = STUB_DETAIL[start]
+					out.write(f"{why}\t{start:#x}\t{window}\t{how}\n")
 			print(f"apply: every refused stub written to {roll}")
 	report_regions(candidates, binary)
 	report_units(candidates, placed, home, WIDE_SITES["256-bit"],

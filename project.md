@@ -14007,6 +14007,76 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 314 -- a roll that could not answer the question it was written for
+
+`repair-blame.txt` carried a window's first byte and a reader's address. A window is a
+RANGE and a reader is a SITE, so a reader that is a mid-window passenger could not be
+attributed to the window holding it -- and a walk up the blame graph stopped at any
+reader that was not itself a window start.
+
+437 of the 443 blamed starts are frontier sites and 65 of that class's sites are
+passengers, so the closure was wrong by exactly those. It reported **no cycles at all**
+and 443 windows depending on something outside the blamed set, which is not a finding:
+it is what a walk that cannot follow an edge prints.
+
+**This is Finding 310's defect for the third time in this file** -- keying on a start
+where an extent is meant -- and this time it was in the DIAGNOSTIC rather than in the
+census, which is worse. A census bucket that is wrong gets quoted; a roll that cannot
+answer its own question **reads exactly like a roll that answers it and finds
+nothing.**
+
+The roll carries `width` and `end` now, `end` as a byte address rather than an
+instruction count so a consumer can map a reader to a window without parsing the
+listing -- which was costing four minutes a question.
+
+#### What the closure says once it can follow an edge
+
+    readers falling inside SOME blamed window   1,126 of 1,141
+      of which inside the window they blame        63
+    readers outside every blamed window            15
+
+**98.7% of the blame is internal to the withheld class.** The ranking inverts with it:
+
+    class                                  sites  only  gain   per
+    lost to a refused stub                    17   103   120   7.1
+    declined: 256-bit: arithmetic              31    45    76   2.5
+    lost to an overlap                        15    50    65   4.3
+    declined: no SSE form at any register      6     0    19     -
+
+`no SSE form at any register` is the one the broken walk would have picked. It is
+terminal for 156 chains from six sites, which looks like the highest leverage in the
+tree -- and **no window depends on it alone**, so releasing it releases nothing by
+itself. An edge count is not a lever, and only a closure that follows extents can tell
+them apart.
+
+#### The strategy column refutes what the reason implied
+
+`moved: 256-bit, no Y strategy took it` comes from `lower_vex`, the per-instruction
+fallback, so the obvious reading is that the window was built as `plain`. Recorded:
+
+    strategy of the 39 refused stubs    39 unit
+
+Every one is `unit` -- the strategy that DOES lower 256-bit. So a member inside a unit
+window is falling through to the per-instruction path, which is a different defect from
+the one the reason suggested and is where the next item is. Two earlier measurements had
+already narrowed it wrongly: 33 of the 36 windows have a span shape for every member,
+so the classifier is not the cause either.
+
+#### The control for an instrument is that the artifact does not move
+
+    apply rc=0
+    IDENTICAL
+
+Byte-identical to the Finding 313 image, 112,536,064 bytes. A diagnostic change that
+alters the output is not a diagnostic change, and nothing else in the run would have
+said so.
+
+The extent was checked against the listing rather than believed: window `0x140001032`,
+width 9, end `0x140f91807` in the Starfield roll and width 8, end `0x14000105c` in the
+`repairdrop` fixture -- eight instructions, two of the listing lines being encoding
+continuations rather than instructions, and the ninth beginning exactly at the recorded
+end.
+
 ### Finding 313 -- padding says where a function ends, an entry point where one begins
 
 `chunks` splits the code outside `.pdata` at `int3`, and that finds where a function
