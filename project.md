@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **803,704 of 804,951 VEX
-sites -- 99.85%** -- through 202,180 detours, and every `make detour-verify` invariant
-holds on the result. **1,247 sites are left** (Finding 312, 2026-09-30), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **803,955 of 804,951 VEX
+sites -- 99.88%** -- through 202,259 detours, and every `make detour-verify` invariant
+holds on the result. **996 sites are left** (Finding 313, 2026-09-30), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 1,247 after
-Finding 312. Subtracting 1,247 from a 2,337 measured a week earlier would be
+**That pair is a dated pair and only the default has moved since** -- 996 after
+Finding 313. Subtracting 996 from a 2,337 measured a week earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -11900,7 +11900,7 @@ code quickly.
 
 ### Where it stands, 2026-09-23
 
-    default build                         1,247 re-measured   (Finding 312)
+    default build                           996 re-measured   (Finding 313)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
@@ -14006,6 +14006,119 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 313 -- padding says where a function ends, an entry point where one begins
+
+`chunks` splits the code outside `.pdata` at `int3`, and that finds where a function
+ENDS. Between two described functions MSVC leaves no padding at all: it packs several
+leaf functions and their embedded constants there. So one chunk spans the lot --
+entered at its first byte, holding the constants as `(bad)`, and ending wherever the
+next described function starts rather than at a `ret`.
+
+Classified whole it fails three of the four conditions at once, and 319 surviving sites
+went with it: the largest class in the frontier.
+
+`split_refused` re-cuts a refused chunk at its entry points and hands each piece to the
+same `classify`. That is not a new argument -- a call, jump or `lea` destination is a
+true instruction boundary, which is exactly what the second condition already asserts
+about a chunk start.
+
+#### What the recut admitted
+
+    frontier                                  1,247 ->   996    -251
+      declined: outside .pdata                  319 ->    73    -246
+      declined: next instruction will not move  106 ->   101      -5
+    leaf ranges in the oracle              38,697 -> 43,553  +4,856
+    VEX sites in the oracle                17,237 -> 17,498    +261
+    in-place patches                      520,369 -> 520,511    +142
+
+251 left by address and **nothing arrived**. `verify` passes.
+
+#### Three framings were wrong before this one was right
+
+Recorded because each cost a measurement and each looked obviously true:
+
+    the 268 are data, so recount            all 11 chunks entered, ordinary code
+    split at (bad), trust the prefix        0 of 268 end in a transfer
+    they are mid-function fragments         every chunk lies BETWEEN .pdata ranges
+
+The second is the one worth keeping. Splitting at the `(bad)` and trusting everything
+before it admits 268 sites -- and **not one of those segments ends in a control
+transfer**, because a segment spans several packed functions and stops where the
+disassembler lost its footing. Admitting them would have meant dropping the one
+condition that catches a desync which does not announce itself.
+
+#### The first implementation was a hundredfold over-reach
+
+Splitting EVERY chunk turned 3,006 into 108,688 pieces and admitted 14,174 VEX sites,
+from a change meant to recover 141. Two properties said so:
+
+    newly admitted pieces 16-byte aligned     71.9%
+    refused pieces 16-byte aligned            93.9%
+    newly admitted ending in a CONDITIONAL jump  2,216
+
+The alignment inversion is the sharper one: it is the same test `outside.py` used to
+validate the original 865 lea-referenced chunks, and it came back pointing the other
+way. Both come from cutting genuine functions at their internal loop heads. A chunk
+that already passes has nothing to gain from being cut, so only refused ones are.
+
+**A recut piece has lost the first condition, so the third pays for it.** With no
+padding either side, "ends in a transfer" carries the whole weight of *this is where
+the function ends*, and a conditional jump is exactly where a function does not end.
+Requiring a `ret` or unconditional `jmp` costs 9 VEX sites of 142 and drops 236 pieces
+of 1,239.
+
+#### The ceiling was wrong by a factor of two, and the reason is the finding
+
+**Predicted 132, measured 246.** The prediction was written down before the run,
+together with the note that this class is terminal for zero blame edges so the figure
+was a CEILING rather than a floor, and that exceeding it would mean the oracle grew
+somewhere unmeasured. It was exceeded, so that check was run: all 246 released sites
+inside an admitted range, none outside, which is the answer that matters.
+
+The ceiling was wrong because **the input was reconstructed instead of asked for.**
+`leaf_ranges` takes its entry evidence from `detour.analysis_context`'s `blocked` set;
+the measurement built its own from `targets.collect` plus `call_targets` plus
+`lea_targets`. Those are different sets -- `blocked` carries every direct branch and
+call destination scraped from the disassembly and carries **no** `lea` targets -- so
+the answer was a true measurement of a set the tool does not use.
+
+    with the reconstructed set   133 of 246 covered, 113 apparently not
+    with `blocked`, as apply does    246 of 246 covered
+
+**For a moment the first line read as a correctness fault**: 113 sites released with
+nothing vouching for the bytes. It was an artifact of the instrument, and the
+instrument was one call away -- `analysis_context` returns `blocked`, and that is what
+apply passes. `evidence.md`'s rule about another tree's facts holds inside one tree:
+a value you rebuild is a measurement nobody took.
+
+#### And the two entry sets disagree, which is its own finding
+
+`outside.main` reports using `lea_targets`; `detour` builds the oracle from `blocked`,
+which has none. So the report and the oracle answer "where does code begin"
+differently, and the report is the more generous of the two. `analysis_context`'s own
+docstring is about exactly this -- "one construction, because two would drift" -- one
+level further out than it was written for.
+
+Not acted on. Adding `lea_targets` to `blocked` would grow the oracle and wants its
+own measurement rather than riding along on this one.
+
+#### The control is inside the tool, because nothing else guards this
+
+`outside` is a report target, not a gate, and no suite exercises `classify`. So
+`leaf_ranges` runs `control()` before answering, and it refuses with *the control
+failed, so no result below means anything*. Its cases are the ones
+`split_refused`'s argument needs, and the load-bearing one is a pair: the SAME chunk
+accepted whole and refused recut.
+
+Sabotaged by making `classify` stop reading the seventh field, which is how the
+distinction would really be lost:
+
+    outside.py: the control failed -- recut, ends in a conditional jump
+    was accepted and must be refused. No result below means anything.
+
+Without it, that field falling out of use brings back 236 mid-function pieces and
+nothing downstream says so -- the oracle is simply bigger.
 
 ### Finding 312 -- the destination is the other source, and the order is kept
 

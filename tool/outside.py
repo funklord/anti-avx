@@ -145,6 +145,28 @@ def chunks(instructions, ranges):
 	with the padding that follows the previous function, so a chunk taken
 	without splitting starts at a `cc` -- and then every test of "does
 	anything call this address" asks about the padding and answers no.
+
+	**With `known`, split at every entry point as well, because padding
+	finds where a function ENDS and an entry point finds where one
+	BEGINS.** Between two `.pdata` functions MSVC packs several leaf
+	functions and their embedded constants with no `int3` between them, so
+	one chunk spans the lot: it is entered, it contains the constants as
+	`(bad)`, and it ends wherever the next described function starts rather
+	than at a `ret`. Classified whole it fails three of the four conditions
+	at once and 319 sites went with it.
+
+	Cutting at an entry point costs nothing and is not a new argument: a
+	call, jump or `lea` destination is a true instruction boundary, which is
+	exactly what the second condition already asserts about a chunk start.
+	Each piece is then classified by the SAME four conditions, and the ones
+	that are entered, end in a transfer and hold no `(bad)` are admitted --
+	141 of the 319. The rest stay refused, which is `function_ranges`'
+	trade kept rather than widened. Finding 313.
+
+	It under-admits on purpose. An internal jump target inside a genuine
+	leaf function cuts it in two, and the first piece then ends at the loop
+	head rather than at a `ret` and is refused. Losing a piece is the right
+	direction to be wrong in.
 	"""
 	starts = [start for start, _end in ranges]
 	out = []
@@ -172,10 +194,90 @@ def chunks(instructions, ranges):
 	return out
 
 
+def split_refused(instructions, found, known):
+	"""`found`, with every REFUSED chunk re-cut at its entry points.
+
+	**Padding says where a function ends and an entry point says where one
+	begins, and between two `.pdata` functions MSVC leaves no padding.** It
+	packs several leaf functions and their embedded constants there, so one
+	chunk spans the lot: entered at its first byte, holding the constants as
+	`(bad)`, and ending wherever the next described function starts rather
+	than at a `ret`. Classified whole it fails three conditions at once, and
+	319 of Starfield's surviving sites went with it.
+
+	Re-cutting is not a new argument. A call, jump or `lea` destination is a
+	true instruction boundary, which is precisely what the second condition
+	already asserts about a chunk start -- so each piece is handed to
+	`classify` and judged by the same conditions, with the third one
+	tightened because the first no longer holds: see `classify`. 133 VEX
+	sites in 1,003 pieces are admitted; the rest stay refused, which keeps
+	`function_ranges`' trade rather than widening it.
+
+	**Only refused chunks, and that bound is measured rather than cautious.**
+	Cutting every chunk turned 3,006 into 108,688 pieces and admitted 14,174
+	VEX sites -- a hundredfold change to the oracle, from a change meant to
+	recover 141 sites. Two properties said so: the admitted pieces were 71.9%
+	16-byte aligned against 93.9% for the refused ones, inverting the test
+	that validated the original 865, and 2,216 of them ended in a CONDITIONAL
+	jump, which is mid-function. Both come from cutting genuine functions at
+	their internal loop heads. A chunk that already passes has nothing to
+	gain from being cut and everything to lose, so it is left whole.
+
+	It still under-admits, on purpose: an internal jump target inside a
+	refused leaf function cuts it in two and the first piece then ends at the
+	loop head rather than at a `ret`. Losing a piece is the right direction
+	to be wrong in. Finding 313.
+	"""
+	out = []
+	order = [address for address, _e, _m, _o in instructions]
+	rows = {address: (encoding, mnemonic)
+	        for address, encoding, mnemonic, _o in instructions}
+	place = {address: i for i, address in enumerate(order)}
+	for chunk in found:
+		if classify(chunk, known)[1] or chunk[0] not in place:
+			out.append(chunk)
+			continue
+		piece = None
+		i = place[chunk[0]]
+		while i < len(order) and order[i] < chunk[1]:
+			address = order[i]
+			encoding, mnemonic = rows[address]
+			if piece is not None and address in known and address != piece[0]:
+				out.append(piece)
+				piece = None
+			if piece is None:
+				piece = [address, address, 0, 0, 0, "", True]
+			piece[1] = address + len(encoding)
+			piece[2] += 1
+			piece[5] = mnemonic
+			if encoding[:1] in (b"\xc4", b"\xc5"):
+				piece[3] += 1
+			if mnemonic == "(bad)":
+				piece[4] += 1
+			i += 1
+		if piece is not None:
+			out.append(piece)
+	return out
+
+
 def classify(chunk, known):
-	"""(verdict, accepted as code) for one chunk."""
-	_first, _end, _count, _vex, bad, last = chunk
-	terminates = last in TERMINATORS or (last.startswith("j") and last != "(bad)")
+	"""(verdict, accepted as code) for one chunk.
+
+	**A recut piece is held to a stricter third condition, because it has
+	lost the first.** A whole chunk is bracketed by `int3`, so "ends in a
+	transfer" only has to rule out a desync; a conditional jump is enough,
+	being a thing compiler output does at the end of a padded block. A piece
+	cut at an entry point has no padding either side, so that condition is
+	carrying the whole weight of "this is where the function ends" -- and a
+	conditional jump is exactly where a function does NOT end. Requiring a
+	`ret` or an unconditional `jmp` costs 9 VEX sites of 142 and drops 236 of
+	1,239 pieces, which is a cheap price for the condition that was dropped.
+	Finding 313.
+	"""
+	_first, _end, _count, _vex, bad, last = chunk[:6]
+	recut = len(chunk) > 6 and chunk[6]
+	terminates = last in TERMINATORS if recut else \
+		last in TERMINATORS or (last.startswith("j") and last != "(bad)")
 	if bad:
 		return "contains (bad) -- not code", False
 	called = chunk[0] in known
@@ -188,6 +290,44 @@ def classify(chunk, known):
 	return "uncalled, runs off the end", False
 
 
+def control():
+	"""Refuse to answer unless `classify` still tells the two cases apart.
+
+	**The recut rule is a distinction, and a distinction is what rots
+	silently.** If the seventh field stops being read, every recut piece
+	falls back to the loose terminator test and 236 mid-function pieces come
+	back with it -- and nothing downstream would say so, because the oracle
+	would simply be bigger. A control that lives beside the tool is run when
+	somebody remembers; this one is run when they do not.
+
+	Each case is one that has to hold for `split_refused`'s argument to
+	stand, and the conditional-jump pair is the whole of it: the SAME chunk
+	is accepted whole and refused recut. Finding 313.
+	"""
+	entry = 0x1000
+	known = {entry}
+	cases = (
+		("whole, ends in a conditional jump", [entry, 0x1010, 4, 1, 0, "jne"],
+		 True),
+		("recut, ends in a conditional jump",
+		 [entry, 0x1010, 4, 1, 0, "jne", True], False),
+		("recut, ends in ret", [entry, 0x1010, 4, 1, 0, "ret", True], True),
+		("recut, ends in an unconditional jmp",
+		 [entry, 0x1010, 4, 1, 0, "jmp", True], True),
+		("recut, holds a (bad)", [entry, 0x1010, 4, 1, 1, "ret", True], False),
+		("recut, nothing enters it",
+		 [0x2000, 0x2010, 4, 1, 0, "ret", True], False),
+	)
+	for name, chunk, want in cases:
+		got = classify(chunk, known)[1]
+		if got is not want:
+			raise SystemExit(
+				f"outside.py: the control failed -- {name} was "
+				f"{'accepted' if got else 'refused'} and must be "
+				f"{'accepted' if want else 'refused'}. No result below "
+				f"means anything.")
+
+
 def leaf_ranges(instructions, ranges, known):
 	"""(start, end) of every chunk outside .pdata that is provably code.
 
@@ -195,8 +335,10 @@ def leaf_ranges(instructions, ranges, known):
 	concatenate into one oracle. See the module docstring for why each of
 	the four conditions is required.
 	"""
+	control()
 	return sorted((first, end)
-	              for chunk in chunks(instructions, ranges)
+	              for chunk in split_refused(
+	                  instructions, chunks(instructions, ranges), known)
 	              for first, end in [(chunk[0], chunk[1])]
 	              if classify(chunk, known)[1])
 
@@ -226,7 +368,7 @@ def main(argv):
 	print(f"  plus addresses taken by a RIP-relative lea    {len(known):>9,}")
 	print()
 
-	found = chunks(instructions, ranges)
+	found = split_refused(instructions, chunks(instructions, ranges), known)
 	with_vex = [c for c in found if c[3]]
 	print(f"chunks outside .pdata               {len(found):>9,}")
 	print(f"  of which contain a VEX site       {len(with_vex):>9,}")
