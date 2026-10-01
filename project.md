@@ -14007,6 +14007,117 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 315 -- a reason that was true and described the wrong party
+
+All 39 of Starfield's refused stubs say `moved: 256-bit, no Y strategy took it`. That
+sentence says a Y strategy declined the window. **The strategy is `unit`, which is a Y
+strategy, and it took it.**
+
+The reason is `lower_vex`'s own words re-labelled with a `moved: ` prefix, and
+`lower_vex` is right about its own situation: it was handed a 256-bit instruction and it
+has no answer for one. What it cannot know is WHY it was handed one. A swallowed
+neighbour rides in `preceding` rather than as a span member -- the comment above the
+backward-widening guard says why, and that as a member it would be "emitted correctly
+and accounted nowhere" -- so `moved_instruction` offers it to `lower_vex`, which is the
+only lowering a carried instruction is ever offered. The span emission lowers 256-bit
+perfectly well and never sees it.
+
+The reason now names that. It is the only change kept from this item.
+
+#### What the borrowed wording cost
+
+Two narrowings, each measured and each wrong:
+
+    a member has no span shape      33 of 36 windows have one for every member
+    the window was built as plain   all 39 are `unit`
+
+The second needed Finding 314's strategy column to settle, and the first cost a 400-line
+probe. **A reason that describes the callee's situation rather than the caller's is
+worth less than one that is merely true**, because the reader's next question is always
+"how did it get here".
+
+The diagnosis fell out in one step once the strategy was in the roll: for a back-widened
+window `window_start = before_address`, so the site the roll names IS the carried
+instruction, and all three sampled are 256-bit VEX -- `vmovups (%rcx),%ymm5`,
+`vmulps %ymm3,%ymm3,%ymm0`, `vmulps %ymm3,%ymm0,%ymm1`.
+
+#### Refusing the widening instead was measured and reverted
+
+The obvious fix is to refuse a 256-bit neighbour where the guard already refuses EVEX,
+one line up, and for the same reason: `moved_instruction` is the only thing that will
+lower it and it cannot. Measured:
+
+    frontier                                   996 ->  996      0 left, 0 arrived
+    refused stubs                               39 ->    0    -39
+    lost to a refused stub                      17 ->    0    -17
+    never a candidate                            4 ->    0     -4
+    lost to an overlap                          15 ->    6     -9
+    declined: 256-bit: arithmetic rather than a copy  31 -> 57  +26
+    windows not placed                         443 ->  469    +26
+
+**Not one site was lowered.** The 39 refusals went to zero and the 30 sites moved
+sideways. Reverted, and the revert proved byte-identical to the pre-change image.
+
+Three reasons, and the third is the one that decided it:
+
+- **It gains nothing and costs 26 windows.** The narrower window is a real loss in the
+  window economy even though the frontier is flat.
+- **The new labels are LESS precise.** The 26 that moved are 10 `vdivps`, 5 `vsubps`,
+  5 `vaddps`, 3 `vorps`, 1 `vmulps` all-distinct, one aliased `vmulpd` and one
+  `vcvtdq2ps` -- every one a shape this tool already lowers, through `lanereg3`,
+  `lanealias` and `LANE_UNARY`. Calling them "arithmetic rather than a copy" blames the
+  arithmetic, which is not the problem. This file has paid for an imprecise bucket three
+  times (310, 314, and the fallback that produced 310); a fourth is not worth a tidier
+  refusal count.
+- **It is a diagnostic regression.** `stub-refused.txt` is what made this class visible
+  at all. Emptying it moves the information into the census under a vaguer name, so the
+  roll that found the item would no longer find it.
+
+#### The fix for the imprecision was itself imprecise, twice
+
+**First it flattened the reasons it should have left alone.** Tested on the width and
+placed before the re-label, it swallowed `the FMA would not lower` and `no direct SSE
+form and not a sequence` as well: three of the 39 traded a reason naming the family for
+one naming only the width. 36 + 2 + 1 became 39, and the roll is what showed it. Only
+the generic reason is re-worded now.
+
+**Then the repair double-counted.** Popping the generic reason can leave the inner
+counter empty, and an `else` on it fired a second `the VEX neighbour would not lower`
+for the very refusals just recorded -- 39 reasons over 39 stubs would have become 78.
+It is a tally now, because the fallback exists for a `lower_vex` that refused and said
+nothing, which is a third case and wants counting rather than inferring from emptiness.
+
+Both were caught by a control over `moved_instruction` directly rather than by a
+twenty-minute image run:
+
+    generic 256-bit   reasons=1  the swallowed neighbour is 256-bit ...
+    256-bit FMA       reasons=1  the FMA would not lower            kept
+    256-bit permute   reasons=1  no direct SSE form and not a sequence  kept
+    128-bit           reasons=0  lowered
+
+**This is worth more than the finding it belongs to.** The whole item reverted a change
+for making labels less precise, and the replacement did the same thing on its first two
+drafts. Precision about a diagnostic is not a thing one is careful about once.
+
+#### The kept change is inert by construction, and is not exercised by any fixture
+
+The lowering `reasons` Counter is written at 47 sites and read at none -- the one
+apparent read is a different local, a list of stale-read tuples -- so a reason string
+cannot reach emission. Confirmed rather than argued: the image is byte-identical.
+
+**No fixture produces the new wording.** Only Starfield does, 39 times. That is
+`evidence.md`'s unproduced-diagnostic hazard, and it is recorded rather than waved past:
+a fixture would need a dense 256-bit run with a unit window widening backwards into it,
+which is buildable and is its own piece of work.
+
+#### Where it leaves the next item
+
+The 26 sites have working shapes and no strategy claims their window. So the question is
+not how to lower 256-bit arithmetic -- Findings 284, 300 and 312 did that -- but **why
+no span or unit takes a window in a dense run of 256-bit instructions.** That is the
+same question as the 469 unplaced windows and the 506-site withheld class, which is now
+over half the frontier and the only large number left.
+
 ### Finding 314 -- a roll that could not answer the question it was written for
 
 `repair-blame.txt` carried a window's first byte and a reader's address. A window is a

@@ -3109,10 +3109,49 @@ def moved_instruction(entry, at, pool=0, reasons=None):
 		out = lower_vex(address, moved, moved_operands, moved_mnemonic, at,
 		                scratch, pool, inner)
 		if out is None and reasons is not None:
-			if inner:
-				for why, count in inner.items():
-					reasons["moved: " + why.replace("lower: ", "")] += count
-			else:
+			# **Only the GENERIC refusal is re-worded.** The first
+			# version tested the width alone and ran before the re-label,
+			# so it swallowed `the FMA would not lower` and `no direct SSE
+			# form and not a sequence` as well -- three of the 39 traded a
+			# reason that names the family for one that names only the
+			# width. That is the same loss of precision this item reverted
+			# a whole change over, reintroduced by the fix for it, and the
+			# roll is what showed it: 36 + 2 + 1 became 39.
+			generic = "lower: 256-bit, no Y strategy took it"
+			told = 0
+			if inner and generic in inner:
+				# **Name the condition, not the symptom.** Re-labelling
+				# `lower_vex`'s own words gave `moved: 256-bit, no Y
+				# strategy took it`, which says a Y strategy declined the
+				# window -- and the window's strategy is `unit`, which is a
+				# Y strategy and took it. What actually happened is that a
+				# SWALLOWED neighbour is 256-bit, and `lower_vex` is the
+				# only thing offered one: the span emission lowers 256-bit
+				# and a carried instruction never reaches it, because it
+				# rides in `preceding` rather than as a member.
+				#
+				# All 39 of Starfield's refused stubs are this, and the
+				# borrowed wording cost two wrong narrowings -- first that a
+				# member had no span shape (33 of 36 windows have one for
+				# every member), then that the window was built as `plain`
+				# (all 39 are `unit`). A reason that describes the caller's
+				# situation rather than the callee's is worth more than one
+				# that is merely true. Finding 315.
+				count = inner.pop(generic)
+				reasons["moved: the swallowed neighbour is 256-bit, and "
+				        "only the span emission lowers one"] += count
+				told += 1
+			# **A tally, not an `else`.** Popping the generic reason can
+			# leave `inner` empty, and an `else` on it then fired a second,
+			# spurious `the VEX neighbour would not lower` for the very
+			# refusals just recorded -- 39 reasons over 39 stubs would have
+			# become 78. The fallback exists for a `lower_vex` that refused
+			# and said nothing, which is a third case and wants counting
+			# rather than inferring from emptiness.
+			for why, count in list(inner.items()) if inner else ():
+				reasons["moved: " + why.replace("lower: ", "")] += count
+				told += 1
+			if not told:
 				reasons["moved: the VEX neighbour would not lower"] += 1
 		return out
 	# A relative branch is re-aimed rather than relocated: its displacement
