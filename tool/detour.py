@@ -871,11 +871,56 @@ def run_configuration():
 	72 of. Nothing in either header could have said so -- only the count
 	gave it away, and only because the two happen to differ by enough to
 	notice. Finding 308.
+
+	**Naming the flags is not enough either, and this is the harder case.**
+	Two rolls were produced from the same image, the same flags and the
+	same total of 996 surviving sites, with 31 and 57 sites in one bucket.
+	Their headers were BYTE-IDENTICAL, because what differed was the tool:
+	one was written before an experiment was reverted and one after. Every
+	guard that exists passed, and the join built on them put 26 sites in a
+	class their own run does not have.
+
+	So the header carries a fingerprint of the tool's own sources. It
+	changes whenever any of them changes, which is the point -- a snapshot
+	taken across an edit is meant to stop comparing equal. Hashing the
+	files rather than asking git is deliberate: these trees are edited for
+	hours between commits, so `HEAD` is the same for every roll in a
+	session and a dirty flag only says that something changed, not what.
+	Finding 316.
 	"""
 	return (f"shadow-regs={SHADOW_REGS_RULE}"
 	        f" teb-scratch={TEB_SCRATCH}"
 	        f" index-const={'on' if INDEX_CONST else 'off'}"
-	        f" spill={SPILL}")
+	        f" spill={SPILL}"
+	        f" tool={tool_fingerprint()}")
+
+
+_FINGERPRINT = None
+
+
+def tool_fingerprint():
+	"""Twelve hex digits over the sources this run is made of.
+
+	Computed once. Every `.py` beside this file is read in sorted order, so
+	the digest covers the collector, the patcher, the lowering tables and
+	the scratch finder alike -- a change in any of them can move a bucket.
+	An unreadable file is folded in by name rather than skipped, because a
+	fingerprint that quietly ignores what it cannot read is one that agrees
+	across the change it was written to catch.
+	"""
+	global _FINGERPRINT
+	if _FINGERPRINT is None:
+		import hashlib
+		from pathlib import Path
+		digest = hashlib.sha256()
+		for source in sorted(Path(__file__).parent.glob("*.py")):
+			digest.update(source.name.encode())
+			try:
+				digest.update(source.read_bytes())
+			except OSError:
+				digest.update(b"<unreadable>")
+		_FINGERPRINT = digest.hexdigest()[:12]
+	return _FINGERPRINT
 
 
 INDEX_PLACEHOLDER = 0x5A5A5A5A

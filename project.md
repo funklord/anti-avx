@@ -14007,6 +14007,45 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 316 -- two rolls, byte-identical headers, different contents
+
+    # Starfield-unpacked.exe	996 surviving	shadow-regs=all teb-scratch=auto ...   arith=31
+    # Starfield-unpacked.exe	996 surviving	shadow-regs=all teb-scratch=auto ...   arith=57
+
+Same image. Same flags. Same total. 31 sites against 57 in one bucket, because one was
+written before an experiment was reverted and one after. **Every guard that exists
+passed**, and a join built on the pair reported 26 sites in a class their own run does
+not have.
+
+This is the fourth variant of one hazard, and the only one nothing could have caught:
+
+    image           Finding 240   the path is fixed, so the header names the image
+    configuration   Finding 308   the same image under two flag sets
+    extent          Finding 314   a window start where a range was meant
+    the tool        here          the same image, the same flags, different code
+
+So the header carries a fingerprint of the tool's own sources, `tool=ab3539a9fa2e`.
+**Hashing the files rather than asking git is deliberate**: these trees are edited for
+hours between commits, so `HEAD` is identical for every roll in a session and a dirty
+flag says only that something changed, not what.
+
+#### The control runs in three directions
+
+    stable across two calls        True   ab3539a9fa2e
+    moves when scratch.py changes  True   cfa103c6e688
+    restores when reverted         True
+
+The middle one is load-bearing and names a DIFFERENT file on purpose: it shows the
+digest covers the collector, the patcher, the lowering tables and the scratch finder,
+any of which can move a bucket. The third shows it is a function of content rather than
+of time. An unreadable source folds in by name rather than being skipped, because a
+fingerprint that ignores what it cannot read agrees across exactly the change it exists
+to catch.
+
+**The guard's first act was to refuse the rolls already in hand**, the apply-written
+ones predating the fingerprint, which is the behaviour wanted rather than an
+inconvenience.
+
 ### Finding 315 -- a reason that was true and described the wrong party
 
 All 39 of Starfield's refused stubs say `moved: 256-bit, no Y strategy took it`. That
