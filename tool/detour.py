@@ -7203,6 +7203,22 @@ UNIT_LIMITS = (12, 6, 3, 1)
 UNIT_REFUSED = Counter()
 UNIT_EXAMPLES = {}
 
+# **Which rung of the ladder each unit window was actually taken at.**
+# `unit_shortening` descends from 12 members to 1 because "a greedy window
+# starves its own helper", and it snapshots the refusal counters around the
+# retries -- correctly, so a site that succeeds short does not also leave the
+# long window's reason behind. The consequence is that a DESCENT is invisible:
+# the roll shows only sites the whole ladder refused, 41 of them, while every
+# window that placed shorter than it could have is unrecorded.
+#
+# That matters because the cost of a short window is not a refusal, it is an
+# overlap -- `unit_shortening` says so itself, "a shorter window is one more
+# likely to be overlapped by its neighbour" -- and there are 53,101 skipped
+# for overlap against 41 refused. So the question of what helper pressure
+# costs cannot be read off the refusal roll at all, in either direction.
+# Finding 317.
+UNIT_RUNG = Counter()
+
 # **The rungs the ladder did not take, for the windows that can be
 # dropped.** The stale-read repair withholds a whole window because of one
 # instruction it swallowed, and at 1,318 windows for 1,364 survivors each
@@ -7337,6 +7353,7 @@ def unit_shortening(instructions, plain, index, blocked, home,
 		lone = unit_candidate(instructions, plain, index, blocked, home,
 		                      ranges, scope, tls, limit=cap, back=back)
 		if lone is not None:
+			UNIT_RUNG[(cap, "back" if back else "forward")] += 1
 			# **Walked on demand, not now.** The ladder is eight rungs and
 			# there are 35,428 unit windows, so building every rung at
 			# every site is eight times the collection for an answer only
@@ -10382,6 +10399,7 @@ def collect(binary, listing, context=None):
 	REGION_REFUSED.clear()
 	REGION_EXAMPLES.clear()
 	UNIT_REFUSED.clear()
+	UNIT_RUNG.clear()
 	UNIT_EXAMPLES.clear()
 	WIDE_SITES.clear()
 	instructions, plain, blocked, sources, switch_tables, switch_seen = \
@@ -16427,6 +16445,20 @@ def apply_all(binary, listing, output):
 					why, window, _p, _d, how = STUB_DETAIL[start]
 					out.write(f"{why}\t{start:#x}\t{window}\t{how}\n")
 			print(f"apply: every refused stub written to {roll}")
+	if UNIT_RUNG:
+		# **What the ladder cost, which the refusal roll cannot show.** The
+		# first rung is the window the strategy wants; everything below it
+		# is a window shortened to find a helper, and a shorter window is
+		# one more likely to be overlapped. Finding 317.
+		taken = sum(UNIT_RUNG.values())
+		best = UNIT_RUNG.get((UNIT_LIMITS[0], "forward"), 0)
+		print(f"apply: unit windows by the rung they were taken at, of "
+		      f"{taken:,}: {best:,} at the full {UNIT_LIMITS[0]} forward "
+		      f"({100 * best / taken:.1f}%), the rest shortened or reversed "
+		      f"to find a helper")
+		for (cap, way), count in sorted(
+				UNIT_RUNG.items(), key=lambda kv: (-kv[1], kv[0])):
+			print(f"apply:   {cap:>3} member(s) {way:<8} {count:>8,}")
 	report_regions(candidates, binary)
 	report_units(candidates, placed, home, WIDE_SITES["256-bit"],
 	             binary)

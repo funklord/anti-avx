@@ -14007,6 +14007,75 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 317 -- the ladder barely descends, and what that leaves
+
+`unit_shortening` descends from 12 members to 1 because "a greedy window starves its own
+helper", and it snapshots the refusal counters around the retries -- so a DESCENT leaves
+no trace. The roll shows the 41 sites the whole ladder refused and nothing about windows
+that placed shorter than they could have. `UNIT_RUNG` records the rung each one was
+actually taken at:
+
+    12 member(s) forward    35,028   97.8%
+     3 member(s) forward       254
+    12 member(s) back          196   not a descent -- reversed, same length
+     6 member(s) forward       180
+     1 member(s) back           83
+     1 member(s) forward        62
+
+**Helper starvation costs 579 windows of 35,803 -- 1.6%.** The 196 taken backwards are
+Finding 277's widening rather than starvation, so they do not count.
+
+#### The hypothesis it was measured to test, and dropped
+
+`lanereg` demands two helpers because it loads both slot sources into registers, where
+the FMA path reads one as a memory operand and accumulates in a single register.
+Finding 301 excused the FMA form from the two-helper budget for exactly that and was
+worth 66 windows; `TWO_HELPERS` has one consumer, inside `unit_candidate`, which refuses
+without a per-thread block -- so the budget could honestly have asked for one.
+
+**The criterion was written down before the measurement**: if most windows take the full
+rung, starvation is rare and the change is worth the three `lanereg3` sites in the roll
+and nothing more. 97.8% take the full rung. Dropped, for 25 minutes of measurement
+rather than an implementation.
+
+#### Overlap looks like the loss and is not
+
+35,803 unit windows were taken and 19,255 placed; 15,900 candidates were foreclosed by a
+placed window, and `place_stubs` resolves overlap by `sorted(candidates, key=c[0])` with
+a running watermark -- purely positional, so a one-site `plain` window forecloses a
+twelve-member `unit` window four bytes later. That is weighted interval scheduling solved
+by the worst standard heuristic, and it reads like a large opportunity.
+
+It is not. **`lost to an overlap` is 15 sites.** A foreclosed candidate's sites are
+almost always lowered by the window that won or by a later one, so 15,900 foreclosures
+cost 15 survivors. The frontier bounds the prize at 996 however many candidates compete,
+and this is the shape `evidence.md` calls a price with two halves: the numerator looked
+like 29,000 sites and the denominator is the frontier.
+
+#### What the whole endgame is worth, which is the part worth keeping
+
+The withheld class is 502 sites in 443 windows and 98.7% of its blame is internal, so it
+moves only when the classes it terminates on clear. Those anchors are six classes holding
+**75 sites** between them -- refused stub 17, arithmetic 31, overlap 15, no SSE form 6,
+never a candidate 4, no known upper half 2. Clearing every one of them:
+
+    blamed windows released    266 of 443
+    blamed windows still stuck 177
+
+The 177 wait on the withheld class itself -- self-blame, and passengers whose own window
+is not a blamed start. At roughly 1.13 sites per window the 266 are about 300 sites, so
+
+    75 anchor sites + ~300 released  ~375
+    frontier 996 -> ~620
+
+**That is the realistic floor of this approach**, and the 620 is mostly structural: 228
+`next instruction is a branch target`, 101 `next instruction will not move`, 73 `outside
+.pdata` and ~200 withheld sites whose blame is circular. Worth stating plainly rather
+than discovering it one item at a time -- and worth stating that no single remaining item
+is large: the biggest anchor is 31 sites, and two of the six are classes already measured
+as negatives (F16C needs a call into injected code; refusing the backward widening moved
+nothing).
+
 ### Finding 316 -- two rolls, byte-identical headers, different contents
 
     # Starfield-unpacked.exe	996 surviving	shadow-regs=all teb-scratch=auto ...   arith=31
