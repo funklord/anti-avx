@@ -7563,8 +7563,30 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# The neighbour is carried in `preceding` rather than as a member:
 	# `build_stub` emits that list before the span, which is the order it
 	# already executed in, and `place_stubs` reads it to record which
-	# boundaries a window swallows deliberately. As a member it is emitted
-	# correctly and accounted nowhere.
+	# boundaries a window swallows deliberately.
+	#
+	# **This used to add "as a member it is emitted correctly and accounted
+	# nowhere", and that was wrong.** Measured: taken as a member the whole
+	# of `verify` passes -- every boundary, every branch target, zero VEX in
+	# the stub section -- because `swallowed` never recorded FORWARD members
+	# either and `verify` derives an internal boundary from the window's
+	# extent. Ordering needs nothing either: this block runs before the
+	# site's own `take` and `span_entries` walks `members` in list order
+	# with no sort, so the instruction that executes first is listed first.
+	#
+	# **The route is sound and does not pay, which is a different reason to
+	# leave it alone.** A member's registers join the set the helper must
+	# avoid, and 54 windows then found none -- a refusal reason that did not
+	# previously exist, `no volatile xmm and scratch slot to stash it`. The
+	# frontier held at 996 with detours unchanged at 202,259, which is what
+	# shows nothing was lowered: the refusal moved from stub time to collect
+	# time. Unplaced windows rose 443 to 471.
+	#
+	# So the asymmetry is real -- the forward walk below says a 256-bit
+	# neighbour is a MEMBER, never a passenger, and this direction carries
+	# one -- and closing it needs the helper demand to fall first. That is a
+	# dependency between two items and it was invisible until one was built.
+	# Finding 318.
 	#
 	# **It is `window_start` and not `start` because this function already
 	# has a `start`** -- the enclosing FUNCTION's address, used for the

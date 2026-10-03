@@ -14007,6 +14007,68 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 318 -- the same class refused three ways, and a disproved objection
+
+`lost to a refused stub` is 17 sites releasing 103 windows that depend on nothing else,
+the largest cascading anchor in Finding 317's bound. It has now been attacked three ways
+and held at 996 every time.
+
+    refuse the backward widening       996 -> 996   Finding 315, reverted
+    take the neighbour as a member     996 -> 996   here, reverted
+    (and the shapes were never the obstacle: 33 of 36 windows carry a span
+     shape for every member, measured before either attempt)
+
+Both reverts proved byte-identical to the baseline image. **Three mechanisms, one
+number: the class is a floor.**
+
+#### The asymmetry is real and is the whole explanation
+
+The forward walk states the rule: *a 256-bit neighbour is a MEMBER, never a passenger*,
+because "emitting VEX into a stub is the one thing this tool exists not to do". The
+backward path carries one into `preceding`, which IS the passenger path, so
+`moved_instruction` is the only lowering offered it and `moved_instruction` cannot do
+256-bit. That accounts for all 39 refused stubs -- strategy `unit` throughout, the roll
+naming the carried instruction because a back-widened window starts at it.
+
+**A rule written down and applied in one direction is worse than one not written**, since
+the comment reads as the file's settled position and the other half of the file disagrees
+with it silently.
+
+#### The objection that blocked it was false, and that is worth more than the change
+
+The comment said a member would be "emitted correctly and accounted nowhere". Measured:
+taken as a member, **the whole of `verify` passes** -- every boundary, every branch
+target, zero VEX in the stub section. `swallowed` never recorded FORWARD members either,
+and `verify` derives an internal boundary from the window's extent. Ordering needed
+nothing: the backward block runs before the site's own `take` and `span_entries` walks
+`members` in list order with no sort.
+
+The claim is corrected in place rather than argued with here, because the next person to
+read it would be sent away from a route that works.
+
+#### Why it still does not pay, and the dependency it exposed
+
+    frontier                996 -> 996
+    detours            202,259 -> 202,259   unchanged
+    unit refused            92 ->  146      +54
+    windows not placed     443 ->  471      +28
+
+**The detour count is what settles it.** Thirty-nine stubs building would mean
+thirty-nine more detours; there were none, so nothing was lowered. The +54 are a reason
+that did not previously exist -- `no volatile xmm and scratch slot to stash it` -- because
+a member's registers join the set the helper must avoid. The refusal moved from stub time
+to collect time and the site was lost either way.
+
+So this chains to the hypothesis dropped in Finding 317. Helper starvation was 1.6% and
+not worth attacking; **this change creates it, 54 times**, which means the backward member
+is only affordable if helper demand falls first -- a one-helper `lanereg` through
+`span_slot_op`, the thing Finding 317 declined on its own merits. Two items that are each
+not worth doing alone and might be worth doing together, and the dependency was invisible
+until one of them was built.
+
+The ladder confirms where the pressure came from: 97.9% at the full rung against 97.8%
+before, so it is the member set rather than the window length.
+
 ### Finding 317 -- the ladder barely descends, and what that leaves
 
 `unit_shortening` descends from 12 members to 1 because "a greedy window starves its own
