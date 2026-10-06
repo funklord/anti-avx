@@ -7257,6 +7257,35 @@ REPAIR_SUBSTITUTED = 0
 # Finding 311.
 STUB_DETAIL = {}
 
+# **Bytes a rebuilt window gave up, which the census could not name.** The
+# stale-read repair replaces a guilty window with another rung rather than
+# dropping it, and the replacement is a DIFFERENT rung -- it may start
+# earlier and it is usually shorter. A site the original covered and the
+# replacement does not is then in no final extent, carries no decline
+# because the collector did produce a candidate for it, and is not dropped
+# because the window was rebuilt rather than dropped.
+#
+# So it fell through every test into `never a candidate` -- the bucket
+# Finding 310 named as the place a mis-keyed lookup goes to be invisible,
+# and which still has no assertion attached. Four sites, every one an
+# ordinary three-register shape this tool lowers, sitting next to an FMA.
+# Finding 319.
+REPAIR_EXCLUDED = set()
+
+# **Every 256-bit site the collector got past its own door.** Finding 310
+# said the only thing that makes a bucket named for missing information
+# honest is an assertion about what may land in it, and `never a candidate`
+# still had none: it absorbed the rebuild casualties above for as long as
+# the repair has been substituting windows, and nothing could have said so.
+#
+# This is the weaker claim that can actually be made -- not "the bucket is
+# empty", which it is not, but "the bucket says which of two things
+# happened". A site the loop refused at its head (not VEX, `(bad)`, inside
+# a data island, already patched in place) never reached a strategy; a site
+# past that point was offered to every one of them and a silent exit is a
+# defect rather than a property of the binary. Finding 319.
+COLLECT_SEEN = set()
+
 REPAIR_READERS = set()
 REPAIR_BLAMED_BY = defaultdict(set)
 REPAIR_DROPPED_WHY = Counter()
@@ -10420,6 +10449,7 @@ def collect(binary, listing, context=None):
 	SAVED_XMM.update(saved_xmm_map(binary))
 	REGION_REFUSED.clear()
 	REGION_EXAMPLES.clear()
+	COLLECT_SEEN.clear()
 	UNIT_REFUSED.clear()
 	UNIT_RUNG.clear()
 	UNIT_EXAMPLES.clear()
@@ -10517,6 +10547,7 @@ def collect(binary, listing, context=None):
 			continue
 		if address in already:
 			continue
+		COLLECT_SEEN.add(address)
 		vex = inplace.decode_vex(encoding)
 		if vex is None:
 			continue
@@ -14772,6 +14803,7 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 	REPAIR_BLAME_WHERE.clear()
 	REPAIR_SPLITTABLE.clear()
 	REPAIR_READERS.clear()
+	REPAIR_EXCLUDED.clear()
 	REPAIR_BLAMED_BY.clear()
 	REPAIR_DROPPED_WHY.clear()
 	REPAIR_DROPPED_SITES.clear()
@@ -14927,6 +14959,12 @@ def repaired_placement(instructions, blocked, sources, candidates, patched,
 				swapped.pop(start, None)
 			else:
 				swapped[start] = other
+				# A set difference and not a suffix: the replacement is
+				# another rung, so it may begin earlier as well as end
+				# sooner.
+				REPAIR_EXCLUDED.update(
+					set(range(start, start + width))
+					- set(range(other[0], other[0] + other[4])))
 	# **Not settling means the windows below are known-guilty.** The
 	# previous version placed them and left a wrong image for `verify` to
 	# find. Refusing is the only honest end: there is no partial repair
@@ -15183,8 +15221,24 @@ def frontier_census(original, patched, listing):
 			          else "lost to an overlap or a refused stub")
 		elif address in wanted:
 			reason = "a placed window covered it (should not happen)"
+		elif address in REPAIR_EXCLUDED:
+			reason = "excluded by a window the repair rebuilt"
+		elif address in COLLECT_SEEN:
+			reason = "the collector reached it and recorded nothing"
+		elif not COLLECT_SEEN:
+			# **The branch above cannot fire against an empty set, and it
+			# did not.** `COLLECT_SEEN.clear()` was first wired into
+			# `repaired_placement`, which runs AFTER `collect` fills it, so
+			# every site reaching here read "never reached" -- including one
+			# measured as passing all four of the loop's head guards, which
+			# is what made the answer impossible rather than merely wrong.
+			#
+			# A distinction drawn against an empty set is not a weaker
+			# distinction, it is a constant. Saying so here costs one branch
+			# and makes the failure name itself. Finding 319.
+			reason = "unclassifiable: COLLECT_SEEN was never filled"
 		else:
-			reason = "never a candidate"
+			reason = "the collector never reached it"
 		counted[reason] += 1
 		reason_of[address] = reason
 		if row is not None:

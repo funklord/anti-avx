@@ -14007,6 +14007,67 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 319 -- the bucket Finding 310 warned about, and an assertion made vacuous
+
+`never a candidate` held four sites. Finding 310 emptied it from 31 to 4 and said the
+part that mattered: a bucket named for the absence of information is where a mis-keyed
+lookup goes to be invisible, and the only thing that makes one honest is an assertion
+about what may land in it -- "`unaccounted` has one. This did not." It still did not.
+
+    never a candidate                                4 ->  1
+    excluded by a window the repair rebuilt               3
+    the collector reached it and recorded nothing         1
+    total                                          996 -> 996   image IDENTICAL
+
+**Three of the four were rebuild casualties.** The stale-read repair substitutes another
+ladder rung for a guilty window rather than dropping it. The replacement comes from
+`UNIT_ALTERNATIVES`, so it may begin EARLIER as well as end sooner -- which is why the
+excluded region is a set difference and not a suffix. A site the original covered and
+the replacement does not is in no final extent, carries no decline because the collector
+did produce a candidate for it, and is not dropped because the window was rebuilt. It
+fell through every test into the fallback, and has done for as long as the repair has
+been substituting windows.
+
+**The fourth is a genuine silent exit** and is now labelled as a defect rather than as a
+property of the binary, which is the distinction the bucket could not draw.
+
+#### Two readings eliminated by measurement, not by argument
+
+The loop head has exactly one guard that records nothing -- `if address in already:
+continue`, the in-place patch set, "anything already rewritten in place needs nothing
+further". Measured for all four: not in the patch set, and not in a data island either.
+That is what moved the search past the head of the loop, where reading had put it.
+
+#### And then the assertion was made vacuous in the same edit
+
+The fix split the fallback into "the collector reached it" and "never reached it", keyed
+on a `COLLECT_SEEN` set filled just past the head guards. The clear landed in
+`repaired_placement`, which runs AFTER `collect` fills it. So the set was empty at census
+time, the "reached" branch could never fire, and every site read **never reached** --
+including one measured as passing all four head guards, which is what made the answer
+impossible rather than merely wrong.
+
+**A distinction drawn against an empty set is not a weaker distinction, it is a
+constant.** `evidence.md`'s control-that-cannot-fail, introduced inside the fix for a
+bucket that existed because nothing asserted what may land in it.
+
+Two things keep it from recurring. The clear sits beside `UNIT_REFUSED.clear()` inside
+`collect` now. And the census **names an empty set rather than classifying against it**:
+`unclassifiable: COLLECT_SEEN was never filled`. The control runs both ways -- 0 entries
+before a collect, 4 after.
+
+#### What it is worth, which is nothing in sites
+
+The pick was made on a cascade of 30 -- four sites and 26 windows waiting only on them --
+and that figure assumed the four were a lever. Three are rebuild casualties, and
+recovering those needs the repair to SPLIT a window rather than shorten it, which
+Finding 281 measured as worse: 2,346 -> 2,349.
+
+So the lever did not exist and what was wrong was the label hiding its absence. That is
+Finding 310's shape exactly, which is the finding this one keeps rediscovering -- and the
+reason to record it is that the next reader will otherwise price this bucket as work
+again.
+
 ### Finding 318 -- the same class refused three ways, and a disproved objection
 
 `lost to a refused stub` is 17 sites releasing 103 windows that depend on nothing else,
