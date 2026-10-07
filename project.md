@@ -14007,6 +14007,44 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 321 -- a fingerprint that cried wolf
+
+Finding 316 put a digest of the tool's sources in every roll header, because two rolls
+from the same image and the same flags had differed only by the code that wrote them. It
+hashed every `.py` beside `detour.py` -- 26 files, including the style gate, its test
+suite, `pe_build.py` and a dozen oracles. **This program imports six of them.**
+
+So when another session committed a change to `style_gate.py`, the fingerprint moved and
+a join between this session's rolls was refused. The refusal was correct by the guard's
+own rule and wrong about the world: a lint tool cannot move a bucket in the rewriter's
+census.
+
+**A guard that cries wolf is one somebody switches off**, which is `evidence.md`'s
+long-ignore-list failure arriving from the other side -- there a gate is silenced by
+instalments for reporting falsely, here it would be ignored for reporting irrelevantly.
+Either way the next real divergence goes unnoticed.
+
+The digest covers the import closure now, taken from `sys.modules` rather than from a
+static scan -- an import made lazily is still an import -- and it is no longer cached,
+because a value computed before a lazy import would cover less than the run did. It is
+read when a roll is written, by which time everything is loaded, and six files cost
+nothing.
+
+#### The control has two sides now, which the first one did not
+
+    scratch.py          moves=True   wanted=True
+    patch.py            moves=True   wanted=True
+    outside.py          moves=True   wanted=True
+    lower.py            moves=True   wanted=True
+    style_gate.py       moves=False  wanted=False
+    pe_build.py         moves=False  wanted=False
+    test_style_gate.py  moves=False  wanted=False
+    why.py              moves=False  wanted=False
+
+Finding 316's control proved only that the digest COULD move, which a digest over the
+whole directory does readily. What it could not prove is that the digest stays still when
+nothing relevant changed, and that is the half a guard is judged on in daily use.
+
 ### Finding 320 -- a three-link chain built on two refusals read as one
 
 Findings 318 and the overlap measurement left what looked like a single item with three

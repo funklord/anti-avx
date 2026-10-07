@@ -895,32 +895,50 @@ def run_configuration():
 	        f" tool={tool_fingerprint()}")
 
 
-_FINGERPRINT = None
-
-
 def tool_fingerprint():
-	"""Twelve hex digits over the sources this run is made of.
+	"""Twelve hex digits over the sources this run is actually made of.
 
-	Computed once. Every `.py` beside this file is read in sorted order, so
-	the digest covers the collector, the patcher, the lowering tables and
-	the scratch finder alike -- a change in any of them can move a bucket.
-	An unreadable file is folded in by name rather than skipped, because a
-	fingerprint that quietly ignores what it cannot read is one that agrees
-	across the change it was written to catch.
+	**The import closure, not the directory.** The first version hashed
+	every `.py` beside this file -- 26 of them, including the style gate,
+	its test suite and a dozen oracles, none of which this program imports
+	or can be affected by. Another session editing the gate therefore moved
+	the fingerprint and refused a join that was perfectly sound. A guard
+	that cries wolf is one somebody switches off, which is the long-ignore-
+	list failure of `evidence.md` arriving from the other side.
+
+	So the digest covers what `sys.modules` says was loaded from this
+	directory: this file and the six it imports, transitively, which is
+	exactly the set that can move a bucket. Taken from the loader rather
+	than from a static scan, because an import this file makes lazily is
+	still an import.
+
+	**Not cached.** The first version was, and a cached value computed
+	before a lazy import would cover less than the run did. It is read when
+	a roll is written, by which time everything is loaded, and six files
+	cost nothing to hash. An unreadable source folds in by name rather than
+	being skipped, because a fingerprint that ignores what it cannot read
+	agrees across exactly the change it exists to catch. Finding 321.
 	"""
-	global _FINGERPRINT
-	if _FINGERPRINT is None:
-		import hashlib
-		from pathlib import Path
-		digest = hashlib.sha256()
-		for source in sorted(Path(__file__).parent.glob("*.py")):
-			digest.update(source.name.encode())
-			try:
-				digest.update(source.read_bytes())
-			except OSError:
-				digest.update(b"<unreadable>")
-		_FINGERPRINT = digest.hexdigest()[:12]
-	return _FINGERPRINT
+	import hashlib
+	import sys as _sys
+	from pathlib import Path
+	here = Path(__file__).resolve().parent
+	sources = {Path(__file__).resolve()}
+	for module in list(_sys.modules.values()):
+		where = getattr(module, "__file__", None)
+		if not where:
+			continue
+		found = Path(where).resolve()
+		if found.parent == here and found.suffix == ".py":
+			sources.add(found)
+	digest = hashlib.sha256()
+	for source in sorted(sources):
+		digest.update(source.name.encode())
+		try:
+			digest.update(source.read_bytes())
+		except OSError:
+			digest.update(b"<unreadable>")
+	return digest.hexdigest()[:12]
 
 
 INDEX_PLACEHOLDER = 0x5A5A5A5A
