@@ -893,6 +893,69 @@ tls_directory:
 	.long	0, 0
 """)
 
+
+# **The three sign-mask extractors, whose destination is a GPR.** A 256-bit
+# form yields twice the bits of its 128-bit one, so the halves combine as
+# `low | high << n` -- 16 for `vpmovmskb`, 4 for `vmovmskps`, 2 for
+# `vmovmskpd`. Each value here sets one element in the LOW half and the
+# corresponding one in the UPPER, so a lowering that drops the upper half or
+# shifts it wrongly cannot reach the answer:
+#
+#     vpmovmskb  byte 0 and byte 16   -> 0x00010001
+#     vmovmskps  float 0 and float 4  -> 0b00010001 = 17
+#     vmovmskpd  double 0 and double 2 -> 0b0101     = 5
+#
+# Each is added and its expected value subtracted, so a correct lowering
+# contributes nothing and 77 is reached by the constant alone. Ignoring the
+# upper half gives 1, 1 and 1; shifting by 8 rather than 16 gives 0x0101.
+# Finding 322.
+PROGRAMS["maskgpr"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	bytes(%rip), %rsi
+	vmovups	(%rsi), %ymm1
+	vmovups	0x20(%rsi), %ymm2
+	vmovups	0x40(%rsi), %ymm3
+	vpmovmskb	%ymm1, %eax
+	vmovmskps	%ymm2, %ecx
+	vmovmskpd	%ymm3, %edx
+	subl	$0x10001, %eax	/* the byte mask, exactly */
+	addl	%ecx, %eax
+	subl	$17, %eax		/* the float mask */
+	addl	%edx, %eax
+	subl	$5, %eax		/* the double mask */
+	addl	$77, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+bytes:	.byte 0x80, 0, 0, 0, 0, 0, 0, 0
+	.byte 0, 0, 0, 0, 0, 0, 0, 0
+	.byte 0x80, 0, 0, 0, 0, 0, 0, 0
+	.byte 0, 0, 0, 0, 0, 0, 0, 0
+	.long 0xBF800000, 0x3F800000, 0x3F800000, 0x3F800000
+	.long 0xBF800000, 0x3F800000, 0x3F800000, 0x3F800000
+	.quad 0xBFF0000000000000, 0x3FF0000000000000
+	.quad 0xBFF0000000000000, 0x3FF0000000000000
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
 PROGRAMS["blendv"] = (77, """
 	.text
 	.globl _start

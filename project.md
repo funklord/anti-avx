@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **803,955 of 804,951 VEX
-sites -- 99.88%** -- through 202,259 detours, and every `make detour-verify` invariant
-holds on the result. **996 sites are left** (Finding 313, 2026-09-30), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **803,991 of 804,951 VEX
+sites -- 99.88%** -- through 202,263 detours, and every `make detour-verify` invariant
+holds on the result. **960 sites are left** (Finding 322, 2026-10-08), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 996 after
-Finding 313. Subtracting 996 from a 2,337 measured a week earlier would be
+**That pair is a dated pair and only the default has moved since** -- 960 after
+Finding 322. Subtracting 960 from a 2,337 measured weeks earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -11900,7 +11900,7 @@ code quickly.
 
 ### Where it stands, 2026-09-23
 
-    default build                           996 re-measured   (Finding 313)
+    default build                           960 re-measured   (Finding 322)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
@@ -14006,6 +14006,84 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 322 -- the mask extractors, whose destination is not a vector register
+
+`vpmovmskb`, `vmovmskps` and `vmovmskpd` read a ymm and write a general-purpose
+register. `span_shape_name` has called them "a register-to-register move" since Finding
+253, and that bucket's own comment says they are not -- "7 are `vpmovmskb`, which writes
+a general-purpose one". Being neither a move nor arithmetic, they fell past every branch
+in `span_operand_shape` into None.
+
+    frontier                                          996 ->  960    -36
+      kept: its window was withheld                   502 ->  481    -21
+      declined: 256-bit: arithmetic rather than a copy  31 ->   20    -11
+      lost to an overlap                               15 ->   12     -3
+      lost to a refused stub                           17 ->   16     -1
+    windows not placed                                443 ->  423    -20
+    detours                                       202,259 -> 202,263   +4
+
+**36 against a predicted 30**, and the whole of `verify` passes -- 19 checks, including
+`no surviving 256-bit read takes an upper half this rewrite left stale`. 803,991 of
+804,951 sites, 99.88%.
+
+The cascade ran further than the closure's 19 windows: releasing 11 sites freed 21
+withheld windows and four more from the overlap and stub classes. That is the fourth time
+a first-order closure figure has proved a floor rather than an estimate, which is now the
+expected direction rather than a surprise.
+
+#### A 256-bit form yields twice the bits, so the halves need a shift
+
+    vpmovmskb   32 bits against 16    low | high << 16
+    vmovmskps    8 bits against  4    low | high << 4
+    vmovmskpd    4 bits against  2    low | high << 2
+
+Eight instructions, two helpers, no extra general-purpose register, no FLAGS, no memory:
+
+    movups slot(%block),%H1    H1 = the source's upper half
+    pmovmskb %H1,%dst          dst = the high bits
+    movd   %dst,%H2            them, in a vector register
+    pslld  $n,%H2              shifted into place
+    pmovmskb %src,%dst         dst = the low bits
+    movd   %dst,%H1            them -- the upper half is spent
+    por    %H2,%H1             combined
+    movd   %H1,%dst            and back out
+
+**Combining in a vector register is what makes it clean, and three other routes were
+worked out and rejected first.** `shl` and `or` do it in two instructions and write
+FLAGS, which a stub may not -- the constraint `vptest` is held out of `LANE_UNARY` for.
+`lea` is flag-free and reaches `vmovmskpd` in one instruction and `vmovmskps` in two, and
+cannot reach 16 at all because its scale stops at 8. Staging two halfwords through a
+scratch slot works for `vpmovmskb` and not for the other two, whose halves are not
+byte-aligned -- and it would draw on the block scratch slots that Finding 320 measured as
+the scarce resource. `pslld` and `por` write no flags, take any shift, need no memory,
+and serve all three mnemonics from one path with `n` from a table.
+
+**No extra GPR either.** The destination is written by the original instruction anyway,
+so using it as the temporary costs nothing and the borrow machinery is untouched. The
+first design asked for a second GPR and `window_gpr_unnamed` would have supplied one;
+not needing it is better, because `unit_candidate` already refuses when fewer than two
+are unnamed.
+
+#### Everything was checked against `as` before being written
+
+All seven encodings, `encode_rr`'s REX behaviour, and the arithmetic -- `low` occupies
+the bits below the shift, so addition equals OR, which is what makes the `lea` form
+sound where it fits. The one detail memory would have got wrong: **`movmskps` carries no
+`66` prefix** while `pmovmskb` and `movmskpd` both do.
+
+#### Both controls fire, with different failure modes
+
+    every shift forced to 8     exit 57   a wrong ANSWER
+    the shape never returned    exit 29   SIGILL, the VEX surviving
+
+The fixture sets one element in the low half AND its counterpart in the upper -- byte 0
+and byte 16, float 0 and float 4, double 0 and double 2 -- so dropping a half gives 1
+and shifting by 8 rather than 16 gives 0x0101, neither of which reaches 77. Each mask is
+added and its expected value subtracted, so a correct lowering contributes nothing and
+the constant alone carries the answer.
+
+`check-shadow-pe` holds it, and the A/B is real: 29 without permanent slots, 77 with.
 
 ### Finding 321 -- a fingerprint that cried wolf
 

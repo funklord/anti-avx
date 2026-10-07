@@ -4520,6 +4520,21 @@ YMM_REGISTER_MOVES = frozenset(("vmovups", "vmovaps", "vmovupd", "vmovapd",
 # exactly. `vptest` is deliberately absent -- it writes FLAGS, and a stub
 # may not, which is the constraint `encode_tls_base` is built around.
 # Finding 285.
+# **The sign-mask extractors, whose destination is a general-purpose
+# register.** `span_shape_name` has called these "a register-to-register
+# move" since Finding 253 and the bucket's own comment says they are not:
+# "7 are `vpmovmskb`, which writes a general-purpose one". Eleven sites.
+#
+# A 256-bit form produces twice the bits of its 128-bit one -- 32 against
+# 16 for `vpmovmskb`, 8 against 4 for `vmovmskps`, 4 against 2 for
+# `vmovmskpd` -- so the halves combine as `low | high << n` with n the
+# 128-bit width. The value is (prefix, opcode, n).
+MASK_TO_GPR = {
+	"vpmovmskb": (0x66, b"\x0f\xd7", 16),
+	"vmovmskps": (None, b"\x0f\x50", 4),
+	"vmovmskpd": (0x66, b"\x0f\x50", 2),
+}
+
 LANE_UNARY = frozenset(("vcvtdq2ps", "vcvtps2dq", "vcvttps2dq",
                         "vrcpps", "vrsqrtps", "vsqrtps", "vsqrtpd"))
 
@@ -4571,7 +4586,7 @@ GPR_MOVABLE = frozenset(("load", "store", "regmove"))
 # sources' upper halves into registers before operating; `perm2` and
 # `permil` do the same. Finding 255.
 TWO_HELPERS = frozenset(("lanereg", "lanereg3", "perm2", "permil", "blendv",
-                         "immreg3"))
+                         "immreg3", "maskgpr"))
 
 SLOT_LANE_FORMS = ("vextractf128", "vextracti128",
                    "vinsertf128", "vinserti128",
@@ -5006,6 +5021,14 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 			and len(wide) == 2:
 		return ("lanemove", canonical_ymm(fields[1]),
 		        canonical_ymm(fields[0]))
+	# **A mask extractor reads a ymm and writes a GPR**, so it is neither a
+	# move nor arithmetic and fell past every branch here into None. The
+	# upper half is in a slot like any other and the two results combine
+	# with a shift and an or. Finding 322.
+	if SHADOW_REGS_RULE == SHADOW_REGS_ALL \
+			and mnemonic in MASK_TO_GPR and len(fields) == 2 \
+			and len(wide) == 1 and wide[0] == fields[0]:
+		return ("maskgpr", canonical_ymm(fields[0]))
 	if len(fields) == 2 and len(wide) == 1:
 		if "(" in fields[0] and wide[0] == fields[1]:
 			return ("load", canonical_ymm(fields[1]))
@@ -6438,6 +6461,51 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += operation
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
+			continue
+		if what == "maskgpr":
+			# **Both halves masked, then combined in a vector register.**
+			# The destination is a GPR, so there is nothing to narrow and
+			# no slot to write back; what there is instead is a shift the
+			# 128-bit form cannot do, because `pmovmskb` on an xmm yields
+			# 16 bits where the ymm form yields 32.
+			#
+			#     movups slot(%block),%H1   H1 = the source's upper half
+			#     pmovmskb %H1,%dst         dst = the high bits
+			#     movd   %dst,%H2           H2 = them, in a vector register
+			#     pslld  $n,%H2             shifted into place
+			#     pmovmskb %src,%dst        dst = the low bits
+			#     movd   %dst,%H1           H1 = them (upper half spent)
+			#     por    %H2,%H1            combined
+			#     movd   %H1,%dst           and back out
+			#
+			# **Combining in a vector register is what keeps it clean.**
+			# `shl` and `or` would do it in two instructions and write
+			# FLAGS, which a stub may not -- the constraint `vptest` is
+			# held out of `LANE_UNARY` for. `lea` is flag-free and cannot
+			# reach a shift of 16, its scale stopping at 8. `pslld` and
+			# `por` write no flags, take any shift, and serve all three
+			# mnemonics from one path with `n` from the table.
+			#
+			# No extra general-purpose register either: the destination is
+			# written by the original instruction anyway, so using it as
+			# the temporary costs nothing, and the borrow machinery is
+			# untouched. Finding 322.
+			if second_helper is None:
+				return refuse("maskgpr wants a second helper")
+			if len(tail) < 2 or (tail[1] & 0xC0) != 0xC0:
+				return refuse("maskgpr is not register to register")
+			prefix, opcode, shift = MASK_TO_GPR[mnemonic]
+			destination = ((tail[1] >> 3) & 7) | (vex["R"] << 3)
+			source = (tail[1] & 7) | (vex["B"] << 3)
+			body += span_slot_move(helper, False, base, slot, block,
+			                       at + len(body))
+			body += encode_rr(prefix, opcode, destination, helper)
+			body += encode_rr(0x66, b"\x0f\x6e", second_helper, destination)
+			body += encode_rr(0x66, b"\x0f\x72", 6, second_helper, shift)
+			body += encode_rr(prefix, opcode, destination, source)
+			body += encode_rr(0x66, b"\x0f\x6e", helper, destination)
+			body += encode_rr(0x66, b"\x0f\xeb", helper, second_helper)
+			body += encode_rr(0x66, b"\x0f\x7e", helper, destination)
 			continue
 		if what == "lanealias":
 			# **The destination is the other source, and the order is
