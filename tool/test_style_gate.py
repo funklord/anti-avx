@@ -1134,6 +1134,37 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		self.assertIn("1 heading(s)", few)
 		self.assertIn("4 heading(s)", many)
 
+	def test_a_repeated_section_NUMBER_is_reported(self):
+		"""A number is an identifier, and the repeat check above cannot
+		see one: two sections carrying 130 with different titles are
+		different headings. Two sessions appending to one document pick
+		the next number by reading the file, and between the read and
+		the write the other has taken it -- which happened three times in
+		one afternoon 2026-09-06 while writing into another tree, and had
+		already happened twice unnoticed."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": "# T\n\n## 1. One\n\n## 1. Other\n"})
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("section 1 repeats", out)
+
+	def test_a_number_restarting_under_a_new_parent_is_not_a_repeat(self):
+		"""The case that decides the rule's shape, and the reason it is
+		keyed by parent rather than by number alone: several of these
+		documents write a bare `### 1.` under each `##`, and fuzznet has
+		three such. Flagging those would be a gate switched off by
+		instalments in the trees that number most."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": "# T\n\n## 1. A\n\n### 1. x\n"
+		                                   "\n## 2. B\n\n### 1. y\n"})
+		self.assertEqual(rc, 0, out)
+
+	def test_an_unnumbered_document_is_untouched(self):
+		"""Three of the sixteen number no sections at all, so the check
+		has to be silent rather than merely correct there."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": "# T\n\n## One\n\n## Two\n"})
+		self.assertEqual(rc, 0, out)
+
 	def test_a_repeated_heading_is_still_reported(self):
 		"""The rule the mode exists for, unmoved by the fix."""
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
@@ -1580,6 +1611,94 @@ class ReportsItsScope(unittest.TestCase):
 		self.assertNotIn("conform", r.stdout)
 		self.assertNotIn("not checked", r.stdout)
 		self.assertIn("whitespace and indentation", r.stdout)
+
+
+class RustDocCommentsHaveASummary(unittest.TestCase):
+	"""A doc comment opening with a bare `///` has no summary line.
+
+	rustdoc takes the first line of a doc comment as the item's summary,
+	and `missing_docs` cannot see that it is empty: the comment is present,
+	it just says nothing before its first heading. netcfgd found one on a
+	public function, wrote the check into its copy of the gate (their
+	2775190, 2026-09-13), and the copy then sat one unrestricted `sync`
+	away from losing it. Taken into the source 2026-09-15.
+
+	The pattern is exact -- a `///` line carrying nothing after the
+	slashes, whose predecessor is not a doc comment -- and the fixtures
+	below are its two neighbours as much as itself: a bare `///` INSIDE a
+	doc comment is a paragraph break and must not fire, and `////` is a
+	separator and not a doc comment at all.
+	"""
+
+	CONFIG = "floor = 0.1\n"
+	DOC = "# One\n\nsome prose\n"
+
+	def docs(self, files: dict[str, str]) -> tuple[int, str]:
+		files = {".style-gate.toml": self.CONFIG, "project.md": self.DOC,
+		         **files}
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			for name, text in files.items():
+				(root / name).parent.mkdir(parents=True, exist_ok=True)
+				(root / name).write_text(text, encoding="utf-8")
+			gate = Path(__file__).resolve().parent / "style_gate.py"
+			r = subprocess.run([sys.executable, str(gate), "docs"], cwd=root,
+			                   capture_output=True, text=True, timeout=120)
+			return r.returncode, r.stdout + r.stderr
+
+	def test_a_bare_opening_line_is_reported_by_file_and_line(self):
+		"""The finding itself, and where it is."""
+		rc, out = self.docs({"src/lib.rs":
+		                     "///\n/// # Errors\n///\n/// Never.\n"
+		                     "pub fn f() {}\n"})
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("src/lib.rs:1:1: doc comment has no summary line", out)
+
+	def test_a_summary_line_passes(self):
+		rc, out = self.docs({"src/lib.rs":
+		                     "/// Does the thing.\n///\n/// # Errors\n"
+		                     "///\n/// Never.\npub fn f() {}\n"})
+		self.assertEqual(rc, 0, out)
+
+	def test_a_paragraph_break_inside_a_doc_comment_is_not_an_opening(self):
+		"""The same bare `///`, one line down, is the blank line between
+		the summary and the body -- the shape every documented function
+		with an `# Errors` section has. A check that fired on it would
+		report every good comment in the tree."""
+		rc, out = self.docs({"src/lib.rs":
+		                     "/// Summary.\n///\n/// Body.\nfn f() {}\n"})
+		self.assertEqual(rc, 0, out)
+		self.assertNotIn("no summary line", out)
+
+	def test_four_slashes_are_a_separator_not_a_doc_comment(self):
+		rc, out = self.docs({"src/lib.rs": "////\nfn f() {}\n"})
+		self.assertEqual(rc, 0, out)
+
+	def test_only_the_line_that_opens_is_named(self):
+		"""One finding per comment, not one per blank `///` in it."""
+		_, out = self.docs({"src/lib.rs":
+		                    "///\n///\n/// late summary\nfn f() {}\n"})
+		self.assertEqual(out.count("no summary line"), 1, out)
+
+	def test_the_population_is_the_gates_own(self):
+		"""The copy this came from walked rglob and named `target` by
+		hand. Here a `.rs` under an excluded directory is not looked at
+		because discover() never kept it -- so the count says 1, not 2,
+		and the bad file in target/ is not a finding."""
+		rc, out = self.docs({"src/lib.rs": "/// ok\nfn f() {}\n",
+		                     "target/gen.rs": "///\nfn g() {}\n"})
+		self.assertEqual(rc, 0, out)
+		self.assertIn("1 rust file(s)", out)
+
+	def test_the_verdict_counts_rust_files_and_says_zero_when_there_are_none(self):
+		"""A verdict with no count cannot tell a clean tree from one
+		nothing looked at; and a tree with no Rust says so rather than
+		staying silent about a check that ran over nothing."""
+		_, none = self.docs({})
+		self.assertIn("0 rust file(s)", none)
+		_, two = self.docs({"a.rs": "/// a\nfn a() {}\n",
+		                    "b/c.rs": "/// c\nfn c() {}\n"})
+		self.assertIn("2 rust file(s)", two)
 
 
 if __name__ == "__main__":

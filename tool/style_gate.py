@@ -1951,6 +1951,62 @@ def check_docs(root: Path, cfg: Config,
 	return problems
 
 
+def summaryless_docs(root: Path, files: list[Path],
+                     counts: dict[str, int]) -> list[Problem]:
+	"""Find Rust doc comments that open with a bare `///` and so have no summary.
+
+	Rust's convention, and rustdoc's rendering, take the first line of a doc
+	comment as the summary: it is what the module index shows beside the item
+	and what a reader sees first. A comment that opens with an empty `///`
+	has none, so the rendered page for the item begins with a heading --
+	`# Errors`, usually, because that is the section a public function is
+	obliged to carry.
+
+	`missing_docs` cannot see this. The comment is present; it just says
+	nothing before its first section, which is how one sat on a public
+	function in netcfgd until its 0223 went looking. The rule is netcfgd's,
+	from its 2775190, taken into the source 2026-09-15 because a copy
+	carrying a rule the source lacks is a copy `sync` erases.
+
+	**This is worth a gate where the run-together case is not.** That one --
+	two doc comments with no item between them -- has no exact textual
+	signature, and the lint that would catch it,
+	`clippy::missing_docs_in_private_items`, reported 447 items in the tree
+	that measured it. This one is a single unambiguous pattern: a `///` line
+	whose predecessor is not a doc comment, and which carries nothing after
+	the slashes. `////` and longer are separators, not doc comments, and are
+	left alone.
+
+	The population is the gate's own, not a walk: `files` is what discover()
+	kept, so the tree's excludes and git's ignore rules apply, and a vendored
+	submodule is a gitlink rather than a directory of `.rs` files. The copy
+	this came from walked `rglob` and named its build and vendor directories
+	by hand.
+	"""
+	problems: list[Problem] = []
+	scanned = 0
+	for path in files:
+		if path.suffix != ".rs":
+			continue
+		try:
+			lines = path.read_text(encoding="utf-8").splitlines()
+		except (OSError, UnicodeDecodeError):
+			continue
+		scanned += 1
+		rel = path.relative_to(root)
+		for index, line in enumerate(lines):
+			if line.strip() != "///":
+				continue
+			# A doc comment *opens* here only if the line above is not one.
+			previous = lines[index - 1].strip() if index else ""
+			if previous.startswith("///"):
+				continue
+			problems.append(Problem(rel, index + 1, 1,
+			                        "doc comment has no summary line"))
+	counts["rust"] = scanned
+	return problems
+
+
 # ----------------------------------------------------------------- main
 
 def resolve(argv: list[str]) -> tuple[str, Path, list[Path]]:
@@ -1986,6 +2042,7 @@ def main(argv: list[str]) -> int:
 	if mode == "docs":
 		counts: dict[str, int] = {}
 		problems = check_docs(root, cfg, counts)
+		problems += summaryless_docs(root, files, counts)
 		for problem in problems:
 			print(problem, file=sys.stderr)
 		if problems:
@@ -2004,7 +2061,8 @@ def main(argv: list[str]) -> int:
 		           + (f", {counts['paths']} path(s)" if "paths" in counts
 		              else ", paths not checked") + ")")
 		print(f"style-gate: {cfg['doc_file']}{scanned} says nothing twice and names no "
-		      f"missing file")
+		      f"missing file; {counts['rust']} rust file(s) have a summary "
+		      f"line on every doc comment")
 		return 0
 
 	if mode == "list":
