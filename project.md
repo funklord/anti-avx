@@ -11981,7 +11981,7 @@ is `kept: its window was withheld`:
     no SSE form at any register        5    16    21   4.2   two negated FMA roots
     F16C                              12     9    21   1.8   measured negative
     ~~recorded nothing (vsubps)        1     5     6   6.0~~  a label, Finding 327: 0 sites
-    a cycle with no root               0     5     5     -   4 windows, Finding 327
+    a cycle with no root               0     5     5     -   4 windows; Finding 328 failed
     ~~vpshufb                          3     6     9   3.0~~  landed, Finding 326: 9 sites
 
 Inside the five-site `no SSE form` class, after `vblendvpd` landed:
@@ -14142,6 +14142,33 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 328 -- re-admitting the rootless cycle, and a closure the repair cannot draw
+
+Finding 327's cycle -- four withheld windows at `0x142d8e4db` whose blame ends nowhere --
+looked like a pass after the repair settles: find the largest set of dropped windows
+closed under "every blamer lies inside a window of the set", re-admit it whole, keep it
+only if the placement then has no stale read. The acceptance test is the loop's own, so
+the bytes stay right by construction whatever the set is.
+
+**It changed nothing, and the reason is the set, not the test.** Replayed offline on
+`repair-blame.txt`, the fixed point closes **269 of the 274** dropped windows, not four.
+Containment in a dropped extent is not "would be lowered if the window came back": the
+40 root blamers Finding 327 counted -- refused stubs, overlaps, declined arithmetic --
+all sit inside dropped extents, so they read as internal. The trial re-admitted 269
+windows, came back guilty, and was refused; 274 not placed and 202,286 detours, as
+before. Reverted, the measurement stopped at the census.
+
+**The closure that finds four uses each reader's REASON**, followed into a holder only
+when the reason is `kept: its window was withheld`. Inside the repair no reader has a
+reason yet -- that is the census's work, done afterwards from the image. Drawing it in
+the repair means classifying refused, overlapped and declined readers there, which is
+more machinery than five sites pay for. Recorded so the next reader prices it with
+that cost attached.
+
+`build/` holds the stopped run's output, and `make census` rebuilds it. Its apply
+reported the 799 build's counts exactly, but the image was not compared byte for byte
+and the census was stopped partway.
 
 ### Finding 327 -- the silent exit was a label, and behind it a cycle with no root
 
