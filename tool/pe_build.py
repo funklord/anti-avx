@@ -4395,6 +4395,43 @@ tls_directory:
 """)
 
 
+# **A site too short to jump from that can widen neither way**, so it
+# jumps short. `vaddss` with a destination apart from its first source is
+# four bytes and its SSE form is seven, so it cannot be patched in place;
+# the site is a branch target, so widening back would bury it, and so is
+# the next instruction, so widening forward would bury that. Starfield has
+# 206 sites shaped like this. The window is the site alone, a `jmp rel8`
+# into the `int3` padding after `func_end` -- outside the `.pdata`
+# function, so nothing runs it -- where a `jmp rel32` reaches the stub.
+#
+# 30 + 47, executed. Left in VEX form the program dies of an illegal
+# instruction. Finding 331.
+PROGRAMS["tramp"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	leaq	vals(%rip), %rsi
+	movss	(%rsi), %xmm1		/* 30.0 */
+	movss	4(%rsi), %xmm2		/* 47.0 */
+	xorl	%edx, %edx
+	testl	%edx, %edx
+	jne	site			/* never taken; names `site` a target */
+site:
+	vaddss	%xmm1, %xmm2, %xmm0	/* four bytes, and 77.0 */
+next:
+	cvttss2si %xmm0, %eax
+	testl	%edx, %edx
+	jne	next			/* never taken; names `next` a target */
+	addq	$40, %rsp
+	ret
+func_end:
+	.fill	16, 1, 0xcc		/* inter-function padding, in reach */
+	.p2align 5
+vals:	.float	30.0, 47.0
+""")
+
+
 # **A site that can only widen backward, and must not.** The shape is
 # `backward`'s with one thing added: a never-taken `jne` names the site,
 # so the site's own address is a branch target. A window widening back

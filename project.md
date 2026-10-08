@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,167 of 804,951 VEX
-sites -- 99.90%** -- through 202,291 detours, and every `make detour-verify` invariant
-holds on the result. **784 sites are left** (Finding 329, 2026-10-08), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,199 of 804,951 VEX
+sites -- 99.91%** -- through 202,323 detours, and every `make detour-verify` invariant
+holds on the result. **752 sites are left** (Finding 331, 2026-10-09), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 784 after
-Finding 329. Subtracting 784 from a 2,337 measured weeks earlier would be
+**That pair is a dated pair and only the default has moved since** -- 752 after
+Finding 331. Subtracting 752 from a 2,337 measured weeks earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -11904,12 +11904,12 @@ code quickly.
 
 ### Where it stands, 2026-10-08
 
-    default build                           784 re-measured   (Finding 329)
+    default build                           752 re-measured   (Finding 331)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,167 of 804,951 VEX sites, 99.90%, through 202,291 detours**, and 180 further
+**804,199 of 804,951 VEX sites, 99.91%, through 202,323 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
@@ -11948,12 +11948,12 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-### The frontier, on the default (Finding 329)
+### The frontier, on the default (Finding 331)
 
     kept: its window was withheld                        313
-    declined: next instruction is a branch target        228
-    declined: next instruction will not move             101
-    declined: outside .pdata                              73
+    declined: next instruction is a branch target        200
+    declined: next instruction will not move              96
+    declined: outside .pdata                              74
     declined: 256-bit: arithmetic rather than a copy       17
     lost to a refused stub                                16
     lost to an overlap                                    12
@@ -14142,6 +14142,61 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 331 -- a short site jumps short, into the padding between functions
+
+The three 128-bit floors were 402 of the 784 survivors, more than every 256-bit class
+put together. Two of them are one problem: a site under five bytes cannot carry `jmp
+rel32`, and its window can widen neither forward nor back -- 206 of the 228 `next
+instruction is a branch target` are SANDWICHED, the site and its successor both branch
+targets (Finding 299). Finding 299 measured the standard escape and set it aside: a
+2-byte `jmp rel8` into inter-function `int3` padding that holds the `jmp rel32` reaches
+only 28 of 228, and "a mechanism for 28 sites is not a mechanism". Ranked by sites it
+had become the largest lever left.
+
+**Re-measured across all three classes first**, a 5-byte slot in a run of `0xcc`
+within `rel8` reach, each run's capacity shared out:
+
+    declined: next instruction is a branch target   228   28 in reach   28 assignable
+    declined: next instruction will not move        101    5 in reach    5 assignable
+    declined: outside .pdata                         73   38 in reach   18 assignable
+
+The third is declined for what `outside.py` refuses on purpose, not for size, so reach
+does not help it. 33 predicted.
+
+**Built as a fallback at the decline**, after both widenings have failed: the window
+is the site alone, its first two bytes a `jmp rel8` to a claimed slot, the slot a `jmp
+rel32` to the stub, which returns to the end of the site as any window's does. A slot
+is padding only if nothing runs or reads it -- outside every function extent `.pdata`
+describes or `outside.leaf_ranges` infers, outside every data island, holding no branch
+target -- and each is handed out once. `TRAMPOLINE` maps site to slot, module-level
+for `UNIT_ALTERNATIVES`'s reason.
+
+    frontier                                          784 ->  752    -32
+      declined: next instruction is a branch target   228 ->  200    -28
+      declined: next instruction will not move        101 ->   96     -5
+      declined: outside .pdata                         73 ->   74     +1
+    detours                                       202,291 -> 202,323    +32
+
+**33 for 33, and one of them is right to stay.** It took a slot and then failed the
+`.pdata` check that still guards the site's own extent, so it moved class rather than
+placing. 804,199 of 804,951, 99.91%. These are 128-bit sites, so no withheld window
+was waiting on them: 265 not placed, unchanged.
+
+`verify` learns one thing: five one-byte `int3`s become one instruction where a slot is
+written, so four boundaries go, and it names them as such rather than calling them
+swallowed. Only for windows actually placed. On Starfield it names 128, which is 32
+slots times four, and every other check passes.
+
+`tramp` (in `check-pe`) is the sandwiched shape executed: a four-byte `vaddss` whose
+SSE form is seven, the site and its successor each named by a never-taken branch, and
+`int3` padding after `func_end`. 29 originally, 77 rewritten through `eb 0f` and `e9`,
+and 29 with `TRAMPOLINE_RULE` off and no detour placed.
+
+**Three bugs in the first draft, each of which would have read as "padding is scarce"**:
+the run lookup bisected on a nonsense key; the extent test looked at one range where
+leaf ranges nest; and a range starting exactly at a run's end counted as overlapping it
+-- which is where padding always ends, so nearly every run would have been refused.
 
 ### Finding 330 -- the member-taking back-widening alone is neutral, to the site
 

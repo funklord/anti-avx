@@ -7402,6 +7402,12 @@ UNIT_RUNG = Counter()
 # same collection and so fill this identically, which is the property
 # Finding 197 needs and the reason it is not a parameter. Finding 281.
 UNIT_ALTERNATIVES = {}
+# **A site too short for `jmp rel32` that can widen neither way** takes a
+# 2-byte `jmp rel8` into inter-function `int3` padding instead, and the
+# padding holds the `jmp rel32` to its stub. Site -> the padding address,
+# module-level for the reason above: `place_stubs` unpacks a candidate as a
+# strict nine-tuple. Finding 331.
+TRAMPOLINE = {}
 REPAIR_SUBSTITUTED = 0
 
 # **Why each dropped window was dropped**, keyed `(strategy, reason)`.
@@ -10614,6 +10620,54 @@ def in_island(islands, address):
 	return False
 
 
+TRAMPOLINE_RULE = True
+
+
+def trampoline_slots(binary, ranges, islands, blocked):
+	"""`[start, end, next]` for every `int3` run of 5+ bytes that is padding.
+
+	Padding means nothing executes or reads it: outside every function
+	extent `.pdata` describes or `outside.leaf_ranges` infers, outside every
+	data island, and holding no branch target. `next` is where the next
+	five-byte slot would go, so two sites never share one. Finding 331.
+	"""
+	vaddr, raddr, size = inplace.text_mapping(binary)
+	with open(binary, "rb") as image:
+		image.seek(raddr)
+		text = image.read(size)
+	starts = [low for low, _high in ranges]
+	out = []
+	for found in re.finditer(rb"\xcc{5,}", text):
+		low, high = vaddr + found.start(), vaddr + found.end()
+		# Ranges starting strictly before the run's end: padding usually
+		# ends exactly where the next function begins.
+		at = bisect.bisect_left(starts, high) - 1
+		if any(ranges[i][1] > low for i in (at - 1, at) if i >= 0):
+			continue
+		if in_island(islands, low) or in_island(islands, high - 1):
+			continue
+		if any(address in blocked for address in range(low, high)):
+			continue
+		out.append([low, high, low])
+	return out
+
+
+def take_trampoline(slots, site):
+	"""Claim a five-byte padding slot a `jmp rel8` at `site` reaches."""
+	low, high = site + 2 - 128, site + 2 + 127
+	# Runs do not overlap, so only the one starting before `low` can reach
+	# into range from below.
+	at = max(0, bisect.bisect_left(slots, [low]) - 1)
+	while at < len(slots) and slots[at][0] <= high:
+		run = slots[at]
+		start = max(run[2], low)
+		if start <= high and start + 5 <= run[1]:
+			run[2] = start + 5
+			return start
+		at += 1
+	return None
+
+
 def collect(binary, listing, context=None):
 	"""(in-place patches, class C detour candidates, statistics).
 
@@ -10630,6 +10684,7 @@ def collect(binary, listing, context=None):
 	REGION_REFUSED.clear()
 	REGION_EXAMPLES.clear()
 	COLLECT_SEEN.clear()
+	TRAMPOLINE.clear()
 	UNIT_REFUSED.clear()
 	UNIT_RUNG.clear()
 	UNIT_EXAMPLES.clear()
@@ -10693,6 +10748,7 @@ def collect(binary, listing, context=None):
 	skipped = Counter()
 	declined = {}
 	islands = data_islands(instructions)
+	slots = trampoline_slots(binary, ranges, islands, blocked)
 	for index, (address, encoding, mnemonic, operands,
 	            _comment) in enumerate(instructions):
 		if not encoding or encoding[0] not in (0xC4, 0xC5):
@@ -11601,6 +11657,21 @@ def collect(binary, listing, context=None):
 						behind_told = told
 						back = "previous will not move"
 
+			# **Neither neighbour, so jump short instead.** The site alone
+			# is the window and a `jmp rel8` its first two bytes, aimed at
+			# five bytes of padding within reach that carry the `jmp
+			# rel32`. The stub returns to the end of the site as any
+			# window's does, so nothing else about the candidate changes.
+			# Finding 299 measured the reach at 28 of 228 sandwiched sites
+			# and set it aside as too few; ranked by sites, it is now the
+			# largest lever left. Finding 331.
+			if reason is not None and TRAMPOLINE_RULE:
+				slot = take_trampoline(slots, address)
+				if slot is not None:
+					TRAMPOLINE[address] = slot
+					reason = None
+					displaced, preceding = [], []
+					start, window = address, len(encoding)
 			if reason is not None:
 				skipped[reason] += 1
 				declined[address] = reason
@@ -16601,6 +16672,15 @@ def apply_all(binary, listing, output):
 
 	for site, window, stub_address, _length, _prologue in placed:
 		offset = raddr + (site - vaddr)
+		if window < 5:
+			# The short jump and its padding slot. Finding 331.
+			slot = TRAMPOLINE[site]
+			data[offset:offset + window] = (
+				bytes([0xEB, (slot - (site + 2)) & 0xFF])
+				+ inplace.nop_padding(window - 2))
+			there = raddr + (slot - vaddr)
+			data[there:there + 5] = encode_jump(slot + 5, stub_address)
+			continue
 		jump = encode_jump(site + 5, stub_address)
 		pad = window - 5
 		data[offset:offset + window] = jump + inplace.nop_padding(pad)
@@ -17255,6 +17335,21 @@ def verify(original, patched, listing=None):
 				      f"inside the TLS callback array at 0x{low:x}, whose "
 				      f"first entry this rewrite names on purpose")
 				unexplained = unexplained - inside_cb
+	# **And the padding a trampoline wrote its `jmp rel32` into**: five
+	# one-byte `int3`s become one instruction, so four boundaries go, by
+	# design and only where a short window was placed. Finding 331.
+	if unexplained:
+		written = set()
+		for window_at, window_len, *_rest in placed:
+			if window_len < 5 and window_at in TRAMPOLINE:
+				slot = TRAMPOLINE[window_at]
+				written.update(range(slot + 1, slot + 5))
+		inside_slot = unexplained & written
+		if inside_slot:
+			print(f"verify: {len(inside_slot):,} lost boundary/ies are "
+			      f"inside the int3 padding a trampoline's jump was "
+			      f"written into")
+			unexplained = unexplained - inside_slot
 	if unexplained:
 		print(f"verify: FAILED -- {len(unexplained):,} boundaries lost that "
 		      f"were not swallowed on purpose", file=sys.stderr)
@@ -17263,7 +17358,8 @@ def verify(original, patched, listing=None):
 		problems += 1
 	else:
 		print(f"verify: {len(lost):,} boundaries lost, every one an "
-		      f"instruction a widened window swallowed deliberately")
+		      f"instruction a widened window swallowed deliberately or "
+		      f"padding named above")
 
 	# **This one could never fail, and saying so is the point.** `reachable`
 	# is `targets.collect` and the collector refuses to swallow anything in a
