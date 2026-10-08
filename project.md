@@ -11973,7 +11973,7 @@ structural floors. Nothing about the knot is a lowering gap -- the shapes all ex
 terminal set is in the class, so the gain is a floor rather than an estimate):
 
     class / family                 sites  only  gain   per   status
-    lost to a refused stub            16   103   119   7.4   FLOOR, three attempts
+    lost to a refused stub            16   103   119   7.4   FLOOR, four (Finding 325)
     lost to an overlap                12    50    62   5.2   10/15 was that floor
     no SSE form at any register        5     6    11   2.2   derived, not re-joined
     vpermd                             3    14    17   5.7   declined: cross-lane
@@ -14132,6 +14132,57 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 325 -- the refused-stub chain, rebuilt at 808, and the stubs move rather than leave
+
+The handover's top class row was `lost to a refused stub`, 16 sites and a closure of 119,
+every one refused `moved: the swallowed neighbour is 256-bit, and only the span emission
+lowers one`. I built Finding 318's chain again -- the one-helper `lanereg` (link 1) and
+the backward 256-bit neighbour taken as a MEMBER rather than carried in `preceding`
+(link 2) -- **without first reading Finding 320, which had built both at 996 and
+measured them a loss.** Reverted; nothing of it is in the tree. `verify` passed whole
+on A+B, so the loss is placement economy and not correctness. **The rolls in `build/`
+are A+B's** until the next `make census` rebuilds them from the committed tool.
+
+    against the 808 build                       808     A     A+B
+    frontier                                    808   826     826
+      kept: its window was withheld             331   345     347
+      lost to a refused stub                     16    18       0
+      declined: 256-bit: arithmetic, not a copy  20    20      33
+      kept: a repair left it in VEX form         11    13      13
+      excluded by a window the repair rebuilt     2     2       4
+      the collector reached it, recorded nothing  0     0       2
+    windows not placed                          280   293     315
+    VEX sites in dropped windows                840   887     964
+    stubs refused                                36    39       5
+    detours                                 202,282 202,274 202,274
+
+**Link 1 alone costs exactly 18 again**, as it did at 996 (996 -> 1,014). It places more
+units, they swallow VEX.128 writes whose upper-half zeroing a surviving 256-bit reader
+still reads, and the repair withholds thirteen more windows than before.
+
+**Link 2 does what Finding 320's did not: the refused stubs go**, 36 to 5, and the class
+empties. The sites do not. They redistribute into the withheld class, into `arithmetic
+rather than a copy` (the neighbour taken as a member pulls windows into shapes a span
+cannot lower), and into 22 new `no volatile xmm and scratch slot to stash it` refusals in
+`build/unit-refused.txt` -- Finding 320's real blocker, met again from the other side.
+The total does not move.
+
+Two sites, `vorps` at `0x142dc3d39` and `0x142dc3d4e`, fell into `the collector reached
+it and recorded nothing` under A+B, the bucket Finding 319 warned is where a mis-keyed
+lookup hides. It is gone with the revert, and anyone rebuilding link 2 meets it first.
+
+**So the refused-stub row is a floor four attempts deep**, and Finding 320's conclusion
+stands with one more measurement under it: what links 2 and 3 need is scratch slots,
+not helpers, and the block layout change it describes is the only route left in that
+direction. The closure's 119 for this class assumed the readers behind those windows
+would follow; at 808, placing their writers without lowering the readers only feeds the
+repair.
+
+**The process failure is the cheaper half to fix.** The handover row said "FLOOR, three
+attempts" and I read it as a ranking rather than as a warning; `grep -n 'Finding 318'
+project.md` would have found Finding 320 in one line. A row whose status names prior
+attempts is a pointer to read them first.
 
 ### Finding 324 -- `blendv` takes a stashed `xmm0` as its mask register
 
