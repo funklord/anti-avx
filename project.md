@@ -11902,12 +11902,28 @@ already built and tested for the case.
 Everything below is what a fresh start needs and none of it is derivable from the
 code quickly.
 
-### Where it stands, 2026-09-23
+### Where it stands, 2026-10-08
 
     default build                           960 re-measured   (Finding 322)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
+
+**803,991 of 804,951 VEX sites, 99.88%, through 202,263 detours**, and 180 further
+VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
+`verify` checks pass, including that no surviving 256-bit read takes an upper half
+the rewrite left stale. Re-derive the share from `build/text.asm` rather than
+quoting it: this line has twice carried a rewritten count from one configuration
+beside a frontier from another.
+
+**Run as `funk`, not as a second account.** Everything outside this tree belongs to
+`funk` and the mismatch cost most of 2026-10-08's second half: `build/wineprefix` is
+funk's so three gates failed until `PE_PREFIX` was overridden; Proton writes a lock
+into its own directory so it needed a 1.4 GB scratch copy; the game install is
+`755 funk` so it needed a 38-link symlink farm instead of Finding 74's one-line copy;
+and `/home/funk/.steam/steam.pipe` is `prw------- funk`, which is where the run
+actually stopped. The tree itself is `drwxrwsr-x funk:users`, which is the only
+reason a second account can work here at all. `sudo` requires a password.
 
 **The first two were re-measured on 2026-09-22, against each other, on the same
 tool.** ~~The default reproduced 2,687 exactly.~~ **It is 2,478, and it had been
@@ -11932,17 +11948,53 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-### The frontier, on the default (Finding 309)
+### The frontier, on the default (Finding 322)
 
-    kept: its window was withheld                        834
-    declined: outside .pdata                             319
+    kept: its window was withheld                        481
     declined: next instruction is a branch target        228
-    declined: next instruction will not move             106
-    declined: 256-bit: arithmetic rather than a copy       72
-    lost to an overlap or a refused stub                  59
-    kept: a repair left it in VEX form                    13
-    declined: no SSE form at any register                  6
-    never a candidate                                      4
+    declined: next instruction will not move             101
+    declined: outside .pdata                              73
+    declined: 256-bit: arithmetic rather than a copy       20
+    lost to a refused stub                                16
+    lost to an overlap                                    12
+    kept: a repair left it in VEX form                     11
+    declined: no SSE form at any register                   6
+    excluded by a window the repair rebuilt                 3
+    the collector reached it and recorded nothing           1
+    (and eight singletons)
+
+**The two halves are unrelated problems**, which sixteen buckets hid: 574 of the
+survivors are 256-bit and 481 of those are the withheld class, a closed knot with
+98.7% of its blame internal; the other 386 are 128-bit and scalar sitting in three
+structural floors. Nothing about the knot is a lowering gap -- the shapes all exist.
+
+**What is left, ranked on the extent-aware closure** (`only` = windows whose entire
+terminal set is in the class, so the gain is a floor rather than an estimate):
+
+    class / family                 sites  only  gain   per   status
+    lost to a refused stub            16   103   119   7.4   FLOOR, three attempts
+    lost to an overlap                12    50    62   5.2   10/15 was that floor
+    no SSE form at any register        6    31    37   6.2   see the subsets below
+    vpermd                             3    14    17   5.7   declined: cross-lane
+    F16C                              12     5    17   1.4   measured negative
+    vpshufb                            3     6     9   3.0   untried
+
+Inside the six-site `no SSE form` class one subset carries nearly all of it:
+
+    vblendvpd  (one site, 0x14374ecee)      1    25    26
+    all four negated FMA                    4     6    10
+    vpermilps (memory control)              1     0     1
+
+**`vblendvpd` is the best ratio in the project**: one site, 25 windows, and a known
+cause -- the roll says `blendv cannot borrow xmm0 as a helper`, because the SSE form
+takes its mask only from an implicit `xmm0`. The `blendv` shape already exists from
+Finding 307.
+
+`vpermd` was declined on engineering grounds rather than value: it is a CROSS-LANE
+permute, eight dwords selected from the full 256 bits by a control vector, which is
+exactly what no span shape can split per 128-bit lane. Emulating it means making the
+halves contiguous and doing eight index-computed loads, about forty instructions, for
+three sites.
     and 180 that are not instructions                    180
 
 **~~Every remaining class is a measured floor.~~ That was said twice, of the
@@ -12067,20 +12119,88 @@ needed was in the README.
   * ~~**`--teb-scratch=auto` as the default**~~ **Taken 2026-09-29, Finding 309:
     688 sites, and the gap had widened from 341 when Finding 297 raised it.**
     `--teb-scratch=off` is the A/B.
-  * **FP add and multiply with `src2 == D`** (Finding 284, re-sized at 303). They
-    commute in arithmetic and not in x86: with two NaN operands the result carries
-    the FIRST source's payload, so exchanging them changes the bytes, and
-    `COMMUTATIVE_YMM` excludes FP add and multiply for that reason. Raised as 30
-    sites; measured against the blame edges it is 64 of the releasing blamers, so
-    it also holds withheld windows. Unlike the FMA rounding rule, which was already
-    project policy since Finding 4, this would be a NEW semantic deviation.
+  * ~~**FP add and multiply with `src2 == D`**~~ **Retired 2026-09-30 without being
+    answered, by Finding 312.** The question was whether to exchange the sources,
+    which changes which NaN payload propagates. `lanealias` keeps the operand order
+    instead and lowers the shape exactly, so there is nothing to authorise. It could
+    never have covered the class anyway: of the 39 aliased sites only 28 were FP add
+    or multiply, and `vsub*`, `vpsubd` and `vcmpltps` do not commute at all.
 
-### Two claims that are scoped, not current
+### The run, and what it did and did not show (Finding 323)
 
-`project.md` and the README both used to say the rewritten binary loads 305 modules
-under Proton before the frontier at `0x1428D1492`. **That was the previous default
-and nobody has run this one**, so both now say which binary they describe. Anyone
-re-running it should replace the address as well as the count.
+Taken 2026-10-08 on the holder's instruction, both binaries, same prefix, same farm:
+
+    original     exit  29 after    4 s   EXCEPTION_ILLEGAL_INSTRUCTION
+                                         addr=00000001422D2BF4   RVA 0x22D2BF4
+    rewritten    exit 124 after 3600 s   zero exceptions, stopped on the bound
+
+**The original's fault address is Finding 74's**, reproducing across five months and
+two changes of default, which is what makes it a control. The rewritten build does
+not die there, so **the frontier is not on the first four seconds of the path** --
+never measured before.
+
+**It then hangs rather than progressing.** 286 modules and 2 MB resident, frozen
+from minute three, nothing drawn on a 1920x1080 Xvfb, and the log ending in
+`EnumProcessModulesEx` repeated to exhaustion: a Steam-presence or integrity check
+spinning with no client. So the AVX-dense code is never reached and **"no exception
+in an hour" is evidence of being stuck, not of working.** The 252 MB RSS quoted from
+an earlier 300-second run is withdrawn -- that run had no `+loaddll` and what the
+memory belonged to is unknown.
+
+**To reach the translated code the run must be `funk`'s, with Steam signed in.** The
+client was up for 16 days reporting `-steamid=0`, which may mean nobody is logged in,
+in which case the loop spins for any account. The 960 build is staged at
+`build/Starfield-antiavx-960.exe`, sha256 `c948fb5f905c...`, readable by the group.
+Finding 74's three-line recipe then applies unchanged, and `PROTON_LOG` only flushes
+when the process EXITS -- which is why two timed-out runs produced no log at all.
+
+### Measured negatives: do not retry these
+
+Each cost a measurement and each is reverted byte-identical unless noted.
+
+  * **Refusing the backward widening** over a 256-bit neighbour (315). 39 refused
+    stubs to zero, frontier flat at 996, 26 windows lost, labels less precise.
+  * **Taking that neighbour as a member** (318). Correct -- `verify` passes, which
+    disproves the "accounted nowhere" objection the comment carried -- and flat,
+    because a member's registers join the helper's avoid-set and 54 windows then
+    found none.
+  * **The three-link chain** (320): one-helper `lanereg`, then the member, then the
+    passenger. Link 1 alone costs 18 sites; links 1+2 together are no better than
+    link 1. The 54 refusals are `no volatile xmm and scratch slot to stash it`, an
+    AND of two scarcities, and `claimed` is seeded from the members' own slots -- the
+    block's four scratch slots share index space with the first four PERMANENT slots,
+    so a window touching ymm0-ymm3 loses them. **The blocker is addressing, not
+    register count**, and what links 2 and 3 need is a block whose scratch area sits
+    above the sixteen permanent slots.
+  * **`never a candidate` as a lever** (319). Three of its four sites are rebuild
+    casualties; recovering them needs the repair to SPLIT a window, which Finding 281
+    measured as worse at 2,346 to 2,349.
+  * **Overlap as a scheduling problem** (317). `place_stubs` is greedy by address and
+    15,900 unit candidates are foreclosed, but `lost to an overlap` is 12 sites: a
+    foreclosed candidate's sites are lowered by whichever window won. The frontier
+    bounds the prize however many candidates compete.
+  * **Helper starvation as a target** (317). `UNIT_RUNG` says 97.8% of unit windows
+    are taken at the full twelve forward; shortening costs 579 windows of 35,803.
+
+### Instruments added 2026-09-30 to 10-08, and why each exists
+
+  * **The window extent in `repair-blame.txt`** (314). It carried a start and a
+    reader, so a mid-window passenger could not be attributed to its window and the
+    closure terminated early -- reporting no cycles where it could not have found
+    one. Finding 310's defect, in the diagnostic rather than the census.
+  * **The strategy in `stub-refused.txt`** (314). `moved: 256-bit, no Y strategy
+    took it` reads as if a Y strategy declined; all 39 are `unit`, which is one.
+  * **`UNIT_RUNG`** (317), because the ladder snapshots its refusals, so a DESCENT
+    left no trace at all.
+  * **A tool fingerprint in every roll header** (316, narrowed at 321). Two rolls
+    from the same image and flags, with byte-identical headers, differed by 31 and 57
+    in a bucket because the code differed. It covers the IMPORT CLOSURE, not the
+    directory: the first version hashed 26 files including the style gate and cried
+    wolf when another session changed it.
+  * **`COLLECT_SEEN` and `REPAIR_EXCLUDED`** (319), which split `never a candidate`
+    into a named mechanism and a defect. The first draft of the split was vacuous --
+    the clear sat in `repaired_placement`, which runs after `collect` fills it, so a
+    distinction was drawn against an empty set.
 
 ### Working notes for this machine
 
