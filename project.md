@@ -33,11 +33,13 @@ larger than every remaining item put together. Finding 305.
 
 The default became `--shadow-regs=all` on 2026-09-18 (Finding 287), which is where the
 2,622-site fall from 5,691 comes from. **The 960-site build has now been run** (Finding
-323, 2026-10-08): it raises no exception in 300 seconds where the unmodified binary dies
-in four on `EXCEPTION_ILLEGAL_INSTRUCTION` at RVA `0x22d2bf4` -- the address Finding 74
-recorded. So the frontier is no longer on the path the game takes to start. Whether it
-PLAYS is still unmeasured, and the old `0x1428D1492` observation belongs to a binary this
-tree no longer produces.
+323, 2026-10-08): it gets past the point where the unmodified binary dies in four seconds
+on `EXCEPTION_ILLEGAL_INSTRUCTION` at RVA `0x22d2bf4` -- the address Finding 74 recorded.
+**It then HANGS rather than progressing**, spinning in `EnumProcessModulesEx` at 286
+modules and 2 MB resident for an hour, which is a Steam-presence check and not the
+translation. So the frontier is not on the first four seconds of the path, and nothing
+beyond that is measured. The old `0x1428D1492` observation belongs to a binary this tree
+no longer produces.
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
@@ -14034,16 +14036,38 @@ that point with 17,972 survivors. This one has 960 and raises no exception at al
 seventy-five times the original's lifetime, its last activity being `wineusb` device
 enumeration -- real initialisation, well past the loader.
 
-#### What this does and does not settle
+#### What this does and does not settle, corrected after an hour-long run
 
-**It settles that the frontier is no longer on the path the game takes to start.** That
-was never measured before; the 2,687-to-960 progression was structural throughout.
+**It settles that the frontier is not on the first four seconds of the path.** The
+original dies there and the rewritten build does not, which was never measured before;
+the 2,687-to-960 progression was structural throughout.
 
-**It does not settle that the game plays.** No exception in five minutes is not a frame,
-a window or a menu, and this session is headless -- `running-code.md`'s own warning that
-a black capture is what a locked phone looks like applies to anything I could claim from
-a screenshot. The process may be waiting rather than progressing: `/etc/machine-id` is
-absent and Proton says so on every run.
+**It does NOT settle that the build progresses, and the longer run showed it does not.**
+Given an hour, a built prefix, a 1920x1080 Xvfb and `XDG_RUNTIME_DIR` set:
+
+    exit 124 after 3600s     the bound, not a fault
+    exceptions                  0    throughout
+    modules                   286    frozen from minute three
+    RSS                   2120 KB    frozen
+    display              mean = 0    nothing drawn
+
+**It is hung, not running.** The log ends in `EnumProcessModulesEx` repeated to
+exhaustion -- the process enumerating its own modules in a loop, which is a pre-gameplay
+integrity or Steam-presence check, and with no Steam client it spins forever. Two
+megabytes resident is a stub, not a game loading assets. So the AVX-dense rendering and
+simulation code is never reached, and **"no exception in an hour" is evidence of being
+stuck rather than of working.**
+
+**The commit that recorded this finding was titled "the 960-site build runs where the
+original dies in four seconds", and "runs" is too strong.** It gets past where the
+original dies. What happens after the DRM loop is unmeasured, and the 252 MB RSS quoted
+from the 300-second run cannot be compared to anything: that run had no `+loaddll`, so
+its module count is zero in the log and what the memory belonged to is unknown.
+
+This is the shape `running-code.md` warns about -- a comfortable explanation that ends an
+investigation costs more than no explanation, because no explanation keeps somebody
+looking. Running Steam, or a build with the check stubbed, is what would reach the code
+the translation exists for.
 
 #### Two environment findings worth more than the numbers
 
