@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,143 of 804,951 VEX
-sites -- 99.90%** -- through 202,282 detours, and every `make detour-verify` invariant
-holds on the result. **808 sites are left** (Finding 324, 2026-10-08), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,152 of 804,951 VEX
+sites -- 99.90%** -- through 202,286 detours, and every `make detour-verify` invariant
+holds on the result. **799 sites are left** (Finding 326, 2026-10-08), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 808 after
-Finding 324. Subtracting 808 from a 2,337 measured weeks earlier would be
+**That pair is a dated pair and only the default has moved since** -- 799 after
+Finding 326. Subtracting 799 from a 2,337 measured weeks earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -11904,12 +11904,12 @@ code quickly.
 
 ### Where it stands, 2026-10-08
 
-    default build                           808 re-measured   (Finding 324)
+    default build                           799 re-measured   (Finding 326)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,143 of 804,951 VEX sites, 99.90%, through 202,282 detours**, and 180 further
+**804,152 of 804,951 VEX sites, 99.90%, through 202,286 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
@@ -11948,13 +11948,13 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-### The frontier, on the default (Finding 324)
+### The frontier, on the default (Finding 326)
 
-    kept: its window was withheld                        331
+    kept: its window was withheld                        325
     declined: next instruction is a branch target        228
     declined: next instruction will not move             101
     declined: outside .pdata                              73
-    declined: 256-bit: arithmetic rather than a copy       20
+    declined: 256-bit: arithmetic rather than a copy       17
     lost to a refused stub                                16
     lost to an overlap                                    12
     kept: a repair left it in VEX form                     11
@@ -11965,20 +11965,24 @@ default the placer table is `plain`, `unit` and `spill` and nothing else.
 
 **The two halves are unrelated problems**, which sixteen buckets hid: 574 of the
 survivors are 256-bit and 481 of those are the withheld class (Finding 322's
-figures; the withheld class is 331 since Finding 324), a closed knot with
+figures; the withheld class is 325 since Finding 326), a closed knot with
 98.7% of its blame internal; the other 386 are 128-bit and scalar sitting in three
 structural floors. Nothing about the knot is a lowering gap -- the shapes all exist.
 
-**What is left, ranked on the extent-aware closure** (`only` = windows whose entire
-terminal set is in the class, so the gain is a floor rather than an estimate):
+**What is left, ranked on the extent-aware closure** (`only` = the sites in windows
+whose entire terminal set is in the class, so the gain is a floor rather than an
+estimate). Re-joined against the 799 build, `build/repair-blame.txt` with
+`build/frontier-sites.txt`, a reader followed into its holder only where its own reason
+is `kept: its window was withheld`:
 
     class / family                 sites  only  gain   per   status
-    lost to a refused stub            16   103   119   7.4   FLOOR, four (Finding 325)
-    lost to an overlap                12    50    62   5.2   10/15 was that floor
-    no SSE form at any register        5     6    11   2.2   derived, not re-joined
-    vpermd                             3    14    17   5.7   declined: cross-lane
-    F16C                              12     5    17   1.4   measured negative
-    vpshufb                            3     6     9   3.0   untried
+    lost to a refused stub            16   178   194  12.1   FLOOR, four (Finding 325)
+    lost to an overlap                12    86    98   8.2   10/15 was that floor
+    vpermd                             3    26    29   9.7   declined: cross-lane
+    no SSE form at any register        5    16    21   4.2   two negated FMA roots
+    F16C                              12     9    21   1.8   measured negative
+    recorded nothing (vsubps)          1     5     6   6.0   untried, a bookkeeping hole
+    ~~vpshufb                          3     6     9   3.0~~  landed, Finding 326: 9 sites
 
 Inside the five-site `no SSE form` class, after `vblendvpd` landed:
 
@@ -11989,8 +11993,14 @@ Inside the five-site `no SSE form` class, after `vblendvpd` landed:
 **`vblendvpd` was the best ratio in the project and paid six times its closure**: the
 closure said 26 and the frontier fell 152; the 25 counted were only the windows this
 site blamed alone, and what released the rest is not measured. Every row
-in the table above is a floor computed the same way, and the class rows other than
-this one were measured against the 960-site build and want re-joining against 808.
+in the table above is a floor computed the same way. `vpshufb` paid its closure
+exactly, 9 for 9 (Finding 326).
+
+**`vdivps` is the mnemonic to read the two FLOOR rows through**: across the classes it
+is 10 roots holding 89 windows and 135 sites, more than any other, and `vsubps` and
+`vaddps` follow with 65 and 43 windows. Ten of the sixteen refused stubs are `vdivps`,
+three `vorps`; the twelve overlaps are mixed, four `vsubps` and no more than two of
+anything else.
 
 `vpermd` was declined on engineering grounds rather than value: it is a CROSS-LANE
 permute, eight dwords selected from the full 256 bits by a control vector, which is
@@ -14133,6 +14143,67 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 326 -- `lanereg3` reads its second source out of the slot
+
+Finding 325's lesson, applied: lower a ROOT blamer, and touch nothing else. The
+closure on the rebuilt 808 rolls named three `vpshufb` sites -- `0x1434dc104`,
+`0x14365ca76`, `0x14365ca81` -- as the only blamers of six withheld windows, and every
+one was refused `lanereg3 wants a second helper` in `build/unit-refused.txt`.
+
+The upper half of a three-operand lane op loaded both sources' slots into two helpers.
+The second one need not be in a register at all: it is an SSE operation's memory
+source, read straight from its slot off the block register, the move `span_slot_op`
+already makes for the FMA forms on Finding 312's alignment argument:
+
+    movaps  %xmm1,%xmm3              low half, unchanged
+    pshufb  %xmm4,%xmm3
+    movups  0x60(%r11),%xmm5         source 1's upper half
+    pshufb  0x90(%r11),%xmm5         the control's, AS AN OPERAND
+    movups  %xmm5,0x80(%r11)         into the destination's slot
+
+**Only at the refusal.** `need` is untouched, which is the difference from Finding 325's
+link 1: lowering the budget changed which windows formed everywhere and cost 18 sites
+twice, while a fallback where the emitter used to refuse can change only the windows
+that refused. At 808 that is exactly these three.
+
+    frontier                                          808 ->  799     -9
+      kept: its window was withheld                   331 ->  325     -6
+      declined: 256-bit: arithmetic, not a copy        20 ->   17     -3
+    windows not placed                                280 ->  274     -6
+    detours                                       202,282 -> 202,286    +4
+
+**9 for 9, the closure exactly**, and no other class moved. `verify` passes, 19 checks.
+804,152 of 804,951, 99.90%. Of the uses Findings 306 and 324 tabulate, every one missed
+the closure or beat it; this one met it, and it is the smallest -- three roots, six
+windows, no window in the count with a blamer outside the class.
+
+#### The fixture failed twice before it tested anything
+
+`pshufb1` reproduces `0x14365ca76` register for register, with a lane-reversing control
+so a dropped upper half and a low-lane-for-high mix-up each score differently from 77.
+
+- **First version: the refusal reinstated and still 77.** It named every xmm but
+  `xmm15`, meaning to leave one helper. Only `xmm0`-`xmm5` are candidates -- a
+  non-volatile register is borrowed only where the function saves it -- so the window
+  found NO helper, fell to the stash, and the stash takes two. Reading the stub showed
+  `xmm0` and `xmm2` saved to scratch slots.
+- **Second version: one volatile register free, and `off` answered 77 as well.** A frame
+  span lowered the whole run with two helpers, so the fixture never needed a permanent
+  slot and the gate's control refused it. Loading the sources above a branch target, as
+  `crossregion` does, makes the shuffle read them from slots the region did not define.
+
+    the fix                       77    through `pshufb 0x90(%r11),%xmm5`
+    --shadow-regs=off             29    the VEX surviving
+    the old refusal reinstated    29    and unit-refused.txt names `lanereg3 wants a second helper`
+
+`check-shadow-pe` holds it.
+
+**The negated FMA is not the same change.** `vfnmadd231ps` is the other one-helper
+candidate, two roots and twelve windows, but `D = addend - product` needs the addend as
+the subtract's destination: one register cannot hold both the product and the addend,
+and the sign flip that would avoid it is the construction Finding 306 measured wrong for
+NaN payloads. It wants a scratch slot for the product.
+
 ### Finding 325 -- the refused-stub chain, rebuilt at 808, and the stubs move rather than leave
 
 The handover's top class row was `lost to a refused stub`, 16 sites and a closure of 119,
@@ -14151,7 +14222,7 @@ are A+B's** until the next `make census` rebuilds them from the committed tool.
       declined: 256-bit: arithmetic, not a copy  20    20      33
       kept: a repair left it in VEX form         11    13      13
       excluded by a window the repair rebuilt     2     2       4
-      the collector reached it, recorded nothing  0     0       2
+      the collector reached it, recorded nothing  1     1       2
     windows not placed                          280   293     315
     VEX sites in dropped windows                840   887     964
     stubs refused                                36    39       5
@@ -14170,7 +14241,10 @@ The total does not move.
 
 Two sites, `vorps` at `0x142dc3d39` and `0x142dc3d4e`, fell into `the collector reached
 it and recorded nothing` under A+B, the bucket Finding 319 warned is where a mis-keyed
-lookup hides. It is gone with the revert, and anyone rebuilding link 2 meets it first.
+lookup hides. The 808 build has one there already, `vsubps` at `0x142d8e50a`, and the
+row first said 0 for it, written from memory rather than from the roll -- the frontier
+table in the handover lists it. A+B's two are new and went with the revert; anyone
+rebuilding link 2 meets them first.
 
 **So the refused-stub row is a floor four attempts deep**, and Finding 320's conclusion
 stands with one more measurement under it: what links 2 and 3 need is scratch slots,

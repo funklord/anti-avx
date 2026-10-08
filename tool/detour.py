@@ -6425,7 +6425,16 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# into the destination's slot, which is a THIRD slot and the
 			# reason this shape needs the region's slot count rather than
 			# a span's two.
-			if second_helper is None:
+			#
+			# **With one helper the second source is an operand**, read
+			# out of its slot the way `span_slot_op` reads FMA sources.
+			# Only at the refusal: the helper budget is left alone, since
+			# lowering `need` for `lanereg` placed windows that were not
+			# root blamers and cost 18 sites twice (Findings 320, 325).
+			# Three `vpshufb` roots, nine sites. Finding 326.
+			alone = second_helper is None and block is not None \
+				and slot_arithmetic_safe()
+			if second_helper is None and not alone:
 				return refuse("lanereg3 wants a second helper")
 			if second is None or third is None:
 				return refuse("lanereg3 source is in no slot")
@@ -6444,6 +6453,21 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# The upper half, between slots.
 			body += span_slot_move(helper, False, base, third, block,
 			                       at + len(body))
+			if alone:
+				# mod 10 off the block register, so no SIB: it is drawn
+				# from VOLATILE_GPRS and is never `rsp` or `r12`.
+				register = block[0]
+				operation = inplace.sse_encoding(
+					dict(vex, L=0, R=helper >> 3, X=0, B=register >> 3),
+					tail[:1] + bytes([0x80 | ((helper & 7) << 3)
+					                  | (register & 7)])
+					+ struct.pack("<i", base + second * SLOT))
+				if operation is None:
+					return refuse("lanereg3 high operation has no SSE form")
+				body += operation
+				body += span_slot_move(helper, True, base, slot, block,
+				                       at + len(body))
+				continue
 			body += span_slot_move(second_helper, False, base, second,
 			                       block, at + len(body))
 			operation = inplace.sse_encoding(

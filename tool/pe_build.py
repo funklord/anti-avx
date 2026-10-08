@@ -790,6 +790,77 @@ tls_directory:
 """)
 
 
+# **A three-operand lane op with one helper**, Starfield's `vpshufb
+# %ymm4,%ymm1,%ymm3` at 0x14365ca76. Every VOLATILE xmm but `xmm5` is
+# named and read after the window, so exactly one is free across it and
+# the window gets one helper -- where the upper half used to load both
+# sources and refused `lanereg3 wants a second helper`. The control is
+# read out of its slot instead. Only xmm0-xmm5 count: leaving a
+# non-volatile one unnamed gives no helper at all, the stash takes two,
+# and the fixture's first version passed with the refusal reinstated.
+# The sources are loaded above a branch target, as in `crossregion`, so
+# the shuffle reads them from permanent slots: without that a frame span
+# lowers the whole run with two helpers and `off` answers 77 too.
+#
+# The source is bytes 0..31 and the control reverses each lane, so the
+# result is 15..0 then 31..16: bytes 0, 16 and 31 are 15 + 31 + 16 = 62,
+# plus 15. A dropped upper half scores 15 + 0 + 0, and an upper half
+# shuffled from the low lane 15 + 15 + 0. Finding 326.
+PROGRAMS["pshufb1"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	xorps	%xmm0, %xmm0		/* xmm0-xmm4 named and read after */
+	xorps	%xmm2, %xmm2		/* the window: xmm5 is the one free */
+	leaq	source(%rip), %rsi
+	leaq	control(%rip), %rdx
+	vmovdqu	(%rsi), %ymm1		/* bytes 0..31 */
+	vmovdqu	(%rdx), %ymm4		/* reverse each lane */
+	movl	$1, %ecx
+	testl	%ecx, %ecx
+	jne	here			/* always taken; `here` is a target */
+here:
+	vpshufb	%ymm4, %ymm1, %ymm3	/* both sources defined above it */
+	movq	%rsp, %rdi
+	vmovdqu	%ymm3, (%rdi)
+	orps	%xmm0, %xmm2		/* read, so live across the window */
+	movd	%xmm2, %ecx		/* zero, unless a helper leaked */
+	movzbl	(%rdi), %eax		/* byte 0:  15 */
+	addl	%ecx, %eax
+	movzbl	16(%rdi), %ecx		/* byte 16: 31 */
+	addl	%ecx, %eax
+	movzbl	31(%rdi), %ecx		/* byte 31: 16 */
+	addl	%ecx, %eax		/* 15 + 31 + 16 = 62 */
+	addl	$15, %eax		/* 62 + 15 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.byte	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+	.byte	16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31
+	.p2align 5
+control:
+	.byte	15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+	.byte	15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **A variable-count shift, which is NOT the immediate form.** Both wear
 # the mnemonic `vpsllq` and they are different encodings: `0F 73 /6` is
 # the immediate group, where ModRM.reg is an opcode extension and `vvvv`
