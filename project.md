@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,152 of 804,951 VEX
-sites -- 99.90%** -- through 202,286 detours, and every `make detour-verify` invariant
-holds on the result. **799 sites are left** (Finding 326, 2026-10-08), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,167 of 804,951 VEX
+sites -- 99.90%** -- through 202,291 detours, and every `make detour-verify` invariant
+holds on the result. **784 sites are left** (Finding 329, 2026-10-08), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 799 after
-Finding 326. Subtracting 799 from a 2,337 measured weeks earlier would be
+**That pair is a dated pair and only the default has moved since** -- 784 after
+Finding 329. Subtracting 784 from a 2,337 measured weeks earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -11904,12 +11904,12 @@ code quickly.
 
 ### Where it stands, 2026-10-08
 
-    default build                           799 re-measured   (Finding 326)
+    default build                           784 re-measured   (Finding 329)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,152 of 804,951 VEX sites, 99.90%, through 202,286 detours**, and 180 further
+**804,167 of 804,951 VEX sites, 99.90%, through 202,291 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
@@ -11948,9 +11948,9 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-### The frontier, on the default (Findings 326, 327)
+### The frontier, on the default (Finding 329)
 
-    kept: its window was withheld                        326
+    kept: its window was withheld                        313
     declined: next instruction is a branch target        228
     declined: next instruction will not move             101
     declined: outside .pdata                              73
@@ -11958,13 +11958,13 @@ default the placer table is `plain`, `unit` and `spill` and nothing else.
     lost to a refused stub                                16
     lost to an overlap                                    12
     kept: a repair left it in VEX form                     11
-    declined: no SSE form at any register                   5
+    declined: no SSE form at any register                   3
     excluded by a window the repair rebuilt                 2
     (and eight singletons)
 
 **The two halves are unrelated problems**, which sixteen buckets hid: 574 of the
 survivors are 256-bit and 481 of those are the withheld class (Finding 322's
-figures; the withheld class is 326 since Finding 327), a closed knot with
+figures; the withheld class is 313 since Finding 329), a closed knot with
 98.7% of its blame internal; the other 386 are 128-bit and scalar sitting in three
 structural floors. Nothing about the knot is a lowering gap -- the shapes all exist.
 
@@ -11978,7 +11978,7 @@ is `kept: its window was withheld`:
     lost to a refused stub            16   178   194  12.1   FLOOR, four (Finding 325)
     lost to an overlap                12    86    98   8.2   10/15 was that floor
     vpermd                             3    26    29   9.7   declined: cross-lane
-    no SSE form at any register        5    16    21   4.2   two negated FMA roots
+    ~~no SSE form at any register      5    16    21   4.2~~  negated FMA landed, Finding 329: 15
     F16C                              12     9    21   1.8   measured negative
     ~~recorded nothing (vsubps)        1     5     6   6.0~~  a label, Finding 327: 0 sites
     a cycle with no root               0     5     5     -   4 windows; Finding 328 failed
@@ -14142,6 +14142,55 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 329 -- a negated FMA with one helper keeps its product in a scratch slot
+
+The two `vfnmadd231ps` root blamers -- `0x142dcfd70` and `0x142dcfe1e`, both
+`vfnmadd231ps <rip>,%ymm4,%ymm0` -- held twelve windows nothing else blamed, and both
+were refused `negated FMA wants a second helper`. Finding 326 set them aside: `D =
+addend - product` needs the addend as the subtract's destination while the product
+is still wanted, and in the 231 order the only slot free to write is the destination's,
+which holds the addend.
+
+**The block has scratch slots nobody was using.** Transient indices below `TLS_SLOTS`,
+addressed off the block pointer like any slot, with the mover and the stash drawing on
+them through one `claimed` set (Finding 267). Where a window has exactly one helper and
+a negated FMA member, `unit_candidate` claims one for the product and passes it in the
+block tuple; the upper half becomes
+
+    movups  <s1 slot>,%xmm5          the factor
+    mulps   <rip>,%xmm5              the product
+    movups  %xmm5,0x10(%r11)         out to the scratch slot
+    movups  <dst slot>,%xmm5         the addend, which is the destination
+    subps   0x10(%r11),%xmm5         addend - product, the product as an operand
+    movups  %xmm5,<dst slot>
+
+The same as the two-helper form except that the second register is a slot. Only where
+the emitter used to refuse: the helper budget is untouched, Finding 326's rule.
+
+    frontier                                          799 ->  784    -15
+      kept: its window was withheld                   326 ->  313    -13
+      declined: no SSE form at any register             5 ->    3     -2
+    windows not placed                                274 ->  265     -9
+    detours                                       202,286 -> 202,291     +5
+
+`verify` passes, 19 checks. 804,167 of 804,951, 99.90%. **15 against a bound of 18**:
+nine of the twelve windows only these two blamed were released, and three found
+another blamer as the repair re-settled -- the shortfall Finding 306 describes for a
+small class, here three windows.
+
+`fnm1` reproduces `0x142dcfd70`, memory multiplier and all, with one volatile helper and
+its sources above a branch target, the two conditions `pshufb1` taught. Its lanes are
+`ymm0 - 6`, so the un-negated sequence scores 113 and a dropped upper half 76:
+
+    the fix                       77    through `subps 0x10(%r11),%xmm5`
+    --shadow-regs=off             29    the VEX surviving
+    the old refusal reinstated    29    and unit-refused.txt names `negated FMA wants a second helper`
+
+**The scratch slots are a resource the other refusals may want too.** Finding 320 named
+them as what a member-taking back-widening lacks -- `no volatile xmm and scratch slot to
+stash it`. Here one was free at both sites, which is not a claim that one always is: a
+window that also needs the mover or the stash draws on the same few.
 
 ### Finding 328 -- re-admitting the rootless cycle, and a closure the repair cannot draw
 

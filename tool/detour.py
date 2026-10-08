@@ -6204,7 +6204,8 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 				return refuse("FMA source is in no slot")
 			if block is None:
 				return refuse("FMA member wants a per-thread block")
-			if second_helper is None:
+			product_slot = block[10] if len(block) > 10 else None
+			if second_helper is None and product_slot is None:
 				return refuse("negated FMA wants a second helper")
 			order = FMA_PATTERN.match(mnemonic).group(3)
 			kind = mnemonic[-2:]
@@ -6271,6 +6272,27 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if piece is None:
 				return refuse("negated FMA cannot reach a slot")
 			body += piece
+			if second_helper is None:
+				# The product out to its scratch slot, the addend into the
+				# helper, and the product subtracted from it as an operand.
+				body += span_slot_move(helper, True, base, product_slot,
+				                       block, at + len(body))
+				if gadd is MEMORY:
+					piece = at_mem(load, None, helper, SLOT)
+					if piece is None:
+						return refuse("negated FMA cannot reach its addend")
+					body += piece
+				else:
+					body += span_slot_move(helper, False, base, gadd,
+					                       block, at + len(body))
+				piece = span_slot_op(prefix, take, helper, base,
+				                     product_slot, block)
+				if piece is None:
+					return refuse("negated FMA cannot reach its product")
+				body += piece
+				body += span_slot_move(helper, True, base, slot, block,
+				                       at + len(body))
+				continue
 			if gadd is MEMORY:
 				piece = at_mem(load, None, second_helper, SLOT)
 				if piece is None:
@@ -8132,8 +8154,26 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		# vector register at all -- refusing here for want of one refused
 		# every GPR-movable window the moment this check was added.
 		return refuse("no xmm helper free at the site")
+	# **A negated FMA with one helper keeps its product in a scratch
+	# slot.** `D = addend - product` wants the addend as the subtract's
+	# destination while the product is still needed, and with one
+	# register the product has to go somewhere -- not into the
+	# destination's slot, which for the 231 order IS the addend. A spare
+	# block scratch slot is the somewhere, claimed here so the mover and
+	# the stash cannot hand it out too. Both of Starfield's negated FMA
+	# root blamers are 231 and had exactly one helper. Finding 329.
+	product_slot = None
+	if len(helpers) == 1 and any(
+			kind in ("lanereg3", "lanemem")
+			and instructions[position][2] in FMA_SPAN_FORMS
+			and FMA_PATTERN.match(instructions[position][2]).group(1) == "n"
+			for kind, position, _r in members):
+		free_slots = [i for i in range(TLS_SLOTS) if i not in claimed]
+		if free_slots:
+			product_slot = free_slots[0]
+			claimed.add(product_slot)
 	block = block[:5] + (mover, mover_save, borrowed_xmm, stashed_xmm,
-	                     mover_slot)
+	                     mover_slot, product_slot)
 	first = helpers[0] if helpers else None
 	second = helpers[1] if len(helpers) > 1 else None
 	# **Mode True stashes a LIVE index register in an xmm, so it cannot

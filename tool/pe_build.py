@@ -861,6 +861,77 @@ tls_directory:
 """)
 
 
+# **A negated FMA with one helper**, Starfield's `vfnmadd231ps
+# 0xcc4447(%rip),%ymm4,%ymm0` at 0x142dcfd70: the 231 order, the
+# multiplier from memory. `xmm0`-`xmm4` are named and read after the
+# window so `xmm5` is the one helper, and the sources are loaded above a
+# branch target so the FMA reads them from permanent slots, as `pshufb1`
+# had to. With one register the product goes to a block scratch slot
+# while the addend is loaded, and is subtracted from it as an operand;
+# it used to refuse `negated FMA wants a second helper`.
+#
+# ymm0 = ymm0 - 3 * 2, so lanes 0, 4 and 7 are -5, -1 and 2: -4, plus
+# 81. The un-negated sequence scores 113, a dropped upper half 76.
+# Finding 329.
+PROGRAMS["fnm1"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	xorps	%xmm2, %xmm2		/* xmm0-xmm4 named and read after */
+	xorps	%xmm3, %xmm3		/* the window: xmm5 is the one free */
+	xorps	%xmm4, %xmm4
+	leaq	source(%rip), %rsi
+	leaq	threes(%rip), %rdx
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8}, the addend */
+	vmovups	(%rdx), %ymm1		/* 3.0 in every lane */
+	movl	$1, %ecx
+	testl	%ecx, %ecx
+	jne	here			/* always taken; `here` is a target */
+here:
+	vfnmadd231ps twos(%rip), %ymm1, %ymm0	/* ymm0 -= ymm1 * 2 */
+	movq	%rsp, %rdi
+	vmovups	%ymm0, (%rdi)
+	orps	%xmm2, %xmm3		/* read, so live across the window */
+	orps	%xmm4, %xmm3
+	movd	%xmm3, %ecx		/* zero, unless a helper leaked */
+	cvttss2si (%rdi), %eax		/* lane 0: 1 - 6 = -5 */
+	addl	%ecx, %eax
+	cvttss2si 16(%rdi), %ecx	/* lane 4: 5 - 6 = -1 */
+	addl	%ecx, %eax
+	cvttss2si 28(%rdi), %ecx	/* lane 7: 8 - 6 = 2 */
+	addl	%ecx, %eax		/* -5 - 1 + 2 = -4 */
+	addl	$81, %eax		/* -4 + 81 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.p2align 5
+threes:	.float 3.0, 3.0, 3.0, 3.0
+	.float 3.0, 3.0, 3.0, 3.0
+	.p2align 5
+twos:	.float 2.0, 2.0, 2.0, 2.0
+	.float 2.0, 2.0, 2.0, 2.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **A variable-count shift, which is NOT the immediate form.** Both wear
 # the mnemonic `vpsllq` and they are different encodings: `0F 73 /6` is
 # the immediate group, where ModRM.reg is an opcode extension and `vvvv`
