@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **803,991 of 804,951 VEX
-sites -- 99.88%** -- through 202,263 detours, and every `make detour-verify` invariant
-holds on the result. **960 sites are left** (Finding 322, 2026-10-08), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,143 of 804,951 VEX
+sites -- 99.90%** -- through 202,282 detours, and every `make detour-verify` invariant
+holds on the result. **808 sites are left** (Finding 324, 2026-10-08), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 960 after
-Finding 322. Subtracting 960 from a 2,337 measured weeks earlier would be
+**That pair is a dated pair and only the default has moved since** -- 808 after
+Finding 324. Subtracting 808 from a 2,337 measured weeks earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -11904,12 +11904,12 @@ code quickly.
 
 ### Where it stands, 2026-10-08
 
-    default build                           960 re-measured   (Finding 322)
+    default build                           808 re-measured   (Finding 324)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**803,991 of 804,951 VEX sites, 99.88%, through 202,263 detours**, and 180 further
+**804,143 of 804,951 VEX sites, 99.90%, through 202,282 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
@@ -11948,9 +11948,9 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-### The frontier, on the default (Finding 322)
+### The frontier, on the default (Finding 324)
 
-    kept: its window was withheld                        481
+    kept: its window was withheld                        331
     declined: next instruction is a branch target        228
     declined: next instruction will not move             101
     declined: outside .pdata                              73
@@ -11958,13 +11958,14 @@ default the placer table is `plain`, `unit` and `spill` and nothing else.
     lost to a refused stub                                16
     lost to an overlap                                    12
     kept: a repair left it in VEX form                     11
-    declined: no SSE form at any register                   6
-    excluded by a window the repair rebuilt                 3
+    declined: no SSE form at any register                   5
+    excluded by a window the repair rebuilt                 2
     the collector reached it and recorded nothing           1
     (and eight singletons)
 
 **The two halves are unrelated problems**, which sixteen buckets hid: 574 of the
-survivors are 256-bit and 481 of those are the withheld class, a closed knot with
+survivors are 256-bit and 481 of those are the withheld class (Finding 322's
+figures; the withheld class is 331 since Finding 324), a closed knot with
 98.7% of its blame internal; the other 386 are 128-bit and scalar sitting in three
 structural floors. Nothing about the knot is a lowering gap -- the shapes all exist.
 
@@ -11974,21 +11975,22 @@ terminal set is in the class, so the gain is a floor rather than an estimate):
     class / family                 sites  only  gain   per   status
     lost to a refused stub            16   103   119   7.4   FLOOR, three attempts
     lost to an overlap                12    50    62   5.2   10/15 was that floor
-    no SSE form at any register        6    31    37   6.2   see the subsets below
+    no SSE form at any register        5     6    11   2.2   derived, not re-joined
     vpermd                             3    14    17   5.7   declined: cross-lane
     F16C                              12     5    17   1.4   measured negative
     vpshufb                            3     6     9   3.0   untried
 
-Inside the six-site `no SSE form` class one subset carries nearly all of it:
+Inside the five-site `no SSE form` class, after `vblendvpd` landed:
 
-    vblendvpd  (one site, 0x14374ecee)      1    25    26
+    ~~vblendvpd  (one site, 0x14374ecee)      1    25    26~~  landed, Finding 324: 152 sites
     all four negated FMA                    4     6    10
     vpermilps (memory control)              1     0     1
 
-**`vblendvpd` is the best ratio in the project**: one site, 25 windows, and a known
-cause -- the roll says `blendv cannot borrow xmm0 as a helper`, because the SSE form
-takes its mask only from an implicit `xmm0`. The `blendv` shape already exists from
-Finding 307.
+**`vblendvpd` was the best ratio in the project and paid six times its closure**: the
+closure said 26 and the frontier fell 152; the 25 counted were only the windows this
+site blamed alone, and what released the rest is not measured. Every row
+in the table above is a floor computed the same way, and the class rows other than
+this one were measured against the 960-site build and want re-joining against 808.
 
 `vpermd` was declined on engineering grounds rather than value: it is a CROSS-LANE
 permute, eight dwords selected from the full 256 bits by a control vector, which is
@@ -14130,6 +14132,69 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 324 -- `blendv` takes a stashed `xmm0` as its mask register
+
+The handover ranked `vblendvpd %ymm2,%ymm1,%ymm3,%ymm3` at `0x14374ecee` the best ratio in
+the project: one site, 25 withheld windows behind it, and a known refusal in
+`build/unit-refused.txt` -- `blendv cannot borrow xmm0 as a helper`.
+
+    frontier                                          960 ->  808   -152
+      kept: its window was withheld                   481 ->  331   -150
+      declined: no SSE form at any register             6 ->    5     -1
+      excluded by a window the repair rebuilt           3 ->    2     -1
+    windows not placed                                423 ->  280   -143
+    detours                                       202,263 -> 202,282    +19
+
+**152 against a predicted 26**, and the whole of `verify` passes, 19 checks. 804,143 of
+804,951 sites, 99.90%. That is the fifth time a closure figure has proved a floor, and
+by the widest margin: the closure counted the 25 windows whose ENTIRE terminal set was
+this site, and 143 placed. **Why the other 118 were released is not measured**; the
+avalanche Finding 305 describes, where a window withheld in one round blames others in
+the next, is the likely route, and re-joining `build/repair-blame.txt` against the
+960-site roll would settle it.
+
+#### Why `xmm0` was a helper at all, and why that is the easy case
+
+No register at the site is free by the whole-function rule, so `unit_candidate` takes
+its helpers from the stash: every volatile `xmm` the window does not name, saved to a
+block scratch slot and given back at the end of the stub. That list is handed out lowest
+first, so `xmm0` comes first. The `blendv` emitter's own save-and-restore exists to put
+whatever `xmm0` holds out of the way while the mask sits there -- and when `xmm0` IS the
+helper, the place it would be saved is the register being saved, so it refused.
+
+But a helper is by definition a register the window may clobber and no member names.
+A stashed `xmm0` is already given back by the stub, so the mask goes straight into it
+and the other helper accumulates:
+
+    movaps  mask,%xmm0             the low mask, where SSE4.1 wants it
+    movaps  src1,%H                accumulate in the other helper
+    blendvpd src2,%H
+    movaps  %H,dst
+    movups  slot(mask),%xmm0       the upper mask
+    movups  slot(src1),%H
+    blendvpd slot(src2),%H
+    movups  %H,slot(dst)
+
+Four instructions shorter than the save-and-restore path, which is unchanged for the
+case where neither helper is `xmm0`.
+
+#### The fixture had to be forced onto the stash path, twice
+
+`blendvx0` reproduces the site register for register, in the `pd` form no fixture
+covered. **Its first two versions answered 77 with the refusal put back**, so they never
+reached the new branch: `xmm0` carries a float return and is live at `ret`, so the
+helpers came out as the whole-function-free `xmm4` and `xmm5`. Writing `xmm0` after the
+blend did not help either, because `region_helpers` yields only whole-function-free
+registers or ones dead INSIDE the window. Naming `xmm4` and `xmm5` at function entry is
+what forces the stash, as at the real site, and the stub then shows `xmm0` saved,
+loaded with the mask, and restored.
+
+    the fix                       77
+    --shadow-regs=off             29   SIGILL, the VEX surviving
+    the old refusal reinstated    29   and unit-refused.txt names the site's refusal
+
+`check-shadow-pe` holds it, and the gate passes whole.
 
 ### Finding 323 -- it runs, and the original dies in four seconds
 

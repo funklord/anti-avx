@@ -725,6 +725,71 @@ tls_directory:
 """)
 
 
+# **A variable blend that leaves `xmm0` alone**, which is Starfield's last
+# one: `vblendvpd %ymm2,%ymm1,%ymm3,%ymm3` at 0x14374ecee, reproduced
+# register for register. Nothing here names `ymm0`. **The function names
+# xmm4 and xmm5**, so neither is free by the whole-function rule and the
+# helpers come from the stash: every volatile xmm the window does not
+# name, saved in a block scratch slot and given back, handed out lowest
+# first -- `xmm0` first, as at the real site. The emitter refused that as
+# `blendv cannot borrow xmm0 as a helper`; a stashed `xmm0` is where the
+# mask can go with nothing to save.
+#
+# The `pd` form, because the other two fixtures are both `ps` and the
+# opcode differs. src1 is {1,2,3,4}, src2 100.0 throughout, the mask
+# {-,+,-,+} by sign, so the blend is {100,2,100,4}. Lanes 0, 1 and 3 are
+# read: 100 + 2 + 4 = 106, less 29. The wrong side scores 1 + 100 + 100,
+# a dropped upper half 100 + 2 + 0. Finding 324.
+PROGRAMS["blendvx0"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	xorps	%xmm4, %xmm4		/* named, so not free by */
+	xorps	%xmm5, %xmm5		/* the whole-function rule */
+	leaq	source(%rip), %rsi
+	leaq	hundred(%rip), %rdx
+	leaq	mask(%rip), %rax
+	vmovupd	(%rsi), %ymm3		/* src1 = {1,2,3,4}, and the dst */
+	vmovupd	(%rdx), %ymm1		/* src2 = 100.0 */
+	vmovupd	(%rax), %ymm2		/* mask, alternating by sign */
+	vblendvpd %ymm2, %ymm1, %ymm3, %ymm3
+	movq	%rsp, %rdi
+	vmovupd	%ymm3, (%rdi)
+	cvttsd2si (%rdi), %eax		/* lane 0, even: src2 = 100 */
+	cvttsd2si 8(%rdi), %ecx		/* lane 1, odd:  src1 = 2 */
+	addl	%ecx, %eax
+	cvttsd2si 24(%rdi), %ecx	/* lane 3, odd:  src1 = 4 */
+	addl	%ecx, %eax		/* 100 + 2 + 4 = 106 */
+	subl	$29, %eax		/* 106 - 29 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.double 1.0, 2.0, 3.0, 4.0
+	.p2align 5
+hundred:
+	.double 100.0, 100.0, 100.0, 100.0
+	.p2align 5
+mask:	.double -1.0, 1.0, -1.0, 1.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **A variable-count shift, which is NOT the immediate form.** Both wear
 # the mnemonic `vpsllq` and they are different encodings: `0F 73 /6` is
 # the immediate group, where ModRM.reg is an opcode extension and `vvvv`

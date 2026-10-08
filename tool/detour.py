@@ -6108,14 +6108,44 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 				return refuse("blendv wants a per-thread block")
 			if second_helper is None:
 				return refuse("blendv wants a second helper")
-			if 0 in (helper, second_helper):
-				return refuse("blendv cannot borrow xmm0 as a helper")
 			kind = mnemonic[-2:]
 			blend = b"\x0f\x38\x14" if kind == "ps" else b"\x0f\x38\x15"
 			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
 			low_s2 = scratch_finder.xmm_numbers(shape[2])[0]
 			low_s1 = scratch_finder.xmm_numbers(shape[3])[0]
 			low_mask = scratch_finder.xmm_numbers(shape[4])[0]
+			if 0 in (helper, second_helper):
+				# **`xmm0` handed out as a helper is the easy case, not
+				# the impossible one.** A helper is a register the window
+				# may clobber -- dead across it, or stashed and given back
+				# around it -- and one no member names, so `xmm0` is
+				# neither an operand nor anything the program still
+				# wants. The mask goes straight into it with nothing to
+				# save, and the other helper accumulates.
+				#
+				# This used to refuse `blendv cannot borrow xmm0 as a
+				# helper`, because the helpers are handed out lowest
+				# first and the save-and-restore below has nowhere to
+				# put `xmm0` if it is the place it would be saved. That
+				# held one site, 0x14374ecee, and 151 more behind it in
+				# the windows it withheld. Finding 324.
+				other = second_helper if helper == 0 else helper
+				body += encode_rr(None, MOVAPS, 0, low_mask)
+				body += encode_rr(None, MOVAPS, other, low_s1)
+				body += encode_rr(0x66, blend, other, low_s2)
+				body += encode_rr(None, MOVAPS, low_dst, other)
+				body += span_slot_move(0, False, base, fourth, block,
+				                       at + len(body))
+				body += span_slot_move(other, False, base, third, block,
+				                       at + len(body))
+				piece = span_slot_op(0x66, blend, other, base, second,
+				                     block)
+				if piece is None:
+					return refuse("blendv cannot reach the second source")
+				body += piece
+				body += span_slot_move(other, True, base, slot, block,
+				                       at + len(body))
+				continue
 
 			def spare(register):
 				"""Where this operand is, once `xmm0` has been put away."""
