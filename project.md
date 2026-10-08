@@ -11948,9 +11948,9 @@ reachable as the A/B and is where `zero`, `pair`, `run`, `region`, `span`, the
 splats, the long loads and stores and `conststore` still place -- under the new
 default the placer table is `plain`, `unit` and `spill` and nothing else.
 
-### The frontier, on the default (Finding 326)
+### The frontier, on the default (Findings 326, 327)
 
-    kept: its window was withheld                        325
+    kept: its window was withheld                        326
     declined: next instruction is a branch target        228
     declined: next instruction will not move             101
     declined: outside .pdata                              73
@@ -11960,12 +11960,11 @@ default the placer table is `plain`, `unit` and `spill` and nothing else.
     kept: a repair left it in VEX form                     11
     declined: no SSE form at any register                   5
     excluded by a window the repair rebuilt                 2
-    the collector reached it and recorded nothing           1
     (and eight singletons)
 
 **The two halves are unrelated problems**, which sixteen buckets hid: 574 of the
 survivors are 256-bit and 481 of those are the withheld class (Finding 322's
-figures; the withheld class is 325 since Finding 326), a closed knot with
+figures; the withheld class is 326 since Finding 327), a closed knot with
 98.7% of its blame internal; the other 386 are 128-bit and scalar sitting in three
 structural floors. Nothing about the knot is a lowering gap -- the shapes all exist.
 
@@ -11981,7 +11980,8 @@ is `kept: its window was withheld`:
     vpermd                             3    26    29   9.7   declined: cross-lane
     no SSE form at any register        5    16    21   4.2   two negated FMA roots
     F16C                              12     9    21   1.8   measured negative
-    recorded nothing (vsubps)          1     5     6   6.0   untried, a bookkeeping hole
+    ~~recorded nothing (vsubps)        1     5     6   6.0~~  a label, Finding 327: 0 sites
+    a cycle with no root               0     5     5     -   4 windows, Finding 327
     ~~vpshufb                          3     6     9   3.0~~  landed, Finding 326: 9 sites
 
 Inside the five-site `no SSE form` class, after `vblendvpd` landed:
@@ -14142,6 +14142,52 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 327 -- the silent exit was a label, and behind it a cycle with no root
+
+The ranking's new row was one `vsubps` at `0x142d8e50a` in `the collector reached it and
+recorded nothing`, holding four windows by the closure. Finding 319 had left it there as
+"a genuine silent exit" and found no exit. A probe running the census's own steps for
+that one address answered it:
+
+    candidate  0x142d8e505  9 bytes, widened back over `vshufps $0xdd`   dropped by the repair
+    withheld   0x142d8e4fa  to 0x142d8e517   and   0x142d8e505  to 0x142d8e529
+    re-placed by the census, the candidate alone                          refused
+
+**It is in two withheld windows and in neither one's extent as the census computes it.**
+The census finds withheld sites by laying every dropped candidate's stub down again, all
+together, and taking the extents that come back. A window that comes back refused or
+overlapped contributes nothing, and a site with no other reason fell through every test.
+
+**Two fixes moved nothing, and the third is the one that is right for a reason.**
+
+- Keeping the re-placement's refusals in `place_stubs`' `detail`: filled on one refusal
+  path only, so it stayed empty.
+- Its returned refused list: the probe re-placed the candidate ALONE, and laid down
+  together with the rest it is not refused but something else. A probe narrower than the
+  thing it models answered a question the census never asks.
+- A withheld candidate's own extent, checked LAST. 40 surviving sites lie in a withheld
+  extent by `repair-blame.txt`, every root blamer among them, so an early check would
+  have relabelled all forty and erased the reasons that make them roots. Last, it catches
+  only what nothing else claimed.
+
+    `the collector reached it and recorded nothing`     1 ->  0
+    `kept: its window was withheld`                   325 -> 326
+    every other site's reason                       unchanged, diffed line by line
+    frontier                                          799 -> 799
+
+**Worth nothing in sites, and the row it removes was worth nothing either** -- which is
+Finding 319's own conclusion about this bucket, reached a second time. The ranking had
+it at six.
+
+**What the correct label shows is new.** The closure follows a withheld reader into its
+holder, so the four windows that used to end at this "root" now end nowhere: `no-terminal
+windows 4`. They are a CYCLE, withheld only by readers that sit inside each other, with no
+unlowerable instruction anywhere behind them. The repair starts from "everything placed"
+and only drops, so once the avalanche has dropped one member nothing re-admits the set.
+Re-admitting it whole, and checking the stale reads again, is a repair change worth at
+most the five sites inside: `vinsertf128` at `0x142d8e4db` and `0x142d8e4fa`, `vshufps`
+at `0x142d8e500` and `0x142d8e505`, and the `vsubps`.
 
 ### Finding 326 -- `lanereg3` reads its second source out of the slot
 

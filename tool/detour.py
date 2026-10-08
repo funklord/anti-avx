@@ -15301,6 +15301,20 @@ def frontier_census(original, patched, listing):
 			stub_base_of(open(original, "rb").read()), 0, Counter(),
 			home=home, tls=tls_pair_of(tls_for(original)))[0]:
 		inside_dropped.update(range(site, site + window))
+	# **And each withheld candidate's own extent, as a last resort.** The
+	# re-placement above lays every withheld window down together, so one
+	# overlapped by a neighbour, or refused, contributes no extent, and a
+	# site with no other reason fell through to `the collector reached it
+	# and recorded nothing` -- Finding 319's "genuine silent exit", `vsubps`
+	# at 0x142d8e50a, inside withheld windows at 0x142d8e4fa and
+	# 0x142d8e505. Checked LAST, after every specific reason: 40 surviving
+	# sites lie in a withheld extent as `repair-blame.txt` gives them, every
+	# root blamer among them, and
+	# an early check would have relabelled all of them. Finding 327.
+	withheld_extent = set()
+	for start, _e, _o, _m, window, *_rest in candidates:
+		if start in dropped:
+			withheld_extent.update(range(start, start + window))
 	# **Spread over the extent, not the start.** `inside_dropped` above
 	# is spread and these were not, so a site that is inside a candidate
 	# without BEING its start fell past every bucket into `never a
@@ -15363,6 +15377,8 @@ def frontier_census(original, patched, listing):
 			reason = "a placed window covered it (should not happen)"
 		elif address in REPAIR_EXCLUDED:
 			reason = "excluded by a window the repair rebuilt"
+		elif address in withheld_extent:
+			reason = "kept: its window was withheld"
 		elif address in COLLECT_SEEN:
 			reason = "the collector reached it and recorded nothing"
 		elif not COLLECT_SEEN:
