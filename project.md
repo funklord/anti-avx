@@ -14143,6 +14143,28 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 332 -- more scratch slots would unlock nothing measured today
+
+Finding 320 named a block-layout change -- a scratch area above the sixteen permanent
+slots -- as the only route for the refused-stub chain, because what stopped the chain
+was `no volatile xmm and scratch slot to stash it`. Measured on the 752 build before
+building it, `build/unit-refused.txt` holds 44 refusals and **none of them is for
+scratch**:
+
+    vcvtph2ps / vcvtps2ph has no legacy encoding      24   F16C, measured negative
+    vpermd has no legacy encoding                      6   cross-lane
+    too short to place                                10   next a branch target,
+                                                           transfers control, or a
+                                                           neighbour with no legacy form
+    window outside .pdata                              2
+    shape a register-to-register move                  2
+
+The stash refusals exist only when the member-taking back-widening is in -- 22 under
+Finding 325's A+B -- and that widening alone is neutral to the site (Finding 330). So
+the layout change buys a resource nothing in the default build is short of. **Not
+built.** It becomes worth pricing again only alongside a change that makes stash demand
+appear and pays for it.
+
 ### Finding 331 -- a short site jumps short, into the padding between functions
 
 The three 128-bit floors were 402 of the 784 survivors, more than every 256-bit class
@@ -14454,7 +14476,8 @@ rebuilding link 2 meets them first.
 **So the refused-stub row is a floor four attempts deep**, and Finding 320's conclusion
 stands with one more measurement under it: what links 2 and 3 need is scratch slots,
 not helpers, and the block layout change it describes is the only route left in that
-direction. The closure's 119 for this class assumed the readers behind those windows
+direction -- though at 752 nothing in the default build is short of scratch (Finding
+332). The closure's 119 for this class assumed the readers behind those windows
 would follow; at 808, placing their writers without lowering the readers only feeds the
 repair.
 
