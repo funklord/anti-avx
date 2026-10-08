@@ -11975,7 +11975,7 @@ estimate). Re-joined against the 799 build, `build/repair-blame.txt` with
 is `kept: its window was withheld`:
 
     class / family                 sites  only  gain   per   status
-    lost to a refused stub            16   178   194  12.1   FLOOR, four (Finding 325)
+    lost to a refused stub            16   178   194  12.1   FLOOR, five (Finding 330)
     lost to an overlap                12    86    98   8.2   10/15 was that floor
     vpermd                             3    26    29   9.7   declined: cross-lane
     ~~no SSE form at any register      5    16    21   4.2~~  negated FMA landed, Finding 329: 15
@@ -14142,6 +14142,34 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 330 -- the member-taking back-widening alone is neutral, to the site
+
+Finding 325's link 2 -- a backward 256-bit neighbour taken as a MEMBER rather than
+carried in `preceding` -- had only ever been measured on top of link 1, the lowered
+helper budget that costs 18 sites by itself. Finding 326 has since given `lanereg3` a
+one-helper fallback at emission with the budget untouched, and ten of the sixteen
+refused stubs are `vdivps`, a `lanereg3`. So link 2 alone was the untried cell.
+
+    against the 784 build                     784   link 2 alone
+    VEX in the rewritten .text                784            784
+      declined by the collector               430            443
+      refused, stub not buildable              58              4
+      in a window the repair dropped          273            314
+    windows not placed                        265            285
+    stubs refused                              34              2
+    detours                               202,291        202,291
+
+**The refused stubs empty and the total does not move by one site.** Every stub the
+member-taking widening saves places a window that swallows a VEX.128 write some
+surviving 256-bit reader still reads, and the repair withholds twenty more. Finding
+325's mechanism, without link 1's cost on top. Reverted; the run was stopped after the
+census, so there is no frontier breakdown and no `verify` for it.
+
+**So the class is a floor five attempts deep**, and the reason is now the same in all
+five: these sites are roots only because lowering them PLACES windows, and a placed
+window is exactly what the repair's blame is made of. Finding 305's sign rule, met from
+the other side -- a root whose lowering adds placed windows is not a lever.
 
 ### Finding 329 -- a negated FMA with one helper keeps its product in a scratch slot
 
