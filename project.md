@@ -32,10 +32,12 @@ arithmetic` 59 against 2. The decision is larger than it was when it was raised,
 larger than every remaining item put together. Finding 305.
 
 The default became `--shadow-regs=all` on 2026-09-18 (Finding 287), which is where the
-2,622-site fall from 5,691 comes from. **The Proton observation is older than that build**
--- the previous default loaded 305 modules before the frontier at `0x1428D1492` stopped it,
-and nobody has run the new one, so that address belongs to a binary this tree no longer
-produces.
+2,622-site fall from 5,691 comes from. **The 960-site build has now been run** (Finding
+323, 2026-10-08): it raises no exception in 300 seconds where the unmodified binary dies
+in four on `EXCEPTION_ILLEGAL_INSTRUCTION` at RVA `0x22d2bf4` -- the address Finding 74
+recorded. So the frontier is no longer on the path the game takes to start. Whether it
+PLAYS is still unmeasured, and the old `0x1428D1492` observation belongs to a binary this
+tree no longer produces.
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
@@ -14006,6 +14008,70 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 323 -- it runs, and the original dies in four seconds
+
+Instructed by the copyright holder 2026-10-08, after a day of structural numbers was put
+the obvious question: does the game run now. The honest answer at the time was that
+nothing connected the frontier to it -- every figure since Finding 287 was `verify` plus
+fixtures, and `project.md` had said since Finding 74 that the validation path was this
+machine while nobody had taken it for the current default.
+
+Taken now, both binaries, same prefix, same farm, same CPU:
+
+    original     exit  29 after    4 s   EXCEPTION_ILLEGAL_INSTRUCTION
+                                         addr=00000001422D2BF4   RVA 0x22D2BF4
+    rewritten    exit 124 after  300 s   ZERO exceptions of any kind,
+                 (960 survivors)         stopped only by the bound
+
+**The original's fault address is the one Finding 74 recorded**, RVA `0x22d2bf4`,
+`vpxor %xmm0,%xmm0,%xmm0`. Reproducing it across five months and two changes of default
+is what makes this a control rather than an artifact of the environment: the same bytes,
+the same prefix, the same Westmere, the same instruction, in four seconds.
+
+**And the rewritten build does not stop there.** Finding 74's build died 866 bytes past
+that point with 17,972 survivors. This one has 960 and raises no exception at all in
+seventy-five times the original's lifetime, its last activity being `wineusb` device
+enumeration -- real initialisation, well past the loader.
+
+#### What this does and does not settle
+
+**It settles that the frontier is no longer on the path the game takes to start.** That
+was never measured before; the 2,687-to-960 progression was structural throughout.
+
+**It does not settle that the game plays.** No exception in five minutes is not a frame,
+a window or a menu, and this session is headless -- `running-code.md`'s own warning that
+a black capture is what a locked phone looks like applies to anything I could claim from
+a screenshot. The process may be waiting rather than progressing: `/etc/machine-id` is
+absent and Proton says so on every run.
+
+#### Two environment findings worth more than the numbers
+
+**The recorded reproduction no longer works as written.** Finding 74 copies the binary
+into the Steam install beside `Starfield.exe`. The game is not in the local library at
+all -- it is on an NFS mount, `/home/funk/mnt/dl180g6-03/SteamLibrary`, with Proton 10.0
+beside it -- and both are `755 funk:funk` while this session runs as `claude`. Proton
+also writes a lock file into its OWN directory, so even reading it is not enough.
+
+What works instead, and needs no write anywhere outside scratch: **a symlink farm**. 38
+links to the game's top-level entries, the two binaries copied in as the only real files,
+Proton copied to scratch (1.4 GB) so it can take its lock, and `STEAM_COMPAT_DATA_PATH`
+pointed at scratch. The install is untouched, which is better than the recorded method
+rather than merely equal to it.
+
+**And the first two attempts measured nothing, identically.** Under bare `wine` with no
+game directory both binaries loaded 194 modules, the same module set, no illegal
+instruction, exit 53 apiece. That is `evidence.md`'s probe that could not have succeeded
+-- the control failing the same way is what said so, and without the control the 194
+would have read as a result.
+
+#### The claims this corrects
+
+`project.md` line 37 said the Proton observation describes "a binary this tree no longer
+produces" and that nobody had run the new one. True when written, false now. Line 3715's
+"the validation path is this machine" is true only with the farm above. The
+*What is still not verified* entry at line 20966 cites Finding 74's 866 bytes as the
+honest scale of 17,972 survivors on a hot path; at 960 the hot path is clear.
 
 ### Finding 322 -- the mask extractors, whose destination is not a vector register
 
