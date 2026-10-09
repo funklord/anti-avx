@@ -1530,7 +1530,6 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 		return None
 	fields = inplace.split_operands(operands)
 	registers = [o for o in fields if not o.startswith("$")]
-	has_immediate = len(registers) != len(fields)
 
 	body = bytearray()
 	if len(registers) == 3 and registers[-1] != registers[-2]:
@@ -1594,7 +1593,17 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 		# Relative to the end of the instruction, and the instruction has
 		# moved. The field sits four bytes from the end, or five when an
 		# immediate follows it.
-		offset = len(operation) - 4 - (1 if has_immediate else 0)
+		#
+		# **Whether one follows is read off the encoding, not the operand
+		# text.** objdump folds a compare's predicate into the mnemonic --
+		# `vcmpneqps 0x211b285(%rip),%xmm0,%xmm3` carries an imm8 of 04
+		# and no `$` -- so the text said no immediate, the new
+		# displacement went over the last four bytes, and the predicate
+		# became its top byte: `cmpps $0xfd` against an address below the
+		# image. Starfield faulted on it 46 seconds in, the first run past
+		# Finding 333's hang. A RIP operand has no SIB, so everything in
+		# the tail past modrm and disp32 is immediate. Finding 334.
+		offset = len(operation) - 4 - (len(tail) - 6)
 		if offset < 0:
 			if reasons is not None:
 				reasons["lower: the RIP field is not where expected"] += 1
@@ -6480,10 +6489,19 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			low_s2 = scratch_finder.xmm_numbers(source2)[0]
 			low_s1 = scratch_finder.xmm_numbers(source1)[0]
 			body += encode_movaps(low_dst, low_s1)
+			# **`tail[2:]` is the predicate, and every rebuild here keeps
+			# it.** The shape is three ymm registers, so nothing follows
+			# modrm except an imm8 -- and a compare has one that objdump
+			# folds into the mnemonic, so `vcmpltps %ymm2,%ymm0,%ymm1`
+			# arrives here rather than at `immreg3`. Rebuilding opcode and
+			# modrm alone emitted `cmpps` with no predicate, and the CPU
+			# took the next instruction's REX as one: `$0x41`, and a
+			# `movups 0x32d0(%r11)` that ran as `0x32d0(%rbx)`. Starfield
+			# had 49 of them across these four shapes. Finding 334.
 			operation = inplace.sse_encoding(
 				dict(vex, L=0, R=low_dst >> 3, X=0, B=low_s2 >> 3),
 				tail[:1] + bytes([0xC0 | ((low_dst & 7) << 3)
-				                  | (low_s2 & 7)]))
+				                  | (low_s2 & 7)]) + tail[2:])
 			if operation is None:
 				return refuse("lanereg3 low operation has no SSE form")
 			body += operation
@@ -6498,7 +6516,8 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 					dict(vex, L=0, R=helper >> 3, X=0, B=register >> 3),
 					tail[:1] + bytes([0x80 | ((helper & 7) << 3)
 					                  | (register & 7)])
-					+ struct.pack("<i", base + second * SLOT))
+					+ struct.pack("<i", base + second * SLOT)
+					+ tail[2:])
 				if operation is None:
 					return refuse("lanereg3 high operation has no SSE form")
 				body += operation
@@ -6510,7 +6529,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			operation = inplace.sse_encoding(
 				dict(vex, L=0, R=helper >> 3, X=0, B=second_helper >> 3),
 				tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
-				                  | (second_helper & 7)]))
+				                  | (second_helper & 7)]) + tail[2:])
 			if operation is None:
 				return refuse("lanereg3 high operation has no SSE form")
 			body += operation
@@ -6546,7 +6565,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			operation = inplace.sse_encoding(
 				dict(vex, L=0, R=helper >> 3, X=0, B=helper >> 3),
 				tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
-				                  | (helper & 7)]))
+				                  | (helper & 7)]) + tail[2:])
 			if operation is None:
 				return refuse("lanemove operation has no SSE form")
 			body += operation
@@ -6630,7 +6649,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			low = inplace.sse_encoding(
 				dict(vex, L=0, R=destination >> 3, X=0, B=helper >> 3),
 				tail[:1] + bytes([0xC0 | ((destination & 7) << 3)
-				                  | (helper & 7)]))
+				                  | (helper & 7)]) + tail[2:])
 			if low is None:
 				return refuse("lanealias operation has no SSE form")
 			body += low
@@ -6641,7 +6660,8 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# it asks a caller to guarantee is guaranteed above.
 			upper = inplace.sse_encoding(
 				dict(vex, L=0, R=helper >> 3, X=0, B=block[0] >> 3),
-				tail[:1] + slot_tail(helper, base, slot, block[0]))
+				tail[:1] + slot_tail(helper, base, slot, block[0])
+				+ tail[2:])
 			if upper is None:
 				return refuse("lanealias upper half has no SSE form")
 			body += upper
@@ -6694,7 +6714,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			operation = inplace.sse_encoding(
 				dict(vex, L=0, R=helper >> 3, X=0, B=second_helper >> 3),
 				tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
-				                  | (second_helper & 7)]))
+				                  | (second_helper & 7)]) + tail[2:])
 			if operation is None:
 				return refuse("lanereg operation has no SSE form")
 			body += operation

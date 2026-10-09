@@ -521,9 +521,25 @@ REFUSED = [
 	"vpsrld $0x2,%ymm1,%ymm0",
 ]
 
+# **And compares SSE cannot express.** `0F C2` reads only imm8[2:0], so a
+# VEX-only predicate does not fault once the prefix is gone -- it runs as a
+# different compare. These add the unordered sense to one of the eight, and
+# `vcmpgt_oqps` would run as `cmpnleps`: true on a NaN where GT is false.
+#
+# **Asked of `sse_encoding`, one half at a time, and not of `lower_vex`.**
+# `lower_vex` refuses them by mnemonic and always did, so a check through it
+# passed with the guard removed. The span paths narrow each half and call
+# `sse_encoding` directly, and that is where `$0x1e` reached a stub.
+# Finding 334.
+REFUSED_PREDICATES = [
+	"vcmpgt_oqps %ymm2,%ymm1,%ymm0", "vcmpeq_uqps %ymm2,%ymm1,%ymm0",
+	"vcmpgeps %ymm2,%ymm1,%ymm0", "vcmptrueps %ymm2,%ymm1,%ymm0",
+	"vcmpgt_oqps (%rax),%ymm1,%ymm3",
+]
+
 
 def check_refusals():
-	"""Every 256-bit form must have no lowering at all."""
+	"""Every 256-bit form, and every VEX-only predicate, has no lowering."""
 	lowered = []
 	for site in assemble(REFUSED):
 		address, encoding, mnemonic, operands = site
@@ -534,13 +550,19 @@ def check_refusals():
 		if detour.lower_vex(address, encoding, operands, mnemonic, 0,
 		                    scratch=SCRATCH) is not None:
 			lowered.append(f"{mnemonic} {operands}")
+	for site in assemble(REFUSED_PREDICATES):
+		address, encoding, mnemonic, operands = site
+		vex = inplace.decode_vex(encoding)
+		half = dict(vex, L=0)
+		if inplace.sse_encoding(half, encoding[vex["length"]:]) is not None:
+			lowered.append(f"{mnemonic} {operands}")
 	if lowered:
-		print("lowering_cases: these 256-bit forms were LOWERED and must not "
+		print("lowering_cases: these forms were LOWERED and must not "
 		      "be:", file=sys.stderr)
 		for text in lowered:
 			print(f"  {text}", file=sys.stderr)
 		raise SystemExit(1)
-	return len(REFUSED)
+	return len(REFUSED) + len(REFUSED_PREDICATES)
 
 
 def assemble(lines):
@@ -702,7 +724,7 @@ def main(argv):
 	cases = build()
 	emit(cases, argv[1], argv[2])
 	print(f"lowering_cases: {len(cases)} cases from {len(CASES)} mnemonics, "
-	      f"and {refused} 256-bit forms correctly refused")
+	      f"and {refused} forms correctly refused")
 	return 0
 
 

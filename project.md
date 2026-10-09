@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,121 of 804,951 VEX
-sites -- 99.90%** -- through 202,304 detours, and every `make detour-verify` invariant
-holds on the result. **830 sites are left** (Finding 333, 2026-10-09), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,071 of 804,951 VEX
+sites -- 99.89%** -- through 202,311 detours, and every `make detour-verify` invariant
+holds on the result. **880 sites are left** (Finding 334, 2026-10-09), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 830 after
-Finding 333. Subtracting 830 from a 2,337 measured weeks earlier would be
+**That pair is a dated pair and only the default has moved since** -- 880 after
+Finding 334. Subtracting 880 from a 2,337 measured weeks earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -41,6 +41,8 @@ translation. So the frontier is not on the first four seconds of the path, and n
 beyond that is measured. The old `0x1428D1492` observation belongs to a binary this tree
 no longer produces. **Launched through Steam it passed that check and deadlocked in the
 game's allocator, on wrong bytes this rewrite wrote** -- Finding 333, which fixes them.
+**Past that it faulted 46 seconds in, on a compare stub with its predicate lost** --
+Finding 334, which found 564 such stubs across three emitters and fixes all of them.
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
@@ -11905,12 +11907,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           830 re-measured   (Finding 333)
+    default build                           880 re-measured   (Finding 334)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,121 of 804,951 VEX sites, 99.90%, through 202,304 detours**, and 180 further
+**804,071 of 804,951 VEX sites, 99.89%, through 202,311 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
@@ -11925,7 +11927,9 @@ presence check (Finding 323). Copy the build beside `Starfield.exe` as
 
 and `~/steam-1716740.log` has the fault, or the last thing a hung process did. A hang
 is read out of `/proc/<pid>/mem` -- the Windows stack is the low region ending near
-`0x110000` -- which is how Finding 333 was found.
+`0x110000` -- which is how Finding 333 was found. A fault names its address in the
+log, and a stub's address falls in `.avxsse`: disassemble it from the build and the
+original site from `build/text.asm`, which is how Finding 334 was found.
 
 **Run as `funk`, not as a second account.** Everything outside this tree belongs to
 `funk` and the mismatch cost most of 2026-10-08's second half: `build/wineprefix` is
@@ -14153,6 +14157,63 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 334 -- a compare's predicate is in the mnemonic, and three emitters lost it
+
+The 830 build of Finding 333 ran through Steam on 2026-10-09, past the allocator hang,
+and faulted 46 seconds in: `Unhandled page fault on read access to 0000000104895590 at
+address 0000000148D92303`, on the main thread, in `.avxsse`. The stub there held
+
+    original  c5 f8 c2 1d 85 b2 11 02 04   vcmpneqps 0x211b285(%rip),%xmm0,%xmm3
+    stub      0f c2 1d 85 32 b0 bb fd      cmpps $0xfd,-0x444fcd7b(%rip),%xmm3
+
+-- the old displacement's first byte, then the new displacement written one byte late,
+over the predicate. **objdump folds a compare's predicate into the mnemonic**, so
+`vcmpneqps` has no `$` in its operands, and `lower_vex` decided whether an immediate
+followed the RIP field by looking for one in the text. It wrote the displacement over
+the last four bytes. **507 stubs** in that binary pointed outside the image this way:
+366 `cmpps`, 140 `cmpss`, 1 `cmpsd` -- every RIP-relative compare `lower_vex` moved.
+
+Checking the rebuilt stubs for predicates above seven found the second: `cmpps $0x41`
+and `$0x44`, which are no predicate at all. `lanereg3`, `lanereg`, `lanealias` and
+`lanemove` rebuilt their tails as opcode and modrm, dropping the imm8 after it, so the
+CPU took the next instruction's REX as the predicate and that instruction lost it --
+`movups 0x32d0(%r11)` ran as `0x32d0(%rbx)`. **49 stubs.** `vcmpltps %ymm2,%ymm0,%ymm1`
+reaches `lanereg3` rather than `immreg3` for the same reason: no `$`.
+
+With the predicate kept, the third: 8 stubs carried `$0x1e`, GT_OQ. SSE `0F C2` reads
+imm8[2:0] and calls the rest reserved, so it ran as NLE -- **true on a NaN where GT is
+false**, a wrong mask rather than a fault. `has_direct_sse_form` refuses VEX-only
+predicates by mnemonic, but only `lower_vex` asks it; the span paths narrow each half
+and call `sse_encoding` directly. The guard is there now: 16-23 are 0-7 with the QNaN
+signalling flipped and the same mask, so they become imm8 & 7 (16 stubs, `$0x12` and
+`$0x16`); 8-15 and 24-31 are refused.
+
+**Each one was invisible to every check in the tree** for the reason Finding 303 met
+from the other side: the fixtures that carried a compare predicate (`cmpconst`) took it
+through `narrow_piece`, which Finding 303 had fixed, and no fixture put one through the
+other three routes. Three now do -- `cmpimm` in `check-pe` (a 128-bit RIP compare into
+a stub: 29 original, 77 rewritten, and the old rewriter emits `cmpunordps` against
+`0x13fd01d63`), `cmpreg` in `check-shadow-pe` (the register form: 29 off, 77 with
+slots, and the old one emits `$0x41`), and `REFUSED_PREDICATES` in `lowering_cases.py`,
+asked of `sse_encoding` because the first version asked `lower_vex`, which refused them
+by name, and passed with the guard removed.
+
+**The price is 50 sites, 830 -> 880**, and it is the third guard only: the first two
+fix bytes and refuse nothing. Frontier against Finding 333's build:
+
+      kept: its window was withheld                 356 -> 397
+      declined: 256-bit: arithmetic rather than a copy  26 -> 34
+      lost to a refused stub                         16 -> 17
+
+The four GT_OQ sites are refused and the rest is the sign rule cascading from them
+through the repair. A compare SSE cannot express is the operand-exchanged form in
+`lower.py`; carrying that into the span paths would win them back, and is not built.
+
+**Measured on the rebuild, every `cmp` in `.avxsse` now decodes as one of the eight
+named predicates** -- 4,023, none with an explicit `$`, none of 25,926 RIP operands
+outside the image -- and `make detour-verify` passes. `check-vex`, run because
+`lower_vex` changed: 2,387 comparisons, 0 unexplained.
 
 ### Finding 333 -- a VEX.128 zeroing patched in place left the slot stale, and the game hung on it
 

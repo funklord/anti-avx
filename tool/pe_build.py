@@ -654,6 +654,54 @@ tls_directory:
 """)
 
 
+# **The same compare with both sources in registers**, which is the
+# `lanereg3` shape rather than `lanemem`: three ymm operands and no `$`,
+# because objdump folds the predicate into the mnemonic. The slot paths
+# rebuilt the tail as opcode and modrm and dropped the imm8 after it, so
+# `cmpps` took the next instruction's first byte as its predicate and that
+# instruction lost it. Same lanes and same answer as `cmpconst`.
+# Finding 334.
+PROGRAMS["cmpreg"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	vmovups	(%rsi), %ymm0		/* {1,2,3,4,5,6,7,8} */
+	vmovups	32(%rsi), %ymm2		/* {5,5,5,5,0,0,0,9} */
+	vcmpltps %ymm2, %ymm0, %ymm1
+	movq	%rsp, %rdi
+	vmovups	%ymm1, (%rdi)
+	movl	(%rdi), %eax		/* lane 0: 1 < 5  -> -1 */
+	addl	16(%rdi), %eax		/* lane 4: 5 < 0  ->  0 */
+	addl	28(%rdi), %eax		/* lane 7: 8 < 9  -> -1 */
+	addl	$79, %eax		/* -2 + 79 = 77 */
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 1.0, 2.0, 3.0, 4.0
+	.float 5.0, 6.0, 7.0, 8.0
+	.float 5.0, 5.0, 5.0, 5.0
+	.float 0.0, 0.0, 0.0, 9.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **A variable blend**, whose mask is a REGISTER and whose SSE form reads
 # that mask only from the implicit `xmm0`. Starfield's fourteen all look
 # like `%ymm4,%ymm1,%ymm0,%ymm1` -- mask, src2, src1, dst -- so `ymm0` is
@@ -1605,6 +1653,37 @@ scratch:
 	.long 0x5a5a5aa5, 0x5a5a5aa5, 0x5a5a5aa5, 0x5a5a5aa5
 buffer:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
+""")
+
+
+# **A 128-bit compare against a RIP-relative constant, moved into a stub.**
+# The destination is not the first source, so the lowering is
+# `movaps %xmm0,%xmm3; cmpps $4,bound(%rip),%xmm3` and has to live in a
+# stub, which moves the RIP operand. objdump prints the predicate in the
+# mnemonic -- `vcmpneqps` -- so `lower_vex`, reading the operand text for
+# a `$`, thought there was no immediate and wrote the new displacement
+# over the last four bytes: the predicate became 0xfd and the operand
+# pointed below the image. Starfield faulted on exactly this.
+#
+# {1,2,3,4} != {1,0,3,0} is lanes 1 and 3, a mask of 10 and 10 + 67 =
+# 77. NLT -- what 0xfd reads as -- is all four lanes and 82.
+# Finding 334.
+PROGRAMS["cmpimm"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovups	source(%rip), %xmm0
+	vcmpneqps bound(%rip), %xmm0, %xmm3
+	vmovmskps %xmm3, %eax
+	addl	$67, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+source:	.float 1.0, 2.0, 3.0, 4.0
+bound:	.float 1.0, 0.0, 3.0, 0.0
 """)
 
 

@@ -255,6 +255,21 @@ def sse_encoding(vex, tail):
 	"""
 	if vex["map"] not in MAP_ESCAPE or vex["L"]:
 		return None
+	# **A compare's predicate has to be one SSE has.** `0F C2` reads
+	# imm8[2:0] and calls the rest reserved, so a VEX-only predicate does
+	# not fail -- it becomes a different compare. 16-23 are 0-7 with the
+	# QNaN signalling flipped and compute the same mask, so they are
+	# rewritten to it; 8-15 and 24-31 add the unordered sense, and
+	# `$0x1e` (GT_OQ) ran as NLE, true on a NaN where GT is false. Every
+	# path that strips a VEX prefix comes through here, which is why the
+	# guard does too: three emitters had already carried such a predicate
+	# into a stub. The imm8 is the tail's last byte in every form.
+	# Finding 334.
+	if vex["map"] == 1 and len(tail) >= 3 and tail[0] == 0xC2:
+		predicate = tail[-1]
+		if not (predicate < 8 or 16 <= predicate < 24):
+			return None
+		tail = tail[:-1] + bytes([predicate & 7])
 	out = bytearray()
 	legacy = PP_PREFIX[vex["pp"]]
 	if legacy is not None:
