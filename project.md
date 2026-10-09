@@ -14165,6 +14165,19 @@ the layout change buys a resource nothing in the default build is short of. **No
 built.** It becomes worth pricing again only alongside a change that makes stash demand
 appear and pays for it.
 
+**And what stops the 96 `next instruction will not move` sites**, tallied from the
+listing on the same build -- the neighbour each widening would have swallowed:
+
+    after the site    vextractf128 41   vmovups 39   vaddss 9   vmulss 3   four others 1 each
+    before the site   vextractf128 46   vmovups 33   vaddss 9   vmulss 2   six others 1 each
+
+About eighty are 256-bit, the `swallowed neighbour is 256-bit` shape Findings 325 and 330
+measured as neutral when taken as a member. The scalar ones are chains like `vaddss
+%xmm5,%xmm7,%xmm5`, whose second source is the destination: commuting is not allowed --
+a scalar operation takes bits 127:32 from its FIRST source -- so each wants a scratch
+register the site does not have, and is refused `the aliased form has no usable scratch`.
+Perhaps fifteen sites, through the passenger borrow; not attempted.
+
 ### Finding 331 -- a short site jumps short, into the padding between functions
 
 The three 128-bit floors were 402 of the 784 survivors, more than every 256-bit class
