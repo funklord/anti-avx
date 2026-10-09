@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,199 of 804,951 VEX
-sites -- 99.91%** -- through 202,323 detours, and every `make detour-verify` invariant
-holds on the result. **752 sites are left** (Finding 331, 2026-10-09), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,121 of 804,951 VEX
+sites -- 99.90%** -- through 202,304 detours, and every `make detour-verify` invariant
+holds on the result. **830 sites are left** (Finding 333, 2026-10-09), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 752 after
-Finding 331. Subtracting 752 from a 2,337 measured weeks earlier would be
+**That pair is a dated pair and only the default has moved since** -- 830 after
+Finding 333. Subtracting 830 from a 2,337 measured weeks earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -39,7 +39,8 @@ on `EXCEPTION_ILLEGAL_INSTRUCTION` at RVA `0x22d2bf4` -- the address Finding 74 
 modules and 2 MB resident for an hour, which is a Steam-presence check and not the
 translation. So the frontier is not on the first four seconds of the path, and nothing
 beyond that is measured. The old `0x1428D1492` observation belongs to a binary this tree
-no longer produces.
+no longer produces. **Launched through Steam it passed that check and deadlocked in the
+game's allocator, on wrong bytes this rewrite wrote** -- Finding 333, which fixes them.
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
@@ -11902,19 +11903,29 @@ already built and tested for the case.
 Everything below is what a fresh start needs and none of it is derivable from the
 code quickly.
 
-### Where it stands, 2026-10-08
+### Where it stands, 2026-10-09
 
-    default build                           752 re-measured   (Finding 331)
+    default build                           830 re-measured   (Finding 333)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,199 of 804,951 VEX sites, 99.91%, through 202,323 detours**, and 180 further
+**804,121 of 804,951 VEX sites, 99.90%, through 202,304 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
 quoting it: this line has twice carried a rewritten count from one configuration
 beside a frontier from another.
+
+**To run it in the game**, launch through Steam -- outside it the binary spins in a
+presence check (Finding 323). Copy the build beside `Starfield.exe` as
+`Starfield-antiavx.exe` and set the launch options to
+
+    PROTON_LOG=1 WINEDLLOVERRIDES=winedbg.exe=d bash -c 'exec "${@/Starfield.exe/Starfield-antiavx.exe}"' -- %command%
+
+and `~/steam-1716740.log` has the fault, or the last thing a hung process did. A hang
+is read out of `/proc/<pid>/mem` -- the Windows stack is the low region ending near
+`0x110000` -- which is how Finding 333 was found.
 
 **Run as `funk`, not as a second account.** Everything outside this tree belongs to
 `funk` and the mismatch cost most of 2026-10-08's second half: `build/wineprefix` is
@@ -14142,6 +14153,72 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 333 -- a VEX.128 zeroing patched in place left the slot stale, and the game hung on it
+
+Run through Steam on 2026-10-09, at the copyright holder's request, the 752-site build
+passed the presence check that held Finding 323's run, loaded 50 DLLs and raised no
+exception -- then stopped: one thread, 0.56 s of CPU, asleep in a futex for thirteen
+minutes. Its Windows stack, read out of `/proc/<pid>/mem`, waits in `WaitOnAddress`
+under `0x140323460`, a spin lock the allocator takes at `0x1422d161a`. **A wait with no
+other thread in the process is a lock nobody will ever release**, so the question was
+what had written the lock word, not who held it.
+
+The allocator is the function the original dies in, and the first thing past the
+original's fault is this:
+
+    1422d2bf4  vpxor   %xmm0,%xmm0,%xmm0      all 256 bits of ymm0
+    1422d2bf8  vmovdqu %ymm0,-0x51(%rbp)       32 zero bytes over a local
+
+Rewritten, the `vpxor` is `pxor` in place and the store is a `unit` stub that takes its
+upper sixteen bytes from ymm0's permanent slot. **The slot held `0x149518590` and
+`0x209370000`** -- read from the frozen process, the last 256-bit value anything wrote
+to ymm0 -- so the store put two pointers where the original put zeros.
+
+`unit_candidate`'s own docstring names the hole: "one VEX.128 write left in place
+zeroes a machine upper half while the slot keeps the old value". `stale_upper_reads`
+never sees it, because it asks only about readers that SURVIVE; a reader inside a
+window takes its upper half from the slot, and no in-place patch writes a slot.
+
+    lowered 256-bit upper-half reads                       25,124
+      every path in through a VEX.128 write                11,088
+      some paths only                                          20
+      producers that are the xor zeroing idiom             11,076
+
+**The fix is at the reader, where the zero is known.** `zeroed_uppers` asks
+`reaching_definitions` for every 256-bit site once, in `collect`; where every path
+arrives through a VEX.128 write the upper half is zero, and `lower_ymm_span` writes
+sixteen zero bytes into that slot before the member reads it -- two immediate stores,
+no register, and the slot is right again for every reader after. Where only some paths
+arrive that way no constant is right, and the member is refused, so the site falls to
+the repair that already handles a surviving reader.
+
+**A compare is not a write, and the first version said it was.** `reaching_definitions`
+stops at `vcomiss %xmm0,%xmm0` as though it wrote xmm0, and the fix refused that reader
+-- which killed `regioncarry`'s region in `check-pe`. Such a field is now left exactly
+as before.
+
+`staleslot` is the shape, taken from the site: a poisoned 256-bit load above a branch
+target, then `vpxor` and a 32-byte store. **167 without the fix -- 77 plus the poison
+byte -- and 77 with it**; 29 under `--shadow-regs=off`, which leaves the load VEX.
+
+    VEX in .text                                    752 ->  830    +78
+      kept: its window was withheld                 313 ->  356
+      kept: a repair left it in VEX form             11 ->   24
+      declined: ymm value has no known upper half     0 ->   15
+      declined: 256-bit: arithmetic rather than a copy  17 -> 26
+
+**Seventy-eight sites are the price of not writing wrong bytes, and that is the right
+trade.** A survivor faults where it stands; a wrong store corrupts something that fails
+later, somewhere else, with nothing pointing back. The refusals are the 20 partial-path
+reads and what the repair withheld around them, by the sign rule.
+
+**What this does not cover.** A lowered read after `vzeroupper` takes the slot where
+the original reads zero; `vzeroupper` is lowered to nothing and `reaching_definitions`
+walks past it. A straight-line count says at most 153, and the one read checked is a
+false positive -- the `vzeroupper` was on a path that never reached the read -- so the
+real number is unmeasured. The 195 reads `reaching_definitions` cannot resolve are
+untouched too.
 
 ### Finding 332 -- more scratch slots would unlock nothing measured today
 

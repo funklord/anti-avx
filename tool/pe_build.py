@@ -861,6 +861,56 @@ tls_directory:
 """)
 
 
+# **A VEX.128 zeroing idiom patched in place, then a 256-bit store read
+# through the slot**, Starfield's `vpxor %xmm0,%xmm0,%xmm0` and `vmovdqu
+# %ymm0,-0x51(%rbp)` at 0x1422d2bf4, in the allocator the original dies
+# in. `vpxor` zeroes bits 255:128 too, so the store writes 32 zero bytes.
+# Patched in place it becomes `pxor`, which leaves ymm0's permanent slot
+# holding whatever the last 256-bit write put there -- here a poisoned
+# load above a branch target -- and the store's lowering reads the slot.
+# Read back as `zerofill` does: only 32 zero bytes give 77.
+PROGRAMS["staleslot"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	poison(%rip), %rsi
+	vmovdqu	(%rsi), %ymm0		/* the slot now holds poison */
+	movl	$1, %ecx
+	testl	%ecx, %ecx
+	jne	here			/* always taken; `here` is a target */
+here:
+	movq	%rsp, %rdi
+	vpxor	%xmm0, %xmm0, %xmm0	/* all 256 bits of ymm0 */
+	vmovdqu	%ymm0, 8(%rdi)		/* 32 zero bytes */
+	movl	8(%rdi), %eax
+	orl	24(%rdi), %eax		/* the high half */
+	orl	36(%rdi), %eax		/* its last dword */
+	addl	$77, %eax
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+poison:	.long	0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a
+	.long	0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **A negated FMA with one helper**, Starfield's `vfnmadd231ps
 # 0xcc4447(%rip),%ymm4,%ymm0` at 0x142dcfd70: the 231 order, the
 # multiplier from memory. `xmm0`-`xmm4` are named and read after the

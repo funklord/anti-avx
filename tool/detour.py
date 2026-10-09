@@ -5658,6 +5658,21 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		vex = inplace.decode_vex(encoding)
 		if vex is None or not vex["L"]:
 			return refuse("member is not a 256-bit VEX")
+		# **A slot a VEX.128 write should have cleared is cleared here.**
+		# The write was patched in place and left the slot stale, so the
+		# zero it stands for is written before the member reads it -- which
+		# also leaves the slot right for every reader after. See
+		# `zeroed_uppers`. Finding 333.
+		reads = upper_half_sources(mnemonic, operands)
+		if any(r in PARTLY_ZEROED.get(address, ()) for r in reads):
+			return refuse("an upper half zeroed on some paths only")
+		for register in sorted(ZEROED_UPPER.get(address, ())):
+			if register not in reads:
+				continue
+			index = shadow_index(register)
+			if block is None or index is None:
+				return refuse("a zeroed upper half has no permanent slot")
+			body += span_slot_zero(base, index, block)
 		if helper is None and kind not in HELPER_FREE \
 				and not (kind in GPR_MOVABLE and block is not None
 				         and len(block) > 5 and block[5] is not None):
@@ -7408,7 +7423,69 @@ UNIT_ALTERNATIVES = {}
 # module-level for the reason above: `place_stubs` unpacks a candidate as a
 # strict nine-tuple. Finding 331.
 TRAMPOLINE = {}
+# **Upper halves a VEX.128 write zeroed on every path, per 256-bit site.**
+# Site -> the `%ymm` sources it reads whose every reaching definition is a
+# VEX.128 write, and so whose bits 255:128 are zero in the original. Patched
+# in place, that write leaves the register's permanent slot holding what the
+# last 256-bit write put there, and a member reading the slot stores it.
+# `PARTLY_ZEROED` is the same where only some paths arrive that way: no
+# constant is right there, so the member is refused. Module-level for the
+# reason above. Finding 333.
+ZEROED_UPPER = {}
+PARTLY_ZEROED = {}
 REPAIR_SUBSTITUTED = 0
+
+# Compares write flags and name their last operand like a destination.
+NOT_A_WRITE = ("vcomiss", "vcomisd", "vucomiss", "vucomisd", "vptest",
+               "vtestps", "vtestpd")
+
+
+def zeroed_uppers(instructions, blocked, sources):
+	"""({site: {register}}, {site: {register}}) -- see `ZEROED_UPPER`.
+
+	**Found where the game hung.** Run under Steam, the rewritten Starfield
+	deadlocked in its allocator, one thread waiting on a lock nobody held.
+	Just before, `vpxor %xmm0,%xmm0,%xmm0` zeroes all of ymm0 and
+	`vmovdqu %ymm0,-0x51(%rbp)` clears a 32-byte local; patched in place,
+	the `vpxor` left ymm0's slot holding two pointers, and the store wrote
+	them over the struct's upper half. 11,088 lowered reads were this
+	shape, 11,076 of them through a zeroing idiom.
+	"""
+	zeroed, partly = {}, {}
+	for position, row in enumerate(instructions):
+		address, encoding, mnemonic, operands, _comment = row
+		if not operands:
+			continue
+		vex = inplace.decode_vex(encoding)
+		if vex is None or not vex["L"]:
+			continue
+		for field in upper_half_sources(mnemonic, operands):
+			try:
+				where = reaching_definitions(instructions, position, field,
+				                             blocked, sources=sources,
+				                             depth=JOIN_DEPTH)
+			except JoinCycle:
+				where = None
+			if not where:
+				continue
+			# **A compare names its last operand and writes only flags**,
+			# and `reaching_definitions` stops at it as though it wrote.
+			# What stands behind it is unknown here, so the field is left
+			# exactly as it was before this pass: `regioncarry`'s
+			# `vcomiss %xmm0,%xmm0` sits between a 256-bit load and its
+			# reader, and refusing that reader killed the region.
+			if any(instructions[one][2] in NOT_A_WRITE for one in where):
+				continue
+			narrow = 0
+			for one in where:
+				p_vex = inplace.decode_vex(instructions[one][1])
+				if p_vex is not None and not p_vex["L"]:
+					narrow += 1
+			if narrow == len(where):
+				zeroed.setdefault(address, set()).add(field)
+			elif narrow:
+				partly.setdefault(address, set()).add(field)
+	return zeroed, partly
 
 # **Why each dropped window was dropped**, keyed `(strategy, reason)`.
 # The drop count alone says how much is being lost and nothing about
@@ -10691,6 +10768,12 @@ def collect(binary, listing, context=None):
 	WIDE_SITES.clear()
 	instructions, plain, blocked, sources, switch_tables, switch_seen = \
 		context if context is not None else analysis_context(binary, listing)
+	ZEROED_UPPER.clear()
+	PARTLY_ZEROED.clear()
+	if SHADOW_REGS_RULE == SHADOW_REGS_ALL:
+		zeroed, partly = zeroed_uppers(instructions, blocked, sources)
+		ZEROED_UPPER.update(zeroed)
+		PARTLY_ZEROED.update(partly)
 	# The code oracle, in two parts. .pdata is the binary's own statement
 	# about where its functions are and needs no disassembly to read, but the
 	# x64 ABI lets a leaf function omit its unwind data -- and refusing those
