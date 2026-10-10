@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,071 of 804,951 VEX
-sites -- 99.89%** -- through 202,311 detours, and every `make detour-verify` invariant
-holds on the result. **880 sites are left** (Finding 334, 2026-10-09), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,146 of 804,951 VEX
+sites -- 99.90%** -- through 202,333 detours, and every `make detour-verify` invariant
+holds on the result. **805 sites are left** (Finding 335, 2026-10-10), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 880 after
-Finding 334. Subtracting 880 from a 2,337 measured weeks earlier would be
+**That pair is a dated pair and only the default has moved since** -- 805 after
+Finding 335. Subtracting 805 from a 2,337 measured weeks earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -43,6 +43,8 @@ no longer produces. **Launched through Steam it passed that check and deadlocked
 game's allocator, on wrong bytes this rewrite wrote** -- Finding 333, which fixes them.
 **Past that it faulted 46 seconds in, on a compare stub with its predicate lost** --
 Finding 334, which found 564 such stubs across three emitters and fixes all of them.
+**Past that it stopped on a survivor**, a zeroing the repair had kept as VEX for a reader
+Finding 333 refused -- Finding 335, which moves the slot clear to the writer.
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
@@ -11907,12 +11909,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           880 re-measured   (Finding 334)
+    default build                           805 re-measured   (Finding 335)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,071 of 804,951 VEX sites, 99.89%, through 202,311 detours**, and 180 further
+**804,146 of 804,951 VEX sites, 99.90%, through 202,333 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
@@ -14158,6 +14160,71 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 335 -- where only some paths zero an upper half, the writer clears the slot
+
+The 880 build of Finding 334 ran through Steam on 2026-10-10 and stopped 45 seconds in
+on `EXCEPTION_ILLEGAL_INSTRUCTION` at `0x1424E3B5B` -- not a wrong byte this time but a
+survivor, `kept: a repair left it in VEX form`:
+
+    1424e3b35  vmovups 0x20(%rax,%rcx),%ymm0     one path loads all 256 bits
+    1424e3b55  jmp 1424e3b5f                     and skips the zeroing
+    1424e3b57  mov 0x70(%rsp),%edx               a branch target
+    1424e3b5b  vxorps %xmm0,%xmm0,%xmm0          the other zeroes them -- the fault
+    1424e3b5f  vmovups %ymm0,0x0(%rbp)           a branch target, reading both
+
+**Finding 333 refused the store and the repair did the rest.** The store reads ymm0's
+slot, and no constant written at the store is right when one path brings a loaded value
+and the other a zero, so 333 refused it as `an upper half zeroed on some paths only`.
+The store then survived as VEX, a surviving 256-bit reader needs the machine upper half
+really zeroed, and the repair kept the `vxorps` as VEX for its sake. That pairing is
+what 333's 78 sites were, and the game reached one of them.
+
+**So the clear moves to the writer, which is the only place that knows which path ran.**
+`zeroed_uppers` now returns the VEX.128 writers behind each partial field --
+`CLEARING_WRITERS`, 24 writers behind 25 readers here: 7 zeroing idioms, 13 register
+copies like `vmovdqu %xmm0,%xmm2`, and scalars. Such a writer is not patched in place,
+since four bytes have no room for a clear; it is offered only as a `narrow` member of a
+unit window, which stands the block up exactly as for a 256-bit site and emits the
+lowered write followed by `span_slot_zero`. Taken as a plain passenger anywhere else it
+is refused in `moved_instruction`, because a passenger is emitted without the clear. A
+writer that places nowhere stays VEX and faults where it stands -- it never leaves a slot
+wrong. The reader's refusal goes, since every path now leaves the slot right.
+`--writer-clears=off` restores Finding 333's behaviour.
+
+The game's site is `[b57, b5f)` widened back over the `mov`, which starting on a branch
+target is allowed because the target becomes the jump:
+
+    148d05965  mov    0x70(%rsp),%edx
+    148d05969  mov    %gs:0x58,%r11
+    148d05972  mov    0x5a5a5a5a(%r11),%r11      the index, filled by the callback
+    148d05979  xorps  %xmm0,%xmm0
+    148d0597c  movq   $0x0,0x32a0(%r11)          ymm0's slot
+    148d05987  movq   $0x0,0x32a8(%r11)
+    148d05992  jmp    0x1424e3b5f
+
+**`partslot`**, in `check-shadow-pe`, is the shape with the zeroing on the path taken:
+77 with the writer clearing, 29 with `--writer-clears=off` (the store left as VEX and
+faulting), 29 with `--shadow-regs=off`.
+
+**880 -> 805**, of the 78 Finding 333 cost:
+
+      kept: a repair left it in VEX form              24 ->   8
+      declined: ymm value has no known upper half     15 ->   2
+      kept: its window was withheld                  397 -> 358
+      declined: 256-bit: arithmetic rather than a copy  34 -> 25
+      declined: a slot-clearing writer would not place   0 ->   1
+
+Five writers stay VEX: the `vminss` above, and four `vmovdqu` register copies at
+`0x1434d8...` whose windows were withheld. Each was patched in place before and is a
+survivor now, where its reader was the survivor before -- a writer runs on one path and
+its reader on all of them, so the exposure shrank rather than moved. The 8 left as
+`a repair left it in VEX form` are the same mechanism for a different reason and are
+the next sites a run would meet.
+
+`make detour-verify` passes on the 805 build, and the compare audit of Finding 334 is
+clean on it: 0 of 25,929 RIP operands outside the image, every `cmp` one of the eight
+named predicates.
+
 ### Finding 334 -- a compare's predicate is in the mnemonic, and three emitters lost it
 
 The 830 build of Finding 333 ran through Steam on 2026-10-09, past the allocator hang,
@@ -14270,7 +14337,7 @@ byte -- and 77 with it**; 29 under `--shadow-regs=off`, which leaves the load VE
       declined: 256-bit: arithmetic rather than a copy  17 -> 26
 
 **Seventy-eight sites are the price of not writing wrong bytes, and that is the right
-trade.** A survivor faults where it stands; a wrong store corrupts something that fails
+trade** -- Finding 335 has since won back 75 of them by clearing the slot at the writer. A survivor faults where it stands; a wrong store corrupts something that fails
 later, somewhere else, with nothing pointing back. The refusals are the 20 partial-path
 reads and what the repair withheld around them, by the sign rule.
 

@@ -959,6 +959,57 @@ tls_directory:
 """)
 
 
+# **The same store with the zeroing on ONE path only**, Starfield's
+# 0x1424e3b5f: a 256-bit load reaches it round the zeroing and the
+# zeroing reaches it straight. No constant at the store is right, so
+# Finding 333 refused it, the repair then kept the `vxorps` as VEX, and
+# the game faulted on that. The zeroing has to clear the slot itself.
+# The branch is not taken, so the zeroing runs: 32 zero bytes give 77,
+# the poison gives something else, and a site left as VEX faults.
+# Finding 335.
+PROGRAMS["partslot"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	poison(%rip), %rsi
+	vmovdqu	(%rsi), %ymm0		/* the slot now holds poison */
+	movq	%rsp, %rdi
+	xorl	%ecx, %ecx
+	testl	%ecx, %ecx
+	jne	store			/* never taken: the zeroing runs */
+	movl	$5, %edx		/* the game's `mov 0x70(%rsp),%edx` */
+	vpxor	%xmm0, %xmm0, %xmm0	/* all 256 bits of ymm0 */
+store:
+	vmovdqu	%ymm0, 8(%rdi)		/* 32 zero bytes */
+	movl	8(%rdi), %eax
+	orl	24(%rdi), %eax		/* the high half */
+	orl	36(%rdi), %eax		/* its last dword */
+	addl	$77, %eax
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+poison:	.long	0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a
+	.long	0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a, 0x5a5a5a5a
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **A negated FMA with one helper**, Starfield's `vfnmadd231ps
 # 0xcc4447(%rip),%ymm4,%ymm0` at 0x142dcfd70: the 231 order, the
 # multiplier from memory. `xmm0`-`xmm4` are named and read after the

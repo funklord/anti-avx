@@ -891,6 +891,7 @@ def run_configuration():
 	return (f"shadow-regs={SHADOW_REGS_RULE}"
 	        f" teb-scratch={TEB_SCRATCH}"
 	        f" index-const={'on' if INDEX_CONST else 'off'}"
+	        f" writer-clears={'on' if WRITER_CLEARS else 'off'}"
 	        f" spill={SPILL}"
 	        f" tool={tool_fingerprint()}")
 
@@ -3129,7 +3130,7 @@ def moved_branch(moved, mnemonic, operands, comment, address, at):
 	return opcode + struct.pack("<i", delta)
 
 
-def moved_instruction(entry, at, pool=0, reasons=None):
+def moved_instruction(entry, at, pool=0, reasons=None, clearing=False):
 	"""One swallowed instruction, re-encoded to execute at `at`.
 
 	The sixth field is a scratch register for the swallowed instruction, and
@@ -3150,6 +3151,14 @@ def moved_instruction(entry, at, pool=0, reasons=None):
 	"""
 	address, moved, comment, moved_operands, moved_mnemonic = entry[:5]
 	scratch = entry[5] if len(entry) > 5 else None
+	# **A slot-clearing writer is never a passenger.** Moved as one, it is
+	# lowered and the clear it owes is skipped, so the slot keeps a stale
+	# upper half on exactly the path the reader trusts it. Only a `narrow`
+	# member asks with `clearing`, and emits the clear itself. Finding 335.
+	if address in CLEARING_WRITERS and not clearing:
+		if reasons is not None:
+			reasons["moved: a slot-clearing writer cannot ride along"] += 1
+		return None
 	# **EVEX is recognised and left alone, and a window that swallows one
 	# has not left it alone.** `isa_guard` requires every EVEX instruction
 	# in `.text` to be byte-identical: 179 of them are unreachable on a
@@ -4581,7 +4590,7 @@ COMMUTATIVE_YMM = frozenset((
 # whether a helper is needed rather than assume it -- which it did, at 1,704
 # windows of which only 49 had no member wanting one. Finding 250.
 HELPER_FREE = frozenset(("plain", "insert", "bcastmem", "bcastreg",
-                         "extract"))
+                         "extract", "narrow"))
 
 # **Kinds a general-purpose register can move instead.** Each of these puts
 # sixteen bytes between memory and a slot and does nothing to them on the
@@ -5219,7 +5228,7 @@ def span_entries(members, instructions, slots, scope, plain):
 	for kind, position, register in members:
 		address, encoding, mnemonic, operands, comment = instructions[position]
 		moved = None
-		if kind == "plain":
+		if kind in ("plain", "narrow"):
 			moved = (address, encoding, comment, operands, mnemonic,
 			         swallowed_scratch(plain, position, address, encoding,
 			                           operands, mnemonic, scope))
@@ -5663,6 +5672,19 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			if fixed is None:
 				return refuse("passenger cannot be moved")
 			body += fixed
+			continue
+		if kind == "narrow":
+			# The write as it stands, then the zero its VEX form put in bits
+			# 255:128 -- written to the slot, which is where those bits now
+			# live. See `CLEARING_WRITERS`. Finding 335.
+			if block is None or slot is None:
+				return refuse("a slot-clearing writer has no block")
+			fixed = moved_instruction(moved, at + len(body), pool,
+			                          clearing=True)
+			if fixed is None:
+				return refuse("slot-clearing writer cannot be moved")
+			body += fixed
+			body += span_slot_zero(base, slot, block)
 			continue
 		vex = inplace.decode_vex(encoding)
 		if vex is None or not vex["L"]:
@@ -7453,6 +7475,20 @@ TRAMPOLINE = {}
 # reason above. Finding 333.
 ZEROED_UPPER = {}
 PARTLY_ZEROED = {}
+# **And where only some paths arrive zeroed, the WRITER clears the slot.**
+# No constant at the reader is right when one path brings a 256-bit value
+# and another a VEX.128 zeroing, so Finding 333 refused those readers --
+# and the repair then kept the zeroing as VEX for the reader's sake, which
+# is the instruction Starfield next faulted on. Writer -> the `%ymm` whose
+# slot it clears. Such a writer is not patched in place: it is offered
+# only as a `narrow` member of a unit window, which stands the block up
+# and zeroes the slot after the lowered write, and it may not ride as a
+# plain passenger anywhere, since that would skip the clear. A writer
+# that places nowhere stays VEX and faults where it stands rather than
+# leaving a slot wrong. `--writer-clears=off` restores the refusal.
+# Finding 335.
+CLEARING_WRITERS = {}
+WRITER_CLEARS = True
 REPAIR_SUBSTITUTED = 0
 
 # Compares write flags and name their last operand like a destination.
@@ -7461,7 +7497,7 @@ NOT_A_WRITE = ("vcomiss", "vcomisd", "vucomiss", "vucomisd", "vptest",
 
 
 def zeroed_uppers(instructions, blocked, sources):
-	"""({site: {register}}, {site: {register}}) -- see `ZEROED_UPPER`.
+	"""(zeroed, partly, writers) -- see `ZEROED_UPPER` and `CLEARING_WRITERS`.
 
 	**Found where the game hung.** Run under Steam, the rewritten Starfield
 	deadlocked in its allocator, one thread waiting on a lock nobody held.
@@ -7471,7 +7507,7 @@ def zeroed_uppers(instructions, blocked, sources):
 	them over the struct's upper half. 11,088 lowered reads were this
 	shape, 11,076 of them through a zeroing idiom.
 	"""
-	zeroed, partly = {}, {}
+	zeroed, partly, writers = {}, {}, {}
 	for position, row in enumerate(instructions):
 		address, encoding, mnemonic, operands, _comment = row
 		if not operands:
@@ -7496,16 +7532,18 @@ def zeroed_uppers(instructions, blocked, sources):
 			# reader, and refusing that reader killed the region.
 			if any(instructions[one][2] in NOT_A_WRITE for one in where):
 				continue
-			narrow = 0
+			narrow = []
 			for one in where:
 				p_vex = inplace.decode_vex(instructions[one][1])
 				if p_vex is not None and not p_vex["L"]:
-					narrow += 1
-			if narrow == len(where):
+					narrow.append(instructions[one][0])
+			if len(narrow) == len(where):
 				zeroed.setdefault(address, set()).add(field)
 			elif narrow:
 				partly.setdefault(address, set()).add(field)
-	return zeroed, partly
+				for one in narrow:
+					writers.setdefault(one, set()).add(field)
+	return zeroed, partly, writers
 
 # **Why each dropped window was dropped**, keyed `(strategy, reason)`.
 # The drop count alone says how much is being lost and nothing about
@@ -7789,8 +7827,19 @@ def unit_candidate(instructions, plain, index, blocked, home,
 		return None
 	address, encoding, mnemonic, operands, _comment = instructions[index]
 	vex = inplace.decode_vex(encoding)
-	if vex is None or not vex["L"]:
+	if vex is None:
 		return None
+	# **A VEX.128 write that must clear a slot** is the one narrow site
+	# this takes: the window is built round it exactly as round a 256-bit
+	# one, and the member is emitted as the lowered write and then the
+	# clear. See `CLEARING_WRITERS`. Finding 335.
+	narrow = CLEARING_WRITERS.get(address) if not vex["L"] else None
+	if not vex["L"] and not narrow:
+		return None
+	if narrow:
+		shape = ("narrow", min(narrow))
+	else:
+		shape = None
 	# **Asked AFTER the shape, which is the correction.** This read as a
 	# property of the instruction set -- "no legacy encoding, so nothing
 	# reaches it" -- and NO_LEGACY_FORM says no such thing. It forbids one
@@ -7798,8 +7847,9 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# mnemonics produces bytes that decode to nothing. The semantics are
 	# emitted on the plain path by `lower.py`, per shape, and four of them
 	# are 16-byte moves once an upper half is a slot. Finding 246.
-	shape = span_operand_shape(vex, encoding[vex["length"]:], operands, None,
-	                           mnemonic)
+	if shape is None:
+		shape = span_operand_shape(vex, encoding[vex["length"]:], operands,
+		                           None, mnemonic)
 	if shape is None:
 		if mnemonic in NO_LEGACY_FORM:
 			return refuse(f"{mnemonic} has no legacy encoding")
@@ -7979,7 +8029,16 @@ def unit_candidate(instructions, plain, index, blocked, home,
 				break
 			return refuse("too short to place, " + stop)
 		if not wide_next:
-			members.append(("plain", last, None))
+			# A neighbour that clears a slot is a `narrow` member and not
+			# a passenger: `moved_instruction` refuses it as a passenger,
+			# because a passenger is emitted without the clear.
+			clears = CLEARING_WRITERS.get(nxt_address)
+			if clears:
+				told = take(last, ("narrow", min(clears)))
+				if told is not None:
+					return refuse("neighbour names " + told)
+			else:
+				members.append(("plain", last, None))
 		window += len(nxt_encoding)
 		last += 1
 	if window < 5:
@@ -10790,10 +10849,15 @@ def collect(binary, listing, context=None):
 		context if context is not None else analysis_context(binary, listing)
 	ZEROED_UPPER.clear()
 	PARTLY_ZEROED.clear()
+	CLEARING_WRITERS.clear()
 	if SHADOW_REGS_RULE == SHADOW_REGS_ALL:
-		zeroed, partly = zeroed_uppers(instructions, blocked, sources)
+		zeroed, partly, writers = zeroed_uppers(instructions, blocked,
+		                                        sources)
 		ZEROED_UPPER.update(zeroed)
-		PARTLY_ZEROED.update(partly)
+		if WRITER_CLEARS:
+			CLEARING_WRITERS.update(writers)
+		else:
+			PARTLY_ZEROED.update(partly)
 	# The code oracle, in two parts. .pdata is the binary's own statement
 	# about where its functions are and needs no disassembly to read, but the
 	# x64 ABI lets a leaf function omit its unwind data -- and refusing those
@@ -10834,6 +10898,11 @@ def collect(binary, listing, context=None):
 	with open(binary, "rb") as image:
 		readonly = readonly_ranges(image.read(1 << 16))
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
+	# A writer that must clear a slot cannot be patched in place: four
+	# bytes have no room for the clear. See `CLEARING_WRITERS`.
+	if CLEARING_WRITERS:
+		patches = [patch for patch in patches
+		           if patch[0] not in CLEARING_WRITERS]
 	stats["switch tables read"] = switch_tables
 	stats["switch targets blocked"] = switch_seen
 
@@ -10927,6 +10996,17 @@ def collect(binary, listing, context=None):
 			if lone is not None:
 				candidates.append(lone)
 				continue
+		# **A slot-clearing writer has one way in.** Every other strategy
+		# would lower it without the clear, so it is offered as a unit
+		# window or not at all. See `CLEARING_WRITERS`.
+		if address in CLEARING_WRITERS:
+			lone = unit_shortening(instructions, plain, index, blocked,
+			                       home, ranges, scope, tls_slot_offset)
+			if lone is not None:
+				candidates.append(lone)
+			else:
+				declined[address] = "a slot-clearing writer would not place"
+			continue
 
 		strategy = None
 		y_reason = []
@@ -14685,7 +14765,7 @@ def main(argv):
 	# be built and compared. See Finding 46.
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
 	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE, TEB_SCRATCH
-	global INDEX_CONST
+	global INDEX_CONST, WRITER_CLEARS
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -14713,6 +14793,16 @@ def main(argv):
 				      f"not {want!r}", file=sys.stderr)
 				return 2
 			SHADOW_REGS_RULE = want
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--writer-clears="):
+			want = item.split("=", 1)[1]
+			if want not in ("on", "off"):
+				print(f"detour.py: --writer-clears wants on or off, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			WRITER_CLEARS = want == "on"
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
