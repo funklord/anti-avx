@@ -892,6 +892,7 @@ def run_configuration():
 	        f" teb-scratch={TEB_SCRATCH}"
 	        f" index-const={'on' if INDEX_CONST else 'off'}"
 	        f" writer-clears={'on' if WRITER_CLEARS else 'off'}"
+	        f" hammock={'on' if HAMMOCK_RULE else 'off'}"
 	        f" spill={SPILL}"
 	        f" tool={tool_fingerprint()}")
 
@@ -3090,7 +3091,8 @@ def swallowable_transfer(encoding, mnemonic, operands, comment, address):
 	                         address) is not None
 
 
-def moved_branch(moved, mnemonic, operands, comment, address, at):
+def moved_branch(moved, mnemonic, operands, comment, address, at,
+                 internal=None):
 	"""A swallowed branch, re-emitted at `at` aimed where it always went.
 
 	`ret` carries no displacement and copies across untouched. An indirect
@@ -3121,6 +3123,12 @@ def moved_branch(moved, mnemonic, operands, comment, address, at):
 		return None		# indirect: relocate's business, not this one
 	if target is None:
 		return None
+	# **A target inside the same window is the stub's copy of it.** The
+	# original bytes there are padding now, so a branch aimed at them would
+	# run the padding and skip the work. `internal` maps each such target
+	# to where the stub emits it. See `HAMMOCK`. Finding 336.
+	if internal and target in internal:
+		target = internal[target]
 	# rel32 is measured from the END of the instruction, which is five bytes
 	# for `e9`/`e8` and SIX for the two-byte conditional opcode. Getting that
 	# wrong lands every conditional one byte short of its target.
@@ -3130,7 +3138,8 @@ def moved_branch(moved, mnemonic, operands, comment, address, at):
 	return opcode + struct.pack("<i", delta)
 
 
-def moved_instruction(entry, at, pool=0, reasons=None, clearing=False):
+def moved_instruction(entry, at, pool=0, reasons=None, clearing=False,
+                      internal=None):
 	"""One swallowed instruction, re-encoded to execute at `at`.
 
 	The sixth field is a scratch register for the swallowed instruction, and
@@ -3241,7 +3250,7 @@ def moved_instruction(entry, at, pool=0, reasons=None, clearing=False):
 	if moved_mnemonic.startswith(CONTROL_PREFIXES) \
 			and "(%rip)" not in moved_operands:
 		out = moved_branch(moved, moved_mnemonic, moved_operands, comment,
-		                   address, at)
+		                   address, at, internal)
 		if out is None and reasons is not None:
 			reasons["moved: the branch shape cannot be re-aimed"] += 1
 		return out
@@ -7465,6 +7474,25 @@ UNIT_ALTERNATIVES = {}
 # module-level for the reason above: `place_stubs` unpacks a candidate as a
 # strict nine-tuple. Finding 331.
 TRAMPOLINE = {}
+# **A window that holds branch targets of its own.** A short site between
+# two branch targets cannot widen either way, and 200 of the 805 survivors
+# are that shape -- typically `if (a > b) d = a - b; else d = b - a;`, where
+# the site is one arm, its own `jbe` jumps to it and the join is next. When
+# EVERY way into a target is a direct branch from inside the window, the
+# window may hold it: the stub re-emits those branches aimed at its own copy
+# of the target, and the original bytes, padding now, are reached by
+# nothing. Window start -> the targets it holds. Never an indirect target --
+# `INDIRECT_TARGETS` -- since a table or a pointer cannot be re-aimed.
+# Module-level for `TRAMPOLINE`'s reason. Finding 336.
+HAMMOCK = {}
+HAMMOCK_REFUSED = Counter()
+HAMMOCK_RULE = True
+# How far back a hammock may reach for the branches into its targets.
+HAMMOCK_REACH = 64
+# Every address reached otherwise than by a direct branch: relocations,
+# `.pdata`, exception data, switch tables and `lea`-taken addresses. Filled
+# by `analysis_context`. Finding 336.
+INDIRECT_TARGETS = set()
 # **Upper halves a VEX.128 write zeroed on every path, per 256-bit site.**
 # Site -> the `%ymm` sources it reads whose every reaching definition is a
 # VEX.128 write, and so whose bits 255:128 are zero in the original. Patched
@@ -8474,6 +8502,14 @@ def report_units(candidates, placed, home, wide=0, original=None):
 		      f"the forward widening and then the backward fallback:")
 		for (ahead, behind), count in BACKWARD_REFUSED.most_common():
 			print(f"apply:   {ahead:<38} then {behind:<34} {count:>6,}")
+	if HAMMOCK or HAMMOCK_REFUSED:
+		# Candidates, not placements: the placer may still drop one. A
+		# hammock it drops leaves its site in the frontier like any other.
+		print(f"apply: {len(HAMMOCK):,} short site(s) took a window holding "
+		      f"its own branch targets, {sum(HAMMOCK_REFUSED.values()):,} "
+		      f"could not (Finding 336):")
+		for why, count in HAMMOCK_REFUSED.most_common():
+			print(f"apply:   {why:<58} {count:>6,}")
 	if WIDEN_REFUSED:
 		# The half of the pair above that is not geometry: a neighbour
 		# that COULD be swallowed and will not lower as a passenger.
@@ -9537,7 +9573,7 @@ def upper_half_read_later(instructions, index, register, limit=40,
 
 
 def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons,
-                   base, block=None, slot=0):
+                   base, block=None, slot=0, internal=None):
 	"""One swallowed instruction, bracketed by a save and restore if it
 	borrowed a register. Returns the bytes, or None.
 
@@ -9587,7 +9623,7 @@ def emit_swallowed(entry, body, stub_address, pool, spill_base, reasons,
 			return None
 		out += saved
 	fixed = moved_instruction(entry, stub_address + len(body) + len(out), pool,
-	                          reasons)
+	                          reasons, internal=internal)
 	if fixed is None:
 		return None
 	out += fixed
@@ -9945,9 +9981,47 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	# already planted a block pointer it can share. Inside the spill branch
 	# alone it is undefined everywhere else.
 	tls_pair = None
-	for entry in preceding:
+	# **Where the stub puts each target this window holds**, found by
+	# emitting once to learn the lengths and then again with the branches
+	# aimed. Every piece is position-independent in length -- a re-aimed
+	# branch is always rel32, a moved RIP operand always disp32 -- and the
+	# second pass is held to the first's lengths rather than trusted to
+	# them. See `HAMMOCK`. Finding 336.
+	internal = None
+	held = HAMMOCK.get(start)
+	if held:
+		if kind is not None:
+			if reasons is not None:
+				reasons["a hammock with a strategy"] += 1
+			return None, 0
+		probe = {target: stub_address for target in held}
+		labels, lengths, length = {}, [], 0
+		for entry in preceding:
+			labels[entry[0]] = stub_address + length
+			piece = emit_swallowed(entry, bytearray(length), stub_address,
+			                       pool, spill_base, None, base,
+			                       internal=probe)
+			if piece is None:
+				if reasons is not None:
+					reasons["a preceding instruction will not move"] += 1
+				return None, 0
+			lengths.append(len(piece))
+			length += len(piece)
+		labels[start + sum(len(entry[1]) for entry in preceding)] = \
+			stub_address + length
+		if not held <= set(labels):
+			if reasons is not None:
+				reasons["a hammock target is not an instruction it holds"] += 1
+			return None, 0
+		internal = {target: labels[target] for target in held}
+	for position, entry in enumerate(preceding):
 		fixed = emit_swallowed(entry, body, stub_address, pool,
-		                       spill_base, reasons, base)
+		                       spill_base, reasons, base, internal=internal)
+		if fixed is not None and internal is not None \
+				and len(fixed) != lengths[position]:
+			if reasons is not None:
+				reasons["a hammock piece changed length"] += 1
+			return None, 0
 		if fixed is None:
 			if reasons is not None:
 				reasons["a preceding instruction will not move"] += 1
@@ -10683,6 +10757,8 @@ def analysis_context(binary, listing):
 	blocked = set()
 	for values in groups.values():
 		blocked |= values
+	INDIRECT_TARGETS.clear()
+	INDIRECT_TARGETS.update(blocked)
 	instructions = list(parse_with_comments(listing))
 	# The liveness scan wants the plain four-field shape.
 	plain = [(a, e, m, o) for a, e, m, o, _c in instructions]
@@ -10709,6 +10785,7 @@ def analysis_context(binary, listing):
 			# through the pointer, which makes it a branch target like any
 			# other -- see outside.lea_targets.
 			blocked.add(comment)
+			INDIRECT_TARGETS.add(comment)
 
 	# **Where an indirect jump can land**, read from the dispatch rather
 	# than guessed at. `targets.from_switch_tables` looks for runs of
@@ -10720,6 +10797,7 @@ def analysis_context(binary, listing):
 		instructions, binary, starts)
 	fresh = switched - blocked
 	blocked |= switched
+	INDIRECT_TARGETS.update(switched)
 	# **Said out loud, because a count nobody prints cannot be checked.**
 	# The first version of this put the numbers in `stats`, which `apply`
 	# discards as `_stats` -- so "the resolver found nothing" and "the
@@ -10824,6 +10902,61 @@ def take_trampoline(slots, site):
 	return None
 
 
+def hammock_window(instructions, plain, index, blocked, sources, scope,
+                   home):
+	"""(preceding, targets) for a window ending at the site, or (None, why).
+
+	Walks back from the site an instruction at a time until every branch
+	target strictly inside the window -- the site included -- is reached
+	ONLY by direct branches from inside it, and the window holds the five
+	bytes a jump needs. Those branches are then re-aimed into the stub by
+	`build_stub`, so nothing outside can arrive in the middle. The window
+	ends at the site, so the instruction after it -- often the join, and a
+	target -- stays outside. See `HAMMOCK`. Finding 336.
+	"""
+	address, encoding = instructions[index][0], instructions[index][1]
+	end = address + len(encoding)
+	first = index
+	while True:
+		start = instructions[first][0]
+		inside = [row[0] for row in instructions[first + 1:index + 1]
+		          if row[0] in blocked]
+		if any(target in INDIRECT_TARGETS for target in inside):
+			return None, "a target it would hold is reached indirectly"
+		reach = [one for target in inside for one in sources.get(target, ())]
+		if any(one >= end for one in reach):
+			return None, "a target it would hold is reached from after it"
+		if first < index and end - start >= 5 \
+				and all(one >= start for one in reach):
+			break
+		if first == 0:
+			return None, "nothing precedes"
+		before = instructions[first - 1]
+		if before[0] + len(before[1]) != start:
+			return None, "previous not adjacent"
+		if address - before[0] > HAMMOCK_REACH:
+			return None, "the branches in are out of reach"
+		first -= 1
+	preceding = []
+	probe = {target: address for target in inside}
+	for k in range(first, index):
+		at, moved, mnemonic, operands, comment = instructions[k]
+		if moved[:1] in (b"\x62",) or not moved:
+			return None, "an instruction it would swallow is not movable"
+		taken = swallowed_scratch(plain, k, at, moved, operands, mnemonic,
+		                          scope)
+		borrow = None
+		if taken is None:
+			borrow = swallowed_borrow(plain, at, moved, operands, mnemonic,
+			                          home)
+		passenger = (at, moved, comment, operands, mnemonic,
+		             taken if borrow is None else borrow, borrow is not None)
+		if moved_instruction(passenger, at, at, internal=probe) is None:
+			return None, "an instruction it would swallow will not move"
+		preceding.append(passenger)
+	return preceding, frozenset(inside)
+
+
 def collect(binary, listing, context=None):
 	"""(in-place patches, class C detour candidates, statistics).
 
@@ -10841,6 +10974,8 @@ def collect(binary, listing, context=None):
 	REGION_EXAMPLES.clear()
 	COLLECT_SEEN.clear()
 	TRAMPOLINE.clear()
+	HAMMOCK.clear()
+	HAMMOCK_REFUSED.clear()
 	UNIT_REFUSED.clear()
 	UNIT_RUNG.clear()
 	UNIT_EXAMPLES.clear()
@@ -11855,6 +11990,22 @@ def collect(binary, listing, context=None):
 					reason = None
 					displaced, preceding = [], []
 					start, window = address, len(encoding)
+			# **Or hold the branch targets in the way.** Where every branch
+			# into the site comes from just above it, the window reaches
+			# back over those branches and the stub re-aims them at its own
+			# copy of the site. Plain lowerings only: the internal labels
+			# are worked out in `build_stub`'s plain path. Finding 336.
+			if reason is not None and HAMMOCK_RULE and strategy is None:
+				swallow, held = hammock_window(instructions, plain, index,
+				                               blocked, sources, scope, home)
+				if swallow is not None:
+					reason = None
+					displaced, preceding = [], swallow
+					start = swallow[0][0]
+					window = address + len(encoding) - start
+					HAMMOCK[start] = held
+				else:
+					HAMMOCK_REFUSED[held] += 1
 			if reason is not None:
 				skipped[reason] += 1
 				declined[address] = reason
@@ -14765,7 +14916,7 @@ def main(argv):
 	# be built and compared. See Finding 46.
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
 	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE, TEB_SCRATCH
-	global INDEX_CONST, WRITER_CLEARS
+	global INDEX_CONST, WRITER_CLEARS, HAMMOCK_RULE
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -14793,6 +14944,16 @@ def main(argv):
 				      f"not {want!r}", file=sys.stderr)
 				return 2
 			SHADOW_REGS_RULE = want
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--hammock="):
+			want = item.split("=", 1)[1]
+			if want not in ("on", "off"):
+				print(f"detour.py: --hammock wants on or off, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			HAMMOCK_RULE = want == "on"
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
@@ -17585,8 +17746,9 @@ def verify(original, patched, listing=None):
 	# source and the check above remains the only check. That gap is real
 	# and named rather than papered over.
 	named = set()
+	came_from = {}
 	for address, encoding, mnemonic, operands in inplace.parse_listing(listing):
-		del address, encoding
+		del encoding
 		if not mnemonic.startswith(("j", "call", "loop")) or not operands:
 			continue
 		first = operands.split()[0]
@@ -17596,6 +17758,21 @@ def verify(original, patched, listing=None):
 			named.add(int(first, 16))
 		except ValueError:
 			pass
+		else:
+			came_from.setdefault(int(first, 16), []).append(address)
+	# **A target a hammock holds is reached by nothing outside it**, which
+	# is asked again here of the listing rather than taken from the
+	# collector: every branch naming it lies inside the placed window, and
+	# nothing else can reach it. Then its bytes being padding is correct,
+	# and both checks below excuse it. See `HAMMOCK`. Finding 336.
+	held = set()
+	for window_at, window_len, *_rest in placed:
+		for target in HAMMOCK.get(window_at, ()):
+			if window_at < target < window_at + window_len \
+					and target not in INDIRECT_TARGETS \
+					and all(window_at <= one < window_at + window_len
+					        for one in came_from.get(target, ())):
+				held.add(target)
 	# **A branch inside data names an address that was never an instruction.**
 	# Finding 8 counted 11,892 bytes of `.text` that do not disassemble, and
 	# a linear sweep through them manufactures branches: a repeating
@@ -17608,7 +17785,7 @@ def verify(original, patched, listing=None):
 	# real one, and a real target always was.
 	inside = {a for a in named
 	          if vaddr <= a < vaddr + size and a in before_bounds}
-	broken = inside - after_bounds
+	broken = inside - after_bounds - held
 	if broken:
 		print(f"verify: FAILED -- {len(broken):,} direct branch targets no "
 		      f"longer begin an instruction", file=sys.stderr)
@@ -17649,6 +17826,7 @@ def verify(original, patched, listing=None):
 		low = bisect.bisect_right(ordered, window_at)
 		high = bisect.bisect_left(ordered, window_at + window_len)
 		buried.update(ordered[low:high])
+	buried -= held
 	if buried:
 		print(f"verify: FAILED -- {len(buried):,} direct branch target(s) land "
 		      f"inside a placed window, past its jump", file=sys.stderr)
@@ -17657,7 +17835,8 @@ def verify(original, patched, listing=None):
 		problems += 1
 	else:
 		print(f"verify: no direct branch target lands inside a placed window, "
-		      f"across {len(placed):,} window(s)")
+		      f"across {len(placed):,} window(s), but {len(held):,} a hammock "
+		      f"holds and nothing outside it reaches")
 
 	# **Does anything still read an upper half this rewrite left stale?**
 	# Six lowerings leave one, and each is supposed to have proved nothing
@@ -17919,6 +18098,43 @@ def verify(original, patched, listing=None):
 	else:
 		print(f"verify: {stub_calls:,} call(s) in the stub section, every "
 		      f"one an instruction a window covered and re-emitted")
+	# **And no branch in a stub lands inside a window past its jump.** A
+	# hammock's targets are padding in `.text` now, and every branch that
+	# reached one was re-aimed at the stub's copy -- the excuse above says
+	# nothing OUTSIDE reaches them, and this is the other half: a branch
+	# that was moved into a stub and not re-aimed would land in the padding
+	# and skip the work. Read off the emitted bytes, so it asks the output
+	# rather than `build_stub`'s own bookkeeping. Finding 336.
+	starts = sorted((start, window) for start, window, *_r in placed)
+	keys = [start for start, _w in starts]
+	stray = []
+	for line in done.stdout.splitlines():
+		fields = line.split("\t")
+		if len(fields) < 3:
+			continue
+		words = fields[2].split()
+		if len(words) < 2 or not words[0].startswith(("j", "call")) \
+				or not words[1].startswith("0x"):
+			continue
+		try:
+			target = int(words[1], 16)
+		except ValueError:
+			continue
+		where = bisect.bisect_right(keys, target) - 1
+		if where >= 0:
+			start, window = starts[where]
+			if start < target < start + window:
+				stray.append((line.split(":")[0].strip(), target))
+	if stray:
+		print(f"verify: FAILED -- {len(stray):,} branch(es) in the stub "
+		      f"section land inside a placed window past its jump",
+		      file=sys.stderr)
+		for at, target in stray[:8]:
+			print(f"    {at} -> 0x{target:x}", file=sys.stderr)
+		problems += 1
+	else:
+		print("verify: no branch in the stub section lands inside a placed "
+		      "window past its jump")
 	# **This number is reported, not asserted, and it stopped meaning "one
 	# jump back per detour" the moment a window could swallow a branch.** It
 	# equalled the detour count for as long as every stub held exactly one

@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,146 of 804,951 VEX
-sites -- 99.90%** -- through 202,333 detours, and every `make detour-verify` invariant
-holds on the result. **805 sites are left** (Finding 335, 2026-10-10), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,274 of 804,951 VEX
+sites -- 99.92%** -- through 202,363 detours, and every `make detour-verify` invariant
+holds on the result. **677 sites are left** (Finding 336, 2026-10-10), and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -18,8 +18,8 @@ copyright holder's instruction: 688 sites, 2,337 without it against 1,649 with, 
 measured on 2026-09-22. It asks the loader for two TLS slots and patches the stubs
 from a callback. `--teb-scratch=off` is the A/B.
 
-**That pair is a dated pair and only the default has moved since** -- 805 after
-Finding 335. Subtracting 805 from a 2,337 measured weeks earlier would be
+**That pair is a dated pair and only the default has moved since** -- 677 after
+Finding 336. Subtracting 677 from a 2,337 measured weeks earlier would be
 arithmetic across two tools rather than a gap; re-measure `off` before quoting one.
 
 **The gap was 688 sites when last measured both ways, and it has been WIDENING.**
@@ -44,7 +44,9 @@ game's allocator, on wrong bytes this rewrite wrote** -- Finding 333, which fixe
 **Past that it faulted 46 seconds in, on a compare stub with its predicate lost** --
 Finding 334, which found 564 such stubs across three emitters and fixes all of them.
 **Past that it stopped on a survivor**, a zeroing the repair had kept as VEX for a reader
-Finding 333 refused -- Finding 335, which moves the slot clear to the writer.
+Finding 333 refused -- Finding 335, which moves the slot clear to the writer. **Then
+61 seconds in, on a short site between two branch targets** -- Finding 336, which lets
+a window hold targets only its own branches reach.
 
     Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>
 
@@ -11909,12 +11911,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           805 re-measured   (Finding 335)
+    default build                           677 re-measured   (Finding 336)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,146 of 804,951 VEX sites, 99.90%, through 202,333 detours**, and 180 further
+**804,274 of 804,951 VEX sites, 99.92%, through 202,363 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
@@ -14159,6 +14161,71 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 336 -- a window may hold branch targets that only its own branches reach
+
+The 805 build of Finding 335 ran through Steam on 2026-10-10 and stopped 61 seconds in,
+on a worker thread, on `EXCEPTION_ILLEGAL_INSTRUCTION` at `0x140D3672E` -- a survivor
+filed `declined: next instruction is a branch target`:
+
+    140d36726  jbe    72e
+    140d36728  vsubss %xmm4,%xmm7,%xmm0       one arm, then jmp 732
+    140d3672c  jmp    732
+    140d3672e  vsubss %xmm7,%xmm4,%xmm0       the other arm -- the fault
+    140d36732  vcomiss %xmm3,%xmm0            the join
+
+An absolute difference. The site is four bytes and a Class C lowering wants seven, so it
+needs a detour; it is the `jbe`'s target so it cannot be swallowed backward, and the
+join after it is the `jmp`'s target so it cannot widen forward. **200 of the 805
+survivors were this class**, the largest left, and Finding 331's `jmp rel8` reaches only
+where `int3` padding is within 127 bytes -- here it is 286 away.
+
+**The branch into the site comes from six bytes above it.** A window may hold a target
+when every way into it is a direct branch from inside the same window: the stub
+re-emits those branches aimed at its own copy of the target, and the original bytes,
+padding now, are reached by nothing. Measured before building: of the 200, 159 have
+every branch into the site within 64 bytes and none of them a call.
+
+`hammock_window` walks back from the site until every branch target strictly inside the
+window, the site included, is reached only from inside it and the window holds five
+bytes. It ends at the site, so the join stays outside. A target that is also reached
+INDIRECTLY -- a relocation, `.pdata`, exception data, a switch table, an address taken
+by `lea` -- is refused, since a table cannot be re-aimed; `analysis_context` now keeps
+those apart as `INDIRECT_TARGETS`, where `blocked` had merged them with the direct ones.
+`build_stub` emits the swallowed instructions twice: once to learn where each lands,
+then with every branch to a held target aimed at that label. Lengths are
+position-independent -- a re-aimed branch is always rel32 -- and the second pass is held
+to the first's rather than trusted to it. Earliest-start placement lets the hammock win
+over the other arm's own window, which it contains; that arm is lowered inside it.
+
+The game's site becomes one window from `726` to `732`:
+
+    jbe    <stub copy of 72e>
+    movaps %xmm7,%xmm0; subss %xmm4,%xmm0; jmp 732
+    movaps %xmm4,%xmm0; subss %xmm7,%xmm0; jmp 732
+
+**`verify` asks both halves of the claim of the output.** A held target is excused from
+"still begins an instruction" and from "lands inside a placed window" only where the
+listing, read again in `verify`, shows every branch naming it inside that window and it
+is not indirect. And a new check reads the stub section: no branch there may land
+inside a placed window past its jump -- which is what a branch moved and not re-aimed
+does. With the re-aim removed the `hammock` fixture returns 5 rather than 77, silently,
+and that check fails naming `140004030 -> 0x140001022`; nothing else in `verify` did.
+
+**`hammock`**, in `check-pe`, is the absolute difference with the sandwiched arm taken:
+29 original, 77 rewritten, 29 with `--hammock=off`.
+
+**805 -> 677.** 128 short sites took a hammock and 137 could not:
+
+      an instruction it would swallow will not move      110
+      a target it would hold is reached indirectly        12
+      the branches in are out of reach                    11
+      a target it would hold is reached from after it      4
+
+`declined: next instruction is a branch target` falls 200 -> 71. The 110 are the next
+lever and the same walls as everywhere else -- a swallowed 256-bit neighbour, which only
+the span emission lowers, and aliased forms with no scratch. `make detour-verify` passes
+on the 677 build with 154 targets held, and the compare audit of Finding 334 is clean.
 
 ### Finding 335 -- where only some paths zero an upper half, the writer clears the slot
 

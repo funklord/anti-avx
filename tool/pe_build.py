@@ -1707,6 +1707,39 @@ buffer:	.long 0, 0, 0, 0
 """)
 
 
+# **An absolute difference, whose second arm is a short site between two
+# branch targets**, Starfield's 0x140d3672e: the `jbe` jumps to it and the
+# `jmp` from the first arm lands on the instruction after it, so it can
+# widen neither way. Every branch into it comes from just above, so the
+# window reaches back over them and the stub re-aims the `jbe` at its own
+# copy. 3 <= 10 takes the `jbe`, so the arm that runs is the sandwiched one:
+# 10 - 3 = 7 and 77. Left as VEX it faults. Finding 336.
+PROGRAMS["hammock"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	movss	small(%rip), %xmm7
+	movss	large(%rip), %xmm4
+	comiss	%xmm4, %xmm7
+	jbe	other
+	vsubss	%xmm4, %xmm7, %xmm0
+	jmp	join
+other:
+	vsubss	%xmm7, %xmm4, %xmm0	/* the sandwiched site */
+join:
+	cvttss2si %xmm0, %eax
+	addl	$70, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+small:	.float 3.0
+large:	.float 10.0
+""")
+
+
 # **A 128-bit compare against a RIP-relative constant, moved into a stub.**
 # The destination is not the first source, so the lowering is
 # `movaps %xmm0,%xmm3; cmpps $4,bound(%rip),%xmm3` and has to live in a
