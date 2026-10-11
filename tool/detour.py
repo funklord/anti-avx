@@ -893,6 +893,7 @@ def run_configuration():
 	        f" index-const={'on' if INDEX_CONST else 'off'}"
 	        f" writer-clears={'on' if WRITER_CLEARS else 'off'}"
 	        f" hammock={'on' if HAMMOCK_RULE else 'off'}"
+	        f" switch-guard={'on' if SWITCH_GUARD else 'off'}"
 	        f" spill={SPILL}"
 	        f" tool={tool_fingerprint()}")
 
@@ -10362,6 +10363,22 @@ SWITCH_WIDE = dict(zip(
 SWITCH_LOAD = re.compile(r"^(0x[0-9a-f]+)\(%(\w+),%(\w+),4\),%(\w+)$")
 SWITCH_ADD = re.compile(r"^%(\w+),%(\w+)$")
 SWITCH_BACK = 16			# how far back a dispatch may be spread
+# The byte table a two-level dispatch reads its case number from first:
+# `movzbl 0xd35718(%rax,%r13,1),%eax`, the image base on either side.
+SWITCH_INDEX = re.compile(r"^(0x[0-9a-f]+)\(%(\w+),%(\w+),1\),%(\w+)$")
+SWITCH_BOUND = re.compile(r"^\$(0x[0-9a-f]+),%\w+$")
+
+# **The bytes of every switch table `switch_targets` read**, as absolute
+# (low, high) spans. A table is data, and one that decodes cleanly is
+# invisible to `data_islands`, which sees only what objdump refused: the
+# jump table at 0x140d35710 begins `c5 55 d3 00`, a valid `vpsrlq`, and a
+# window was placed over it. Every switch through that entry then went to
+# `__ImageBase + 0xd37919e9`. Finding 337.
+SWITCH_DATA = []
+SWITCH_GUARD = True
+# The rows `switch_data_rows` turned to `(bad)`, which `data_islands` keeps
+# out of its clustering and adds back as the exact table spans.
+SWITCH_TURNED = set()
 
 
 def require_qemu(qemu):
@@ -10467,6 +10484,105 @@ def switch_dispatch(window):
 	return None
 
 
+def switch_index(window):
+	"""(offset, length) of the byte table a dispatch indexes first, or None.
+
+	MSVC compiles a sparse switch to two loads through the image base:
+
+	    cmp     $0x12,%eax
+	    ja      default
+	    movzbl  0xd35718(%rax,%r13,1),%eax     # the case's slot
+	    mov     0xd35710(%r13,%rax,4),%edx     # the slot's RVA
+	    add     %r13,%rdx
+	    jmp     *%rdx
+
+	The byte table has no terminator to read, so its length is the bound
+	the dispatch checks against -- one more than the `cmp` before the load
+	-- and 256, every value a byte can index, where no bound is found.
+	Pure, so it is tested.
+	"""
+	rows = list(window)
+	if not rows:
+		return None
+	operands = rows[-1][3] or ""
+	if rows[-1][2] != "jmp" or not operands.startswith("*%"):
+		return None
+	register = operands[2:].strip()
+	holder = None
+	for prior in rows[-2::-1]:
+		match = SWITCH_ADD.match(prior[3] or "")
+		if prior[2] == "add" and match and match.group(2) == register:
+			holder = match.group(1)
+			break
+	if holder is None:
+		return None
+	for k in range(len(rows) - 2, -1, -1):
+		match = SWITCH_INDEX.match(rows[k][3] or "")
+		if rows[k][2] != "movzbl" or not match:
+			continue
+		offset, left, right, _into = match.groups()
+		if holder not in (left, right):
+			continue
+		length = 256
+		for prior in rows[k - 1::-1] if k else ():
+			bound = SWITCH_BOUND.match(prior[3] or "")
+			if prior[2] == "cmp" and bound:
+				length = min(256, int(bound.group(1), 16) + 1)
+				break
+		return int(offset, 16), length
+	return None
+
+
+SWITCH_MERGED = ([], [], 0)
+
+
+def in_switch_data(low, high):
+	"""Whether [low, high) overlaps a byte of any table in `SWITCH_DATA`.
+
+	Asked once per in-place patch, half a million times, so the spans are
+	merged and searched rather than scanned.
+	"""
+	global SWITCH_MERGED
+	if SWITCH_MERGED[2] != len(SWITCH_DATA):
+		starts, ends = [], []
+		for start, end in sorted(SWITCH_DATA):
+			if ends and start <= ends[-1]:
+				ends[-1] = max(ends[-1], end)
+			else:
+				starts.append(start)
+				ends.append(end)
+		SWITCH_MERGED = (starts, ends, len(SWITCH_DATA))
+	starts, ends, _count = SWITCH_MERGED
+	k = bisect.bisect_right(starts, high - 1) - 1
+	return k >= 0 and ends[k] > low
+
+
+def switch_data_rows(instructions, plain):
+	"""Turn every row overlapping a switch table into `(bad)`, in place.
+
+	Done to the shared rows rather than at each consumer, because every
+	guard this file has against data -- the candidate loop, `data_islands`,
+	`verify`'s island check, a passenger that will not move -- is keyed on
+	`(bad)` already. Returns how many rows it turned.
+	"""
+	turned = 0
+	SWITCH_TURNED.clear()
+	key = lambda row: row[0]
+	for low, high in sorted(SWITCH_DATA):
+		k = bisect.bisect_left(instructions, low, key=key)
+		if k and instructions[k - 1][0] + len(instructions[k - 1][1]) > low:
+			k -= 1
+		while k < len(instructions) and instructions[k][0] < high:
+			row = instructions[k]
+			if row[2] != "(bad)":
+				SWITCH_TURNED.add(row[0])
+				instructions[k] = (row[0], row[1], "(bad)", "", None)
+				plain[k] = (row[0], row[1], "(bad)", "")
+				turned += 1
+			k += 1
+	return turned
+
+
 def switch_targets(instructions, binary, starts):
 	"""Where an indirect `jmp` through a switch table can land.
 
@@ -10537,6 +10653,9 @@ def switch_targets(instructions, binary, starts):
 	# Rows are indexed rather than unpacked so four-field `parse_listing`
 	# output works as well as five-field `parse_with_comments`.
 	window = deque(maxlen=SWITCH_BACK)
+	global SWITCH_MERGED
+	SWITCH_DATA.clear()
+	SWITCH_MERGED = ([], [], 0)
 	for row in instructions:
 		window.append(row)
 		mnemonic, operands = row[2], row[3] or ""
@@ -10559,6 +10678,29 @@ def switch_targets(instructions, binary, starts):
 				break
 			entries.append(base + value)
 			k += 1
+		# **The table is data whatever it held**, even an entry short of
+		# being counted as one: the dispatch reads it, so its bytes are
+		# never ours to rewrite.
+		if entries:
+			SWITCH_DATA.append((base + offset,
+			                    base + offset + 4 * len(entries)))
+		# **Every byte of an index table names a slot of the dword table**,
+		# so it is less than that table's length, and the first byte that
+		# is not ends it. Without this the 256-byte fallback, taken where
+		# no `cmp` bound is found, ran the table at 0x141823748 on into
+		# the next function's prologue and kept three of its VEX
+		# instructions as data. A bound the dispatch checks still wins
+		# where it is shorter.
+		index = switch_index(window)
+		start = None if index is None else at(base + index[0])
+		if start is not None and entries:
+			length = 0
+			while (length < index[1] and start + length < len(data)
+			       and data[start + length] < len(entries)):
+				length += 1
+			if length:
+				SWITCH_DATA.append((base + index[0],
+				                    base + index[0] + length))
 		if len(entries) >= 2:
 			found.update(entries)
 			tables += 1
@@ -10798,6 +10940,10 @@ def analysis_context(binary, listing):
 	fresh = switched - blocked
 	blocked |= switched
 	INDIRECT_TARGETS.update(switched)
+	turned = switch_data_rows(instructions, plain) if SWITCH_GUARD else 0
+	print(f"collect: {len(SWITCH_DATA):,} switch table span(s), "
+	      f"{sum(high - low for low, high in SWITCH_DATA):,} bytes, "
+	      f"{turned:,} row(s) taken as data", file=sys.stderr)
 	# **Said out loud, because a count nobody prints cannot be checked.**
 	# The first version of this put the numbers in `stats`, which `apply`
 	# discards as `_stats` -- so "the resolver found nothing" and "the
@@ -10825,19 +10971,34 @@ def data_islands(instructions, gap=None):
 	the `vphsubd` at 0x142c4079a, and that one is itself a constant pool's
 	bytes. So the over-coverage is free here, which is why the collector
 	can afford to refuse on it.
+
+	**A switch table is an island over exactly its own bytes.** Its rows
+	are `(bad)` once `switch_data_rows` has run, and clustering them with a
+	256-byte gap swept in the real code between neighbouring tables: four
+	clusters held in-place patches the first build made correctly, and
+	`verify` failed on them. So the turned rows are kept out of the
+	clustering and the table spans are merged in as they are. Finding 337.
 	"""
 	if gap is None:
 		gap = ISLAND_GAP
 	islands = []
 	for row in instructions:
-		if row[2] != "(bad)" or not row[1]:
+		if row[2] != "(bad)" or not row[1] or row[0] in SWITCH_TURNED:
 			continue
 		low, high = row[0], row[0] + len(row[1])
 		if islands and low - islands[-1][1] <= gap:
 			islands[-1][1] = max(islands[-1][1], high)
 		else:
 			islands.append([low, high])
-	return islands
+	if not SWITCH_TURNED:
+		return islands
+	merged = []
+	for low, high in sorted(islands + [list(span) for span in SWITCH_DATA]):
+		if merged and low <= merged[-1][1]:
+			merged[-1][1] = max(merged[-1][1], high)
+		else:
+			merged.append([low, high])
+	return merged
 
 
 def in_island(islands, address):
@@ -11033,6 +11194,11 @@ def collect(binary, listing, context=None):
 	with open(binary, "rb") as image:
 		readonly = readonly_ranges(image.read(1 << 16))
 	patches, stats, _blocked = inplace.build_patches(listing, ranges)
+	# `build_patches` reads the listing itself, so the rows turned to data
+	# above never reach it. Finding 337.
+	if SWITCH_GUARD:
+		patches = [patch for patch in patches if not in_switch_data(
+			patch[0], patch[0] + len(patch[1]))]
 	# A writer that must clear a slot cannot be patched in place: four
 	# bytes have no room for the clear. See `CLEARING_WRITERS`.
 	if CLEARING_WRITERS:
@@ -14162,10 +14328,42 @@ def switch_selftest():
 			print(f"selftest: {what}: switch_dispatch gave {shown}, "
 			      f"want {want}", file=sys.stderr)
 			failures += 1
+	for what, rows, expected in SWITCH_INDEX_CASES:
+		window = [(0, b"", mnemonic, operands) for mnemonic, operands in rows]
+		got = switch_index(window)
+		if got != expected:
+			print(f"selftest: {what}: switch_index gave {got}, want "
+			      f"{expected}", file=sys.stderr)
+			failures += 1
 	if not failures:
-		print(f"selftest: {len(SWITCH_CASES)} switch dispatches, read and "
-		      f"refused")
+		print(f"selftest: {len(SWITCH_CASES)} switch dispatches and "
+		      f"{len(SWITCH_INDEX_CASES)} index tables, read and refused")
 	return failures
+
+
+# The game's own two-level dispatch, at 0x140d355a6. Finding 337.
+SWITCH_INDEX_CASES = [
+	("the game's two-level dispatch, bounded by its cmp",
+	 [("lea", "-0x1(%r9),%eax"), ("cmp", "$0x12,%eax"),
+	  ("ja", "0x140d355fc"), ("movzbl", "0xd35718(%rax,%r13,1),%eax"),
+	  ("mov", "0xd35710(%r13,%rax,4),%edx"), ("add", "%r13,%rdx"),
+	  ("jmp", "*%rdx")],
+	 (0xd35718, 0x13)),
+	("the image base as the base rather than the index, no bound",
+	 [("movzbl", "0x1000(%r13,%rcx,1),%ecx"),
+	  ("mov", "0x2000(%r13,%rcx,4),%eax"), ("add", "%r13,%rax"),
+	  ("jmp", "*%rax")],
+	 (0x1000, 256)),
+	("a byte load through some other register is not the index",
+	 [("movzbl", "0x1000(%rbx,%rcx,1),%ecx"),
+	  ("mov", "0x2000(%r13,%rcx,4),%eax"), ("add", "%r13,%rax"),
+	  ("jmp", "*%rax")],
+	 None),
+	("a one-level dispatch has no index table",
+	 [("mov", "0x181d498(%r9,%rax,4),%ecx"), ("add", "%r9,%rcx"),
+	  ("jmp", "*%rcx")],
+	 None),
+]
 
 
 def region_selftest():
@@ -14916,7 +15114,7 @@ def main(argv):
 	# be built and compared. See Finding 46.
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
 	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE, TEB_SCRATCH
-	global INDEX_CONST, WRITER_CLEARS, HAMMOCK_RULE
+	global INDEX_CONST, WRITER_CLEARS, HAMMOCK_RULE, SWITCH_GUARD
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -14954,6 +15152,16 @@ def main(argv):
 				      f"not {want!r}", file=sys.stderr)
 				return 2
 			HAMMOCK_RULE = want == "on"
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--switch-guard="):
+			want = item.split("=", 1)[1]
+			if want not in ("on", "off"):
+				print(f"detour.py: --switch-guard wants on or off, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			SWITCH_GUARD = want == "on"
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
@@ -17637,6 +17845,26 @@ def verify(original, patched, listing=None):
 	else:
 		print(f"verify: none of {len(islands):,} data island(s) "
 		      f"({span:,} bytes) was modified")
+	# **Nor a byte of a switch table**, which the island check above says
+	# it cannot see when the table decodes end to end. That was not a
+	# hypothetical: the table at 0x140d35710 begins `c5 55 d3 00`, a
+	# window was placed over it, and the game jumped through the entry to
+	# an address outside the image. `SWITCH_DATA` is filled by the
+	# `analysis_context` call above, from the original's dispatches.
+	# Finding 337.
+	tables = [(low - tv, high - tv) for low, high in SWITCH_DATA
+	          if 0 <= low - tv and high - tv <= ts]
+	moved = [(low, high) for low, high in tables
+	         if before_text[low:high] != after_text[low:high]]
+	if moved:
+		low, high = moved[0]
+		print(f"verify: {len(moved):,} switch table(s) modified by the "
+		      f"rewrite, first at 0x{low + tv:x}-0x{high + tv:x}",
+		      file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: none of {len(tables):,} switch table span(s) "
+		      f"({sum(h - l for l, h in tables):,} bytes) was modified")
 	# **The same call apply makes -- through the same function, now.** This
 	# said so in a comment while `apply` grew a repair pass this did not,
 	# and the drift cost 15 reported stale reads the image did not have.

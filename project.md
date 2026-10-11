@@ -5,9 +5,10 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,274 of 804,951 VEX
-sites -- 99.92%** -- through 202,363 detours, and every `make detour-verify` invariant
-holds on the result. **677 sites are left** (Finding 336, 2026-10-10), and 180
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,266 of 804,946 VEX
+sites -- 99.92%** -- through 202,359 detours, and every `make detour-verify` invariant
+holds on the result. **680 sites are left** (Finding 337, 2026-10-11), five more rows
+that read as VEX are switch-table bytes and not instructions, and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
 are re-derived from `build/text.asm` rather than carried, because this line twice
@@ -11911,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           677 re-measured   (Finding 336)
+    default build                           680 re-measured   (Finding 337)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,274 of 804,951 VEX sites, 99.92%, through 202,363 detours**, and 180 further
+**804,266 of 804,946 VEX sites, 99.92%, through 202,359 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
@@ -14161,6 +14162,59 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 337 -- a switch table that decodes as VEX is data, and was being rewritten
+
+The 677 build of Finding 336 ran through Steam on 2026-10-11 and stopped about 95 seconds
+in, twice, identically: two and then three worker threads took
+`EXCEPTION_ACCESS_VIOLATION` on executing `0x2137919E9`, an address outside the image,
+with `rdx` holding the same value. The 805 and 880 builds had stopped on survivors before
+reaching this point, so it is older than Finding 336 rather than caused by it -- a build
+with `--hammock=off` stopped 54 seconds in on the survivor at `0x140D3672E` that 336
+removes, which is why that build could not answer the question.
+
+The second run's backtrace named the dispatch:
+
+    140d355af  movzbl 0xd35718(%rax,%r13,1),%eax     r13 = __ImageBase
+    140d355b8  mov    0xd35710(%r13,%rax,4),%edx
+    140d355c0  add    %r13,%rdx
+    140d355c3  jmp    *%rdx
+
+and the table it reads had been rewritten:
+
+    original   140d35710  c5 55 d3 00  fc 55 d3 00     RVAs 0xd355c5, 0xd355fc
+    rewritten  140d35710  e9 19 79 d3  07 55 d3 00     a detour's jmp rel32
+
+`c5 55 d3 00` is a valid VEX.256 `vpsrlq (%rax),%ymm5,%ymm8`, and a window was placed
+over it with the `cld` after it as a passenger. `0x140000000 + 0xd37919e9` is the fault.
+
+**Every data guard was keyed on `(bad)`.** Finding 225's islands cluster what objdump
+refused, so a table that decodes end to end is in no population -- which `verify`'s own
+comment on the island check said. `switch_targets` had read this exact table since
+Finding 174 to block its targets, and never kept its bytes. It now records every table it
+reads in `SWITCH_DATA`: the dword table over its entries, and the byte table a two-level
+dispatch reads first (`switch_index`), bounded by the dispatch's `cmp` and cut at the
+first byte that is not a valid slot. `switch_data_rows` turns the rows overlapping them
+into `(bad)`, so the candidate loop, passengers and `verify` refuse them as they refuse
+any island; the in-place patches, which `build_patches` reads from the listing directly,
+are filtered by span. `data_islands` adds the tables as exact spans rather than
+clustering their rows: the first build clustered them with the 256-byte gap and swept in
+real code between neighbouring tables, and `verify` failed on four islands holding
+correct in-place patches. The slot cut exists because the first version's 256-byte
+fallback, taken where no `cmp` is found, ran the table at `0x141823748` into the next
+function's prologue and kept three real VEX instructions as data.
+
+`verify` checks that no byte of any table changed. **Against the 677 build it fails**,
+naming 4 tables, first `0x140c55714`; against this one it passes, 2,383 spans. Five rows
+the listing counted as VEX instructions are table bytes -- `0x140c55716`, `0x140d35710`
+and Finding 225's `vphsubd` pool at `0x142c4079a` -- so the denominator is 804,946, not
+804,951. `--switch-guard=off` restores the old behaviour. There is no PE fixture: a
+table entry that decodes as a lowerable VEX instruction needs an RVA whose third byte is
+a VEX opcode, which puts the target past 1 MB; the control is the game build above.
+
+**677 -> 685 survivors** by `verify`'s count over the same listing, five of which are the
+table bytes above: 680 real instructions left of 804,946. The 202,359 detours and
+520,334 in-place patches are against 202,363 and 520,338.
 
 ### Finding 336 -- a window may hold branch targets that only its own branches reach
 
