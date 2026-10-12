@@ -14163,6 +14163,37 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 339 -- the stale-read repair costs 350 sites on the machines this is for
+
+The 636 build's last run died at `0x14374DCDC`, `kept: its window was withheld`, whose
+blame chain ends at a `vcmpgt_oqpd` with no SSE form (Finding 338). Every reader
+`stale_upper_reads` reports is a surviving 256-bit VEX instruction -- 256-bit sites are
+never patched in place, so a reader outside every placed window is VEX by construction.
+On a machine without AVX such a reader faults before it reads anything, so the stale
+value it would have read is never observed there. The repair keeps the image right on
+an AVX machine, and on the machines this project is for each withheld writer is only one
+more site that faults, earlier.
+
+`--stale-repair=off` measures it. `stale_upper_reads` reports nothing, so the repair
+loop withholds nothing, `apply` reverts no in-place patch for it, and `verify` says that
+it did not check rather than passing quietly. Measured on 2026-10-12 over the same
+listing:
+
+                                         on      off
+    VEX in .text                        636      286
+      kept: its window was withheld     358        0
+      kept: a repair left it in VEX       8        0
+    detours                         202,365  202,382
+
+Both include Finding 337's five table rows, so `off` leaves 281 real instructions of
+804,946 -- 99.97%. Every other `verify` check passes on the `off` image, and the
+game's fatal site is rewritten in it.
+
+**The default stays `on`, and changing it is the holder's decision**: it gives up
+correctness on an AVX machine, which Finding 333 called "the price of not writing wrong
+bytes". `off` is the better image for a CPU without AVX and the worse one anywhere
+else.
+
 ### Finding 338 -- a leaf function is cut only at an entry, and ends at its switch table
 
 The 685 build of Finding 337 ran through Steam on 2026-10-12 and stopped 79 seconds in

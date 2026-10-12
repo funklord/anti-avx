@@ -895,6 +895,7 @@ def run_configuration():
 	        f" hammock={'on' if HAMMOCK_RULE else 'off'}"
 	        f" switch-guard={'on' if SWITCH_GUARD else 'off'}"
 	        f" leaf-entries={'on' if LEAF_ENTRIES else 'off'}"
+	        f" stale-repair={'on' if STALE_REPAIR else 'off'}"
 	        f" spill={SPILL}"
 	        f" tool={tool_fingerprint()}")
 
@@ -10377,6 +10378,9 @@ SWITCH_BOUND = re.compile(r"^\$(0x[0-9a-f]+),%\w+$")
 # `__ImageBase + 0xd37919e9`. Finding 337.
 SWITCH_DATA = []
 SWITCH_GUARD = True
+# Whether a stale upper half read by a surviving VEX instruction is
+# repaired. See `stale_upper_reads`. Finding 339.
+STALE_REPAIR = True
 # Whether a refused leaf chunk is recut only at entry points rather than at
 # every branch target. Finding 338.
 LEAF_ENTRIES = True
@@ -10794,6 +10798,15 @@ def stale_upper_reads(instructions, blocked, sources, placed, patched,
 	folded into a pass. That inversion is what made the first version of
 	this silent exactly where the analysis is weakest.
 	"""
+	# **Every reader here is a surviving 256-bit VEX instruction**, so on a
+	# machine without AVX it faults before it reads anything, and the
+	# value it would have read is never observed. Withholding writers for
+	# its sake keeps the image right on an AVX machine and costs sites on
+	# the machines this project is for. `--stale-repair=off` measures that
+	# trade; it is not the default, because the default is a decision
+	# rather than a measurement. Finding 339.
+	if not STALE_REPAIR:
+		return [], 0, []
 	inside = set()
 	for start, length, _stub, _size, _prologue in placed:
 		inside.update(range(start, start + length))
@@ -15131,7 +15144,7 @@ def main(argv):
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
 	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE, TEB_SCRATCH
 	global INDEX_CONST, WRITER_CLEARS, HAMMOCK_RULE, SWITCH_GUARD
-	global LEAF_ENTRIES
+	global LEAF_ENTRIES, STALE_REPAIR
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -15169,6 +15182,16 @@ def main(argv):
 				      f"not {want!r}", file=sys.stderr)
 				return 2
 			HAMMOCK_RULE = want == "on"
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--stale-repair="):
+			want = item.split("=", 1)[1]
+			if want not in ("on", "off"):
+				print(f"detour.py: --stale-repair wants on or off, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			STALE_REPAIR = want == "on"
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
@@ -18129,6 +18152,10 @@ def verify(original, patched, listing=None):
 	stale, unresolved, unsure = stale_upper_reads(
 		instructions, blocked, sources, placed, narrowed_sites,
 		conservative=True)
+	if not STALE_REPAIR:
+		print("verify: stale upper-half reads NOT checked -- "
+		      "--stale-repair=off; every reader is a surviving VEX "
+		      "instruction (Finding 339)")
 	if unsure:
 		# **A candidate still narrowed in the IMAGE is a repair that did not
 		# happen.** `apply` keeps every one of these in its VEX form; asking
