@@ -138,7 +138,7 @@ def call_targets(instructions):
 	return found
 
 
-def chunks(instructions, ranges):
+def chunks(instructions, ranges, data=None):
 	"""Runs of instructions outside .pdata, split at int3 padding.
 
 	Splitting at padding is the part that matters. A run typically *begins*
@@ -167,12 +167,26 @@ def chunks(instructions, ranges):
 	leaf function cuts it in two, and the first piece then ends at the loop
 	head rather than at a `ret` and is refused. Losing a piece is the right
 	direction to be wrong in.
+
+	**`data` ends a chunk the way padding does.** It is the rows of the
+	switch tables the caller resolved, which MSVC places straight after the
+	function that dispatches through them. Running into them left the last
+	piece holding `(bad)`, and the setters at 0x14087d770 and 0x14087da40
+	-- a `vmovss` and a `ret` per case -- were refused whole, and faulted in
+	the game. A resolved table is known data, so where it starts the
+	function has ended.
+
+	**A trailing `nop` is not where a function ends**, so it is not what
+	"ends in a transfer" reads: the table is aligned, the `nop` before it
+	is padding, and recording it as the last instruction refused the same
+	setters a second time. The last instruction that is not a `nop` must
+	still be a transfer. Finding 338.
 	"""
 	starts = [start for start, _end in ranges]
 	out = []
 	current = None
 	for address, encoding, mnemonic, _operands in instructions:
-		padding = mnemonic == "int3"
+		padding = mnemonic == "int3" or (data is not None and address in data)
 		inside = covered(starts, ranges, address)
 		if inside or padding or (current and address != current[1]):
 			if current:
@@ -184,7 +198,8 @@ def chunks(instructions, ranges):
 			current = [address, address, 0, 0, 0, ""]
 		current[1] = address + len(encoding)
 		current[2] += 1
-		current[5] = mnemonic
+		if not mnemonic.startswith("nop"):
+			current[5] = mnemonic
 		if encoding[:1] in (b"\xc4", b"\xc5"):
 			current[3] += 1
 		if mnemonic == "(bad)":
@@ -194,7 +209,29 @@ def chunks(instructions, ranges):
 	return out
 
 
-def split_refused(instructions, found, known):
+def jump_sources(instructions):
+	"""{target: [source, ...]} for direct jumps, conditional or not.
+
+	Calls are left out on purpose: a call's destination is an entry point,
+	which is what `split_refused` is asking about, and a jump's is not
+	necessarily one.
+	"""
+	found = {}
+	for address, _encoding, mnemonic, operands in instructions:
+		if not operands or not mnemonic.startswith(("j", "loop")):
+			continue
+		first = operands.split()[0]
+		if not first.startswith("0x"):
+			continue
+		try:
+			target = int(first, 16)
+		except ValueError:
+			continue
+		found.setdefault(target, []).append(address)
+	return found
+
+
+def split_refused(instructions, found, known, entries=None):
 	"""`found`, with every REFUSED chunk re-cut at its entry points.
 
 	**Padding says where a function ends and an entry point says where one
@@ -223,12 +260,20 @@ def split_refused(instructions, found, known):
 	their internal loop heads. A chunk that already passes has nothing to
 	gain from being cut and everything to lose, so it is left whole.
 
-	It still under-admits, on purpose: an internal jump target inside a
-	refused leaf function cuts it in two and the first piece then ends at the
-	loop head rather than at a `ret`. Losing a piece is the right direction
-	to be wrong in. Finding 313.
+	**With `entries`, a jump target the chunk's own jumps alone reach is
+	not a cut.** Cutting there split a genuine leaf function in two, and the
+	first piece then ended at a conditional jump and was refused: the setter
+	at 0x14087da40, reached through a vtable, branches over its own store to
+	0x14087da5e, and its `vmovss` stayed VEX and faulted in the game.
+	`entries` holds the addresses that ARE entry points whatever branches to
+	them -- relocated, tabled, called, address-taken -- and a jump target is
+	cut at only when it is one of those or a jump from outside the chunk
+	reaches it. That cuts less, never more, so every piece still begins at
+	an entry and is judged by the same strict conditions. Without `entries`
+	every known address cuts, as before. Finding 338.
 	"""
 	out = []
+	sources = jump_sources(instructions) if entries is not None else {}
 	order = [address for address, _e, _m, _o in instructions]
 	rows = {address: (encoding, mnemonic)
 	        for address, encoding, mnemonic, _o in instructions}
@@ -242,14 +287,16 @@ def split_refused(instructions, found, known):
 		while i < len(order) and order[i] < chunk[1]:
 			address = order[i]
 			encoding, mnemonic = rows[address]
-			if piece is not None and address in known and address != piece[0]:
+			if piece is not None and address in known and address != piece[0] \
+					and cuts(address, chunk, entries, sources):
 				out.append(piece)
 				piece = None
 			if piece is None:
 				piece = [address, address, 0, 0, 0, "", True]
 			piece[1] = address + len(encoding)
 			piece[2] += 1
-			piece[5] = mnemonic
+			if not mnemonic.startswith("nop"):
+				piece[5] = mnemonic
 			if encoding[:1] in (b"\xc4", b"\xc5"):
 				piece[3] += 1
 			if mnemonic == "(bad)":
@@ -258,6 +305,14 @@ def split_refused(instructions, found, known):
 		if piece is not None:
 			out.append(piece)
 	return out
+
+
+def cuts(address, chunk, entries, sources):
+	"""Whether a recut starts a new piece at `address`. See `split_refused`."""
+	if entries is None or address in entries:
+		return True
+	return any(not chunk[0] <= source < chunk[1]
+	           for source in sources.get(address, ()))
 
 
 def classify(chunk, known):
@@ -326,9 +381,53 @@ def control():
 				f"{'accepted' if got else 'refused'} and must be "
 				f"{'accepted' if want else 'refused'}. No result below "
 				f"means anything.")
+	# **And the cut rule, on the game's own shape**: a setter that jumps
+	# over its store to 0x100c, followed by data the whole chunk refuses
+	# on. The piece from 0x1000 must be admitted when only its own jump
+	# reaches 0x100c, and refused when a jump from outside does. Finding
+	# 338.
+	rows = [(0x1000, b"\x48\x8b\x51\x08", "mov", "0x8(%rcx),%rdx"),
+	        (0x1004, b"\x75\x06", "jne", "0x100c"),
+	        (0x1006, b"\xc5\xfa\x11\x42\x40\x90", "vmovss", "%xmm0,0x40(%rdx)"),
+	        (0x100c, b"\x48\x8b\x51\x08", "mov", "0x8(%rcx),%rdx"),
+	        (0x1010, b"\xc3", "ret", ""),
+	        (0x1011, b"\xff", "(bad)", "")]
+	whole = [[0x1000, 0x1012, 6, 1, 1, "(bad)"]]
+	for name, extra, want in (("its own jump alone", [], True),
+	                          ("a jump from outside", [(0x2000, b"\xeb\x00",
+	                                                    "jmp", "0x100c")],
+	                           False)):
+		pieces = split_refused(rows + extra, whole, {0x1000, 0x100c, 0x1011},
+		                       {0x1000, 0x1011})
+		got = any(piece[0] == 0x1000 and classify(piece, {0x1000})[1]
+		          for piece in pieces)
+		if got is not want:
+			raise SystemExit(
+				f"outside.py: the control failed -- with {name} reaching "
+				f"0x100c the piece from 0x1000 was "
+				f"{'accepted' if got else 'refused'}. No result below "
+				f"means anything.")
+	# **A resolved switch table ends a chunk like padding**: the case
+	# `vmovss; ret` followed by its table must be accepted when the table's
+	# rows are named as data, and refused when they are not. Finding 338.
+	case = [(0x3000, b"\xc5\xfa\x10\x05\0\0\0\0", "vmovss",
+	         "0x0(%rip),%xmm0"),
+	        (0x3008, b"\xc3", "ret", ""),
+	        (0x3009, b"\x90", "nop", ""),
+	        (0x300a, b"\xa5\xd7\x87\x00", "(bad)", "")]
+	for name, data, want in (("named as data", {0x300a}, True),
+	                         ("not named", None, False)):
+		got = any(chunk[0] == 0x3000 and classify(chunk, {0x3000})[1]
+		          for chunk in chunks(case, [], data))
+		if got is not want:
+			raise SystemExit(
+				f"outside.py: the control failed -- a case ending in its "
+				f"switch table, {name}, was "
+				f"{'accepted' if got else 'refused'}. No result below "
+				f"means anything.")
 
 
-def leaf_ranges(instructions, ranges, known):
+def leaf_ranges(instructions, ranges, known, entries=None, data=None):
 	"""(start, end) of every chunk outside .pdata that is provably code.
 
 	Returned in the same shape as `patch.function_ranges`, so the two
@@ -338,7 +437,8 @@ def leaf_ranges(instructions, ranges, known):
 	control()
 	return sorted((first, end)
 	              for chunk in split_refused(
-	                  instructions, chunks(instructions, ranges), known)
+	                  instructions, chunks(instructions, ranges, data), known,
+	                  entries)
 	              for first, end in [(chunk[0], chunk[1])]
 	              if classify(chunk, known)[1])
 

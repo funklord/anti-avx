@@ -894,6 +894,7 @@ def run_configuration():
 	        f" writer-clears={'on' if WRITER_CLEARS else 'off'}"
 	        f" hammock={'on' if HAMMOCK_RULE else 'off'}"
 	        f" switch-guard={'on' if SWITCH_GUARD else 'off'}"
+	        f" leaf-entries={'on' if LEAF_ENTRIES else 'off'}"
 	        f" spill={SPILL}"
 	        f" tool={tool_fingerprint()}")
 
@@ -10376,6 +10377,9 @@ SWITCH_BOUND = re.compile(r"^\$(0x[0-9a-f]+),%\w+$")
 # `__ImageBase + 0xd37919e9`. Finding 337.
 SWITCH_DATA = []
 SWITCH_GUARD = True
+# Whether a refused leaf chunk is recut only at entry points rather than at
+# every branch target. Finding 338.
+LEAF_ENTRIES = True
 # The rows `switch_data_rows` turned to `(bad)`, which `data_islands` keeps
 # out of its clustering and adds back as the exact table spans.
 SWITCH_TURNED = set()
@@ -11161,8 +11165,20 @@ def collect(binary, listing, context=None):
 	# them, under conditions strict enough that data cannot pass: bracketed
 	# by int3, entered by a call or jump, ending in a control transfer, and
 	# containing no byte objdump failed to decode.
+	#
+	# **A recut leaf is cut only at an entry point**, so a jump over the
+	# function's own store does not split it -- see `outside.split_refused`.
+	# Entries are what `INDIRECT_TARGETS` holds plus every direct call's
+	# destination. Finding 338.
 	described = inplace.function_ranges(binary)
-	ranges = sorted(described + outside.leaf_ranges(plain, described, blocked))
+	entries = data = None
+	if LEAF_ENTRIES:
+		entries = set(INDIRECT_TARGETS) | outside.call_targets(
+			[row for row in plain if row[2].startswith("call")])
+		data = {row[0] for row in plain if row[2] == "(bad)"
+		        and in_switch_data(row[0], row[0] + len(row[1]))}
+	ranges = sorted(described + outside.leaf_ranges(plain, described, blocked,
+	                                                entries, data))
 	# What each function never touches, for the sites the forward scan
 	# cannot get past. Computed once; it is a pass over the whole listing.
 	scope = scratch_finder.function_scope(plain, ranges)
@@ -15115,6 +15131,7 @@ def main(argv):
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
 	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE, TEB_SCRATCH
 	global INDEX_CONST, WRITER_CLEARS, HAMMOCK_RULE, SWITCH_GUARD
+	global LEAF_ENTRIES
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
@@ -15152,6 +15169,16 @@ def main(argv):
 				      f"not {want!r}", file=sys.stderr)
 				return 2
 			HAMMOCK_RULE = want == "on"
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--leaf-entries="):
+			want = item.split("=", 1)[1]
+			if want not in ("on", "off"):
+				print(f"detour.py: --leaf-entries wants on or off, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			LEAF_ENTRIES = want == "on"
 			del argv[i]
 			break
 	for i, item in enumerate(argv):

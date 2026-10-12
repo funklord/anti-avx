@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,266 of 804,946 VEX
-sites -- 99.92%** -- through 202,359 detours, and every `make detour-verify` invariant
-holds on the result. **680 sites are left** (Finding 337, 2026-10-11), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,315 of 804,946 VEX
+sites -- 99.92%** -- through 202,365 detours, and every `make detour-verify` invariant
+holds on the result. **631 sites are left** (Finding 338, 2026-10-12), five more rows
 that read as VEX are switch-table bytes and not instructions, and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           680 re-measured   (Finding 337)
+    default build                           631 re-measured   (Finding 338)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,266 of 804,946 VEX sites, 99.92%, through 202,359 detours**, and 180 further
+**804,315 of 804,946 VEX sites, 99.92%, through 202,365 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass, including that no surviving 256-bit read takes an upper half
 the rewrite left stale. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,52 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 338 -- a leaf function is cut only at an entry, and ends at its switch table
+
+The 685 build of Finding 337 ran through Steam on 2026-10-12 and stopped 79 seconds in
+on `EXCEPTION_ILLEGAL_INSTRUCTION` at `0x14087DA4D`, a `vmovss` filed `declined: outside
+.pdata`. Its function is a setter with no unwind data, reached through a vtable at file
+offset `0x4b50c68`:
+
+    14087da40  mov    0x8(%rcx),%rdx
+    14087da47  cmpb   $0x0,0x44(%rdx)
+    14087da4b  jne    14087da5e               over its own store
+    14087da4d  vmovss 0x56150bb(%rip),%xmm0   the fault
+    14087da55  vmovss %xmm0,0x40(%rdx)
+    14087da5e  ...
+
+**`split_refused` cut it at its own `jne`'s target.** A refused chunk is recut at every
+known address (Finding 313), so the piece from `0x14087da40` ended at the conditional
+jump and was refused; the docstring called that the right direction to be wrong in, and
+the game reached it. `split_refused` now takes `entries` -- `INDIRECT_TARGETS` plus every
+direct call's destination -- and cuts at a known address only when it is one of those or
+a jump from outside the chunk reaches it. That cuts less and never more, so every piece
+still starts at an entry and is held to the same strict conditions.
+
+That build ran 73 seconds and met two more setters of the same family, at `0x14087DB47`
+and `0x14087D7AE`, each dispatching through a switch whose table follows it. Since
+Finding 337 the table's rows are `(bad)`, so the last piece ran into them and was
+refused for holding data. `chunks` now takes the resolved table rows as `data` and ends
+a chunk at them as at `int3`; and a trailing `nop` -- the table's alignment -- is no
+longer what "ends in a transfer" reads, since padding is not where a function ends.
+`outside.control` checks each rule on the game's shapes and fails with any of them
+removed. `--leaf-entries=off` restores the old oracle.
+
+    VEX in .text                       685 ->  636
+      outside .pdata                    74 ->   30
+
+636 includes Finding 337's five table rows: 631 real instructions left of 804,946.
+Fourteen sites the first cut rule refused, among them `0x1402b2c42`, came back with the
+table rule; why cutting less had refused them was not established.
+
+The same run's fatal fault was elsewhere: seven threads at `0x14374DCDC`, a 256-bit
+`vperm2f128` at the entry of a packed-double math routine, `kept: its window was
+withheld`. Its blame chain ends at the `vcmpgt_oqpd` at `0x14374eb63`, which has no SSE
+form. **Whether to keep withholding writers for a reader that faults anyway is the
+holder's question**: the repair exists so the image stays right on an AVX machine
+(Finding 333's "the price of not writing wrong bytes"), and on a machine without AVX a
+withheld writer is only one more site that faults. The withheld class is 358.
 
 ### Finding 337 -- a switch table that decodes as VEX is data, and was being rewritten
 
