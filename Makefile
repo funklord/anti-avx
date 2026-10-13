@@ -1070,14 +1070,16 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 		{ echo "check-verify: the badrow control failed, but not through"; \
 		  echo "              the candidate-loop check"; exit 1; }
 # The staleupper control needs an image built WITHOUT the repair, so it runs
-# apply under the environment variable and verifies the result normally.
+# apply under the environment variable and verifies the result with the
+# repair's check on -- the default leaves it off since Finding 340.
 # repairdrop is the only fixture the repair pass reaches -- Finding 231
 # measured the other 39 as untouched by it.
 	@set -e; \
-	ANTI_AVX_SABOTAGE=staleupper $(PYTHON) tool/detour.py apply \
+	ANTI_AVX_SABOTAGE=staleupper $(PYTHON) tool/detour.py \
+		--stale-repair=on apply \
 		$(BUILD_DIR)/pe-repairdrop.exe $(BUILD_DIR)/pe-repairdrop.asm \
 		$(BUILD_DIR)/bad-staleupper.exe > /dev/null; \
-	if timeout 300 $(PYTHON) tool/detour.py verify \
+	if timeout 300 $(PYTHON) tool/detour.py --stale-repair=on verify \
 		$(BUILD_DIR)/pe-repairdrop.exe $(BUILD_DIR)/bad-staleupper.exe \
 		$(BUILD_DIR)/pe-repairdrop.asm \
 		> $(BUILD_DIR)/verify-bad-staleupper.log 2>&1; then \
@@ -1117,12 +1119,14 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 # A conservative candidate is one the walk could not rule out, kept in its
 # VEX form at the price of the site (Finding 198). No corrupted image can
 # express "a repair that did not happen", so this needs a code control, and
-# the `conservative` fixture is the only input that produces one.
+# the `conservative` fixture is the only input that produces one. Both
+# halves ask for the repair, which the default leaves off since Finding 340.
 	@set -e; \
-	ANTI_AVX_SABOTAGE=conservative $(PYTHON) tool/detour.py apply \
+	ANTI_AVX_SABOTAGE=conservative $(PYTHON) tool/detour.py \
+		--stale-repair=on apply \
 		$(BUILD_DIR)/pe-conservative.exe $(BUILD_DIR)/pe-conservative.asm \
 		$(BUILD_DIR)/bad-conservative.exe > /dev/null; \
-	if timeout 300 $(PYTHON) tool/detour.py verify \
+	if timeout 300 $(PYTHON) tool/detour.py --stale-repair=on verify \
 		$(BUILD_DIR)/pe-conservative.exe $(BUILD_DIR)/bad-conservative.exe \
 		$(BUILD_DIR)/pe-conservative.asm \
 		> $(BUILD_DIR)/verify-bad-conservative.log 2>&1; then \
@@ -1274,11 +1278,17 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 	@# So this fixture went on answering 77 while covering nothing, which
 	@# is exactly the failure Finding 205 wrote it against, and the gate
 	@# caught it the hour the default changed. Finding 287.
+	@#
+	@# **Its own output, not `sse-regioncarry.exe`.** Writing the shared
+	@# fixture here left an image built under `--shadow-regs=off` that
+	@# `make` then took as up to date, and `check-verify` judged it under
+	@# the default and failed on six boundaries and a clobbered register.
+	@# Finding 340.
 	@set -e; \
 	$(PYTHON) tool/detour.py --shadow-regs=off apply \
 		$(BUILD_DIR)/pe-regioncarry.exe \
 		$(BUILD_DIR)/pe-regioncarry.asm \
-		$(BUILD_DIR)/sse-regioncarry.exe > $(BUILD_DIR)/regioncarry.log; \
+		$(BUILD_DIR)/sse-regioncarry-off.exe > $(BUILD_DIR)/regioncarry.log; \
 	if grep -qE '^apply:   region +[0-9]' $(BUILD_DIR)/regioncarry.log; then \
 		echo "check-pe: regioncarry places a region, so the region lowering"; \
 		echo "          is the thing its answer came from"; \
@@ -1539,7 +1549,7 @@ clean:
 	      $(BUILD_DIR)/icache_bench \
 	      $(BUILD_DIR)/after.asm $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm \
 	      $(BUILD_DIR)/isa-disasm.txt $(BUILD_DIR)/region-refused.txt \
-	      $(BUILD_DIR)/regioncarry.log \
+	      $(BUILD_DIR)/regioncarry.log $(BUILD_DIR)/sse-regioncarry-off.exe \
 	      $(BUILD_DIR)/bad-stubvex.exe $(BUILD_DIR)/bad-section.exe \
 	      $(BUILD_DIR)/bad-island.exe \
 	      $(PE_NAMES:%=$(BUILD_DIR)/verify-%.log) \

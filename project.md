@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,315 of 804,946 VEX
-sites -- 99.92%** -- through 202,365 detours, and every `make detour-verify` invariant
-holds on the result. **631 sites are left** (Finding 338, 2026-10-12), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,665 of 804,946 VEX
+sites -- 99.97%** -- through 202,382 detours, and every `make detour-verify` invariant
+holds on the result. **281 sites are left** (Finding 340, 2026-10-13), five more rows
 that read as VEX are switch-table bytes and not instructions, and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
@@ -11912,15 +11912,15 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           631 re-measured   (Finding 338)
+    default build                           281 re-measured   (Finding 340)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,315 of 804,946 VEX sites, 99.92%, through 202,365 detours**, and 180 further
+**804,665 of 804,946 VEX sites, 99.97%, through 202,382 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
-`verify` checks pass, including that no surviving 256-bit read takes an upper half
-the rewrite left stale. Re-derive the share from `build/text.asm` rather than
+`verify` checks pass. The one that asked whether a surviving 256-bit read takes an
+upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
 quoting it: this line has twice carried a rewritten count from one configuration
 beside a frontier from another.
 
@@ -14163,6 +14163,31 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 340 -- the stale-read repair is off by default, on the holder's decision
+
+The 636 build ran through Steam on 2026-10-12 for 123 seconds, the longest run yet, and
+every illegal instruction in it was the one site, `0x14374DCDC`, on nine threads.
+Finding 339 had measured what withholding writers for a surviving reader costs. **The
+holder decided on 2026-10-13 that `--stale-repair=off` is the default**: the image is
+for machines without AVX, where such a reader faults before it reads. The image stops
+being right on an AVX machine wherever a reader survives, and `--stale-repair=on`
+restores that.
+
+The default image is Finding 339's `off` measurement: **281 real instructions left of
+804,946**, 286 by `verify`'s count with the five table rows.
+
+Two controls test the repair itself and now ask for it: `staleupper`, which breaks the
+image, and `conservative`, which breaks the code. Under the new default the second
+passed `verify`, correctly, because there was no longer anything to catch.
+
+**And a Makefile hazard surfaced on the way.** `check-pe` built `sse-regioncarry.exe`
+under `--shadow-regs=off` to prove the region strategy places, overwriting the fixture
+`check-verify` reads under the default. Any edit to `tool/detour.py` rebuilt it before
+the next `check`, so it never showed; a Makefile-only edit did not, and `check-verify`
+failed on six boundaries and a clobbered register in an image built under other flags.
+The region check writes `sse-regioncarry-off.exe` now, and a second `make check` after
+`check-pe` passes.
+
 ### Finding 339 -- the stale-read repair costs 350 sites on the machines this is for
 
 The 636 build's last run died at `0x14374DCDC`, `kept: its window was withheld`, whose
@@ -14189,7 +14214,8 @@ Both include Finding 337's five table rows, so `off` leaves 281 real instruction
 804,946 -- 99.97%. Every other `verify` check passes on the `off` image, and the
 game's fatal site is rewritten in it.
 
-**The default stays `on`, and changing it is the holder's decision**: it gives up
+**The default stayed `on`, and changing it was the holder's decision** -- taken in
+Finding 340: it gives up
 correctness on an AVX machine, which Finding 333 called "the price of not writing wrong
 bytes". `off` is the better image for a CPU without AVX and the worse one anywhere
 else.

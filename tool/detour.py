@@ -10379,8 +10379,10 @@ SWITCH_BOUND = re.compile(r"^\$(0x[0-9a-f]+),%\w+$")
 SWITCH_DATA = []
 SWITCH_GUARD = True
 # Whether a stale upper half read by a surviving VEX instruction is
-# repaired. See `stale_upper_reads`. Finding 339.
-STALE_REPAIR = True
+# repaired. Off by default since 2026-10-13, on the holder's decision: the
+# image is for machines without AVX, where such a reader faults before it
+# reads. See `stale_upper_reads`. Findings 339 and 340.
+STALE_REPAIR = False
 # Whether a refused leaf chunk is recut only at entry points rather than at
 # every branch target. Finding 338.
 LEAF_ENTRIES = True
@@ -10803,8 +10805,9 @@ def stale_upper_reads(instructions, blocked, sources, placed, patched,
 	# value it would have read is never observed. Withholding writers for
 	# its sake keeps the image right on an AVX machine and costs sites on
 	# the machines this project is for. `--stale-repair=off` measures that
-	# trade; it is not the default, because the default is a decision
-	# rather than a measurement. Finding 339.
+	# trade, and is the default since the holder decided it on 2026-10-13;
+	# `--stale-repair=on` keeps the image right on an AVX machine too.
+	# Findings 339 and 340.
 	if not STALE_REPAIR:
 		return [], 0, []
 	inside = set()
