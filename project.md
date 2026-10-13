@@ -14216,6 +14216,17 @@ so they refused, 207 sites came back as survivors -- 256-bit arithmetic, `vmulps
 failed. The vzeroupper's `nopl (%rax)` was a false positive in the first check; `0F
 18`-`0F 1F` are excluded.
 
+**The step-1 build ran through Steam on 2026-10-14 for about 470 seconds**, three times
+the longest before, and no alignment fault recurred. It ended on a survivor at
+`0x140D80AFD`, a 4-byte `vmulss` filed `next instruction is a branch target`: it and the
+instruction after it are both entered by jumps from elsewhere in the function
+(`0x140d80bad`, `0x140d80bc7` and `0x140d809bc`, `0x140d809d1`), so neither a widened
+window nor Finding 336's hammock can take it. One second earlier the main thread took
+a first-chance access violation in unmodified code, `mov %rdx,(%rcx)` at
+`0x1422CC4BE` with `rcx = 0x88` -- a member of a null object -- which the game
+survived; whether it is the game's own or a wrong value from the rewrite upstream is
+not established.
+
 **What the 678 are, measured on the committed build 2026-10-13** (`alignment_hazard`
 over `objdump -w` of `.avxsse`): `mulps` 218, `addps` 201, `subps` 72, `andps` 52,
 `paddq` 32, `mulpd` 25, `addpd` 21, `addsubps` 14, `blendvps` 12, `pcmpeqb` 12. By
