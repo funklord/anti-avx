@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,665 of 804,946 VEX
-sites -- 99.97%** -- through 202,382 detours, and every `make detour-verify` invariant
-holds on the result. **281 sites are left** (Finding 340, 2026-10-13), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,657 of 804,946 VEX
+sites -- 99.96%** -- through 203,058 detours, and every `make detour-verify` invariant
+holds on the result. **289 sites are left** (Finding 341, 2026-10-13), five more rows
 that read as VEX are switch-table bytes and not instructions, and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           281 re-measured   (Finding 340)
+    default build                           289 re-measured   (Finding 341)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,665 of 804,946 VEX sites, 99.97%, through 202,382 detours**, and 180 further
+**804,657 of 804,946 VEX sites, 99.96%, through 203,058 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
