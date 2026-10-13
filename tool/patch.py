@@ -233,7 +233,65 @@ def decode_vex(encoding):
 	return None
 
 
-def sse_encoding(vex, tail):
+# **Legacy SSE faults on a 16-byte memory operand that is not 16-byte
+# aligned; VEX does not.** These are the legacy forms, by (map, pp, opcode),
+# whose memory operand carries NO such requirement -- a scalar or narrower
+# operand, an explicitly unaligned move, or an instruction whose VEX form
+# required alignment already (`movaps`, `movdqa`, the non-temporals), where
+# lowering changes nothing. Every other form with a memory operand needs it
+# aligned. pp: 0 none, 1 66, 2 F3, 3 F2. Finding 341.
+_ANY = (0, 1, 2, 3)
+ALIGN_GUARD = True
+ALIGNMENT_FREE = set()
+for _pp, _ops in (((0, 1), (0x10, 0x11, 0x12, 0x13, 0x16, 0x17, 0x28, 0x29,
+                             0x2B, 0x2E, 0x2F, 0xAE, 0xC4)),
+                  ((2, 3), tuple(range(0x10, 0x12)) + (0x2C, 0x2D, 0x2A,
+                             0x51, 0x52, 0x53, 0x58, 0x59, 0x5A, 0x5C, 0x5D,
+                             0x5E, 0x5F, 0xC2, 0x7E, 0xD6)),
+                  ((2,), (0x6F, 0x7F, 0x2C, 0x2D)),
+                  ((3,), (0x12, 0xF0, 0x7C, 0x7D)),
+                  ((1,), (0x6F, 0x7F, 0xE7, 0x6E, 0x7E, 0xD6, 0xC4, 0xC5,
+                          0x2B, 0x28, 0x29, 0x2E, 0x2F, 0x12, 0x13, 0x16,
+                          0x17))):
+	for _p in _pp:
+		for _op in _ops:
+			ALIGNMENT_FREE.add((1, _p, _op))
+for _op in (0x6E, 0x7E, 0x5A):
+	ALIGNMENT_FREE.add((1, 0, _op))
+# movsldup/movshdup are F3 0F 12/16 with an m128 that must be aligned, and
+# movhlps-style 12/13/16/17 are m64 only under none/66; take those back.
+ALIGNMENT_FREE.discard((1, 2, 0x12))
+ALIGNMENT_FREE.discard((1, 2, 0x16))
+# haddps/hsubps (F2 7C/7D) are m128 and aligned; take those back too.
+ALIGNMENT_FREE.discard((1, 3, 0x7C))
+ALIGNMENT_FREE.discard((1, 3, 0x7D))
+for _op in list(range(0x20, 0x26)) + list(range(0x30, 0x36)) + [0x2A]:
+	ALIGNMENT_FREE.add((2, 1, _op))		# pmovsx/pmovzx (narrow), movntdqa
+for _op in (0x0A, 0x0B, 0x14, 0x15, 0x16, 0x17, 0x20, 0x21, 0x22,
+            0x60, 0x61, 0x62, 0x63):
+	ALIGNMENT_FREE.add((3, 1, _op))		# scalar rounds, extracts, inserts,
+						# and pcmpXstrX, which SSE4.2 exempts
+
+
+def memory_operand(tail):
+	"""The memory operand's kind: None for a register, "rip", or "other"."""
+	if len(tail) < 2:
+		return None
+	mod, rm = tail[1] >> 6, tail[1] & 7
+	if mod == 3:
+		return None
+	return "rip" if mod == 0 and rm == 5 else "other"
+
+
+def needs_alignment(vex, tail):
+	"""Whether the legacy form of this needs its memory operand aligned
+	where the VEX form did not. See `ALIGNMENT_FREE`."""
+	if memory_operand(tail) is None:
+		return False
+	return (vex["map"], vex["pp"], tail[0]) not in ALIGNMENT_FREE
+
+
+def sse_encoding(vex, tail, guarded=False):
 	"""The SSE bytes equivalent to a VEX prefix plus everything after it.
 
 	**Refuses VEX.L, and that refusal is the whole point of this guard being
@@ -270,6 +328,20 @@ def sse_encoding(vex, tail):
 		if not (predicate < 8 or 16 <= predicate < 24):
 			return None
 		tail = tail[:-1] + bytes([predicate & 7])
+	# **And a memory operand legacy SSE needs aligned, where nothing says it
+	# is.** `vmulps -0x8(%rax),%xmm2,%xmm1` reads any address; `mulps` the
+	# same operand faults unless it is 16-byte aligned, and Starfield ran
+	# one into a general-protection fault 158 seconds in. A RIP operand's
+	# address is fixed, and `verify` checks each one; anything else is
+	# refused here, and `lower_vex` loads it with `movups` first. Every path
+	# that strips a VEX prefix comes through here, but only a caller with
+	# somewhere else to go asks for the refusal: the in-place pass, whose
+	# site becomes a detour, and `lower_vex`, which loads first. The 256-bit
+	# emitters have no fallback yet and `verify` counts what they leave.
+	# Finding 341.
+	if guarded and ALIGN_GUARD and needs_alignment(vex, tail) \
+			and memory_operand(tail) != "rip":
+		return None
 	out = bytearray()
 	legacy = PP_PREFIX[vex["pp"]]
 	if legacy is not None:
@@ -463,7 +535,7 @@ def build_patches(listing, ranges=None):
 			blocked[mnemonic] += 1
 			continue
 
-		replacement = sse_encoding(vex, tail)
+		replacement = sse_encoding(vex, tail, guarded=True)
 		if replacement is None:
 			stats["unencodable"] += 1
 			continue

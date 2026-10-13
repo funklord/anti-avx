@@ -896,6 +896,7 @@ def run_configuration():
 	        f" switch-guard={'on' if SWITCH_GUARD else 'off'}"
 	        f" leaf-entries={'on' if LEAF_ENTRIES else 'off'}"
 	        f" stale-repair={'on' if STALE_REPAIR else 'off'}"
+	        f" align-guard={'on' if inplace.ALIGN_GUARD else 'off'}"
 	        f" spill={SPILL}"
 	        f" tool={tool_fingerprint()}")
 
@@ -1582,7 +1583,27 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 	# counted decline into a stub that could never build, under a reason
 	# naming a four-operand form. Finding 111.
 
-	operation = inplace.sse_encoding(vex, tail)
+	# **A memory operand legacy SSE needs aligned is loaded with `movups`
+	# first**, and the operation runs register to register: VEX read the
+	# operand at any address, and `sse_encoding` refuses the legacy memory
+	# form unless the address is fixed. The load goes to the scratch where
+	# there is one, or -- for an operation that commutes exactly and was
+	# going to copy src1 into the destination anyway -- to the destination,
+	# with src1 as the register operand. Finding 341.
+	if inplace.ALIGN_GUARD and inplace.needs_alignment(vex, tail) \
+			and inplace.memory_operand(tail) != "rip":
+		source = registers_of(vex, tail)[1] if len(registers) == 3 \
+			else None
+		split = unaligned_split(vex, tail, mnemonic, source, body,
+		                        scratch)
+		if split is None:
+			if reasons is not None:
+				reasons["lower: an unaligned memory operand and no "
+				        "register to load it into"] += 1
+			return None
+		return split
+
+	operation = inplace.sse_encoding(vex, tail, guarded=True)
 	if operation is None:
 		if reasons is not None:
 			# `sse_encoding` refuses two different things and they mean
@@ -1626,6 +1647,73 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 		             + operation[offset + 4:])
 	body += operation
 	return bytes(body)
+
+
+# Operations whose two sources commute bit for bit -- no NaN to choose
+# between, no order in the result. Finding 341.
+EXACTLY_COMMUTATIVE = re.compile(
+	r"^v(andp[sd]|orp[sd]|xorp[sd]|pand|por|pxor|padd[bwdq]|paddus?[bw]"
+	r"|pcmpeq[bwdq]|pmull[wd]|pmulhu?w|pmuludq|pmuldq|pm(ax|in)[su][bwd]"
+	r"|pavg[bw])$")
+
+
+def addressing_bytes(tail):
+	"""How many bytes past the modrm a memory operand's SIB and
+	displacement take."""
+	mod, rm = tail[1] >> 6, tail[1] & 7
+	sib = 1 if rm == 4 else 0
+	base = tail[2] & 7 if sib and len(tail) > 2 else None
+	if mod == 1:
+		disp = 1
+	elif mod == 2 or (mod == 0 and (rm == 5 or base == 5)):
+		disp = 4
+	else:
+		disp = 0
+	return sib + disp
+
+
+def unaligned_split(vex, tail, mnemonic, source, body, scratch):
+	"""`movups mem,L` and the operation on L, or None. See `lower_vex`.
+
+	`body` holds what `lower_vex` has set up so far: nothing, or the
+	`movaps src1,dest` of a three-operand form, whose src1 is `source`
+	(None for any other form). The memory operand addresses through
+	general registers only, so loading it before or after that copy reads
+	the same bytes.
+	"""
+	extra = addressing_bytes(tail)
+	if len(tail) < 2 + extra:
+		return None
+	addressing = tail[2:2 + extra]
+	immediate = tail[2 + extra:]
+	destination = (vex["R"] << 3) | ((tail[1] >> 3) & 7)
+	copied = len(body) > 0
+
+	def load(into):
+		return inplace.sse_encoding(
+			dict(vex, map=1, pp=0, W=0, R=into >> 3, L=0),
+			bytes([0x10, (tail[1] & 0xC7) | ((into & 7) << 3)])
+			+ addressing)
+
+	def operate(onto, operand):
+		return inplace.sse_encoding(
+			dict(vex, R=onto >> 3, X=0, B=operand >> 3),
+			bytes([tail[0], 0xC0 | ((onto & 7) << 3) | (operand & 7)])
+			+ immediate)
+
+	if scratch is not None and scratch != destination \
+			and scratch != source:
+		first, second = load(scratch), operate(destination, scratch)
+		if first is None or second is None:
+			return None
+		return first + bytes(body) + second
+	if copied and source is not None and source != destination \
+			and EXACTLY_COMMUTATIVE.match(mnemonic):
+		first, second = load(destination), operate(destination, source)
+		if first is None or second is None:
+			return None
+		return first + second
+	return None
 
 
 def prologue_frame(data, unwind_at, start, depth=0):
@@ -11955,8 +12043,16 @@ def collect(binary, listing, context=None):
 		           and len(registers) == 3
 		           and registers[-1] != registers[-2]
 		           and registers[0] == registers[-1])
+		# **And a memory operand legacy SSE needs aligned**, which is loaded
+		# with `movups` into a scratch first. Finding 341.
+		shape = inplace.decode_vex(encoding)
+		unaligned = (shape is not None and inplace.ALIGN_GUARD
+		             and inplace.needs_alignment(
+		                 shape, encoding[shape["length"]:])
+		             and inplace.memory_operand(
+		                 encoding[shape["length"]:]) != "rip")
 		scratch = None
-		if needs_sequence or aliased:
+		if needs_sequence or aliased or unaligned:
 			scratch = scratch_finder.find_scratch(plain, index, scope=scope)
 			trial = lower_vex(address, encoding, operands, mnemonic,
 			                  address, scratch, address)
@@ -15188,6 +15284,16 @@ def main(argv):
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
+		if item.startswith("--align-guard="):
+			want = item.split("=", 1)[1]
+			if want not in ("on", "off"):
+				print(f"detour.py: --align-guard wants on or off, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			inplace.ALIGN_GUARD = want == "on"
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
 		if item.startswith("--stale-repair="):
 			want = item.split("=", 1)[1]
 			if want not in ("on", "off"):
@@ -18247,7 +18353,9 @@ def verify(original, patched, listing=None):
 		print(f"verify: all {len(inside_switch):,} switch targets from "
 		      f"{resolved_tables:,} tables still begin an instruction")
 
-	done = subprocess.run(["objdump", "-d", "-j", ".avxsse", patched],
+	# `-w`, so an instruction is one line: a long one wrapped onto a second
+	# line left the alignment check below reading half its bytes.
+	done = subprocess.run(["objdump", "-d", "-w", "-j", ".avxsse", patched],
 	                      capture_output=True, text=True, errors="replace")
 	stub_vex = sum(1 for line in done.stdout.splitlines()
 	               if len(line.split("\t")) >= 3
@@ -18438,7 +18546,111 @@ def verify(original, patched, listing=None):
 	      f"plus one per swallowed transfer")
 	if stub_vex:
 		problems += 1
+
+	# **No legacy SSE operand that must be aligned, unless its address is
+	# fixed and is.** VEX reads a memory operand at any address and legacy
+	# SSE faults on a 16-byte one that is not aligned; the game reached
+	# `mulps -0x8(%rax)` 158 seconds in. `sse_encoding` refuses the form,
+	# and this asks the output: every rewritten site in `.text` and every
+	# stub instruction, read from the image's own bytes. A RIP operand is
+	# allowed where its target is aligned, which is a fact of the image.
+	# Finding 341.
+	hazards, stub_hazards, rip_checked = [], [], 0
+	for line in done.stdout.splitlines():
+		parts = line.split("\t")
+		if len(parts) < 3 or "%xmm" not in parts[2]:
+			continue
+		try:
+			where = int(parts[0].strip().rstrip(":"), 16)
+			code = bytes.fromhex(parts[1].replace(" ", ""))
+		except ValueError:
+			continue
+		verdict = alignment_hazard(code, where)
+		if verdict == "rip":
+			rip_checked += 1
+		elif verdict == "an unaligned RIP target":
+			hazards.append((where, parts[2].strip()))
+		elif verdict is not None:
+			stub_hazards.append((where, parts[2].strip()))
+	# A site inside a placed window is not an instruction any more -- its
+	# bytes are the window's jump and padding, and the jump's rel32 read as
+	# an opcode was a false `pxor (%rsi)` at 0x141d5c2b8. The window's code
+	# is in the stub section, which the loop above reads.
+	windowed = sorted((start, start + length)
+	                  for start, length, *_rest in placed)
+	window_starts = [low for low, _high in windowed]
+
+	def in_window(address):
+		k = bisect.bisect_right(window_starts, address) - 1
+		return k >= 0 and address < windowed[k][1]
+
+	for row in instructions:
+		if row[1][:1] not in (b"\xc4", b"\xc5") or not (tv <= row[0] < tv + ts):
+			continue
+		if in_window(row[0]):
+			continue
+		code = bytes(after_text[row[0] - tv:row[0] - tv + len(row[1])])
+		if code == row[1]:
+			continue
+		verdict = alignment_hazard(code, row[0])
+		if verdict == "rip":
+			rip_checked += 1
+		elif verdict is not None:
+			hazards.append((row[0], f"in place, was {row[2]} {row[3]}"))
+	if hazards:
+		print(f"verify: FAILED -- {len(hazards):,} legacy SSE instruction(s) "
+		      f"take a memory operand that must be 16-byte aligned and is "
+		      f"not known to be", file=sys.stderr)
+		for where, text in hazards[:10]:
+			print(f"    0x{where:x}  {text}", file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: no rewritten site in .text and no RIP operand needs "
+		      f"an alignment nothing guarantees; {rip_checked:,} RIP "
+		      f"operand(s) that need it are aligned")
+	# **Open, and counted rather than passed.** The 256-bit emitters still
+	# write `op mem,xmm` halves with no fallback, so these are what the
+	# guard does not yet reach. Finding 341.
+	if stub_hazards:
+		print(f"verify: OPEN -- {len(stub_hazards):,} stub instruction(s) "
+		      f"take a register-addressed operand legacy SSE needs aligned, "
+		      f"first 0x{stub_hazards[0][0]:x} {stub_hazards[0][1]} "
+		      f"(Finding 341)")
 	return 1 if problems else 0
+
+
+def alignment_hazard(code, address):
+	"""None, "rip" for an aligned fixed operand, or why `code` faults.
+
+	`code` is one legacy instruction's bytes at `address`. See the check
+	at the end of `verify`. Finding 341.
+	"""
+	i, pp = 0, 0
+	while i < len(code) and code[i] in (0x66, 0xF2, 0xF3):
+		pp = {0x66: 1, 0xF3: 2, 0xF2: 3}[code[i]]
+		i += 1
+	if i < len(code) and 0x40 <= code[i] <= 0x4F:
+		i += 1
+	if i + 1 >= len(code) or code[i] != 0x0F:
+		return None
+	i += 1
+	space = 1
+	if code[i] in (0x38, 0x3A):
+		space = 2 if code[i] == 0x38 else 3
+		i += 1
+	tail = code[i:]
+	# `0F 18` to `0F 1F` are the hint and multi-byte NOP space -- the
+	# `nopl (%rax)` a lowered `vzeroupper` leaves -- and touch no memory.
+	if space == 1 and tail and 0x18 <= tail[0] <= 0x1F:
+		return None
+	shape = {"map": space, "pp": pp}
+	if not inplace.needs_alignment(shape, tail):
+		return None
+	if inplace.memory_operand(tail) == "rip":
+		displacement = struct.unpack_from("<i", tail, 2)[0]
+		target = address + len(code) + displacement
+		return "rip" if target % 16 == 0 else "an unaligned RIP target"
+	return "a register-addressed operand"
 
 
 if __name__ == "__main__":

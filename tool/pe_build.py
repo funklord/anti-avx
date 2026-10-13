@@ -1772,6 +1772,32 @@ bound:	.float 1.0, 0.0, 3.0, 0.0
 
 
 
+# An m128 operand eight bytes off alignment, which VEX reads and legacy SSE
+# faults on: the game's `vmulps -0x8(%rax),%xmm2,%xmm1`, in the
+# three-operand form a stub lowers and the two-operand form that was
+# patched in place. 2 * 3 * 2 in lane 0, plus 65. Finding 341.
+PROGRAMS["unaligned"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	block+8(%rip), %rax
+	vmovups	source(%rip), %xmm2
+	vmulps	(%rax), %xmm2, %xmm1
+	vmulps	16(%rax), %xmm1, %xmm1
+	vcvttss2si %xmm1, %eax
+	addl	$65, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+source:	.float 2.0, 1.0, 1.0, 1.0
+	.p2align 4
+block:	.float 0.0, 0.0, 3.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0
+""")
+
+
 # 9. A zero store with a conditional branch between it and the zeroing, and
 # the branch not taken. Walking back over a `jcc` is sound -- reaching the
 # store by falling through one means it was not taken on this execution --

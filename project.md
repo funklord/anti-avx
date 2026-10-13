@@ -14163,12 +14163,21 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
-### Finding 341 -- legacy SSE needs a 16-byte operand aligned, and VEX did not (IN PROGRESS)
+### Finding 341 -- legacy SSE needs a 16-byte operand aligned, and VEX did not (step 1 of 2)
 
-**Status at the fold, 2026-10-13: the code is in the working tree, uncommitted, and its
-full run (selftest, the three gates, `check-vex`, the Starfield build, `verify`,
-frontier) was still going.** Pick up here: read that run's results, commit the code if
-they pass, then do step 2 below.
+**Step 1 is committed and is the build in the game directory.** Selftest, the three
+gates and `check-vex` pass; on Starfield `verify` passes with 6,262 RIP operands that
+need alignment all aligned, no hazard at any in-place site, and **678 stub instructions
+`OPEN`** -- the 256-bit emitters, first `0x1489b9b8d mulps 0xf0(%rbp),%xmm0`. Survivors
+286 -> 294 (289 real). Step 2 below is what the next session picks up.
+
+**The control for step 1 is the fixture, not `verify`.** `verify` cannot tell from an
+image's bytes which emitter wrote a stub instruction, so a hazard in a `lower_vex` stub
+is counted `OPEN` like a 256-bit half, and `verify` passes the `--align-guard=off`
+`unaligned` image. Running it is what discriminates: 77 against 5. `verify`
+discriminates again once step 2 makes `OPEN` a failure. Its in-place half skips sites
+inside a placed window: a window's jump at `0x141d5c2b6` put `0f ef 06` at the next
+site, read as `pxor (%rsi)`, a false hazard.
 
 The 286 build (Finding 340) ran 158 seconds, the longest yet, and died in a stub at
 `0x148BC1982` on `EXCEPTION_ACCESS_VIOLATION` reading `0xFFFFFFFFFFFFFFFF` -- a #GP:
