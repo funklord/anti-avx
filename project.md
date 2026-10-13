@@ -14163,6 +14163,57 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 341 -- legacy SSE needs a 16-byte operand aligned, and VEX did not (IN PROGRESS)
+
+**Status at the fold, 2026-10-13: the code is in the working tree, uncommitted, and its
+full run (selftest, the three gates, `check-vex`, the Starfield build, `verify`,
+frontier) was still going.** Pick up here: read that run's results, commit the code if
+they pass, then do step 2 below.
+
+The 286 build (Finding 340) ran 158 seconds, the longest yet, and died in a stub at
+`0x148BC1982` on `EXCEPTION_ACCESS_VIOLATION` reading `0xFFFFFFFFFFFFFFFF` -- a #GP:
+
+    original  1418ed680  vmulps -0x8(%rax),%xmm2,%xmm1     any address
+    stub      148bc1982  mulps  -0x8(%rax),%xmm1           16-byte aligned only
+              rax = 0xa09ef3a0, so the operand is at ...398
+
+**Nothing in the rewriter asked whether the program's own memory operands are aligned**
+-- only its slots (Finding 152). A census of the shipped image, alignment-requiring
+legacy forms whose original was VEX, excluding `movaps`/`movdqa` and the non-temporals
+whose VEX forms required alignment already:
+
+    in place  pointer        663     stub  pointer        3,300
+    in place  rsp, %16==0      7     stub  rsp, %16==0      593
+    in place  rip, aligned    87     stub  rip, aligned   6,175
+    rip, unaligned: none
+
+**Step 1, in the working tree.** `patch.ALIGNMENT_FREE` lists, by (map, pp, opcode), the
+legacy forms whose memory operand needs no alignment; `needs_alignment` is the rest.
+`sse_encoding(..., guarded=True)` refuses such a form with a non-RIP operand, and only
+the two callers with a fallback ask: the in-place pass, whose site becomes a detour,
+and `lower_vex`, which loads with `movups` into the scratch -- or into the destination
+for an exactly commutative op, `EXACTLY_COMMUTATIVE` -- and runs the op register to
+register (`unaligned_split`). `collect` asks the liveness scan for a scratch for such a
+site. `verify` reads the image's bytes (`alignment_hazard`, objdump `-w`): an in-place
+hazard or an unaligned RIP target fails; stub hazards print as `OPEN`, counted.
+`--align-guard=off` restores the old encoder. Fixture `unaligned` in `check-pe`: 77
+rewritten, 5 (the #GP) with `--align-guard=off`, 29 original; `verify` fails the `off`
+image naming both `mulps`.
+
+**Guarding every caller was tried first and is the wrong order**: the 256-bit emitters
+write `op mem,xmm` halves through `narrow_piece` (about twenty callers) with no scratch,
+so they refused, 207 sites came back as survivors -- 256-bit arithmetic, `vmulps`,
+`vaddps`, `vandps`, `vsubps`, `vpaddq` -- and `splatop`, `permilps` and `pshufb1`
+failed. The vzeroupper's `nopl (%rax)` was a false positive in the first check; `0F
+18`-`0F 1F` are excluded.
+
+**Step 2, open: the 256-bit emitters.** Give `narrow_piece`'s callers the same
+`movups` fallback -- they have helper registers (span/unit pools) but `narrow_piece`
+is not told one -- then make `verify`'s `OPEN` line a failure. The census says up to
+3,300 pointer and 593 stack operands in stubs; how many come from the 256-bit paths
+is unmeasured. Until then those faults stay possible wherever the game's data is
+not aligned.
+
 ### Finding 340 -- the stale-read repair is off by default, on the holder's decision
 
 The 636 build ran through Steam on 2026-10-12 for 123 seconds, the longest run yet, and
