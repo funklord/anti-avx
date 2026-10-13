@@ -14216,6 +14216,18 @@ so they refused, 207 sites came back as survivors -- 256-bit arithmetic, `vmulps
 failed. The vzeroupper's `nopl (%rax)` was a false positive in the first check; `0F
 18`-`0F 1F` are excluded.
 
+**What the 678 are, measured on the committed build 2026-10-13** (`alignment_hazard`
+over `objdump -w` of `.avxsse`): `mulps` 218, `addps` 201, `subps` 72, `andps` 52,
+`paddq` 32, `mulpd` 25, `addpd` 21, `addsubps` 14, `blendvps` 12, `pcmpeqb` 12. By
+base: `r11` 272, `rcx` 184, `rax` 65, `r8` 36, `rbp`/`rsp`/`rbx` 18 each, `rdi` 16.
+**Most of the `r11` ones are the stubs' own slots**, `0x32a0(%r11)` onwards at
+offsets that are multiples of 16: the TLS template declares 16-byte alignment and the
+slot sits at a 16-byte offset, so they are aligned wherever the loader honours that --
+a heap allocation on x64 does. `verify` cannot see that from one instruction; the
+emitter knows it is addressing a slot and should say so, or move it with `movups`
+as Finding 152 did for the stack. The other ~400 are the program's data through
+`rcx`, `rax` and the rest, and are the real exposure.
+
 **Step 2, open: the 256-bit emitters.** Give `narrow_piece`'s callers the same
 `movups` fallback -- they have helper registers (span/unit pools) but `narrow_piece`
 is not told one -- then make `verify`'s `OPEN` line a failure. The census says up to
