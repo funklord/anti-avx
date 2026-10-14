@@ -14167,7 +14167,7 @@ clashing passenger, which is why the fixture had to come from outside it.
 
 **Found by the store audit of Finding 341** (every stub store against the stores of the
 instructions its window replaced): after setting aside 57,162 stack stores that the same
-stub reloads -- borrowed-register saves, so no stack slot is left changed -- 179 stores
+stub reloads -- borrowed-register saves -- 179 stores
 were left, all `mov %rax,disp(%rip)` writing the upper half of a 32-byte store to a
 global, each 7 bytes past its target:
 
@@ -14185,8 +14185,23 @@ Gates, `check-vex` and `verify` pass on the build, and the store audit of it fin
 unexplained store: the 179 moved into "inside an original store", 70,293 -> 70,472.
 It is the build in the game directory, and **its Steam run, 2026-10-14, ended exactly as
 before** -- the null write at `0x1422CC4BE` 147 seconds in, then the survivor at
-`0x140D80AFD` -- so this was not what zeroed the frame pointer. That stays open, with the
-stack stores ruled out by the audit as well. There is no
+`0x140D80AFD` -- so this was not what zeroed the frame pointer. That stays open.
+
+**~~The stack stores are ruled out~~ -- they are not.** A borrowed-register save
+reloads the REGISTER afterwards and leaves the stack slot holding the register's value,
+so each of those 57,162 stores changes memory permanently and is safe only where the
+slot is dead. Classified by the function's own unwind data (scratch script, not in the
+tree): 35,797 land in the outgoing home area of a function that makes calls, past its
+prologue -- dead between calls; **571 are in a window inside the prologue and 3,493 in
+a function that makes no call**, where the slot may be a pushed register or a live
+local; 17,295 are in chained entries and 6 outside `.pdata`, unclassified. A save at
+the top of the stack after `push %rbp` and before the frame is allocated would put an
+xmm register's low bytes where `pop %rbp` reads them -- the zeroed-`rbp` shape. The
+twelve direct callees of the crashing caller were checked and none has such a store;
+deeper callees were not. Separately, no stub writes `rbp` more often than its window's
+originals (49 windows checked). **The 571 and 3,493 are the next thing to check**:
+whether `window_borrow`'s placement excludes a window inside the prologue, and what
+it assumes about a function with no call. There is no
 fixture: forcing the mover with a RIP operand and no free xmm is the missing control,
 and so is a `verify` check that every stub store lies inside an original store.
 
