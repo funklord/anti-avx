@@ -14235,7 +14235,10 @@ callee returned with `rbp` zero. None of the sixteen backtrace frames is in the 
 section, and the one stub the function itself enters (`0x148c7c17a`) does not touch
 `rbp`. The stub section holds about forty instructions that write `rbp`; they look like
 moved originals (`pextrq $1,%xmm0,%rbp`), and checking each against its site is the
-next step. **This is a corruption lead, and the most valuable open item.**
+next step. **This is a corruption lead, and the most valuable open item.** First place
+to look: `0x140f14380`, the last call before the bad one, whose stubs store to
+`(%rsp)` -- compare each against its original instruction. Reproduced on a third run
+2026-10-14, 96 seconds in.
 
 **What the 678 are, measured on the committed build 2026-10-13** (`alignment_hazard`
 over `objdump -w` of `.avxsse`): `mulps` 218, `addps` 201, `subps` 72, `andps` 52,
