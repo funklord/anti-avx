@@ -14239,6 +14239,18 @@ emitter knows it is addressing a slot and should say so, or move it with `movups
 as Finding 152 did for the stack. The other ~400 are the program's data through
 `rcx`, `rax` and the rest, and are the real exposure.
 
+**Half of the ~400 program-data hazards are one shape, measured 2026-10-14**: the unit
+lowering's memory form, 205 of 398 with a slot move beside them --
+
+    movaps %xmm4,%xmm0;  mulps 0xf0(%rbp),%xmm0       low:  dst = src1 op mem
+    movups 0x32e0(%r11),%xmm6;  mulps 0x100(%rbp),%xmm6   high: helper = slot op mem+16
+
+The low half can load `mem` into the helper, which is free until the high half. The
+high half needs a second register: either do it FIRST, borrowing the low destination
+to hold `mem+16` (sound only where that destination is not also src1, whose low half
+must survive), or have the unit strategy find a second dead xmm and refuse without
+one. That is the design to build; it was not started.
+
 **Step 2, open: the 256-bit emitters.** Give `narrow_piece`'s callers the same
 `movups` fallback -- they have helper registers (span/unit pools) but `narrow_piece`
 is not told one -- then make `verify`'s `OPEN` line a failure. The census says up to
