@@ -14181,8 +14181,9 @@ measured from the end of its own instruction, so every such store landed one slo
 now. It is silent corruption of program data and a candidate cause of the zeroed frame
 pointer above -- **not established**; the next Steam run of this build says.
 
-Gates, `check-vex` and `verify` pass on the build. **At the fold the store audit of the
-new build was still running; it should report no unexplained RIP store.** There is no
+Gates, `check-vex` and `verify` pass on the build, and the store audit of it finds no
+unexplained store: the 179 moved into "inside an original store", 70,293 -> 70,472.
+It is the build in the game directory. There is no
 fixture: forcing the mover with a RIP operand and no free xmm is the missing control,
 and so is a `verify` check that every stub store lies inside an original store.
 
