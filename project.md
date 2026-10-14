@@ -14251,7 +14251,20 @@ to hold `mem+16` (sound only where that destination is not also src1, whose low 
 must survive), or have the unit strategy find a second dead xmm and refuse without
 one. That is the design to build; it was not started.
 
-**Step 2, open: the 256-bit emitters.** Give `narrow_piece`'s callers the same
+**Step 2's first part landed 2026-10-14: the unit lowering's `lane` and `lanemem`.**
+`narrow_piece` takes a `scratch`; given one, a half legacy SSE needs aligned goes
+through `unaligned_split`. The low half passes the helper, free until the upper half;
+the upper half passes `second_helper`, which the unit already takes when two xmm are
+dead, and without one emits as before. `OPEN` fell 678 -> 505 with no survivor added
+(294). Fixture `unaligned256` in `check-shadow-pe`: 77, 5 with `--align-guard=off`,
+29 with `--shadow-regs=off`. The first remaining hazard is an upper half with no
+second helper, `mulps 0x100(%rbp),%xmm6` at `0x1489b9b9f`.
+
+**The 505 that remain** include the ~270 slot operands through `r11` above, which a TLS
+block the loader aligns makes safe; the rest are upper halves with one helper and the
+other 256-bit emitters.
+
+**Step 2, rest open: the other 256-bit emitters.** Give `narrow_piece`'s callers the same
 `movups` fallback -- they have helper registers (span/unit pools) but `narrow_piece`
 is not told one -- then make `verify`'s `OPEN` line a failure. The census says up to
 3,300 pointer and 593 stack operands in stubs; how many come from the 256-bit paths

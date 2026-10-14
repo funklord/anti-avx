@@ -1798,6 +1798,47 @@ block:	.float 0.0, 0.0, 3.0, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0
 """)
 
 
+# The same operand at 256 bits: both halves eight bytes off alignment, the
+# low through the unit's helper and the high through its second. 2 * 3 in
+# the low half's lane 0 and 5 * 4 in the high half's, plus 51. Finding 341.
+PROGRAMS["unaligned256"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	leaq	block+8(%rip), %rax
+	vmovups	source(%rip), %ymm2
+	vmulps	(%rax), %ymm2, %ymm1
+	vextractf128 $1, %ymm1, %xmm3
+	vcvttss2si %xmm1, %eax
+	vcvttss2si %xmm3, %ecx
+	addl	%ecx, %eax
+	addl	$51, %eax
+	vzeroupper
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.float 2.0, 1.0, 1.0, 1.0, 5.0, 1.0, 1.0, 1.0
+	.p2align 4
+block:	.float 0.0, 0.0, 3.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0, 1.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # 9. A zero store with a conditional branch between it and the zeroing, and
 # the branch not taken. Walking back over a `jcc` is sound -- reaching the
 # store by falling through one means it was not taken on this execution --

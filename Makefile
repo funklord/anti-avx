@@ -234,7 +234,8 @@ check-shadow-pe:
 	            backward backtarget commute laneconv \
 	            fmamem fma231 fma132 fmareg fmareg213 fmareg132 \
 	            fmasub fmaas fmasa fnmreg fnmmem blendv blendv0 blendvx0 \
-	            cmpconst cmpreg maskgpr pshufb1 fnm1 staleslot partslot; do \
+	            cmpconst cmpreg maskgpr pshufb1 fnm1 staleslot partslot \
+	            unaligned256; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \

@@ -3494,7 +3494,7 @@ def commuted_piece(vex, tail):
 	return inplace.sse_encoding(narrow, tail[:1] + bytes([modrm]) + tail[2:])
 
 
-def narrow_piece(vex, tail, delta, address, length, at):
+def narrow_piece(vex, tail, delta, address, length, at, scratch=None):
 	"""One 128-bit half of a 256-bit memory operand, `delta` bytes along.
 
 	**There are two ways to move an operand, and which applies is a property
@@ -3514,6 +3514,13 @@ def narrow_piece(vex, tail, delta, address, length, at):
 		moved = tail if delta == 0 else inplace.offset_operand(tail, delta)
 		if moved is None:
 			return None
+		# **Given a free register, a half that legacy SSE needs aligned is
+		# loaded with `movups` first**, as `lower_vex` does for a 128-bit
+		# site. Without one it is emitted as before and `verify` counts it
+		# `OPEN`. Finding 341.
+		if scratch is not None and inplace.ALIGN_GUARD \
+				and inplace.needs_alignment(narrow, moved):
+			return unaligned_split(narrow, moved, "", None, b"", scratch)
 		return inplace.sse_encoding(narrow, moved)
 	target = rip_target(tail, address, length)
 	if target is None:
@@ -6950,8 +6957,10 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			low_s1 = scratch_finder.xmm_numbers(shape[2])[0]
 			if low_dst != low_s1:
 				body += encode_movaps(low_dst, low_s1)
+			# The helper is free until the upper half, so the low half
+			# loads its operand through it. Finding 341.
 			low = narrow_piece(vex, tail, 0, address, len(encoding),
-			                   at + len(body))
+			                   at + len(body), scratch=helper)
 			if low is None:
 				return refuse("lanemem low half cannot be narrowed")
 			body += low
@@ -6961,8 +6970,11 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += span_slot_move(helper, False, base, second, block,
 			                       at + len(body))
 			high_vex, high_tail = retarget(vex, tail, helper)
+			# The helper holds the slot here, so the upper half loads
+			# through the second, where there is one. Finding 341.
 			piece = narrow_piece(high_vex, high_tail, SLOT, address,
-			                     len(encoding), at + len(body))
+			                     len(encoding), at + len(body),
+			                     scratch=second_helper)
 			if piece is None:
 				return refuse("lanemem high half cannot be narrowed")
 			body += piece
@@ -6983,7 +6995,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		# from inside the stub section. `check-pe` returned 5 for the
 		# fixture built to catch exactly this.
 		low = narrow_piece(vex, tail, 0, address, len(encoding),
-		                   at + len(body))
+		                   at + len(body), scratch=helper)
 		if low is None:
 			return refuse("lane low half cannot be narrowed")
 		body += low
@@ -6991,7 +7003,8 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 		                       at + len(body))
 		high_vex, high_tail = retarget(vex, tail, helper)
 		piece = narrow_piece(high_vex, high_tail, SLOT, address,
-		                     len(encoding), at + len(body))
+		                     len(encoding), at + len(body),
+		                     scratch=second_helper)
 		if piece is None:
 			return refuse("lane high half cannot be narrowed")
 		body += piece
