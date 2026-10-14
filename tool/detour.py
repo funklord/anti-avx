@@ -18635,7 +18635,95 @@ def verify(original, patched, listing=None):
 		      f"take a register-addressed operand legacy SSE needs aligned, "
 		      f"first 0x{stub_hazards[0][0]:x} {stub_hazards[0][1]} "
 		      f"(Finding 341)")
+
+	# **Every RIP store a stub makes lands inside one its window made.** A
+	# fixed address is the program's data, and a stub writes it only on the
+	# program's behalf -- so its bytes must lie inside a RIP store among the
+	# instructions the window replaced. The GPR mover placed 179 of these one
+	# slot load past their target, over the next variable, and nothing in
+	# this function could see it; an audit outside the tree found it.
+	# Finding 342.
+	by_stub = sorted((stub, stub + size, begin, begin + length)
+	                 for begin, length, stub, size, *_rest in placed)
+	stub_starts = [row[0] for row in by_stub]
+	original_rows = sorted((row[0], row) for row in instructions)
+	original_at = [address for address, _row in original_rows]
+	stray, rip_stores = [], 0
+	for line in done.stdout.splitlines():
+		parts = line.split("\t")
+		if len(parts) < 3 or "(%rip)" not in parts[2]:
+			continue
+		target, width = rip_store(parts[2])
+		if target is None:
+			continue
+		try:
+			where = int(parts[0].strip().rstrip(":"), 16)
+		except ValueError:
+			continue
+		rip_stores += 1
+		k = bisect.bisect_right(stub_starts, where) - 1
+		if k < 0 or where >= by_stub[k][1]:
+			stray.append((where, parts[2].strip()))
+			continue
+		begin, end = by_stub[k][2], by_stub[k][3]
+		inside = False
+		i = bisect.bisect_left(original_at, begin)
+		while i < len(original_at) and original_at[i] < end:
+			row = original_rows[i][1]
+			if isinstance(row[4], int) and "(%rip)" in (row[3] or ""):
+				o_target, o_width = rip_store(
+					f"{row[2]} {row[3]} # 0x{row[4]:x}")
+				if o_target is not None and o_target <= target \
+						and target + width <= o_target + o_width:
+					inside = True
+					break
+			i += 1
+		if not inside:
+			stray.append((where, parts[2].strip()))
+	if stray:
+		print(f"verify: FAILED -- {len(stray):,} stub RIP store(s) land "
+		      f"outside every RIP store their window replaced",
+		      file=sys.stderr)
+		for where, text in stray[:10]:
+			print(f"    0x{where:x}  {text}", file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: every one of {rip_stores:,} stub RIP store(s) lands "
+		      f"inside a RIP store its window replaced")
 	return 1 if problems else 0
+
+
+def rip_store(text):
+	"""(target, width) of a RIP-relative store in objdump's text, or
+	(None, 0). The width is the source register's, a GPR's being 8 and an
+	immediate's 8 for `movq`/`movl`'s operand size. Finding 342."""
+	body, _hash, comment = text.partition("#")
+	fields = body.split(None, 1)
+	if len(fields) < 2 or not comment.strip().startswith("0x"):
+		return None, 0
+	mnemonic, operands = fields[0], fields[1].strip()
+	if mnemonic.startswith(("cmp", "test", "ucomi", "comi", "vcomi",
+	                        "vucomi", "prefetch", "nop", "lea", "push",
+	                        "call", "jmp", "j")):
+		return None, 0
+	parts = [f.strip() for f in re.split(r",(?![^(]*\))", operands)]
+	if len(parts) < 2 or not parts[-1].endswith("(%rip)"):
+		return None, 0
+	source = parts[-2]
+	if "%ymm" in source:
+		width = 32
+	elif "%xmm" in source:
+		width = {"movss": 4, "vmovss": 4, "movd": 4, "vmovd": 4,
+		         "movsd": 8, "vmovsd": 8, "movq": 8, "vmovq": 8,
+		         "movlps": 8, "vmovlps": 8, "movhps": 8,
+		         "vmovhps": 8}.get(mnemonic, 16)
+	elif source.startswith("$"):
+		width = 4 if mnemonic.endswith("l") else 8
+	elif re.match(r"%e|%r\d+d", source):
+		width = 4
+	else:
+		width = 8
+	return int(comment.strip().split()[0], 16), width
 
 
 def alignment_hazard(code, address):

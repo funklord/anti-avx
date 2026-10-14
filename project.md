@@ -14208,14 +14208,11 @@ see what the depth model already accounts for. Check a sample of the 571 against
 `rsp_depths` before treating them as a cause. There is no
 fixture: forcing the mover with a RIP operand and no free xmm is the missing control.
 
-**A `verify` check for the class is written and UNCOMMITTED at the fold, 2026-10-14**:
-every RIP-relative store in a stub (`rip_store` reads target and width from objdump's
-text) must lie inside a RIP store among the instructions its window replaced, mapped
-through `placed`'s stub ranges. Its control was running: the new `verify` against the
-pre-fix image (`Starfield-f341c.exe` in the session scratch, gone with it) must fail
-naming the 179, and against the committed build must pass. **Next session: rerun
-both** -- the pre-fix image can be rebuilt by reverting `gpr_move_half`'s placement
--- and commit the check only if the control fails and the build passes.
+**`verify` now checks the class**: every RIP-relative store in a stub (`rip_store`
+reads target and width from objdump's text) must lie inside a RIP store among the
+instructions its window replaced, mapped through `placed`'s stub ranges. Against the
+pre-fix image it fails naming exactly the 179; against the committed build it passes,
+1,425 stub RIP stores all inside; `check-verify` passes on all 49 fixtures.
 
 ### Finding 341 -- legacy SSE needs a 16-byte operand aligned, and VEX did not (step 1 of 2)
 
