@@ -14183,7 +14183,10 @@ pointer above -- **not established**; the next Steam run of this build says.
 
 Gates, `check-vex` and `verify` pass on the build, and the store audit of it finds no
 unexplained store: the 179 moved into "inside an original store", 70,293 -> 70,472.
-It is the build in the game directory. There is no
+It is the build in the game directory, and **its Steam run, 2026-10-14, ended exactly as
+before** -- the null write at `0x1422CC4BE` 147 seconds in, then the survivor at
+`0x140D80AFD` -- so this was not what zeroed the frame pointer. That stays open, with the
+stack stores ruled out by the audit as well. There is no
 fixture: forcing the mover with a RIP operand and no free xmm is the missing control,
 and so is a `verify` check that every stub store lies inside an original store.
 
