@@ -2629,7 +2629,7 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "runborrow": 56, "regmove": 56, "nonvol": 72, "nonvolbad": 72, "unwindsave": 72, "memsrc": 56}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "ripstore": 56, "runborrow": 56, "regmove": 56, "nonvol": 72, "nonvolbad": 72, "unwindsave": 72, "memsrc": 56}
 
 # **Samples whose prologue saves a non-volatile xmm**, as `(register,
 # offset from rsp)`. The sample must really do the save in its code AND
@@ -4313,6 +4313,77 @@ source:	.long 0, 0, 0, 0
 	.p2align 5
 sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+# **`noxmm` with both memory sides RIP-relative, and the store the one that
+# matters.** The mover emits a store as the slot load and then the memory
+# `mov`, and a RIP displacement counts from the end of its own instruction:
+# placed at the pair's start, each upper-half store landed seven bytes --
+# one slot load -- past its target, over whatever followed. 179 such stores
+# in Starfield, and `noxmm` could not see it, its operands being `(%rsi)` and
+# `(%rdi)`. Finding 342.
+#
+# Every volatile xmm stays live across both sites, so neither has a helper.
+# The filler between them is integer work, which keeps the two sites from
+# pairing without reading -- and so freeing -- any vector register.
+#
+# 6 x 2.0 = 12, and 65 is read from the stored upper half: misplaced, it is
+# never written there and reads 0. `guard`, right after `sink`, must still
+# be 0, and the misplaced second half writes `source`'s last qword across
+# it, so the set byte at source+27 lands at guard+2. 12 + 65 + 0 = 77.
+PROGRAMS["ripstore"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$56, %rsp
+	movss	two(%rip), %xmm0
+	movss	two(%rip), %xmm1
+	movss	two(%rip), %xmm2
+	movss	two(%rip), %xmm3
+	movss	two(%rip), %xmm4
+	movss	two(%rip), %xmm5
+	vmovups	source(%rip), %ymm7	/* RIP load, upper half by a GPR */
+	movl	$3, %ecx		/* integer filler: keeps the two */
+	addl	%ecx, %ecx		/* sites apart without reading */
+	addl	%ecx, %ecx		/* a vector register */
+	addl	%ecx, %ecx
+	addl	%ecx, %ecx
+	addl	%ecx, %ecx
+	vmovups	%ymm7, sink(%rip)	/* RIP store, upper half by a GPR */
+	addss	%xmm1, %xmm0		/* every volatile xmm read here, so */
+	addss	%xmm2, %xmm0		/* all were live at both sites */
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0
+	cvttss2si %xmm0, %eax		/* 12, if all six survived */
+	addl	sink+16(%rip), %eax	/* + 65, only if the store landed */
+	addl	guard(%rip), %eax	/* + 0, unless it landed past it */
+	addq	$56, %rsp
+	ret
+func_end:
+	.p2align 4
+two:	.float 2.0
+	.p2align 5
+source:	.long 0, 0, 0, 0
+	.long 65, 0, 0x01000000, 0
+	.p2align 5
+sink:	.long 0, 0, 0, 0
+	.long 0, 0, 0, 0
+guard:	.long 0, 0, 0, 0
 	.p2align 4
 tls_raw:
 	.long	0x55667788, 0x11223344

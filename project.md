@@ -14205,8 +14205,15 @@ space by the `rsp` depth `rsp_depths` models at every instruction, prologue incl
 and refuses a function that references that region itself or copies `rsp` toward it.
 The audit compared offsets against the frame after the prologue only, so it cannot
 see what the depth model already accounts for. Check a sample of the 571 against
-`rsp_depths` before treating them as a cause. There is no
-fixture: forcing the mover with a RIP operand and no free xmm is the missing control.
+`rsp_depths` before treating them as a cause.
+
+**`ripstore`, in `check-pe`, is the fixture**: `noxmm` with both memory sides
+RIP-relative, every volatile xmm live across a load and a store kept apart by integer
+filler, and a `guard` after `sink` that the misplaced half would overwrite. It returns
+77; built by a copy of `detour.py` with the fix reverted it returns 12, and `verify`
+fails it with one stray RIP store, where the fixed build passes with 3. It is not in
+`check-shadow-pe`, because `--shadow-regs=off` carries it correctly by the `run`
+lowering and that gate requires `off` to fail.
 
 **`verify` now checks the class**: every RIP-relative store in a stub (`rip_store`
 reads target and width from objdump's text) must lie inside a RIP store among the
