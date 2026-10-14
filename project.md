@@ -14199,9 +14199,13 @@ the top of the stack after `push %rbp` and before the frame is allocated would p
 xmm register's low bytes where `pop %rbp` reads them -- the zeroed-`rbp` shape. The
 twelve direct callees of the crashing caller were checked and none has such a store;
 deeper callees were not. Separately, no stub writes `rbp` more often than its window's
-originals (49 windows checked). **The 571 and 3,493 are the next thing to check**:
-whether `window_borrow`'s placement excludes a window inside the prologue, and what
-it assumes about a function with no call. There is no
+originals (49 windows checked). **The 571 and 3,493 are the next thing to check**, and probably
+weaker than they look: `window_borrow` places a save in the caller's 32-byte shadow
+space by the `rsp` depth `rsp_depths` models at every instruction, prologue included,
+and refuses a function that references that region itself or copies `rsp` toward it.
+The audit compared offsets against the frame after the prologue only, so it cannot
+see what the depth model already accounts for. Check a sample of the 571 against
+`rsp_depths` before treating them as a cause. There is no
 fixture: forcing the mover with a RIP operand and no free xmm is the missing control,
 and so is a `verify` check that every stub store lies inside an original store.
 
