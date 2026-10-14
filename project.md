@@ -14163,6 +14163,29 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 342 -- a GPR mover's RIP store landed one slot load past its target
+
+**Found by the store audit of Finding 341** (every stub store against the stores of the
+instructions its window replaced): after setting aside 57,162 stack stores that the same
+stub reloads -- borrowed-register saves, so no stack slot is left changed -- 179 stores
+were left, all `mov %rax,disp(%rip)` writing the upper half of a 32-byte store to a
+global, each 7 bytes past its target:
+
+    original  vmovups %ymm0,0x145fafde8         upper half at ...df8 and ...e00
+    stub      mov %rax,...  # 0x145fafdff        and ...e07
+
+`gpr_move_half` emits a store as the slot load and then the memory store, and handed
+`encode_mem64` the pair's start as the store's position; a RIP displacement is
+measured from the end of its own instruction, so every such store landed one slot load
+(7 bytes) high, over the next variable. The memory side is placed where it is emitted
+now. It is silent corruption of program data and a candidate cause of the zeroed frame
+pointer above -- **not established**; the next Steam run of this build says.
+
+Gates, `check-vex` and `verify` pass on the build. **At the fold the store audit of the
+new build was still running; it should report no unexplained RIP store.** There is no
+fixture: forcing the mover with a RIP operand and no free xmm is the missing control,
+and so is a `verify` check that every stub store lies inside an original store.
+
 ### Finding 341 -- legacy SSE needs a 16-byte operand aligned, and VEX did not (step 1 of 2)
 
 **Step 1 is committed and is the build in the game directory.** Selftest, the three

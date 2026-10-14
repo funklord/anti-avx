@@ -5528,13 +5528,19 @@ def gpr_move_half(mover, to_slot, vex, tail, address, encoding, at, base,
 		moved = inplace.offset_operand(tail, SLOT + half)
 		if moved is None:
 			return None
-	memory = encode_mem64(mover, not to_slot, vex, moved, address, encoding,
-	                      at)
-	if memory is None:
-		return None
 	slot_side = encode_gpr_at(mover, to_slot,
 	                          block[0] if block is not None else None,
 	                          base + slot * SLOT + half)
+	# **The memory side is placed where it is emitted.** A store comes
+	# second, after the slot load, and a RIP displacement is measured from
+	# the end of its own instruction: placing it at the pair's start put
+	# every RIP store seven bytes -- one slot load -- past its target, and
+	# wrote 0x145fafdff where the program wrote 0x145fafdf8. 179 such
+	# stores in Starfield. Finding 342.
+	memory = encode_mem64(mover, not to_slot, vex, moved, address, encoding,
+	                      at if to_slot else at + len(slot_side))
+	if memory is None:
+		return None
 	return memory + slot_side if to_slot else slot_side + memory
 
 
