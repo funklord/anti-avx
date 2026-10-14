@@ -14163,6 +14163,36 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 343 -- what two survivor classes are made of, measured 2026-10-14
+
+Read from the Finding 342 build's frontier (294 survivors), to choose the next lever.
+Nothing in the code changed.
+
+**`next instruction will not move`, 102 -- the largest class -- is a span problem, not
+a placement one.** Of the 202 neighbours either side of these sites, 85 are
+`vextractf128` and 73 a 256-bit `vmovups`, and the apply log's refusal reasons agree:
+"no direct SSE form and not a sequence" 88 and "the swallowed neighbour is 256-bit, and
+only the span emission lowers one" 77. Typically the site sits between two neighbours
+that each got a one-instruction window of their own (`0x1404a572a`), so neither
+widening has anywhere to go. Lowering a 256-bit neighbour as a passenger needs the slot
+machinery, so this class belongs to the shadow-register work.
+
+**`outside .pdata`, 30, is mostly code nothing is known to enter.** A read-only scratch
+audit (outside.py's own `chunks`, `split_refused` and `classify`, against the report
+mode's `known` set) puts the sites in eleven chunks:
+
+    uncalled, ends in ret       0x1407c7570, 0x1407c7590 (12 sites) -- no call, jump,
+                                lea or relocation names them; packed after a ret
+    called, runs off the end    0x140732160, 0x140e43c7e/c94/c99, 0x1413fcbf0,
+                                0x14234c563 -- the piece ends at a cut, not a transfer
+    accepted by the report      0x1414c3ce0, 0x1422cf7a0 -- refused in `collect`, whose
+                                recut uses entries and outside jumps (Finding 338)
+    contains (bad)              0x1422cf7ed
+
+The twelve uncalled sites can execute only if something reaches them by an address no
+table records. Treating them as code would widen the oracle on no positive evidence,
+which is the trade `leaf_ranges` refuses. At 30 sites the class does not justify that.
+
 ### Finding 342 -- a GPR mover's RIP store landed one slot load past its target
 
 **Found by the store audit of Finding 341** (every stub store against the stores of the
