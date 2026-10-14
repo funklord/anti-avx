@@ -14227,6 +14227,16 @@ a first-chance access violation in unmodified code, `mov %rdx,(%rcx)` at
 survived; whether it is the game's own or a wrong value from the rewrite upstream is
 not established.
 
+**The null write is not the game's own: a frame pointer came back zero.** Measured on a
+second run, 2026-10-14, the same pair 162 seconds in. The caller at `0x141e8c098`
+passes `lea 0x88(%rbp),%rcx`, and `rbp` is its frame pointer, set once at
+`0x141e8bd4f` from `rax - 0x78` and never written again in the function -- so a
+callee returned with `rbp` zero. None of the sixteen backtrace frames is in the stub
+section, and the one stub the function itself enters (`0x148c7c17a`) does not touch
+`rbp`. The stub section holds about forty instructions that write `rbp`; they look like
+moved originals (`pextrq $1,%xmm0,%rbp`), and checking each against its site is the
+next step. **This is a corruption lead, and the most valuable open item.**
+
 **What the 678 are, measured on the committed build 2026-10-13** (`alignment_hazard`
 over `objdump -w` of `.avxsse`): `mulps` 218, `addps` 201, `subps` 72, `andps` 52,
 `paddq` 32, `mulpd` 25, `addpd` 21, `addsubps` 14, `blendvps` 12, `pcmpeqb` 12. By
