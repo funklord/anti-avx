@@ -14238,7 +14238,18 @@ moved originals (`pextrq $1,%xmm0,%rbp`), and checking each against its site is 
 next step. **This is a corruption lead, and the most valuable open item.** First place
 to look: `0x140f14380`, the last call before the bad one, whose stubs store to
 `(%rsp)` -- compare each against its original instruction. Reproduced on a third run
-2026-10-14, 96 seconds in.
+2026-10-14, 96 seconds in, and a fourth at 142.
+
+**That callee looks innocent, by an audit of every stub's stores** (a scratch script,
+not in the tree): each store a stub makes to program memory, against the stores of the
+instructions its window replaced, resolving RIP targets and setting aside slot storage.
+On the committed build: 70,292 inside an original store, 42,696 own storage, 57,328
+not -- of which 46,502 are `(%rsp)` and 10,647 `disp(%rsp)`, the borrowed-register save
+area, and 179 RIP. The four in `0x140f14380` are `movups %xmmN,(%rsp)` after its
+`push %rdi; sub $0x20,%rsp`, inside its own outgoing home space and clear of the `rbx`
+it saved at `0x10(%rsp)` on entry. So the zeroed `rbp` comes from deeper, and the
+question to ask of those 57,000 is which ones fall outside the frame their function
+has allocated at that point -- a frameless leaf, or a window before the prologue ends.
 
 **What the 678 are, measured on the committed build 2026-10-13** (`alignment_hazard`
 over `objdump -w` of `.avxsse`): `mulps` 218, `addps` 201, `subps` 72, `andps` 52,
