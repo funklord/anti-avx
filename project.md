@@ -14326,7 +14326,8 @@ moved originals (`pextrq $1,%xmm0,%rbp`), and checking each against its site is 
 next step. **This is a corruption lead, and the most valuable open item.** First place
 to look: `0x140f14380`, the last call before the bad one, whose stubs store to
 `(%rsp)` -- compare each against its original instruction. Reproduced on a third run
-2026-10-14, 96 seconds in, and a fourth at 142.
+2026-10-14, 96 seconds in, a fourth at 142, and a fifth 2026-10-15 at 147 on the same `fcca7c16` build -- the
+null write with `rbp` zero, then `0x140D80AFD` on another thread half a second later.
 
 **That callee looks innocent, by an audit of every stub's stores** (a scratch script,
 not in the tree): each store a stub makes to program memory, against the stores of the
