@@ -14163,7 +14163,30 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
-### Finding 345 -- the wider of two windows at one address goes first
+### Finding 346 -- what the 36 overlap survivors are, measured 2026-10-16
+
+Measured by replaying `place_stubs` on the candidate list `frontier` hands it (the
+`7bdaf976` build), logging `rescue_seat` and the chained `build_stub` at every placed
+window that ends exactly on one of the 36. Every one of them is stranded the same way:
+a neighbour's window ends on the site and the next window starts after it, so only
+the rescue could take it, and the rescue does not.
+
+- **29, all 256-bit: the passenger has a `unit` strategy.** `rescue_seat` takes a
+  passenger with no strategy or a `spill` one, because `moved_instruction` lowers
+  only the plain rules. These are the `vdivps`/`vmulps`/`vsubps` blocks around
+  `0x142db9f76` and `0x142dcc161`, plus `0x14374e704` under a 93-byte run. Taking them
+  means chaining unit lowerings into one window.
+- **5, scalar: the seat is found and the extended stub refuses.** The reasons are
+  `the window will not hold one borrow displacement` and `a displaced instruction
+  will not move`: the passenger needs a borrow the extended window cannot give it.
+  The five are `0x1406d6923`, `0x140d72ab6`, `0x1422d6ab0`, `0x142489c0f` and `0x1426cfe8b`.
+- **2: the rescue is never asked.** `0x1426aeac1` and `0x1426aeb09` are both branch
+  targets, sitting after a `jne`/`vmovaps`/`jmp` diamond whose join is also a branch
+  target. Their only candidate widens backwards over the whole diamond, and the
+  window before it took the `jne`.
+
+So the 29 and the 5 are the unit-lowering and passenger-borrow work this tree has
+stopped on, and the bucket holds no placement-order gain like Finding 345's.
 
 `place_stubs` takes candidates in address order, and two can share an address: a
 neighbour alone, and a short site widened backwards over that neighbour. Collection
