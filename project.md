@@ -14188,6 +14188,14 @@ the rescue could take it, and the rescue does not.
 So the 29 and the 5 are the unit-lowering and passenger-borrow work this tree has
 stopped on, and the bucket holds no placement-order gain like Finding 345's.
 
+**The 13 `lost to a refused stub` are the same two classes.** `build/stub-refused.txt`
+lists 15 refused windows. 14 are `unit`, and their refusals name the span emission,
+`no direct SSE form` or `the FMA would not lower`. The one plain window is the 51-byte
+hammock at `0x142295d4f` that carries `0x142295d7e`. Each of its 13 instructions lowers
+on its own under any internal-target map. Rebuilt with `emit_swallowed`'s reasons
+exposed, it refuses at its `vmovss (%rax),%xmm0` passenger, which borrows xmm1: `the
+window will not hold one borrow displacement`.
+
 `place_stubs` takes candidates in address order, and two can share an address: a
 neighbour alone, and a short site widened backwards over that neighbour. Collection
 order put the narrow one first, so the wide one -- which removes both -- was lost to
