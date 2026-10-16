@@ -14181,6 +14181,11 @@ places. `verify` passes (1,425 stub RIP stores inside, 505 `OPEN` as before), an
 `check`, `check-pe`, `check-shadow-pe` and `check-spill`. Nothing in the 36 that remain
 was examined.
 
+Run in the game 2026-10-16 (`7bdaf976`): the sixth reproduction of Finding 342's
+stop, unchanged -- the null write at `0x1422CC4BE` with `rbp` zero, 156 s after the
+image loaded, then the illegal instruction at `0x140D80AFD`. Neither gained site is
+on that path, so the two are neither a fix nor a regression there.
+
 ### Finding 344 -- an A/B against the stack borrows, inconclusive so far
 
 The zeroed `rbp` of Finding 342 is suspected of coming from a stub's stack save, and
