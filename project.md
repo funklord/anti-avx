@@ -14180,8 +14180,14 @@ default build lowers.
 `0x142BE520D` as a survivor, so it cannot get further. `--shadow=off` leaves 327 --
 33 more than the default, none of them that site -- and `verify` passes. It removes
 the borrow the suspicion is about, a save placed in the caller's shadow space by
-`rsp_depths`, so it is the variant in the game directory now. The same null write
-again clears the caller's shadow; anything else, read against its own survivors.
+`rsp_depths`. **Its run, 2026-10-16, stopped 44 seconds in** on
+`vmulps (%rax),%xmm1,%xmm6` at `0x142437E05`, one of its 33 extra survivors -- inconclusive
+again, and the default build (`fcca7c16`) is back in the game directory.
+
+**Whole-switch A/B has reached its limit here.** Every switch that removes a borrow also
+leaves sites the default lowers, and the game reaches some of them on the way to 147
+seconds. A conclusive comparison needs the borrow withheld only where it can be withheld
+without a survivor -- a per-site control in the borrow code, which does not exist.
 
 ### Finding 343 -- what two survivor classes are made of, measured 2026-10-14
 
