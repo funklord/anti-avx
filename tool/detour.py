@@ -16968,7 +16968,16 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 	# and that is the question census has to answer.
 	refused, overlapped = set(), set()
 	committed_to = 0
-	entries = sorted(candidates, key=lambda c: c[0])
+	# **The wider of two windows at one address goes first.** A short site
+	# widened backwards starts on its neighbour, which is often a candidate
+	# of its own at the same address: the neighbour alone, and the window
+	# carrying the neighbour AND the site. In collection order the narrow
+	# one came first and the wide one was then lost to an overlap, which
+	# cost the site whenever the rescue below could not seat it --
+	# `0x1406f62fc`, whose forward neighbour is an unaligned `vdpps`.
+	# A wide window that is refused commits nothing, so the narrow one
+	# still places after it. Two sites in Starfield, none lost. Finding 345.
+	entries = sorted(candidates, key=lambda c: (c[0], -c[4]))
 	rescued = set()
 	for i, entry in enumerate(entries):
 		start, encoding, operands, mnemonic, window, displaced, \

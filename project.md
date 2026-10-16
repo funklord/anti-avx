@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,657 of 804,946 VEX
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,659 of 804,946 VEX
 sites -- 99.96%** -- through 203,058 detours, and every `make detour-verify` invariant
-holds on the result. **289 sites are left** (Finding 341, 2026-10-13), five more rows
+holds on the result. **287 sites are left** (Finding 345, 2026-10-16), five more rows
 that read as VEX are switch-table bytes and not instructions, and 180
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Finding 290). All four figures come from the same run; the denominator and the 180
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           289 re-measured   (Finding 341)
+    default build                           287 re-measured   (Finding 345)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,657 of 804,946 VEX sites, 99.96%, through 203,058 detours**, and 180 further
+**804,659 of 804,946 VEX sites, 99.96%, through 203,058 detours**, and 180 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,24 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 345 -- the wider of two windows at one address goes first
+
+`place_stubs` takes candidates in address order, and two can share an address: a
+neighbour alone, and a short site widened backwards over that neighbour. Collection
+order put the narrow one first, so the wide one -- which removes both -- was lost to
+an overlap wherever the rescue could not seat the site. `0x1406f62fc` is the shape: a
+`vmulps` between a `vbroadcastss` and an unaligned `vdpps (%rdx)`, the forward
+neighbour refused by Finding 341's guard.
+
+Sorting by address and then by window, widest first, measured on Starfield 2026-10-16:
+294 -> 292 survivors, `lost to an overlap` 44 -> 36. The two gained are `0x1406f62fc`
+and `0x142d8d67b`; the other six rows that moved are the same sites now tried and
+refused rather than overlapped, which is why `refused` reads 15 against 11. No site
+was lost: a wide window that will not build commits nothing, so the narrow one still
+places. `verify` passes (1,425 stub RIP stores inside, 505 `OPEN` as before), and so do
+`check`, `check-pe`, `check-shadow-pe` and `check-spill`. Nothing in the 36 that remain
+was examined.
 
 ### Finding 344 -- an A/B against the stack borrows, inconclusive so far
 
