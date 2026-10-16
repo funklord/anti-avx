@@ -14163,6 +14163,26 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 344 -- an A/B against the stack borrows, inconclusive so far
+
+The zeroed `rbp` of Finding 342 is suspected of coming from a stub's stack save, and
+the project already keeps the switches that compare binaries for exactly that:
+`--shadow=off` takes the caller's 32-byte shadow away, `--fallback=off` the per-site
+stack borrow. Built with both (`e7a6d007`, 2026-10-15), `verify` passes and 2,031 sites
+survive against 294 -- 1,750 of them `no home space to borrow`. A null write at
+`0x1422CC4BE` again would clear the borrows; getting past it would implicate them.
+
+**The run, 2026-10-15, answered neither**: 47 seconds in it stopped on
+`vsubss %xmm0,%xmm7,%xmm0` at `0x142BE520D`, a site this build left in place and the
+default build lowers.
+
+**Each switch alone, 2026-10-16:** `--fallback=off` leaves 1,535 and keeps
+`0x142BE520D` as a survivor, so it cannot get further. `--shadow=off` leaves 327 --
+33 more than the default, none of them that site -- and `verify` passes. It removes
+the borrow the suspicion is about, a save placed in the caller's shadow space by
+`rsp_depths`, so it is the variant in the game directory now. The same null write
+again clears the caller's shadow; anything else, read against its own survivors.
+
 ### Finding 343 -- what two survivor classes are made of, measured 2026-10-14
 
 Read from the Finding 342 build's frontier (294 survivors), to choose the next lever.
