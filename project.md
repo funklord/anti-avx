@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,661 of 804,948 VEX
-sites -- 99.96%** -- through 203,058 detours, and every `make detour-verify` invariant
-holds on the result. **287 sites are left** (Finding 347, 2026-10-17), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,627 of 804,948 VEX
+sites -- 99.96%** -- through 203,207 detours, and every `make detour-verify` invariant
+holds on the result. **321 sites are left** (Finding 348, 2026-10-17), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           287 re-measured   (Finding 347)
+    default build                           321 re-measured   (Finding 348)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,661 of 804,948 VEX sites, 99.96%, through 203,058 detours**, and 164 further
+**804,627 of 804,948 VEX sites, 99.96%, through 203,207 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14163,6 +14163,54 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 348 -- the zeroed frame pointer was a borrow into a split function's shadow
+
+**The crash every Steam run since Finding 342 has stopped on is a rewrite bug, and
+this is it.** `0x141e92950` saves its caller's `rbx` and `rbp` into its own shadow --
+entry `0x8(%rsp)` and `0x10(%rsp)` -- then zeroes `rbp` for its own use and reloads both
+at exit. The stub for the `vandps`/`vcomiss` window at `0x141e92a90` borrowed `xmm1`
+with `movups %xmm1,0x70(%rsp)`: at that depth, 16 bytes over exactly those two slots.
+The restore gave back `xmm1` and nothing else, so the function returned a float's
+halves as `rbx` and `rbp`. A scalar's upper half is usually zero, the caller's
+`lea 0x88(%rbp),%rcx` became `0x88`, and the game wrote through it at `0x1422CC4BE` --
+with `rbx` zero too, as every crash dump showed.
+
+**Why the borrow analysis said the shadow was free:** MSVC split the function across
+five `.pdata` entries, four of them chained (`UNW_FLAG_CHAININFO`). The prologue that
+writes the shadow is in the first, the site in the fourth, the epilogue that reads it
+in the fifth. `shadow_depths` follows the chain for the frame size, so the
+displacement was right, but asks "is the region still read from here" over the one
+entry's instructions, and the fourth fragment never mentions it. Of 236,427 entries,
+56,269 are chained fragments of 25,581 functions.
+
+**The fix:** a chained fragment, or a function that has them, lends neither its shadow
+nor its callee home space. Its sites take the TLS spill instead. The parent is read
+from the `RUNTIME_FUNCTION` after the fragment's unwind codes, and every one of the
+56,269 names a real `.pdata` start.
+
+**A second bug, found by the audit that measured the first.** When a site takes the
+stack fallback (Finding 204), `build_stub` sets `base = 0` to address its own 16 bytes,
+and nothing reset it after `STACK_CLOSE`. A passenger after it then saved its borrow
+at `(%rsp)`, inside the function's frame again (`0x1406d6927`). `base` is `None` after
+the close now, so such a passenger refuses.
+
+Measured with a scratch audit of every stub store to the stack, by window, against
+the stores the window's own instructions make:
+
+    stores in split functions that are no original store    15,410 -> 10
+    stores after a closed stack allocation                      28 -> 0
+
+The 10 left are original stores the audit cannot match: a `vextractf128` to the
+stack, and the members of one long copy run beyond its lookahead. **The cost is 34
+sites**, 292 -> 326 by `verify`'s count: 27 from the chained rule and 7 from the
+reset. `verify` passes on the result.
+
+**This rested on a gap no gate covers.** `verify`'s store check (Finding 342) looks at
+stores to fixed addresses. A borrow save is matched by its own restore, so the store
+audit filed it as "saved and restored" and never asked whose slot it was. Nothing
+in `check-pe` builds a function with chained unwind info. A fixture that does is the
+open half of this finding.
+
 ### Finding 347 -- the listing ran out of step into 165 function starts
 
 `build/text.asm` was one linear `objdump` sweep. Data embedded in `.text` -- a switch
@@ -14461,7 +14509,9 @@ callee returned with `rbp` zero. None of the sixteen backtrace frames is in the 
 section, and the one stub the function itself enters (`0x148c7c17a`) does not touch
 `rbp`. The stub section holds about forty instructions that write `rbp`; they look like
 moved originals (`pextrq $1,%xmm0,%rbp`), and checking each against its site is the
-next step. **This is a corruption lead, and the most valuable open item.** First place
+next step. **This was the corruption lead, and Finding 348 explains it:** a borrow wrote into a
+split function's shadow over its saved `rbp`. Whether the game gets past it is for
+the next run to say. What follows is the search as it went. First place
 to look: `0x140f14380`, the last call before the bad one, whose stubs store to
 `(%rsp)` -- compare each against its original instruction. Reproduced on a third run
 2026-10-14, 96 seconds in, a fourth at 142, and a fifth 2026-10-15 at 147 on the same `fcca7c16` build -- the

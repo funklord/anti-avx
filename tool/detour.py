@@ -2689,6 +2689,18 @@ def home_space_map(binary, plain, ranges, blocked):
 	rva, size = struct.unpack_from("<II", data, pe + 24 + 112 + 3 * 8)
 	at = rva_to_offset(data, rva) if rva and size else None
 	fixed_frame = set()
+	# **A chained fragment lends nothing**, of either region. Its `.pdata`
+	# entry is a piece of a function MSVC split for unwinding, not a
+	# function: the prologue that writes the region and the epilogue that
+	# reads it back can each sit in a different fragment, so "is the region
+	# still read from here" asked of one fragment's instructions answers no
+	# for a region that is live. `0x141e92950` saves `rbx` and `rbp` into
+	# its shadow and reloads them three fragments later; a borrow in the
+	# fragment between, at `0x141e92a90`, wrote `xmm1` over both, and the
+	# caller got `rbp` back as zero and wrote through it -- the null write
+	# at `0x1422CC4BE` every Steam run since Finding 342 stopped on. A
+	# chained site falls back to the TLS spill instead. Finding 348.
+	chained = set()
 	unwind_at, prologue_end = {}, {}
 	if at is not None:
 		for i in range(size // 12):
@@ -2700,8 +2712,20 @@ def home_space_map(binary, plain, ranges, blocked):
 				continue
 			unwind_at[base + begin] = (off, base)
 			prologue_end[base + begin] = base + begin + data[off + 1]
-			if not data[off + 3] & 0xF:		# no frame register
+			if data[off] >> 3 & 4:			# UNW_FLAG_CHAININFO
+				# The fragment and the function it continues: the primary
+				# entry covers only the first piece, so it is no more a
+				# whole function than the fragments are. The parent's
+				# RUNTIME_FUNCTION follows the codes, padded to an even
+				# count.
+				chained.add(base + begin)
+				parent = off + 4 + 2 * ((data[off + 2] + 1) & ~1)
+				if parent + 4 <= len(data):
+					chained.add(base + struct.unpack_from("<I", data,
+					                                      parent)[0])
+			elif not data[off + 3] & 0xF:		# no frame register
 				fixed_frame.add(base + begin)
+	fixed_frame -= chained
 
 	starts = [start for start, _end in ranges]
 	calls = [False] * len(ranges)
@@ -2742,7 +2766,7 @@ def home_space_map(binary, plain, ranges, blocked):
 	# walk wants that function's whole instruction list. `plain` is in
 	# address order, so a function's rows are found by bisection.
 	state = {"plain": plain, "unwind": unwind_at, "prologue": prologue_end,
-	         "data": data, "cache": {}, "home_cache": {},
+	         "chained": chained, "data": data, "cache": {}, "home_cache": {},
 	         "direct": direct, "copies": copies, "blocked": blocked,
 	         "gpr_cache": {}}
 	return (starts, ranges,
@@ -2896,8 +2920,8 @@ def shadow_depths(home, i):
 	# It costs 3 of the 2,153 starved sites, measured. `rsp_depths` can
 	# still model a frameless leaf and is tested doing so; what it cannot do
 	# is tell a leaf from the tail of somebody else's function.
-	if start not in state["unwind"]:
-		return state["cache"].setdefault(i, None)
+	if start not in state["unwind"] or start in state["chained"]:
+		return state["cache"].setdefault(i, None)	# see `home_space_map`
 	frame = prologue_frame(data, state["unwind"], start)
 	if frame is None:
 		return state["cache"].setdefault(i, None)	# a frame register
@@ -10232,6 +10256,19 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 		body += restored
 		if SPILL == SPILL_STACK or stack_borrow:
 			body += STACK_CLOSE
+		if stack_borrow:
+			# **The sixteen bytes are gone once `STACK_CLOSE` gives them
+			# back**, and `base` still said zero. A passenger emitted after
+			# this saved its own borrow at `(%rsp)` -- which is the
+			# function's frame again, so the save overwrote whatever the
+			# function kept there and the restore put back only the
+			# register. `0x1406d6927` was one of 16 such stubs in functions
+			# MSVC split, found by auditing every stub store to the stack
+			# against the window's original stores. A passenger that wants
+			# a borrow now refuses here rather than write into a frame that
+			# lent nothing. A second allocation is not the answer: the
+			# stub's unwind code describes one, at `prologue`. Finding 348.
+			base = None
 		lowered = b""
 	elif kind in ("span", "region", "unit"):
 		# **The upper halves live in the callee home space for the length
