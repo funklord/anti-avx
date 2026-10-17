@@ -14196,6 +14196,20 @@ on its own under any internal-target map. Rebuilt with `emit_swallowed`'s reason
 exposed, it refuses at its `vmovss (%rax),%xmm0` passenger, which borrows xmm1: `the
 window will not hold one borrow displacement`.
 
+**And the 70 `next instruction is a branch target`.** These counts are from the
+`7bdaf976` apply log, by the backward fallback's reason: 50 sites are themselves branch
+targets, 11 follow an instruction that does not fall through (a `jmp`, or a `call`
+whose return would land mid-window), and 13 have a predecessor that will not move. A
+neighbour tally over the 102 `will not move` and these 70 together names what refuses:
+- `vextractf128 $1,%ymm,%xmm`: 41 forward and 46 backward. Only span code lowers it.
+- 256-bit `vmovups`: about 40 forward.
+- Aliased scalars such as `vaddss %xmm4,%xmm9,%xmm4`, which need a scratch the passenger
+  does not have. 9 forward, 20 backward.
+
+`0x1411bf3d5`/`0x1411bf3d9` is the scalar shape: two aliased `vaddss` stranded between
+a placed window and a branch target, each the other's only neighbour. None of this is
+reachable without span lowering, passenger borrows or re-aimed outside branches.
+
 `place_stubs` takes candidates in address order, and two can share an address: a
 neighbour alone, and a short site widened backwards over that neighbour. Collection
 order put the narrow one first, so the wide one -- which removes both -- was lost to
