@@ -510,9 +510,15 @@ scan: $(REPORT)
 
 report: scan
 
-$(LISTING): $(TARGET) | $(BUILD_DIR)
-	@echo "  objdump  $< -> $@  (~0.9 GB, ~30 s)"
-	$(OBJDUMP) -d -j .text $< > $@
+# `resync.py` restarts the decode at every `.pdata` function start the linear
+# sweep ran past out of step, after embedded data. Without it two VEX
+# instructions were missing from the listing and shipped unconverted
+# (Finding 347). Written to a temporary and moved, so a failed resync
+# leaves no listing that looks finished.
+$(LISTING): $(TARGET) tool/resync.py | $(BUILD_DIR)
+	@echo "  objdump  $< -> $@  (~0.9 GB, ~2 min)"
+	set -o pipefail; $(OBJDUMP) -d -j .text $< | $(PYTHON) tool/resync.py $< > $@.tmp
+	mv $@.tmp $@
 
 # Without `-j .text` objdump also disassembles the 234 KB .bind DRM section,
 # which is flagged CODE and decodes as ~85,000 phantom instructions from

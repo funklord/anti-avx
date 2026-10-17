@@ -5,12 +5,12 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,659 of 804,946 VEX
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,661 of 804,948 VEX
 sites -- 99.96%** -- through 203,058 detours, and every `make detour-verify` invariant
-holds on the result. **287 sites are left** (Finding 345, 2026-10-16), five more rows
-that read as VEX are switch-table bytes and not instructions, and 180
+holds on the result. **287 sites are left** (Finding 347, 2026-10-17), five more rows
+that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
-(Finding 290). All four figures come from the same run; the denominator and the 180
+(Findings 290, 347). All four figures come from the same run; the denominator and the 164
 are re-derived from `build/text.asm` rather than carried, because this line twice
 held a rewritten count from one configuration beside a frontier from another.
 
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           287 re-measured   (Finding 345)
+    default build                           287 re-measured   (Finding 347)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,659 of 804,946 VEX sites, 99.96%, through 203,058 detours**, and 180 further
+**804,661 of 804,948 VEX sites, 99.96%, through 203,058 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,50 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 347 -- the listing ran out of step into 165 function starts
+
+`build/text.asm` was one linear `objdump` sweep. Data embedded in `.text` -- a switch
+table, mostly -- decodes as instructions, and the last of them can run past the data
+into the function after it. The sweep is then out of step until the encodings line up
+again, and the listing shows phantom instructions where the real ones are.
+
+Measured 2026-10-17 against `.pdata`: **165 of 236,427 function starts were not
+instruction boundaries**, and two of them only looked like one, because they sat
+on a continuation line of a 9-byte `movabs`. An address-keyed read of the listing (the
+first count, 163) takes such a line for a boundary. Decoding from each start until it
+meets the sweep, and diffing the VEX sets:
+
+- **Two real VEX instructions were missing**, `vmovss 0x4(%rcx),%xmm0` and
+  `vmovss (%rcx),%xmm4` at `0x1424bfb74`/`0x1424bfb79`. They open the function at
+  `0x1424bfb70`, which follows a switch table. Nothing counted them, nothing converted
+  them, and `7bdaf976` shipped them as VEX.
+- **No phantom VEX**: no instruction the rewriter converted was a misreading, so the
+  out-of-step stretches corrupted nothing.
+- The other 1,483 direct-branch and call targets off a boundary hold no real VEX
+  either. The 31 that start with a VEX byte decode as `(bad)`, which is data.
+
+`tool/resync.py` now sits after `objdump` in the listing rule. Where a row straddles a
+`.pdata` start, the bytes before the start become one `(bad)` row and the code is
+decoded afresh from the start until a boundary agrees with the sweep. It fails rather
+than guesses when the two do not agree within 256 bytes. It also fails when a second
+start falls inside the fresh decode, and when any start in range is still off a
+boundary at the end. On Starfield: 165 spliced, none left, and exactly the two
+`vmovss` gained against the old listing's VEX set.
+
+**`patch.disassemble` reads through the same filter**, for the original image and the
+patched one. Both `verify` and `frontier` read their counts from it. Without the
+filter, the first `verify` of the new build refused one lost boundary at
+`0x1424bfb7b`: that address is a boundary only in the old out-of-step reading of the
+original, and the patched bytes no longer decode to it. Through the filter, the
+original reads **804,953 VEX** (two more, exactly the pair) and 164 undecodable
+VEX-prefixed rows, 16 fewer, because those were artifacts of the same misreading. The
+rebuilt image passes `verify`: `804,953 -> 292`, 804,661 removed. Its survivor roll
+is the old one line for line, since the pair converts in place.
+
+Only `.pdata` starts are trusted for this. A branch target can sit inside data that
+merely decodes, and restarting there would manufacture the phantom instructions this
+removes.
 
 ### Finding 346 -- what the 36 overlap survivors are, measured 2026-10-16
 

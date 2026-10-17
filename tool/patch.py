@@ -118,6 +118,7 @@ DESTINATION_IN_VVVV = frozenset("""
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import lower			# noqa: E402  -- after the sys.path fix above
+import resync			# noqa: E402
 
 
 # objdump renders a redundant REX prefix as its own token -- `rex.W jmp *m64`
@@ -785,10 +786,17 @@ def disassemble(path):
 	survivor. The caller reports both and the frontier counts the decoded
 	ones. Finding 290.
 	"""
-	done = subprocess.run(["objdump", "-d", "-j", ".text", path],
-	                      capture_output=True, text=True, errors="replace")
+	# **Through `resync`, as the listing is**, or the two disagree wherever
+	# the linear sweep runs out of step into a function: the original
+	# image reads boundaries there that the patched one, its bytes
+	# rewritten, does not, and `verify` reported one lost at 0x1424bfb7b.
+	# Finding 347.
+	done = subprocess.Popen(["objdump", "-d", "-j", ".text", path],
+	                        stdout=subprocess.PIPE, text=True, errors="replace")
 	bounds, vex, undecoded = set(), set(), set()
-	for line in done.stdout.splitlines():
+	lines = (line for chunk in resync.resync(path, done.stdout)
+	         for line in chunk.splitlines())
+	for line in lines:
 		parts = line.split("\t")
 		if len(parts) < 3:
 			continue
@@ -807,6 +815,8 @@ def disassemble(path):
 				undecoded.add(address)
 			else:
 				vex.add(address)
+	if done.wait():
+		raise SystemExit(f"objdump failed on {path}: {done.returncode}")
 	return bounds, vex, undecoded
 
 
