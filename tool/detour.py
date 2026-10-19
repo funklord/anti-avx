@@ -7687,11 +7687,20 @@ HAMMOCK_RULE = True
 # displacement is rewritten to the stub's copy of the target, so it still
 # never lands in the middle. A rel8 cannot reach a stub, and a table or a
 # pointer cannot be rewritten, so those still refuse. Window start ->
-# {jump address: (the target it names, its length)}; `HAMMOCK_LABELS` is window start ->
+# {jump address: (the target it names, its length, the slot a rel8 is
+# aimed at or None)}; `HAMMOCK_LABELS` is window start ->
 # {target: its offset in the stub}, written by `build_stub`. Finding 351.
 HAMMOCK_REAIM = {}
 HAMMOCK_LABELS = {}
 HAMMOCK_REAIM_RULE = True
+# **A hammock that holds what comes AFTER the site.** A short site whose
+# next instruction is a target can take that instruction as a passenger
+# and hold it, where every way in is a jump that can be re-aimed: a rel32
+# as above, or a rel8 that reaches a five-byte slot in the window's own
+# padding, which holds a `jmp rel32` to the stub's copy. Window start ->
+# {slot address: the target its jump names}. The rel8 itself is in
+# `HAMMOCK_REAIM` with its slot. Finding 353.
+HAMMOCK_FORWARD = {}
 # How far back a hammock may reach for the branches into its targets.
 HAMMOCK_REACH = 64
 # Every address reached otherwise than by a direct branch: relocations,
@@ -10221,7 +10230,12 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	# them. See `HAMMOCK`. Finding 336.
 	internal = None
 	held = HAMMOCK.get(start)
-	if held:
+	forward = start in HAMMOCK_FORWARD
+	if held and forward and kind is not None:
+		if reasons is not None:
+			reasons["a hammock with a strategy"] += 1
+		return None, 0
+	if held and not forward:
 		if kind is not None:
 			if reasons is not None:
 				reasons["a hammock with a strategy"] += 1
@@ -10472,7 +10486,19 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				body += encode_tls_base(ordered[0], ordered[1], tls[0],
 				                        stub_address + len(body))
 				passenger_block = ordered[0]
+	# **A forward hammock's labels are known as its passengers go down**:
+	# the site's lowering is already in `body`, and nothing before a held
+	# passenger may be something a branch into the middle would skip -- a
+	# block pointer planted for a borrowing passenger is exactly that, so
+	# such a window is refused. See `HAMMOCK_FORWARD`. Finding 353.
+	labels = {}
+	if held and forward and passenger_block is not None:
+		if reasons is not None:
+			reasons["a forward hammock with a passenger block"] += 1
+		return None, 0
 	for entry in displaced:
+		if held and forward and entry[0] in held:
+			labels[entry[0]] = len(body)
 		fixed = emit_swallowed(entry, body, stub_address, pool,
 		                       spill_base, reasons, base,
 		                       block=passenger_block,
@@ -10482,6 +10508,12 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["a displaced instruction will not move"] += 1
 			return None, 0
 		body += fixed
+	if held and forward:
+		if set(labels) != set(held):
+			if reasons is not None:
+				reasons["a hammock target is not an instruction it holds"] += 1
+			return None, 0
+		HAMMOCK_LABELS[start] = labels
 
 	# Back to the instruction after the WINDOW, which is not the instruction
 	# after the original once the window has been widened.
@@ -11362,6 +11394,97 @@ def reaimable(instructions, positions, one, target, ranges, islands):
 	return len(moved)
 
 
+def short_jump(instructions, positions, one, target, ranges, islands):
+	"""Whether the branch at `one` is a two-byte jump to `target` in code.
+
+	`jmp rel8` or `jcc rel8`: the displacement is the last byte, and the
+	same tests as `reaimable` keep data that decodes as one out. Finding
+	353.
+	"""
+	if not HAMMOCK_REAIM_RULE or positions is None:
+		return False
+	at = positions.get(one)
+	if at is None:
+		return False
+	_a, moved, mnemonic, _operands, _comment = instructions[at]
+	if len(moved) != 2 or not (moved[0] == 0xEB or 0x70 <= moved[0] <= 0x7F):
+		return False
+	if one + 2 + int.from_bytes(moved[1:], "little", signed=True) != target:
+		return False
+	if ranges is None or not inplace.covered_by(ranges, one, 2):
+		return False
+	return islands is None or not in_island(islands, one)
+
+
+def forward_hammock(instructions, plain, index, blocked, sources, scope,
+                    positions, ranges, islands, limit=4):
+	"""(displaced, held, outer, slots) for a window from the site forward.
+
+	The site is short and its next instruction is a branch target. The
+	window takes that instruction and as many after it as it needs, and
+	holds every target among them, where each way in comes from outside
+	and can be re-aimed: a rel32 directly, a rel8 through a slot in the
+	window's padding. A passenger must not transfer control or borrow,
+	because a branch into the stub's middle skips anything the stub set up
+	before it. Or (None, why). See `HAMMOCK_FORWARD`. Finding 353.
+	"""
+	address, encoding = instructions[index][0], instructions[index][1]
+	end = address + len(encoding)
+	displaced, held, outer = [], [], {}
+	need = 5
+	k = index + 1
+	while True:
+		if end - address >= need and displaced:
+			break
+		if k >= len(instructions) or k - index > limit:
+			return None, "the window runs out before it is long enough"
+		at, moved, mnemonic, operands, comment = instructions[k]
+		if at != end:
+			return None, "next not adjacent"
+		if mnemonic.startswith(CONTROL_PREFIXES):
+			return None, "a passenger transfers control"
+		if not moved or moved[:1] == b"\x62":
+			return None, "a passenger is not movable"
+		if at in blocked:
+			if at in INDIRECT_TARGETS:
+				return None, "a target it would hold is reached indirectly"
+			ways = sources.get(at, ())
+			short = []
+			for one in ways:
+				if address <= one < at + len(moved):
+					return None, "a target it would hold is reached from inside"
+				length = reaimable(instructions, positions, one, at, ranges,
+				                   islands)
+				if length:
+					outer[one] = (at, length, None)
+				elif short_jump(instructions, positions, one, at, ranges,
+				                islands):
+					short.append(one)
+				else:
+					return None, "a way in can be re-aimed neither way"
+			if short:
+				slot = address + need
+				need += 5
+				for one in short:
+					if not -128 <= slot - (one + 2) <= 127:
+						return None, "a rel8 way in does not reach a slot"
+					outer[one] = (at, 2, slot)
+			held.append(at)
+		taken = swallowed_scratch(plain, k, at, moved, operands, mnemonic,
+		                          scope)
+		passenger = (at, moved, comment, operands, mnemonic, taken, False)
+		if moved_instruction(passenger, address, address) is None:
+			return None, "a passenger will not move"
+		displaced.append(passenger)
+		end = at + len(moved)
+		k += 1
+	if not held:
+		return None, "nothing to hold"
+	slots = {slot: target for _o, (target, _l, slot) in outer.items()
+	         if slot is not None}
+	return displaced, (frozenset(held), outer, slots)
+
+
 def hammock_window(instructions, plain, index, blocked, sources, scope,
                    home, positions=None, ranges=None, islands=None):
 	"""(preceding, targets) for a window ending at the site, or (None, why).
@@ -11394,7 +11517,7 @@ def hammock_window(instructions, plain, index, blocked, sources, scope,
 				length = reaimable(instructions, positions, one, target,
 				                   ranges, islands)
 				if length:
-					outer[one] = (target, length)
+					outer[one] = (target, length, None)
 		if any(one >= end and one not in outer for one, _t in reach):
 			return None, "a target it would hold is reached from after it"
 		if first < index and end - start >= 5 \
@@ -11449,6 +11572,7 @@ def collect(binary, listing, context=None):
 	HAMMOCK.clear()
 	HAMMOCK_REAIM.clear()
 	HAMMOCK_LABELS.clear()
+	HAMMOCK_FORWARD.clear()
 	HAMMOCK_REFUSED.clear()
 	UNIT_REFUSED.clear()
 	UNIT_RUNG.clear()
@@ -12513,6 +12637,22 @@ def collect(binary, listing, context=None):
 					HAMMOCK[start] = held
 				else:
 					HAMMOCK_REFUSED[held] += 1
+			# **Or hold what comes after it.** Finding 353.
+			if reason is not None and HAMMOCK_RULE and strategy is None \
+					and index + 1 < len(instructions) \
+					and instructions[index + 1][0] in blocked:
+				ahead, plan = forward_hammock(
+					instructions, plain, index, blocked, sources, scope,
+					positions, ranges, islands)
+				if ahead is not None:
+					reason = None
+					displaced, preceding = ahead, []
+					start = address
+					window = ahead[-1][0] + len(ahead[-1][1]) - address
+					HAMMOCK[start], HAMMOCK_REAIM[start], \
+						HAMMOCK_FORWARD[start] = plan
+				else:
+					HAMMOCK_REFUSED["forward: " + plan] += 1
 			if reason is not None:
 				skipped[reason] += 1
 				declined[address] = reason
@@ -17331,7 +17471,8 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 		# which is padding now, so the two cannot both be placed: whichever
 		# comes second is refused. Windows are placed in address order, so
 		# `spans` is sorted. Finding 351.
-		outer = reaimed_jumps(start) if preceding else {}
+		outer = reaimed_jumps(start) \
+			if preceding or start in HAMMOCK_FORWARD else {}
 		low = bisect.bisect_left(reserved, start)
 		if (low < len(reserved) and reserved[low] < start + window) \
 				or any(start <= one < start + window
@@ -17703,8 +17844,27 @@ def apply_all(binary, listing, output):
 		data[offset:offset + window] = jump + inplace.nop_padding(pad)
 		# The jumps from outside a hammock, pointed at the stub's copy of
 		# what they named. Finding 351.
-		for one, (target, length) in reaimed_jumps(site).items():
+		#
+		# **The padding after a slot is written again.** A slot's jump
+		# lands on top of a multi-byte `nop`, and the first build left that
+		# nop's last bytes behind it: the sweep read them as the start of
+		# an instruction and lost 18 boundaries past the window, one of
+		# them a branch target. Finding 353.
+		slots = sorted(HAMMOCK_FORWARD.get(site, {}))
+		if slots:
+			tail = slots[-1] + 5
+			there = raddr + (tail - vaddr)
+			data[there:offset + window] = inplace.nop_padding(
+				site + window - tail)
+		for one, (target, length, slot) in reaimed_jumps(site).items():
 			label = stub_address + HAMMOCK_LABELS[site][target]
+			if slot is not None:
+				# A rel8 cannot reach the stub; it reaches the slot, whose
+				# jump does. Finding 353.
+				there = raddr + (slot - vaddr)
+				data[there:there + 5] = encode_jump(slot + 5, label)
+				data[raddr + (one - vaddr) + 1] = (slot - (one + 2)) & 0xFF
+				continue
 			at = raddr + (one - vaddr) + length - 4
 			data[at:at + 4] = (label - (one + length)).to_bytes(
 				4, "little", signed=True)
@@ -18462,11 +18622,21 @@ def verify(original, patched, listing=None):
 	# leaves its target unexcused and the checks below fail. Finding 351.
 	held, aimed, misaimed = set(), set(), []
 	for window_at, window_len, stub_at, stub_len, _prologue in placed:
-		for one, (target, length) in reaimed_jumps(window_at).items():
+		for one, (target, length, slot) in \
+				reaimed_jumps(window_at).items():
 			low, high = one - tv, one - tv + length
-			now = one + length + int.from_bytes(after_text[high - 4:high],
-			                                    "little", signed=True)
-			if before_text[low:high - 4] == after_text[low:high - 4] \
+			field = 1 if slot is not None else 4
+			now = one + length + int.from_bytes(
+				after_text[high - field:high], "little", signed=True)
+			# A rel8 lands on a slot inside this window holding a jump
+			# into this window's stub. Finding 353.
+			if slot is not None and now == slot \
+					and window_at <= slot <= window_at + window_len - 5 \
+					and after_text[slot - tv] == 0xE9:
+				now = slot + 5 + int.from_bytes(
+					after_text[slot - tv + 1:slot - tv + 5], "little",
+					signed=True)
+			if before_text[low:high - field] == after_text[low:high - field] \
 					and stub_at <= now < stub_at + stub_len:
 				aimed.add(one)
 			else:

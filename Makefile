@@ -908,7 +908,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
              mxcsr splatrun splatop extract shadowspill regionlive \
-             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim
+             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim fwdhammock
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)

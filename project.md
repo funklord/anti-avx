@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,675 of 804,948 VEX
-sites -- 99.97%** -- through 203,310 detours, and every `make detour-verify` invariant
-holds on the result. **273 sites are left** (Finding 352, 2026-10-19), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,699 of 804,948 VEX
+sites -- 99.97%** -- through 203,328 detours, and every `make detour-verify` invariant
+holds on the result. **249 sites are left** (Finding 353, 2026-10-19), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           273 re-measured   (Finding 352)
+    default build                           249 re-measured   (Finding 353)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,675 of 804,948 VEX sites, 99.97%, through 203,310 detours**, and 164 further
+**804,699 of 804,948 VEX sites, 99.97%, through 203,328 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,70 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 353 -- a hammock holds what follows the site, and a rel8 jumps through a slot
+
+**The other survivor Finding 351's build stopped on, `0x142a61561`**, is one case
+of a rotation switch:
+
+    142a61560  ret
+    142a61561  vaddss %xmm4,%xmm3,%xmm0      a switch target, four bytes
+    142a61565  vxorps 0x24a5103(%rip),%xmm4,%xmm1   <- jmp rel8 at 0x142a615c9
+
+It cannot widen back over the `ret`. Its next instruction is reached by a
+`jmp rel8` from below, which cannot reach a stub, so Finding 351's re-aim does not
+apply. No `int3` padding lies within reach of either jump.
+
+**The window's own padding is within reach.** Taking the next instruction as a
+passenger makes the window 12 bytes, and only five are its jump. So
+`forward_hammock` walks forward from a short site whose next instruction is a
+target, holds every target among the passengers, and accepts each way in from
+outside that can be re-aimed:
+
+  * a rel32 is rewritten as in Finding 351;
+  * a rel8 (`jmp` or `jcc`) is rewritten to a five-byte slot in the window's
+    padding, `start + 5` for the first such target. `apply` writes a
+    `jmp rel32` there to the stub's copy.
+
+The window grows until it holds the jump and every slot. A passenger must not
+transfer control, and must not borrow. A branch into the middle of the stub skips
+whatever the stub set up before it, and a block pointer planted for a borrowing
+passenger is that, so `build_stub` refuses such a window. The labels need no
+second pass: the site's lowering is already in the body when the passengers go
+down, so each held one's offset is the body's length at that point.
+`HAMMOCK_FORWARD` names the slots, and `place_stubs` refuses conflicts as in
+Finding 351.
+
+**`verify` follows a rel8 through its slot.** The rewritten byte must land on a
+slot inside the same window, and the slot's `jmp rel32` must land in that
+window's stub.
+
+**The first build failed `verify` on 18 lost boundaries and a branch target**,
+and the cause was the padding. `apply` filled the window with jump and nops,
+then wrote each slot over the start of a multi-byte `nop`. Where the window ran
+one byte past its last slot, the `nop`'s trailing `00` was left behind, and the
+sweep read it as the start of an instruction that ran into the code after the
+window. `apply` now pads again from the last slot to the window's end.
+
+**`fwdhammock` is the fixture**, built to reach exactly this:
+  * the site is named by a rel8 from below, so neither widening back nor the
+    backward hammock can take it (the first version named it from above, and
+    the backward hammock took it);
+  * a loop's `jmp rel8` returns to the held `addl`;
+  * a one-byte `cltd` leaves the window one byte past its slot.
+
+It returns 77 and the original 29. With the short jump put back, `verify` fails
+three checks and the copy crashes. With the re-pad turned off, `verify` fails on
+a lost boundary.
+
+Measured 2026-10-19:
+
+    verify, VEX in .text      804,953 -> 278   before (Finding 352)
+                              804,953 -> 254   forward hammocks
+
+24 sites, `0x142a61561` among them, and none newly surviving. 42 jumps re-aimed in
+all. Ten fewer in-place patches, because a forward window takes a VEX passenger
+that was patched in place before. `verify` passes, with the same OPEN line.
 
 ### Finding 352 -- a lone 256-bit site jumps short too
 

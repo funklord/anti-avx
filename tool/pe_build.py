@@ -1779,6 +1779,49 @@ large:	.float 10.0
 """)
 
 
+# **A sandwiched site whose next instruction a rel8 jump reaches from
+# below**, Starfield's 0x142a61561: the site is a target, so it cannot
+# widen back, and a `jmp rel8` cannot reach a stub. The window takes the
+# next instruction as a passenger and holds it, and the short jump is
+# re-aimed at a slot in the window's own padding, whose `jmp rel32` goes
+# to the stub's copy. A second rel8 from below names the site, so neither
+# widening back nor Finding 336's hammock can take it. The loop runs the
+# `addl` twice, so 7 + 20 + 50 = 77; a short jump left alone lands inside
+# the window's first jump. Finding 353.
+PROGRAMS["fwdhammock"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	movss	three(%rip), %xmm3
+	movss	four(%rip), %xmm4
+	xorl	%ecx, %ecx
+site:
+	vaddss	%xmm4, %xmm3, %xmm0	/* four bytes, 7.0 */
+next:
+	addl	$10, %ecx		/* a target */
+	cltd				/* one byte, leaving the window one
+					   past its slot: the tail of the nop
+					   under the slot must be padded again */
+	cmpl	$20, %ecx
+	jb	again
+	cvttss2si %xmm0, %eax
+	addl	%ecx, %eax
+	addl	$50, %eax
+	addq	$40, %rsp
+	ret
+again:
+	jmp	next			/* rel8, from below the window */
+	jmp	site			/* never run; a rel8 naming `site` from
+					   below, so no window may reach back */
+func_end:
+	.p2align 4
+three:	.float 3.0
+four:	.float 4.0
+""")
+
+
 # **A 128-bit compare against a RIP-relative constant, moved into a stub.**
 # The destination is not the first source, so the lowering is
 # `movaps %xmm0,%xmm3; cmpps $4,bound(%rip),%xmm3` and has to live in a
