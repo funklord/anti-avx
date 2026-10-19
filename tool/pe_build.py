@@ -1822,6 +1822,52 @@ four:	.float 4.0
 """)
 
 
+# **A forward hammock at a site that borrows.** `fwdhammock` again, but the
+# site is `vsubss` with dst == src2 and the indirect jump below leaves no
+# register provably dead, so the lowering borrows one. Its save and restore
+# have to close before `next`'s label, or the loop's way back in skips the
+# restore's partner or runs it twice. `%xmm2` is the register borrowed and
+# is read at the end: 10 - 3 = 7, plus 100, plus a loop count of 20 taken
+# back off. Starfield faulted at two such sites, `0x140bbc1db` the second
+# arm of a ternary. Finding 354.
+PROGRAMS["fwdspill"] = (107, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	movss	ten(%rip), %xmm1
+	movss	three(%rip), %xmm0
+	movss	hundred(%rip), %xmm2	/* the register the spill will borrow */
+	xorl	%ecx, %ecx
+site:
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, four bytes, 7.0 */
+next:
+	addl	$10, %ecx		/* a target */
+	cltd
+	cmpl	$20, %ecx
+	jb	again
+	leaq	after(%rip), %rax
+	jmp	*%rax			/* indirect: nothing forward is provable */
+after:
+	addss	%xmm2, %xmm0
+	cvttss2si %xmm0, %eax
+	addl	%ecx, %eax
+	subl	$20, %eax
+	addq	$40, %rsp
+	ret
+again:
+	jmp	next			/* rel8, from below the window */
+	jmp	site			/* never run; a rel8 naming `site` from
+					   below, so no window may reach back */
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+hundred:	.float 100.0
+""")
+
+
 # **A 128-bit compare against a RIP-relative constant, moved into a stub.**
 # The destination is not the first source, so the lowering is
 # `movaps %xmm0,%xmm3; cmpps $4,bound(%rip),%xmm3` and has to live in a

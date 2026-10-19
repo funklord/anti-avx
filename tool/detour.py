@@ -10231,7 +10231,13 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	internal = None
 	held = HAMMOCK.get(start)
 	forward = start in HAMMOCK_FORWARD
-	if held and forward and kind is not None:
+	# **A spill closes before the passengers go down**: its save, the
+	# site and its restore -- and a stack allocation's release -- all come
+	# before the first held label, so a branch into one skips a bracket
+	# that is already shut. A passenger that would borrow is refused in
+	# `forward_hammock`, so no block pointer is planted after it either.
+	# Finding 354.
+	if held and forward and kind not in (None, "spill"):
 		if reasons is not None:
 			reasons["a hammock with a strategy"] += 1
 		return None, 0
@@ -12637,8 +12643,11 @@ def collect(binary, listing, context=None):
 					HAMMOCK[start] = held
 				else:
 					HAMMOCK_REFUSED[held] += 1
-			# **Or hold what comes after it.** Finding 353.
-			if reason is not None and HAMMOCK_RULE and strategy is None \
+			# **Or hold what comes after it**, a borrowing site too: the
+			# borrow is given back before the first passenger. Findings
+			# 353 and 354.
+			if reason is not None and HAMMOCK_RULE \
+					and (strategy is None or strategy[0] == "spill") \
 					and index + 1 < len(instructions) \
 					and instructions[index + 1][0] in blocked:
 				ahead, plan = forward_hammock(

@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,699 of 804,948 VEX
-sites -- 99.97%** -- through 203,328 detours, and every `make detour-verify` invariant
-holds on the result. **249 sites are left** (Finding 353, 2026-10-19), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,739 of 804,948 VEX
+sites -- 99.97%** -- through 203,368 detours, and every `make detour-verify` invariant
+holds on the result. **209 sites are left** (Finding 354, 2026-10-19), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           249 re-measured   (Finding 353)
+    default build                           209 re-measured   (Finding 354)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,699 of 804,948 VEX sites, 99.97%, through 203,328 detours**, and 164 further
+**804,739 of 804,948 VEX sites, 99.97%, through 203,368 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,61 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 354 -- a forward hammock takes a site that borrows
+
+**The build of Finding 353 stopped at `0x140bbc1db`**, after first faulting at
+`0x142a481c6`. Both are the same shape: the second arm of a ternary, or the last
+arm before a join.
+
+    140bbc1d3  jbe    0x140bbc1db
+    140bbc1d5  vsubss %xmm6,%xmm0,%xmm0
+    140bbc1d9  jmp    0x140bbc1df          rel8, the join
+    140bbc1db  vsubss %xmm0,%xmm6,%xmm0    four bytes, dst == src2
+    140bbc1df  vcomiss 0x4347c59(%rip),%xmm0
+
+Finding 353's census had already called `0x140bbc1db` "ok": one rel8 way in, and
+room for its slot. **The forward hammock was never asked.** `dst == src2` with
+no dead xmm makes the lowering a `("spill", n)` strategy, and `collect` offered
+hammocks only to sites with no strategy at all. A probe that ran `collect` alone
+and logged both hammock walks found neither one called for either site.
+
+**The exclusion was right for the backward hammock and only inherited by the
+forward one.** A backward hammock's labels point at instructions BEFORE the site,
+which the plain path lays out and the spill path does not. A forward hammock's
+labels come after the site, and the spill path closes before they do: the save,
+the lowering, the restore and any `STACK_CLOSE` all come before the first
+passenger. So a branch to a held label skips a bracket that is already shut. The
+two things that could open after it are refused already:
+  * a block pointer planted for a borrowing passenger is refused in
+    `build_stub`;
+  * a borrowing passenger is refused in `forward_hammock`.
+
+So `collect` offers the forward walk to a spill site too, and `build_stub` lets
+the pair through. Every other strategy is still refused.
+
+**Measured on the full image, against Finding 353's build:**
+
+| | Finding 353 | Finding 354 |
+|---|---:|---:|
+| short sites holding their own targets | 143 | 186 |
+| declined: next instruction is a branch target | 49 | 7 |
+| frontier rows (5 of them switch-table bytes) | 254 | 214 |
+| detours | 203,328 | 203,368 |
+
+That is 40 sites, both of the faulting ones among them. The 7 that remain are
+refused for "a passenger transfers control".
+
+**`fwdspill` is the fixture.** It is `fwdhammock` with three changes:
+  * the site is `vsubss %xmm0,%xmm1,%xmm0`;
+  * an indirect `jmp` leaves no xmm provably dead, so the site borrows `%xmm2`;
+  * `%xmm2` is read at the end.
+
+It answers 107. Measured three ways:
+  * HEAD declines the site, which faults (29);
+  * this change answers 107;
+  * with the held label aimed at the stub's first byte, the loop re-runs the
+    save and the subtraction and answers 103.
 
 ### Finding 353 -- a hammock holds what follows the site, and a rel8 jumps through a slot
 
