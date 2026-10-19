@@ -67,6 +67,19 @@ RSP_MEMORY = re.compile(r"(-?0x[0-9a-f]+)?\(%rsp\)")
 # this frame, and where it points decides whether the home space is still
 # safe -- which is what `taint_offsets` works out rather than assuming.
 RSP_COPY = re.compile(r"^%rsp,\s*%(r[a-z0-9]+)$")
+# A `lea` whose base is `rsp`: a copy with an offset, and as much a pointer
+# into this frame as `RSP_COPY`'s. Group 1 is the displacement where one is
+# printed, group 2 an index register where there is one, group 3 the
+# destination. MSVC's epilogue forms one to reload the registers its
+# prologue saved in the caller's shadow. Finding 355.
+RSP_LEA = re.compile(r"^(-?0x[0-9a-f]+)?\(%rsp(,[^)]*)?\),\s*%(r[a-z0-9]+)$")
+
+
+def rsp_copied(mnemonic, operands):
+	"""True if this instruction leaves a pointer into the frame in a register
+	other than `rsp`: a `mov %rsp,%r` or a `lea k(%rsp),%r`."""
+	return bool(RSP_COPY.match(operands or "")
+	            or (mnemonic == "lea" and RSP_LEA.match(operands or "")))
 # A memory operand and the register it is based on; group 1 is the
 # displacement where one is printed.
 MEMORY_BASE = re.compile(r"(-?0x[0-9a-f]+)?\(%(r[a-z0-9]+)\)")
@@ -2481,6 +2494,28 @@ def copy_reaches_home(rows, frame, region=None, hazards=None):
 			taint[RSP_COPY.match(operands).group(1)] = depth
 			unlocated.discard(RSP_COPY.match(operands).group(1))
 			continue
+		# **A `lea` off `rsp` is a copy too**, offset by its displacement.
+		# Only `mov %rsp,%r` used to be followed, so the epilogue's `lea
+		# 0xe0(%rsp),%r11` and the `mov 0x10(%r11),%rbx` after it read the
+		# caller's shadow unseen: every site past the prologue was told the
+		# shadow was free, and a borrow there overwrote the saved `rbx` and
+		# `rsi`. With an index the pointer is placed nowhere. Finding 355.
+		leaned = RSP_LEA.match(operands) if mnemonic == "lea" else None
+		if leaned:
+			target = canonical("%" + leaned.group(3))
+			if leaned.group(3) in WIDE32 \
+					or NUMBERED_NARROW.match(leaned.group(3)):
+				# A 32-bit result cannot address a stack: a kill.
+				taint.pop(target, None)
+				unlocated.discard(target)
+			elif leaned.group(2) or depth is None:
+				taint.pop(target, None)
+				unlocated.add(target)
+			else:
+				text = leaned.group(1)
+				taint[target] = depth + (int(text, 16) if text else 0)
+				unlocated.discard(target)
+			continue
 		if mnemonic == "lea" and len(fields) == 2 \
 				and fields[1].startswith("%"):
 			match = MEMORY_BASE.fullmatch(fields[0])
@@ -2788,7 +2823,7 @@ def home_space_map(binary, plain, ranges, blocked):
 		# in the binary -- see Finding 96 and `copy_reaches_home` -- and
 		# `--rsp=blanket` restores it for comparison. It is followed
 		# lazily: only a function holding a starved site is ever asked.
-		if RSP_COPY.match(operands):
+		if rsp_copied(mnemonic, operands):
 			copies.add(i)
 
 	# Both regions are worked out per function, on demand, because only the
@@ -2963,7 +2998,8 @@ def shadow_depths(home, i):
 	if pointed:
 		return state["cache"].setdefault(i, None)
 	hazards = [] if REGION_RULE == REGION_LIVE else None
-	if any(RSP_COPY.match(operands) for _a, _m, operands in rows) \
+	if any(rsp_copied(mnemonic, operands)
+	       for _a, mnemonic, operands in rows) \
 			and copy_reaches_home(rows, None, CALLER_SHADOW,
 			                      hazards=hazards):
 		return state["cache"].setdefault(i, None)
@@ -13766,6 +13802,22 @@ SHADOW_CASES = [
 	  ("mov", "%rcx,(%rax)")], True),
 	("a copy that stops below the return address",
 	 [("mov", "%rsp,%rax"), ("mov", "%rcx,(%rax)")], False),
+	# **MSVC's epilogue reaches the shadow through a `lea`, not a copy.**
+	# It reloads what the prologue saved there, and was invisible until
+	# Finding 355: a borrow anywhere before it overwrote the saved `rbx`
+	# and `rsi` at `0x140369280`.
+	("the MSVC epilogue reloading from the caller's shadow",
+	 [("push", "%rdi"), ("sub", "$0xe0,%rsp"), ("lea", "0xe0(%rsp),%r11"),
+	  ("mov", "0x10(%r11),%rbx")], True),
+	("a lea off rsp dereferenced in the frame",
+	 [("push", "%rdi"), ("sub", "$0xe0,%rsp"), ("lea", "0x20(%rsp),%rdx"),
+	  ("mov", "%rcx,(%rdx)")], False),
+	("an indexed lea off rsp, then dereferenced",
+	 [("sub", "$0x28,%rsp"), ("lea", "(%rsp,%rax,8),%rdx"),
+	  ("mov", "%rcx,(%rdx)")], True),
+	("a 32-bit lea off rsp, which addresses nothing",
+	 [("sub", "$0x28,%rsp"), ("lea", "0x30(%rsp),%edx"),
+	  ("mov", "%rcx,(%rdx)")], False),
 ]
 
 # `rsp_depths` walks straight through branches, so what makes it sound is

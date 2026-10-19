@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,739 of 804,948 VEX
-sites -- 99.97%** -- through 203,368 detours, and every `make detour-verify` invariant
-holds on the result. **209 sites are left** (Finding 354, 2026-10-19), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,737 of 804,948 VEX
+sites -- 99.97%** -- through 203,379 detours, and every `make detour-verify` invariant
+holds on the result. **211 sites are left** (Finding 355, 2026-10-20), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           209 re-measured   (Finding 354)
+    default build                           211 re-measured   (Finding 355)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,739 of 804,948 VEX sites, 99.97%, through 203,368 detours**, and 164 further
+**804,737 of 804,948 VEX sites, 99.97%, through 203,379 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,73 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 355 -- a `lea` off `rsp` is a copy of it, and the shadow walk missed it
+
+**Finding 354's build died about 53 seconds in**, on a write fault in a fill loop
+at `0x1407a48a0`. It was not an illegal instruction:
+
+    1407a4752  mov    $0x3,%ebx                  the loop count
+    1407a4773  xor    %esi,%esi                  the fill value
+    1407a4884  call   0x140369280
+    1407a48a0  mov    %rsi,(%rax)                <- rax ran off the stack
+    ...        sub    $0x1,%rbx ; jne 1407a48a0
+
+`rbx` came back from the call as `413baf2c413b9e16` and `rsi` as
+`413baf2c413baf2c`: a pair of floats near 11.73 each. Together that is one xmm
+register's sixteen bytes spread over two callee-saved registers.
+
+`0x140369280` saves `rbx` and `rsi` in the caller's shadow, at `0x8(%rax)` and
+`0x10(%rax)` with `rax = rsp` at entry. Its epilogue reloads them through a
+`lea`:
+
+    140369722  lea    0xe0(%rsp),%r11
+    14036972a  mov    0x10(%r11),%rbx
+    14036972e  mov    0x18(%r11),%rsi
+
+Inside the function, its stubs borrowed xmm registers with
+`movups %xmmN,0xf0(%rsp)` -- the shadow's first sixteen bytes, where `rbx` and
+`rsi` were saved. The borrow gives the register back but leaves its own value
+in the shadow, so the epilogue then reloaded float data into `rbx` and `rsi`.
+
+**The shadow walk tracked copies of `rsp` made by `mov` and not by `lea`.**
+`copy_reaches_home` seeded a tracked pointer only from `mov %rsp,%r`. So `r11`
+was never tracked, the reload through it was not a reader, and every site past
+the prologue was told the shadow was free. The prologue's `mov %rsp,%rax`
+stores were seen, but they come before the sites, so they did not hold the
+region live.
+
+**A `lea k(%rsp),%r` is now a copy offset by `k`.** An indexed one is followed
+as a pointer placed nowhere, and a 32-bit one as a kill, matching the rules a
+copy already had. Both gates that decide whether to walk a function at all --
+`home_space_map`'s `copies` and `shadow_depths` -- now ask the same
+`rsp_copied`.
+
+**Measured on the full image, against Finding 354's build:**
+
+| | Finding 354 | Finding 355 |
+|---|---:|---:|
+| stubs taking the TLS index from the callback | 45,203 | 50,626 |
+| TEB save brackets | 1,504 | 1,601 |
+| detours | 203,368 | 203,379 |
+| frontier rows (5 of them switch-table bytes) | 214 | 216 |
+
+So about 5,400 stubs had been borrowing a shadow that something later reads
+through a `lea`. They take a per-thread slot or the stack instead. Two 256-bit
+sites at `0x14374e622` and `0x14374e639` are now lost to an overlap, so 211
+sites are left. In `0x140369280` itself, no stub writes between `0xe0(%rsp)`
+and `0x10f(%rsp)` any more.
+
+**The tests.** `SHADOW_CASES` gains the epilogue idiom, a `lea` dereferenced
+inside the frame, an indexed `lea` and a 32-bit `lea`. With the new branch
+disabled, the epilogue case and the indexed case fail.
+
+`shadowlea` is the PE fixture. It is `regionlive`'s leaf with every volatile
+xmm live, keeping `rbx` in its shadow and reloading it as the epilogue does:
+  * the unrewritten program dies at 29;
+  * HEAD lends the shadow and returns 110, because `rbx` came back holding
+    `100.0f`'s low bits;
+  * this change returns 160.
 
 ### Finding 354 -- a forward hammock takes a site that borrows
 

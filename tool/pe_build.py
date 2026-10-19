@@ -3069,6 +3069,53 @@ hundred:	.float 100.0
 """)
 
 
+# **A register saved in the caller's shadow and reloaded through a `lea`.**
+# `shadowspill` again, but the function keeps `rbx` in the first eight
+# bytes of its shadow -- where the borrow writes -- and gets it back the way
+# MSVC's epilogue does, `lea 0x28(%rsp),%r11` and then `mov 0x8(%r11)`. The
+# walk followed `mov %rsp,%r` and not `lea k(%rsp),%r`, so the reload was
+# invisible, the shadow was lent at the site, and `rbx` came back holding
+# the borrowed register's low bits. Starfield's `0x140369280` lost `rbx` and
+# `rsi` exactly so. Finding 355.
+#
+# 160 only if `rbx` came back as 50: 7 + 100 + 3 + 50. Every volatile xmm
+# is live, as in `regionlive`, so the site must borrow.
+PROGRAMS["shadowlea"] = (160, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp		/* a frame, and no call: this is a leaf */
+	vzeroupper
+	movl	$50, %ebx
+	movq	%rbx, 0x30(%rsp)	/* the shadow's first eight bytes */
+	xorl	%ebx, %ebx
+	vmovss	three(%rip), %xmm0
+	vmovss	ten(%rip), %xmm1
+	vmovss	hundred(%rip), %xmm2
+	vmovss	one(%rip), %xmm3
+	vmovss	one(%rip), %xmm4
+	vmovss	one(%rip), %xmm5
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, and every volatile is live */
+	vaddss	%xmm2, %xmm0, %xmm0	/* 7 + 100 */
+	vaddss	%xmm3, %xmm0, %xmm0
+	vaddss	%xmm4, %xmm0, %xmm0
+	vaddss	%xmm5, %xmm0, %xmm0	/* + 3 = 110 */
+	vcvttss2si %xmm0, %eax
+	leaq	0x28(%rsp), %r11
+	movq	0x8(%r11), %rbx		/* the epilogue's reload */
+	addl	%ebx, %eax		/* + 50, only if rbx came back */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+ten:	.float 10.0
+one:	.float 1.0
+hundred:	.float 100.0
+""")
+
+
+
 # 38. The region is dead from the site onward, so the borrow is safe --
 # Finding 131. A leaf again, so only the caller's shadow can lend, and this
 # one USES its shadow: it keeps a local there, reads it back, and never
