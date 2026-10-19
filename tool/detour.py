@@ -7666,6 +7666,9 @@ UNIT_ALTERNATIVES = {}
 # module-level for the reason above: `place_stubs` unpacks a candidate as a
 # strict nine-tuple. Finding 331.
 TRAMPOLINE = {}
+# The padding slots `collect` offers, for `unit_trampoline` to ask about
+# from inside the unit ladder. Finding 352.
+UNIT_SLOTS = []
 # **A window that holds branch targets of its own.** A short site between
 # two branch targets cannot widen either way, and 200 of the 805 survivors
 # are that shape -- typically `if (a > b) d = a - b; else d = b - a;`, where
@@ -7974,7 +7977,9 @@ def unit_shortening(instructions, plain, index, blocked, home,
 					                       blocked, home, ranges, scope,
 					                       tls, limit=other_cap,
 					                       back=other_back)
-					if other is None:
+					# A short window needs a slot claimed, which only
+					# `seat_unit` does. Finding 352.
+					if other is None or other[4] < 5:
 						continue
 					if (other[0], other[4]) == (taken[0], taken[4]):
 						continue	# the window that was already dropped
@@ -8003,6 +8008,30 @@ def unit_shortening(instructions, plain, index, blocked, home,
 	# Finding 277.
 	UNIT_REFUSED, UNIT_EXAMPLES = last
 	return None
+
+
+def unit_trampoline(back, members, address):
+	"""Whether a unit window of the site alone can take a trampoline.
+
+	A short site that can widen neither way jumps short into padding, as a
+	plain one does under Finding 331; only the site alone, since a window
+	that absorbed a neighbour is no shorter for it. Asked without claiming,
+	because `unit_shortening` walks rungs it never takes; `seat_unit`
+	claims for the one taken. Finding 352.
+	"""
+	return TRAMPOLINE_RULE and not back and members == 1 \
+		and take_trampoline(UNIT_SLOTS, address, claim=False) is not None
+
+
+def seat_unit(lone, slots):
+	"""`lone`, with its trampoline claimed where it is short, or None."""
+	if lone is None or lone[4] >= 5:
+		return lone
+	slot = take_trampoline(slots, lone[0])
+	if slot is None:
+		return None
+	TRAMPOLINE[lone[0]] = slot
+	return lone
 
 
 def unit_candidate(instructions, plain, index, blocked, home,
@@ -8254,8 +8283,9 @@ def unit_candidate(instructions, plain, index, blocked, home,
 					stop = "neighbour names " + told
 		if stop is not None:
 			# Past five bytes the run simply ends here; under it, there is
-			# no window to place and the reason is the refusal.
-			if window >= 5:
+			# no window to place and the reason is the refusal -- unless a
+			# trampoline can seat the site alone. See `unit_trampoline`.
+			if window >= 5 or unit_trampoline(back, last - index, address):
 				break
 			return refuse("too short to place, " + stop)
 		if not wide_next:
@@ -8271,7 +8301,7 @@ def unit_candidate(instructions, plain, index, blocked, home,
 				members.append(("plain", last, None))
 		window += len(nxt_encoding)
 		last += 1
-	if window < 5:
+	if window < 5 and not unit_trampoline(back, last - index, address):
 		return refuse("too short to place, nothing follows")
 
 	if not inplace.covered_by(ranges, window_start, window):
@@ -11284,8 +11314,11 @@ def trampoline_slots(binary, ranges, islands, blocked):
 	return out
 
 
-def take_trampoline(slots, site):
-	"""Claim a five-byte padding slot a `jmp rel8` at `site` reaches."""
+def take_trampoline(slots, site, claim=True):
+	"""Claim a five-byte padding slot a `jmp rel8` at `site` reaches.
+
+	With `claim` false, only say where one would be. Finding 352.
+	"""
 	low, high = site + 2 - 128, site + 2 + 127
 	# Runs do not overlap, so only the one starting before `low` can reach
 	# into range from below.
@@ -11294,7 +11327,8 @@ def take_trampoline(slots, site):
 		run = slots[at]
 		start = max(run[2], low)
 		if start <= high and start + 5 <= run[1]:
-			run[2] = start + 5
+			if claim:
+				run[2] = start + 5
 			return start
 		at += 1
 	return None
@@ -11514,6 +11548,7 @@ def collect(binary, listing, context=None):
 	declined = {}
 	islands = data_islands(instructions)
 	slots = trampoline_slots(binary, ranges, islands, blocked)
+	UNIT_SLOTS[:] = slots
 	for index, (address, encoding, mnemonic, operands,
 	            _comment) in enumerate(instructions):
 		if not encoding or encoding[0] not in (0xC4, 0xC5):
@@ -11584,8 +11619,9 @@ def collect(binary, listing, context=None):
 		# permanent slots there is no invariant to protect, and `unit` is
 		# then simply the most expensive way to lower a site. Finding 260.
 		if SHADOW_REGS_RULE == SHADOW_REGS_ALL and vex["L"]:
-			lone = unit_shortening(instructions, plain, index, blocked,
-			                       home, ranges, scope, tls_slot_offset)
+			lone = seat_unit(unit_shortening(
+				instructions, plain, index, blocked, home, ranges, scope,
+				tls_slot_offset), slots)
 			if lone is not None:
 				candidates.append(lone)
 				continue
@@ -11593,8 +11629,9 @@ def collect(binary, listing, context=None):
 		# would lower it without the clear, so it is offered as a unit
 		# window or not at all. See `CLEARING_WRITERS`.
 		if address in CLEARING_WRITERS:
-			lone = unit_shortening(instructions, plain, index, blocked,
-			                       home, ranges, scope, tls_slot_offset)
+			lone = seat_unit(unit_shortening(
+				instructions, plain, index, blocked, home, ranges, scope,
+				tls_slot_offset), slots)
 			if lone is not None:
 				candidates.append(lone)
 			else:
@@ -12163,8 +12200,9 @@ def collect(binary, listing, context=None):
 		# refusing there is a hole in the invariant rather than a miss.
 		# Finding 246.
 		if vex["L"] and strategy is None:
-			lone = unit_shortening(instructions, plain, index, blocked,
-			                       home, ranges, scope, tls_slot_offset)
+			lone = seat_unit(unit_shortening(
+				instructions, plain, index, blocked, home, ranges, scope,
+				tls_slot_offset), slots)
 			if lone is not None:
 				candidates.append(lone)
 				continue

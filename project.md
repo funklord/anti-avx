@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,670 of 804,948 VEX
-sites -- 99.97%** -- through 203,305 detours, and every `make detour-verify` invariant
-holds on the result. **278 sites are left** (Finding 351, 2026-10-19), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,675 of 804,948 VEX
+sites -- 99.97%** -- through 203,310 detours, and every `make detour-verify` invariant
+holds on the result. **273 sites are left** (Finding 352, 2026-10-19), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           278 re-measured   (Finding 351)
+    default build                           273 re-measured   (Finding 352)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,670 of 804,948 VEX sites, 99.97%, through 203,305 detours**, and 164 further
+**804,675 of 804,948 VEX sites, 99.97%, through 203,310 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,52 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 352 -- a lone 256-bit site jumps short too
+
+**Finding 351's build ran 104 seconds and stopped on two survivors.**
+`0x142a61561` (a `vaddss`, Finding 353) faulted first, and three seconds later
+`0x142a059a7`:
+
+    142a059a1  je     0x142a05a60
+    142a059a7  vmovups (%rcx),%ymm0        four bytes, the survivor
+    142a059ab  mov    %rbx,0x8(%rax)       a chained .pdata fragment starts here
+
+The load's next instruction begins a chained unwind fragment
+(`UNW_FLAG_CHAININFO`), which the target set counts as a function start, so
+`ymm_run` stops there before reaching a store. The unit window, Finding 246's
+lowering that keeps the upper half in the permanent slot, cannot widen forward
+over the fragment start or backward over the `je`. Eight bytes of `int3` padding
+sit just above the function, within a `jmp rel8`'s reach. But Finding 331's
+trampoline was offered only on the plain path, which a 256-bit site never
+reaches.
+
+**The unit window takes the trampoline now.** `unit_candidate` accepts a window of
+the site alone when a slot is within reach (`unit_trampoline`, asked without
+claiming because the ladder walks rungs it never takes), and `seat_unit` claims
+the slot for the one candidate kept. The rest is Finding 331's machinery
+unchanged: `apply` writes the short jump and the slot's `jmp rel32`, and `verify`
+excuses the padding. The dropped-window alternatives skip a short window, since
+only `seat_unit` claims a slot.
+
+**`tramp256`** in `check-shadow-pe` is the shape: a four-byte `vmovups` load
+between a never-taken `jne` naming it and a never-taken `jne` naming its
+successor, with padding after `func_end`, and a later store of the register. The
+upper lane of the copy is 77. Without slots the load stays VEX and the program
+dies (29). With `TRAMPOLINE_RULE` off it dies too.
+
+**Crossing a chained fragment boundary was measured and not taken.** Only 14
+survivors have a chained fragment start from 16 bytes before them to 32 after, and a window that moved
+a fragment's prologue saves into a stub would unwind with the wrong fragment's
+codes.
+
+Measured 2026-10-19:
+
+    verify, VEX in .text      804,953 -> 283   before (Finding 351)
+                              804,953 -> 278   lone 256-bit sites jump short
+
+Five sites, `0x142a059a7` among them. `verify` passes, with 200 lost boundaries
+all inside trampoline padding, and the same OPEN line.
 
 ### Finding 351 -- a jump from outside a hammock is re-aimed rather than refused
 

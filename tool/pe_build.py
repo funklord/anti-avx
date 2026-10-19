@@ -4824,6 +4824,56 @@ vals:	.float	30.0, 47.0
 """)
 
 
+# **The same shape for a 256-bit load**, Starfield's 0x142a059a7: a
+# four-byte `vmovups (%rcx),%ymm0` after a `je`, whose next instruction
+# begins a chained unwind fragment. `ymm_run` stops at that start and the
+# unit window cannot widen over it, so the load takes the trampoline and
+# its upper half goes to the permanent slot, where the separate store
+# below reads it back. The upper lane of the copy is 77; the store left
+# reading an empty slot gives 0. Finding 352.
+PROGRAMS["tramp256"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	leaq	vals(%rip), %rsi
+	leaq	copy(%rip), %rdi
+	xorl	%edx, %edx
+	testl	%edx, %edx
+	jne	site			/* never taken; names `site` a target */
+site:
+	vmovups	(%rsi), %ymm0		/* four bytes, 256-bit */
+next:
+	movl	%edx, %ecx
+	testl	%edx, %edx
+	jne	next			/* never taken; names `next` a target */
+	vmovups	%ymm0, (%rdi)
+	movl	16(%rdi), %eax
+	vzeroupper
+	addq	$40, %rsp
+	ret
+func_end:
+	.fill	16, 1, 0xcc		/* inter-function padding, in reach */
+	.p2align 5
+vals:	.long	1, 2, 3, 4, 77, 6, 7, 8
+copy:	.long	0, 0, 0, 0, 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **A site that can only widen backward, and must not.** The shape is
 # `backward`'s with one thing added: a never-taken `jne` names the site,
 # so the site's own address is a branch target. A window widening back
