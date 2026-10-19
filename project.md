@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,663 of 804,948 VEX
-sites -- 99.96%** -- through 203,298 detours, and every `make detour-verify` invariant
-holds on the result. **285 sites are left** (Finding 350, 2026-10-19), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,670 of 804,948 VEX
+sites -- 99.97%** -- through 203,305 detours, and every `make detour-verify` invariant
+holds on the result. **278 sites are left** (Finding 351, 2026-10-19), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           285 re-measured   (Finding 350)
+    default build                           278 re-measured   (Finding 351)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,663 of 804,948 VEX sites, 99.96%, through 203,298 detours**, and 164 further
+**804,670 of 804,948 VEX sites, 99.97%, through 203,305 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,75 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 351 -- a jump from outside a hammock is re-aimed rather than refused
+
+**The survivor at `0x140d80afd` that stopped Finding 350's run is a short site
+where every instruction is a branch target**, each reached by rel32 jumps from
+elsewhere in the function:
+
+    140d80af9  vxorps %xmm1,%xmm1,%xmm1   <- je   at 0x140d80b81
+    140d80afd  vaddss %xmm1,%xmm2,%xmm1   <- jmp  at 0x140d80bad, 0x140d80bc7
+    140d80b01  vcomiss %xmm7,%xmm1        <- jmp  at 0x140d809bc, 0x140d809d1
+
+Forward widening swallows `0x140d80b01` and backward widening swallows the site,
+and both are targets. The site's own `vaddss` cannot be patched in place: written
+as `addss %xmm2,%xmm1` it would keep xmm1's upper lanes where VEX takes xmm2's. No
+`int3` padding lies within reach of a `jmp rel8`. Finding 336's hammock was refused
+too, because it holds a target only when every branch to it is inside the window,
+and these come from after it.
+
+**A rel32 jump is a pointer that can be rewritten.** The hammock now accepts a
+target reached from outside the window when every outside way in is a direct jump
+whose last four bytes are its displacement (`reaimable`). The jump stays where it
+is, and `apply` rewrites its displacement to the stub's copy of the target.
+`build_stub` already lays out a label for every preceding instruction and for the
+site; it now also records each held target's offset in `HAMMOCK_LABELS`, which is
+correct at any stub address because every piece's length is position-independent.
+
+A rel8 cannot reach a stub, and a table, a relocation or a `lea` cannot be
+rewritten, so those still refuse. The jump must also lie inside a function range
+and outside every data island, so that a run of data that happens to decode as
+`e9 xx xx xx xx` is never edited.
+
+**Two windows may not share a re-aimed jump.** A window that moved the jump would
+carry it into a stub still aimed at the held target, which is padding now.
+`place_stubs` places windows in address order and refuses whichever comes second:
+a hammock whose jump lies in a placed window, or a window covering a jump a placed
+hammock re-aims. It refused nothing in Starfield.
+
+**`verify` asks the image, not the plan.** For each jump a placed hammock re-aims,
+the rewritten bytes must match the original except for the displacement, and the
+new target must lie inside that window's own stub. Only then does a held target
+reached from outside count as held. Restoring the original jump in a copy of the
+rewritten `reaim` fixture failed three checks: this one, "direct branch targets
+no longer begin an instruction" and "land inside a placed window". The copy
+faulted under wine.
+
+**`reaim` is the fixture** for 0x140d80afd's shape. A `jbe` that is always taken
+reaches the site only through a `jmp.d32` from below the window, and the
+instruction after the site is a branch target, so the site can only be held. It
+returns 77, the original dies of an illegal instruction (29), and a jump left
+aimed at the window crashes.
+
+Measured 2026-10-19:
+
+    verify, VEX in .text      804,953 -> 290   before (Finding 350)
+                              804,953 -> 283   re-aimed jumps
+
+Seven sites, `0x140d80afd` among them, with 10 jumps re-aimed. "Reached from after
+it" no longer refuses anything. Of the 99 hammocks still refused, 84 are "an
+instruction it would swallow will not move", which is the next lever in this
+group. `verify` passes with the same OPEN line (510 register-addressed operands,
+Finding 341).
+
+**What this does not cover.** A forward window -- the site and the target after it
+-- would hold the target among the instructions after the site, and `build_stub`
+lays out labels only for those before it. Of the eight sites listed beforehand as
+forward candidates, four converted through the backward window instead
+(`0x140d80afd`, `0x1419c76fb`, `0x14211253b`, `0x1422964af`). Four still survive:
+`0x141a32dbc`, `0x141a544fa`, `0x14169b320` and `0x141746614`. Of the five listed
+as backward candidates, `0x140301787` and `0x1421d4746` still survive.
 
 ### Finding 350 -- a caller holds what its callee leaves alone, so `ret` frees nothing by itself
 

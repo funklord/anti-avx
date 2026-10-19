@@ -1740,6 +1740,45 @@ large:	.float 10.0
 """)
 
 
+# **A sandwiched site reached by a rel32 jump from after it**, Starfield's
+# 0x140d80afd: the site and the instruction after it are both branch
+# targets, so it widens neither way, and the jump into it comes from below
+# the window, which Finding 336's hammock refused. The `jmp` stays where it
+# is and its displacement is rewritten to the stub's copy of the site.
+# 3 <= 10 takes the `jbe`, so the site is reached only by that jump:
+# 3 - 0 = 3 and 77. A jump left aimed at the window lands in its padding,
+# skips the site and gives 74; left as VEX it faults. Finding 351.
+PROGRAMS["reaim"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	movss	small(%rip), %xmm7
+	movss	large(%rip), %xmm4
+	xorps	%xmm1, %xmm1
+	comiss	%xmm4, %xmm7
+	jbe	later
+	movaps	%xmm4, %xmm2
+site:
+	vsubss	%xmm1, %xmm2, %xmm1	/* the sandwiched site */
+join:
+	cvttss2si %xmm1, %eax
+	addl	$74, %eax
+	addq	$40, %rsp
+	ret
+later:
+	movaps	%xmm7, %xmm2
+	jmp.d32	site			/* rel32, from after the window */
+dead:
+	jmp	join			/* makes the join a branch target */
+func_end:
+	.p2align 4
+small:	.float 3.0
+large:	.float 10.0
+""")
+
+
 # **A 128-bit compare against a RIP-relative constant, moved into a stub.**
 # The destination is not the first source, so the lowering is
 # `movaps %xmm0,%xmm3; cmpps $4,bound(%rip),%xmm3` and has to live in a
