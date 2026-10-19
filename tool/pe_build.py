@@ -2724,6 +2724,8 @@ _start:
 	addl	%ecx, %eax		/* 16 only if BOTH stores got the half */
 	imull	$6, %eax, %eax
 	addl	$11, %eax		/* 16 * 6 + 11 = 107 */
+	xorps	%xmm1, %xmm1		/* what frees the two the pair takes: */
+	xorps	%xmm2, %xmm2		/* a ret no longer does (Finding 350) */
 	addq	$40, %rsp
 	ret
 func_end:

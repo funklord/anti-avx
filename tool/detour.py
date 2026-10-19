@@ -1873,17 +1873,7 @@ RETURN_GPRS = frozenset(("rax", "rdx"))
 # Every spelling of every one of them, because a read of `%r8b` is a read of
 # `%r8` and a scan keyed on the 64-bit name alone would not see it. The
 # high-byte forms alias bits 15:8 of the first three.
-GPR_SPELLINGS = {}
-for _wide, _parts in (
-		("rax", ("rax", "eax", "ax", "al", "ah")),
-		("rcx", ("rcx", "ecx", "cx", "cl", "ch")),
-		("rdx", ("rdx", "edx", "dx", "dl", "dh")),
-		("r8", ("r8", "r8d", "r8w", "r8b")),
-		("r9", ("r9", "r9d", "r9w", "r9b")),
-		("r10", ("r10", "r10d", "r10w", "r10b")),
-		("r11", ("r11", "r11d", "r11w", "r11b"))):
-	for _part in _parts:
-		GPR_SPELLINGS[_part] = _wide
+GPR_SPELLINGS = scratch_finder.GPR_SPELLINGS
 
 # The spellings whose write reaches all 64 bits: a 32-bit write zero-extends,
 # an 8- or 16-bit one leaves the rest of the register alone and is therefore
@@ -1972,8 +1962,9 @@ VOLATILE_XMM = (0, 1, 2, 3, 4, 5)
 # callee takes and nothing here knows how many.
 ARGUMENT_XMM = frozenset((0, 1, 2, 3))
 
-# What a `ret` hands back.
-RETURN_XMM = frozenset((0,))
+# What a `ret` may hand back: `__vectorcall` returns a homogeneous aggregate
+# in xmm0 to xmm3, which is what DirectXMath's matrix functions return.
+RETURN_XMM = frozenset((0, 1, 2, 3))
 
 # Moves whose last operand is written and not also read, which is what makes
 # a write a KILL rather than another read. Deliberately the plain moves:
@@ -2043,18 +2034,34 @@ def xmm_live_out(plain, first, last, inside_targets, exit_live=None):
 	Nothing special is needed to get that right, which is the point of
 	asking liveness rather than asking a rule.
 	"""
+	clobbered = scratch_finder.function_clobber(plain, plain[first][0]) \
+		if first < last else None
+	kept = frozenset(VOLATILE_XMM) - (clobbered[1] if clobbered else
+	                                  frozenset())
+
+	def adjust(position, read, written):
+		mnemonic = plain[position][2]
+		if mnemonic.startswith("ret"):
+			# Finding 350: what the function leaves alone, its caller may
+			# be holding.
+			return read | kept, written
+		if mnemonic.startswith("call"):
+			return read | (scratch_finder.calls_clobber(plain, position)[2]
+			               & frozenset(VOLATILE_XMM)), written
+		return read, written
 	return register_live_out(plain, first, last, inside_targets, xmm_effect,
-	                         frozenset(VOLATILE_XMM), exit_live)
+	                         frozenset(VOLATILE_XMM), exit_live, adjust)
 
 
-def gpr_function_scope(plain, ranges):
+def gpr_function_scope(plain, ranges, standard=()):
 	"""Per function, the volatile GPRs it provably never touches.
 
 	`scratch.function_scope`'s argument, applied to general-purpose
 	registers instead of to xmm: if a range never NAMES `r10`, nothing in
 	it reads `r10`; no callee can expect it, because it is not an argument
-	register; and no caller can expect it, because it is volatile. So it is
-	free at every point in the range.
+	register; and no caller can expect it, provided some callee clobbers
+	it -- being volatile is not enough, Finding 350. So it is free at every
+	point in the range.
 
 	The escape rule is the same blunt one, and is why this exists here only
 	as a baseline. Any jump whose target is outside the range, any indirect
@@ -2095,8 +2102,14 @@ def gpr_function_scope(plain, ranges):
 		if mnemonic is None or not (mnemonic.startswith(("ret", "jmp", "ud"))
 		                            or mnemonic == "int3"):
 			escapes[i] = True
-	free = [frozenset() if escapes[i]
-	        else frozenset(r for r in VOLATILE_GPRS if r not in mentioned[i])
+	# A register the range never names it never writes, so a caller may be
+	# holding it across the call unless a callee clobbers it. Finding 350.
+	scratch_finder.clobbers(plain, ranges, standard)
+	clobbered = [scratch_finder.function_clobber(plain, start)
+	             for start, _end in ranges]
+	free = [frozenset() if escapes[i] or clobbered[i] is None
+	        else frozenset(r for r in VOLATILE_GPRS if r not in mentioned[i]
+	                       and r in clobbered[i][0])
 	        for i in range(len(ranges))]
 	return starts, free
 
@@ -2120,16 +2133,32 @@ def gpr_live_out(plain, first, last, inside_targets):
 	the reason they are here is that the destination is unknown -- and a
 	set chosen from a guess about an unknown destination is a guess.
 
-	A `ret` is not one of those. It is modelled exactly: the caller reads
-	the return value and nothing else, so `r10` and `r11` are dead at
-	every one.
+	A `ret` is not one of those, but it is not the ABI's either. The caller
+	reads the return value AND every register this function leaves alone,
+	because the compiler allocated registers across calls and knows which
+	ones a callee writes. So `r10` is dead at a `ret` only in a function
+	that clobbers it -- `scratch.clobbers` counts that -- and a function
+	with no clobber registered keeps every register live there. Finding
+	350.
 	"""
+	clobbered = scratch_finder.function_clobber(plain, plain[first][0]) \
+		if first < last else None
+	kept = frozenset(VOLATILE_GPRS) - (clobbered[0] if clobbered else
+	                                   frozenset())
+
+	def adjust(position, read, written):
+		if plain[position][2].startswith("ret"):
+			# Finding 350: what the function leaves alone, its caller may
+			# be holding. 0x142920cac keeps `r9` across a call to a
+			# function that never writes it.
+			return read | kept, written
+		return read, written
 	return register_live_out(plain, first, last, inside_targets, gpr_effect,
-	                         frozenset(VOLATILE_GPRS))
+	                         frozenset(VOLATILE_GPRS), None, adjust)
 
 
 def register_live_out(plain, first, last, inside_targets, effect, everything,
-                      exit_live=None):
+                      exit_live=None, adjust=None):
 	"""`{position: frozenset}` -- which registers are live AFTER each one.
 
 	The backward fixpoint itself, shared by every register family that asks
@@ -2143,8 +2172,7 @@ def register_live_out(plain, first, last, inside_targets, effect, everything,
 		plain, first, last, inside_targets)
 	# **What is live where control leaves the range.** Everything, unless
 	# the caller knows better -- and over a CALL-FREE REGION it does: a
-	# region ends at a call, and the ABI says every volatile register is
-	# dead there, which is the same fact that makes a region a unit at all.
+	# region ends at a call, and what that callee clobbers is dead there.
 	#
 	# The default is not conservatism for its own sake. `gpr_live_out` runs
 	# over whole `.pdata` functions, which end in `ret` and are modelled
@@ -2159,6 +2187,8 @@ def register_live_out(plain, first, last, inside_targets, effect, everything,
 	for position in range(first, last):
 		_a, _e, mnemonic, operands = plain[position]
 		effects[position] = effect(mnemonic, operands or "")
+		if adjust is not None:
+			effects[position] = adjust(position, *effects[position])
 
 	# Seeded once: what is live on the way OUT of a position, before any
 	# successor has been accounted for.
@@ -7102,8 +7132,10 @@ def region_helpers(plain, instructions, first, bound, blocked, scope):
 	beside it. `xmm_live_out` asks whether the register is dead at every
 	position the region covers, which is a question about the region.
 
-	A region that ends at a CALL knows what is live after it: nothing
-	volatile, by the ABI. One that ends at a branch target does not --
+	A region that ends at a CALL knows what is live after it: at most what
+	the callee leaves alone, which the caller may be holding across it
+	(Finding 350) -- not "nothing volatile", which is only what the ABI
+	permits. One that ends at a branch target does not --
 	control carries on in the same function and anything may be wanted --
 	so `exit_live` is seeded only for the call.
 
@@ -7127,8 +7159,13 @@ def region_helpers(plain, instructions, first, bound, blocked, scope):
 	inside = tuple(position for position in range(first, bound)
 	               if instructions[position][0] in blocked)
 	closing = instructions[bound - 1][2]
+	# After the closing call, what the callee leaves alone may still be
+	# wanted by this function -- Finding 350 -- so only what it clobbers is
+	# dead there.
 	live = xmm_live_out(plain, first, bound, inside,
-	                    frozenset() if closing.startswith("call") else None)
+	                    frozenset(VOLATILE_XMM)
+	                    - scratch_finder.calls_clobber(plain, bound - 1)[1]
+	                    if closing.startswith("call") else None)
 	free = set(VOLATILE_XMM)
 	for position in range(first, bound):
 		free -= live[position]
@@ -11362,7 +11399,8 @@ def collect(binary, listing, context=None):
 	                                                entries, data))
 	# What each function never touches, for the sites the forward scan
 	# cannot get past. Computed once; it is a pass over the whole listing.
-	scope = scratch_finder.function_scope(plain, ranges)
+	scope = scratch_finder.function_scope(plain, ranges,
+	                                      inplace.standard_entries(binary))
 	# {address: index}, for following a branch rather than stopping at one.
 	# Built from `plain` because that is the list the liveness scan already
 	# indexes, and the two lists are the same instructions in the same order
@@ -13620,8 +13658,26 @@ def _flow(rows):
 	target land mid-instruction and every case answer the unresolved
 	question instead of the one it asks.
 	"""
-	return [(0x1000 + 4 * i, b"\x90\x90\x90\x90", mnemonic, operands)
-	        for i, (mnemonic, operands) in enumerate(rows)]
+	return _flow_ranges(rows)[0]
+
+
+def _flow_ranges(rows):
+	"""`_flow`, with a `("--", "")` row starting a second function.
+
+	Returns `(plain, ranges)` and registers what each function clobbers,
+	which is what a `ret` and a call are now judged by. Finding 350.
+	"""
+	plain, ranges, start = [], [], 0x1000
+	for mnemonic, operands in rows:
+		if mnemonic == "--":
+			ranges.append((start, 0x1000 + 4 * len(plain)))
+			start = 0x1000 + 4 * len(plain)
+			continue
+		plain.append((0x1000 + 4 * len(plain), b"\x90\x90\x90\x90",
+		              mnemonic, operands))
+	ranges.append((start, 0x1000 + 4 * len(plain)))
+	scratch_finder.clobbers(plain, ranges)
+	return plain, ranges
 
 
 # `(what, rows, position, register, expected)` -- is `register` live after
@@ -13655,15 +13711,24 @@ GPR_CASES = [
 	("a call reads the argument registers",
 	 [("nop", ""), ("call", "0x2000"), ("ret", "")], 0, "r8", True),
 	("a call does not read r10",
-	 [("nop", ""), ("call", "0x2000"), ("ret", "")], 0, "r10", False),
+	 [("nop", ""), ("call", "0x100c"), ("ret", ""), ("--", ""),
+	  ("mov", "$0x0,%r10"), ("ret", "")], 0, "r10", False),
 	("a call does not kill, so a value survives it",
 	 [("mov", "$0x1,%rax"), ("call", "0x2000"), ("sub", "%rax,%rsp"),
 	  ("ret", "")], 0, "rax", True),
 	# A ret is modelled exactly rather than treated as an unknown exit.
 	("a ret reads the return value",
 	 [("nop", ""), ("ret", "")], 0, "rax", True),
-	("a ret does not read the scratch registers",
-	 [("nop", ""), ("ret", "")], 0, "r11", False),
+	# Finding 350: the caller holds what this function leaves alone.
+	("a ret reads a register the function never writes",
+	 [("nop", ""), ("ret", "")], 0, "r11", True),
+	("a ret does not read a register the function clobbers",
+	 [("mov", "$0x1,%r11"), ("nop", ""), ("ret", "")], 1, "r11", False),
+	("a callee's clobber is the function's",
+	 [("nop", ""), ("call", "0x100c"), ("ret", ""), ("--", ""),
+	  ("mov", "$0x0,%r11"), ("ret", "")], 0, "r11", False),
+	("an indirect call clobbers every volatile register",
+	 [("nop", ""), ("call", "*%rax"), ("ret", "")], 0, "r11", False),
 	# Leaving the range is a tail call, and its callee reads what it likes.
 	("a jump out of the range is a tail call, so everything is live",
 	 [("nop", ""), ("jmp", "0x9000")], 0, "r10", True),
@@ -13682,10 +13747,10 @@ GPR_CASES = [
 	  ("ret", "")], 1, "r10", True),
 	("a loop closing below the read does not",
 	 [("add", "%r10,%rax"), ("nop", ""), ("nop", ""), ("jne", "0x1008"),
-	  ("ret", "")], 1, "r10", False),
+	  ("call", "*%rax"), ("ret", "")], 1, "r10", False),
 	("a forward branch does not carry it backwards",
 	 [("add", "%r10,%rax"), ("nop", ""), ("jne", "0x100c"),
-	  ("ret", "")], 1, "r10", False),
+	  ("call", "*%rax"), ("ret", "")], 1, "r10", False),
 	("live on one path of two is live",
 	 [("jne", "0x100c"), ("nop", ""), ("ret", ""),
 	  ("add", "%r10,%rax"), ("ret", "")], 0, "r10", True),
@@ -13787,8 +13852,12 @@ XMM_CASES = [
 	# evidence.
 	("a call reads the argument registers",
 	 [("nop", ""), ("call", "0x2000"), ("ret", "")], 0, 1, True),
-	("a call does not read xmm4",
-	 [("nop", ""), ("call", "0x2000"), ("ret", "")], 0, 4, False),
+	("a call does not read xmm4 when the callee does not",
+	 [("nop", ""), ("call", "0x100c"), ("ret", ""), ("--", ""),
+	  ("xorps", "%xmm4,%xmm4"), ("ret", "")], 0, 4, False),
+	# `__vectorcall` passes arguments in xmm4 and xmm5.
+	("a call to an unknown callee reads xmm4",
+	 [("nop", ""), ("call", "0x2000"), ("ret", "")], 0, 4, True),
 	# **In xmm4 and not xmm0**, which the first version got wrong. xmm0 is
 	# an argument register, so a call reads it whatever else is true, and
 	# the case passed against a sabotage that killed every volatile
@@ -13799,8 +13868,12 @@ XMM_CASES = [
 	  ("addps", "%xmm4,%xmm2"), ("ret", "")], 0, 4, True),
 	("a ret reads the return register",
 	 [("nop", ""), ("ret", "")], 0, 0, True),
-	("a ret does not read the scratch ones",
-	 [("nop", ""), ("ret", "")], 0, 5, False),
+	("a ret reads xmm5 when the function never writes it",
+	 [("nop", ""), ("ret", "")], 0, 5, True),
+	("a ret does not read xmm5 when the function clobbers it",
+	 [("xorps", "%xmm5,%xmm5"), ("nop", ""), ("ret", "")], 1, 5, False),
+	("a ret reads xmm1, which can carry a __vectorcall result",
+	 [("xorps", "%xmm1,%xmm1"), ("nop", ""), ("ret", "")], 1, 1, True),
 	("a jump out of the range is a tail call",
 	 [("nop", ""), ("jmp", "0x9000")], 0, 4, True),
 	("falling off the end of the range is not modelled",
@@ -13812,7 +13885,8 @@ XMM_CASES = [
 	  ("ret", "")], 1, 4, True),
 	("a loop closing below the read does not",
 	 [("addps", "%xmm4,%xmm0"), ("nop", ""), ("nop", ""),
-	  ("jne", "0x1008"), ("ret", "")], 1, 4, False),
+	  ("jne", "0x1008"), ("call", "0x1018"), ("ret", ""), ("--", ""),
+	  ("xorps", "%xmm4,%xmm4"), ("ret", "")], 1, 4, False),
 ]
 
 
@@ -14755,7 +14829,8 @@ def gpr_survey(binary, listing):
 			blocked.add(comment)
 	_p, _c, _s, _sk, declined, home = collect(binary, listing)
 	starts, ranges, _usable, _state = home
-	scope_starts, scope_free = gpr_function_scope(plain, ranges)
+	scope_starts, scope_free = gpr_function_scope(
+		plain, ranges, inplace.standard_entries(binary))
 
 	wanted = sorted(address for address, reason in declined.items()
 	                if reason == "no home space to borrow")
@@ -14907,7 +14982,8 @@ def span_survey(binary, listing, patched):
 	# helper is chosen from -- the same blunt rule `span_helper` uses, and
 	# the same one Finding 141 sharpened for general-purpose registers and
 	# nobody has yet pointed at xmm.
-	scope = scratch_finder.function_scope(plain, ranges)
+	scope = scratch_finder.function_scope(plain, ranges,
+	                                      inplace.standard_entries(binary))
 	region_covered, region_refused = set(), Counter()
 	region_cache, region_slots, region_cost = {}, Counter(), Counter()
 	region_whole = region_emittable = 0

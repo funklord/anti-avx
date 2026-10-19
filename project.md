@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,689 of 804,948 VEX
-sites -- 99.97%** -- through 203,065 detours, and every `make detour-verify` invariant
-holds on the result. **259 sites are left** (Finding 349, 2026-10-19), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,663 of 804,948 VEX
+sites -- 99.96%** -- through 203,298 detours, and every `make detour-verify` invariant
+holds on the result. **285 sites are left** (Finding 350, 2026-10-19), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           259 re-measured   (Finding 349)
+    default build                           285 re-measured   (Finding 350)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,689 of 804,948 VEX sites, 99.97%, through 203,065 detours**, and 164 further
+**804,663 of 804,948 VEX sites, 99.96%, through 203,298 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,94 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 350 -- a caller holds what its callee leaves alone, so `ret` frees nothing by itself
+
+**Starfield got past Finding 349's crash and faulted inside a stub**: an access
+violation at `0x148ded821`, `movups %xmm1,0x20(%r9,%r14,1)`, with `r9` holding
+`0x3f9d9be33f800000` -- two floats, 1.0 and 1.23, used as a pointer. Half a second
+later another thread stopped on the survivor at `0x140d80afd`.
+
+**The original code keeps `r9` live across a call.** `0x142920cac` loads `r9`, calls
+`0x142ccb870`, and stores through `r9` after it returns. The ABI makes `r9` volatile,
+but the compiler allocated registers across the whole program: it knew `0x142ccb870`
+never writes `r9`, and relied on it. The stub for `vmovups (%rdx),%ymm0` at
+`0x142ccb8af` moved the upper half through `r9` without saving it, because
+`gpr_live_out` modelled a `ret` as reading `rax` and `rdx` and nothing else. The same
+error appeared in five places, all trusting what the ABI permits a callee to do rather
+than what this program relies on. `gpr_effect` had already refused that trust for a
+call, on `__chkstk`'s evidence:
+
+  * a `ret`, in `gpr_live_out` and `xmm_live_out`;
+  * a `ret` and a call in `scratch.dead_from`, `dies_here` and the checker `walk`,
+    which killed xmm1-5 and xmm4-5;
+  * the region helper's closing call, seeded with nothing live after it;
+  * `scratch.function_scope` and `gpr_function_scope`: a register a function never
+    names was taken as free everywhere in it, though a caller may hold it across the
+    whole function.
+
+**Now the answer is the clobber set the compiler would have computed.**
+`scratch.clobbers` runs over the same ranges as `function_scope`. For each function it
+counts the registers its reachable instructions certainly write, adds the sets of the
+functions it calls directly (to a fixed point), and counts everything for an indirect
+call, whose target follows the standard convention.
+
+  * At a `ret`, a volatile register is live unless the function clobbers it.
+  * At a call, xmm4/5 die only where the callee clobbers them and does not read them,
+    because `__vectorcall` passes arguments there.
+  * xmm0-3 are always live at a `ret`, since `__vectorcall` returns a homogeneous
+    aggregate in them. This is not hypothetical. `0x1403a30fe` calls `0x140368fc0`
+    and then takes xmm0, xmm1, xmm2 and xmm3 as four results -- an `XMMATRIX`. The
+    old rule killed xmm1-3 at every `ret`, so a stub at the end of such a function
+    could have destroyed three rows of a matrix.
+
+Two choices keep the clobber set from being too large, which is the unsafe direction.
+Writes are recognised from a census of every last operand in the listing: a positive
+list for GPRs, and for vector registers everything but the compares to flags. Only
+code reachable from the entry counts, so jump-table bytes decoded as instructions add
+nothing.
+
+**The entry point and the exports clobber everything** (`patch.standard_entries`,
+279 functions in Starfield). The loader and other modules call them knowing nothing of
+them. Without this, `make check` failed on the `spanblock` fixture. Its only function
+is the entry point and writes only `eax`, so no GPR was left without TEB scratch,
+which a fixture image cannot import.
+
+Being called from outside says what a function clobbers, not what it reads. The first
+version marked those functions as reading every xmm register too, as it rightly does
+for an indirect call, whose callee may take `__vectorcall` arguments in xmm4 and
+xmm5. That emptied `span_helper`'s whole-function answer. With `--shadow-regs=all`,
+the `unaligned256` fixture then lowered the high half of its `vmulps` without a
+helper, as `mulps 0x10(%rax),%xmm0` on an operand 8 bytes off alignment. The fixture
+returned 5 for 77. That is Finding 341's open class, reached by losing a helper
+register.
+
+`longpair` parks an upper half in a register its function never names, xmm1 or
+xmm2. Both were free only by the old `ret` rule, so the fixture now zeroes them just
+before its `ret`.
+
+Where no clobber set is registered, a `ret` keeps every register live and a call kills
+nothing. That costs a scratch and never a value. The selftests build their fixtures'
+clobber sets the same way. The two cases that asserted the ABI rule are now pairs:
+"a ret reads a register the function never writes" and "... does not read one it
+clobbers".
+
+Measured 2026-10-19:
+
+    verify, VEX in .text      804,953 -> 264   before (Finding 349)
+                              804,953 -> 290   clobber sets
+
+All 26 newly surviving sites were converting before and relied on the ABI rule. 23
+are now "next instruction is a branch target": hammocks whose passengers no longer
+find a scratch. 3 are lost to an overlap. In the rebuilt image the stub at
+`0x142ccb8af` saves `rcx` and uses `r11`, which `0x142ccb870` writes in its epilogue;
+`r9` is untouched. `verify` passes with the same OPEN line (510 register-addressed
+operands, Finding 341).
+
+**What this does not cover.** Upper ymm halves are still dead at every call. MSVC
+emits `vzeroupper` before calls -- `0x142920d14` is one -- so its own code treats them
+that way. Direct calls to an address with no range contribute no clobbers, which is
+sound and costs sites.
 
 ### Finding 349 -- a passenger may borrow through TLS, and a VEX form kills its destination
 

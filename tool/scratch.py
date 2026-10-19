@@ -20,14 +20,13 @@ something overwrites it:
 
   * a **full write** to a register kills whatever it held, so if one happens
     before any read, that register is free at the site;
-  * a **call** kills xmm4 and xmm5 outright. They are volatile under Win64
-    and are not argument registers, so no caller can expect them to survive
-    and no callee is passed anything in them. xmm0 to xmm3 are argument
-    registers, so a call *reads* them; xmm6 to xmm15 are preserved, so a
-    call tells us nothing about them;
-  * a **`ret`** kills xmm1 to xmm5. They are volatile, so the caller cannot
-    expect them to survive the call it is about to return from; xmm0 is
-    excluded because it carries the return value;
+  * a **call** kills xmm4 or xmm5 where the callee clobbers it and does
+    not read it. Being volatile is not enough: this binary's callers keep
+    values across a call in registers they know the callee leaves alone
+    (Finding 350), and `__vectorcall` passes arguments in both;
+  * a **`ret`** kills xmm4 or xmm5 where the returning function clobbers
+    it, for the same reason. xmm0 to xmm3 can carry a `__vectorcall`
+    result and are never killed there;
   * a **branch with a direct target** is followed, and this is where the
     measurement sent the design. Stopping at branches refused 5,255 of the
     6,206 sites that could not get a scratch -- 85% of them -- while the
@@ -79,8 +78,9 @@ ZEROING = frozenset("vxorps vxorpd vpxor xorps xorpd pxor".split())
 
 CONTROL = ("j", "ret", "loop", "iret", "syscall", "sysret", "int", "ud", "hlt")
 
-# Volatile under Win64 and not used to pass arguments, so a call ends their
-# lives without reading them.
+# Volatile under Win64 and not used to pass arguments by the standard
+# convention, so a call CAN end their lives -- but only where the callee
+# clobbers them and does not read them, which `calls_dead` decides.
 DEAD_AT_CALL = (4, 5)
 ARGUMENT_REGISTERS = (0, 1, 2, 3)
 
@@ -114,10 +114,12 @@ def xmm_numbers(text):
 	return out
 
 
-# Volatile under Win64 and not the return register, so a `ret` ends their
-# lives: the caller of the function about to return cannot expect any of
-# them to have survived. xmm0 is excluded because it carries the result.
-DEAD_AT_RETURN = (1, 2, 3, 4, 5)
+# Volatile under Win64 and not a return register, so a `ret` CAN end their
+# lives -- but only where the function about to return clobbers them, which
+# `returns_dead` decides. xmm1 to xmm3 are excluded with xmm0 because
+# `__vectorcall` returns a homogeneous aggregate in xmm0 to xmm3, which is
+# what DirectXMath's matrix functions return.
+DEAD_AT_RETURN = (4, 5)
 
 UNCONDITIONAL = ("jmp", "jmpq")
 
@@ -127,6 +129,264 @@ UNCONDITIONAL = ("jmp", "jmpq")
 BUDGET = 400
 
 _ADDRESS_INDEX = {}
+
+
+# **What a function clobbers, which is what its callers may assume.** The
+# ABI lets a callee destroy every volatile register, and the rules above
+# once took that as what callers expect: a `ret` killed xmm1 to xmm5 and a
+# call killed xmm4 and xmm5. This binary was built with whole-program
+# register allocation, so a caller knows which registers a callee really
+# writes and keeps a value live across a call in any register the callee
+# leaves alone. 0x142920cac loads `r9`, calls 0x142ccb870, and stores
+# through `r9` after it -- and a stub in that callee took `r9` as dead at
+# its `ret`, so Starfield faulted at 0x148ded821 on a pointer holding two
+# floats. Finding 350.
+#
+# So a register dies at a `ret` only if the function clobbers it, and at a
+# call only if the callee clobbers it and does not read it. Both sets are
+# what the compiler would have computed: the registers a function writes,
+# plus those of every function it calls directly, plus everything for an
+# indirect call, whose target follows the standard convention. Counting is
+# done in the direction that keeps this sound -- a clobber set too SMALL
+# costs a scratch, one too large hands out a register a caller is holding
+# -- so only instructions reachable from the entry count, jump-table data
+# decoded as code cannot add a write, and a write is recognised only in the
+# forms below, taken from a census of every last operand in the listing.
+
+# Every spelling of each volatile GPR, keyed to its 64-bit name. A read of
+# `%r8b` is a read of `%r8`, and the high-byte forms alias bits 15:8 of the
+# first three.
+GPR_SPELLINGS = {}
+for _wide, _parts in (
+		("rax", ("rax", "eax", "ax", "al", "ah")),
+		("rcx", ("rcx", "ecx", "cx", "cl", "ch")),
+		("rdx", ("rdx", "edx", "dx", "dl", "dh")),
+		("r8", ("r8", "r8d", "r8w", "r8b")),
+		("r9", ("r9", "r9d", "r9w", "r9b")),
+		("r10", ("r10", "r10d", "r10w", "r10b")),
+		("r11", ("r11", "r11d", "r11w", "r11b"))):
+	for _part in _parts:
+		GPR_SPELLINGS[_part] = _wide
+
+ALL_GPRS = frozenset(GPR_SPELLINGS.values())
+ALL_XMM = frozenset(range(6))
+
+# Mnemonic prefixes that write a GPR last operand. A positive list, because
+# the negative one is open: `cmp`, `test`, `bt`, `push` and one-operand
+# `mul`/`div` all end in a register they only read. `imul` is handled apart
+# for that reason.
+GPR_WRITE_PREFIXES = (
+	"adc", "add", "and", "bsf", "bsr", "bswap", "btc", "btr", "bts", "cmov",
+	"crc32", "cvtt", "vcvtt", "dec", "inc", "lar", "lea", "lods", "lsl",
+	"mov", "neg", "not", "or", "pextr", "vpextr", "pmovmskb", "vpmovmskb",
+	"pop", "popcnt", "lzcnt", "tzcnt", "rcl", "rcr", "rol", "ror", "sar",
+	"sbb", "set", "shl", "shr", "sub", "vextractps", "vmov", "xchg", "xor")
+
+# Mnemonic prefixes whose vector last operand is read and not written. Every
+# other vector instruction writes its last operand when it is a register.
+XMM_READ_ONLY_PREFIXES = (
+	"comis", "ucomis", "vcomis", "vucomis", "ptest", "vptest", "vtest",
+	"pcmpestr", "pcmpistr", "vpcmpestr", "vpcmpistr")
+
+
+def written(mnemonic, operands):
+	"""`(gprs, xmms)` this instruction certainly writes: wide GPR names,
+	and the numbers of volatile vector registers."""
+	fields = inplace.split_operands(operands or "")
+	if not fields:
+		return frozenset(), frozenset()
+	last = fields[-1]
+	if not last.startswith("%") or "(" in last or ":" in last:
+		return frozenset(), frozenset()
+	name = last[1:]
+	if name.startswith(("xmm", "ymm", "zmm")):
+		if mnemonic.startswith(XMM_READ_ONLY_PREFIXES):
+			return frozenset(), frozenset()
+		return frozenset(), frozenset(n for n in xmm_numbers(last)
+		                              if n in ALL_XMM)
+	wide = GPR_SPELLINGS.get(name)
+	if wide is None:
+		return frozenset(), frozenset()
+	if mnemonic.startswith("imul"):
+		return (frozenset((wide,)) if len(fields) >= 2 else frozenset(),
+		        frozenset())
+	if not mnemonic.startswith(GPR_WRITE_PREFIXES):
+		return frozenset(), frozenset()
+	out = {wide}
+	if mnemonic.startswith("xchg"):
+		other = GPR_SPELLINGS.get(fields[0][1:]) \
+			if fields[0].startswith("%") else None
+		if other is not None:
+			out.add(other)
+	return frozenset(out), frozenset()
+
+
+def read_xmm(mnemonic, operands):
+	"""Volatile vector registers this instruction may read: every one it
+	names, less a destination it certainly overwrites whole."""
+	fields = inplace.split_operands(operands or "")
+	registers = [o for o in fields if not o.startswith("$")]
+	kills, _sources, _destination = kills_of(mnemonic, registers)
+	return frozenset(n for n in xmm_numbers(operands or "")
+	                 if n in ALL_XMM and n != kills)
+
+
+_CLOBBERS = {}
+
+
+def clobbers(instructions, ranges, standard=()):
+	"""Register, for `instructions`, what each function clobbers and reads.
+
+	Called by `function_scope`, which every caller of the scan already runs
+	over the same listing and ranges. Until it has run, `returns_dead` and
+	`calls_dead` answer nothing for that listing, which is the direction
+	that costs a scratch rather than a program.
+
+	`standard` is the functions code outside the image calls -- the entry
+	point and the exports, `patch.standard_entries`. Their callers know
+	nothing of them and assume every volatile register destroyed.
+	"""
+	addresses = address_index(instructions)
+	starts = [start for start, _end in ranges]
+	at_start = {start: i for i, start in enumerate(starts)}
+	own_gpr = [set() for _ in ranges]
+	own_xmm = [set() for _ in ranges]
+	reads = [set() for _ in ranges]
+	callees = [set() for _ in ranges]
+	everything = [False] * len(ranges)
+	returns, calls = {}, {}
+	for i, (start, end) in enumerate(ranges):
+		entry = addresses.get(start)
+		if entry is None:
+			continue
+		seen, work = set(), [entry]
+		while work:
+			position = work.pop()
+			if position in seen or position >= len(instructions):
+				continue
+			address, _encoding, mnemonic, operands = instructions[position]
+			if not start <= address < end:
+				continue
+			seen.add(position)
+			if mnemonic.startswith("ret"):
+				returns[position] = i
+				continue
+			if mnemonic.startswith(("ud", "hlt", "int3", "(bad)")):
+				continue
+			if mnemonic.startswith("call"):
+				target = branch_target(operands)
+				callee = at_start.get(target)
+				if target is None:
+					# Indirect, so the standard convention: it clobbers
+					# every volatile register.
+					calls[position] = "indirect"
+					everything[i] = True
+				elif callee is not None:
+					calls[position] = callee
+					callees[i].add(callee)
+				reads[i] |= read_xmm(mnemonic, operands)
+				work.append(position + 1)
+				continue
+			gprs, xmms = written(mnemonic, operands)
+			own_gpr[i] |= gprs
+			own_xmm[i] |= xmms
+			reads[i] |= read_xmm(mnemonic, operands)
+			if mnemonic.startswith(CONTROL):
+				target = branch_target(operands)
+				if target is not None and target in addresses:
+					work.append(addresses[target])
+				if not mnemonic.startswith(UNCONDITIONAL) \
+						and target is not None:
+					work.append(position + 1)
+				continue
+			work.append(position + 1)
+	# Through the call graph to a fixed point. The sets only grow and are
+	# bounded, so this ends; a cycle simply converges.
+	# Called from outside, so clobbering everything -- but that says
+	# nothing about what it READS, which an indirect call does: its callee
+	# may take `__vectorcall` arguments in xmm4 and xmm5.
+	outside_called = [False] * len(ranges)
+	for start in standard:
+		if start in at_start:
+			outside_called[at_start[start]] = True
+	gpr = [ALL_GPRS if everything[i] or outside_called[i]
+	       else frozenset(own_gpr[i]) for i in range(len(ranges))]
+	xmm = [ALL_XMM if everything[i] or outside_called[i]
+	       else frozenset(own_xmm[i]) for i in range(len(ranges))]
+	used = [ALL_XMM if everything[i] else frozenset(reads[i])
+	        for i in range(len(ranges))]
+	changed = True
+	while changed:
+		changed = False
+		for i in range(len(ranges)):
+			g, x, r = gpr[i], xmm[i], used[i]
+			for callee in callees[i]:
+				g = g | gpr[callee]
+				x = x | xmm[callee]
+				r = r | used[callee]
+			if (g, x, r) != (gpr[i], xmm[i], used[i]):
+				gpr[i], xmm[i], used[i] = g, x, r
+				changed = True
+	everything_set = (ALL_GPRS, ALL_XMM, ALL_XMM)
+	_CLOBBERS[id(instructions)] = (instructions, {
+		"returns": {p: (gpr[i], xmm[i]) for p, i in returns.items()},
+		"calls": {p: everything_set if i == "indirect"
+		          else (gpr[i], xmm[i], used[i])
+		          for p, i in calls.items()},
+		"functions": (starts, ranges, gpr, xmm, used),
+	})
+
+
+def _clobber_table(instructions):
+	cached = _CLOBBERS.get(id(instructions))
+	if cached is None or cached[0] is not instructions:
+		return None
+	return cached[1]
+
+
+def returns_clobber(instructions, position):
+	"""`(gprs, xmms)` the function returning at `position` clobbers, or
+	two empty sets where nothing is known."""
+	table = _clobber_table(instructions)
+	if table is None:
+		return frozenset(), frozenset()
+	return table["returns"].get(position, (frozenset(), frozenset()))
+
+
+def calls_clobber(instructions, position):
+	"""`(gprs, xmms, xmm_reads)` for the call at `position`. Unknown is
+	nothing clobbered and everything read."""
+	table = _clobber_table(instructions)
+	if table is None:
+		return frozenset(), frozenset(), ALL_XMM
+	return table["calls"].get(position, (frozenset(), frozenset(), ALL_XMM))
+
+
+def function_clobber(instructions, address):
+	"""`(gprs, xmms, xmm_reads)` for the function holding `address`, or
+	None where nothing is known."""
+	table = _clobber_table(instructions)
+	if table is None:
+		return None
+	starts, ranges, gpr, xmm, used = table["functions"]
+	i = bisect.bisect_right(starts, address) - 1
+	if i < 0 or address >= ranges[i][1]:
+		return None
+	return gpr[i], xmm[i], used[i]
+
+
+def returns_dead(instructions, position):
+	"""Vector registers dead at the `ret` at `position`."""
+	return frozenset(DEAD_AT_RETURN) & returns_clobber(instructions,
+	                                                   position)[1]
+
+
+def calls_dead(instructions, position):
+	"""Vector registers dead at the call at `position`: clobbered by the
+	callee, and not read by it either, since `__vectorcall` passes
+	arguments in xmm4 and xmm5 too."""
+	_gprs, xmms, reads = calls_clobber(instructions, position)
+	return (frozenset(DEAD_AT_CALL) & xmms) - reads
 
 
 def address_index(instructions):
@@ -206,9 +466,9 @@ def dead_from(instructions, position, read, depth, addresses, visiting,
 	_address, _encoding, mnemonic, operands = instructions[position]
 
 	if mnemonic in ("call", "callq"):
-		return frozenset(DEAD_AT_CALL) - read
+		return calls_dead(instructions, position) - read
 	if mnemonic.startswith("ret"):
-		return frozenset(DEAD_AT_RETURN) - read
+		return returns_dead(instructions, position) - read
 	if mnemonic.startswith(CONTROL):
 		target = branch_target(operands)
 		if target is None or target not in addresses:
@@ -247,15 +507,15 @@ def dead_from(instructions, position, read, depth, addresses, visiting,
 FUNCTION_SCRATCH = (4, 5)
 
 
-def function_scope(instructions, ranges):
+def function_scope(instructions, ranges, standard=()):
 	"""Per function, the registers it provably never touches.
 
 	A different argument from the forward scan, and it reaches where that one
 	cannot. If xmm4 is not named anywhere in a function then nothing in the
-	function reads it; no callee can expect it, because nothing is passed in
-	it; and no caller can expect it, because it is volatile. So it is free at
-	*every* point in that function, including points the forward scan cannot
-	get past.
+	function reads it; no callee can expect it, provided none reads it; and
+	no caller can expect it, provided some callee clobbers it -- being
+	volatile is not enough, Finding 350. So it is free at *every* point in
+	that function, including points the forward scan cannot get past.
 
 	The way out is control leaving the range, and **a `.pdata` entry is not
 	always a whole function**. MSVC splits one function across two entries,
@@ -296,9 +556,19 @@ def function_scope(instructions, ranges):
 		if mnemonic is None or not (mnemonic.startswith(("ret", "jmp", "ud"))
 		                            or mnemonic == "int3"):
 			escapes[i] = True
+	# **And a caller may hold it across this function** unless the function
+	# clobbers it, which is Finding 350's rule: a register this function
+	# never names is one it never writes, so it is free here only if a
+	# callee writes it -- and no callee reads it, since a `__vectorcall`
+	# callee takes arguments in xmm4 and xmm5 that this function would be
+	# passing on unnamed.
+	clobbers(instructions, ranges, standard)
+	table = _clobber_table(instructions)
+	_s, _r, _gpr, clobbered, read = table["functions"]
 	free = [frozenset() if escapes[i]
 	        else frozenset(r for r in FUNCTION_SCRATCH
-	                       if r not in mentioned[i])
+	                       if r not in mentioned[i]
+	                       and r in clobbered[i] and r not in read[i])
 	        for i in range(len(ranges))]
 	return starts, ranges, free
 
@@ -346,8 +616,8 @@ def dies_here(instructions, index, register, limit=60):
 		_address, _encoding, mnemonic, operands = instructions[position]
 
 		if mnemonic in ("call", "callq"):
-			# Volatile and not an argument register, so a call ends its life.
-			return register in DEAD_AT_CALL
+			# Ends its life only where the callee clobbers it unread.
+			return register in calls_dead(instructions, position)
 		if mnemonic.startswith(CONTROL):
 			return False
 
@@ -399,11 +669,11 @@ def walk(instructions, addresses, start, register, depth):
 			visited = visited | {position}
 			_address, _encoding, mnemonic, operands = instructions[position]
 			if mnemonic in ("call", "callq"):
-				if register in DEAD_AT_CALL:
+				if register in calls_dead(instructions, position):
 					break
 				return UNKNOWN
 			if mnemonic.startswith("ret"):
-				if register in DEAD_AT_RETURN:
+				if register in returns_dead(instructions, position):
 					break
 				return UNKNOWN
 			if mnemonic.startswith(CONTROL):
@@ -457,7 +727,8 @@ def check(listing, binary=None):
 		described = inplace.function_ranges(binary)
 		ranges = sorted(described
 		                + outside.leaf_ranges(instructions, described, blocked))
-		scope = function_scope(instructions, ranges)
+		scope = function_scope(instructions, ranges,
+		                       inplace.standard_entries(binary))
 	checked = live = unknown = whole = 0
 	for i, (address, encoding, mnemonic, operands) in enumerate(instructions):
 		if encoding[:1] not in (b"\xc4", b"\xc5"):

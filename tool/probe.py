@@ -121,7 +121,8 @@ def function_scope(binary, listing):
 	def build():
 		_instructions, plain, _blocked = listing_rows(binary, listing)
 		return scratch_finder.function_scope(
-			plain, function_ranges(binary, listing))
+			plain, function_ranges(binary, listing),
+			scratch_finder.inplace.standard_entries(binary))
 	return cached("scope", binary, listing, build)
 
 

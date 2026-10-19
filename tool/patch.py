@@ -609,6 +609,50 @@ def function_ranges(path):
 	return ranges
 
 
+def standard_entries(path):
+	"""The entry point and every exported function, as addresses.
+
+	Code outside the image calls these -- the loader, another module -- and
+	knows nothing of what they clobber, so their callers assume the standard
+	convention: every volatile register destroyed. Finding 350.
+	"""
+	data = open(path, "rb").read()
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	opt = pe + 24
+	base = struct.unpack_from("<Q", data, opt + 24)[0]
+	out = set()
+	entry = struct.unpack_from("<I", data, opt + 16)[0]
+	if entry:
+		out.add(base + entry)
+	rva, size = struct.unpack_from("<II", data, opt + 112)
+	if not rva or not size:
+		return out
+	sections = struct.unpack_from("<H", data, pe + 6)[0]
+	table = opt + struct.unpack_from("<H", data, pe + 20)[0]
+
+	def offset(at):
+		for i in range(sections):
+			vsize, va, rsize, raw = struct.unpack_from(
+				"<IIII", data, table + i * 40 + 8)
+			if va <= at < va + max(vsize, rsize):
+				return raw + at - va
+		return None
+	directory = offset(rva)
+	if directory is None:
+		return out
+	count, functions = struct.unpack_from("<I", data, directory + 20)[0], \
+		struct.unpack_from("<I", data, directory + 28)[0]
+	where = offset(functions)
+	if where is None:
+		return out
+	for i in range(count):
+		function = struct.unpack_from("<I", data, where + 4 * i)[0]
+		# A forwarder points back into the export directory, not at code.
+		if function and not rva <= function < rva + size:
+			out.add(base + function)
+	return out
+
+
 def covered_by(ranges, address, length):
 	"""True if [address, address+length) lies wholly inside one function."""
 	i = bisect.bisect_right(ranges, (address, 1 << 62)) - 1
