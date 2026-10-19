@@ -3078,7 +3078,8 @@ def home_space_free(home, address):
 	return usable[i]
 
 
-def swallowed_borrow(plain, address, encoding, operands, mnemonic, home):
+def swallowed_borrow(plain, address, encoding, operands, mnemonic, home,
+                     block_span):
 	"""A register a swallowed instruction may borrow, or None.
 
 	`swallowed_scratch` returns None when nothing is dead at the neighbour's
@@ -3103,8 +3104,28 @@ def swallowed_borrow(plain, address, encoding, operands, mnemonic, home):
 
 	The site's own spill block and this one cannot overlap either: `preceding`
 	is emitted before it and `displaced` after.
+
+	**`block_span` is the forward window a TLS block could be planted
+	across**, as `(start, window)`, or None where none can be. `build_stub`
+	plants one for a FORWARD passenger when the window lends no frame slot
+	(Finding 182), but this asked the frame alone, so that path was reached
+	only by accident. Finding 348 made it matter: a split function lends no
+	frame at all now, and 34 sites whose neighbour had borrowed through the
+	stack kept their VEX. One of them, `vmulps` at 0x142437e05, is where
+	Starfield next stopped. A preceding or hammock passenger is given no
+	block and passes None. Finding 349.
 	"""
-	if SPILL not in HOME_SPILLS or borrow_offset(home, address) is None:
+	if SPILL not in HOME_SPILLS:
+		return None
+	# **And only where the window's START lends nothing either.**
+	# `build_stub` takes `base` from the start alone, and plants the block
+	# only when that is None; a start that lends a frame slot would have
+	# this passenger saved into the frame at an address `borrow_offset`
+	# just refused.
+	if borrow_offset(home, address) is None and (
+			block_span is None or SPILL != SPILL_TLS
+			or borrow_offset(home, block_span[0]) is not None
+			or len(window_gpr_free(home, *block_span)) < 2):
 		return None
 	fields = inplace.split_operands(operands)
 	registers = [o for o in fields if not o.startswith("$")]
@@ -11273,7 +11294,7 @@ def hammock_window(instructions, plain, index, blocked, sources, scope,
 		borrow = None
 		if taken is None:
 			borrow = swallowed_borrow(plain, at, moved, operands, mnemonic,
-			                          home)
+			                          home, None)
 		passenger = (at, moved, comment, operands, mnemonic,
 		             taken if borrow is None else borrow, borrow is not None)
 		if moved_instruction(passenger, at, at, internal=probe) is None:
@@ -12207,7 +12228,9 @@ def collect(binary, listing, context=None):
 					if taken is None:
 						borrow = swallowed_borrow(
 							plain, nxt_address, nxt_encoding, nxt_operands,
-							nxt_mnemonic, home)
+							nxt_mnemonic, home,
+							None if tls_slot_offset is None
+							else (address, window + len(nxt_encoding)))
 					passenger = (nxt_address, nxt_encoding, nxt_comment,
 					             nxt_operands, nxt_mnemonic,
 					             taken if borrow is None else borrow,
@@ -12303,7 +12326,7 @@ def collect(binary, listing, context=None):
 					if taken is None:
 						borrow = swallowed_borrow(
 							plain, previous[0], previous[1], previous[3],
-							previous[2], home)
+							previous[2], home, None)
 					passenger = (previous[0], previous[1], previous[4],
 					             previous[3], previous[2],
 					             taken if borrow is None else borrow,

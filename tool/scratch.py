@@ -59,6 +59,7 @@ from collections import Counter
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
 import patch as inplace
+import lower			# noqa: E402  -- after the sys.path fix above
 
 # Instructions that write the whole 128 bits of their destination without
 # reading it. Deliberately a short list: a mnemonic missing from it costs a
@@ -170,6 +171,22 @@ def kills_of(mnemonic, registers):
 		# (which would be a no-op rather than a kill).
 		if destination[0] not in sources:
 			return destination[0], sources, destination
+	elif len(registers) == 3 and len(destination) == 1 \
+			and destination[0] not in sources \
+			and not any("{" in operand for operand in registers) \
+			and (mnemonic in lower.NDS_MNEMONICS
+			     or lower.compare_predicate(mnemonic) is not None):
+		# **A VEX non-destructive form writes its destination whole and
+		# never reads it**: `dst = op(src1, src2)`, with the bits above
+		# 127 zeroed. That is the instruction set's rule rather than this
+		# file's, and it is the shape `lower_vex` already lowers as
+		# `movaps src1,dst; op src2,dst`, whose first move discards the
+		# old `dst`. Counting it as a read hid `xmm5` and `xmm2` from the
+		# passenger at 0x142437e09, which `vshufps $0x88,%xmm0,%xmm1,%xmm5`
+		# writes before anything reads it -- so the `vmulps` beside it
+		# stayed VEX, and Starfield stopped on it. A merge-masked EVEX form
+		# (`{%k}`) does read the destination and is excluded. Finding 349.
+		return destination[0], sources, destination
 	return None, sources, destination
 
 

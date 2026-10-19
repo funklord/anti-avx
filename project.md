@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,627 of 804,948 VEX
-sites -- 99.96%** -- through 203,207 detours, and every `make detour-verify` invariant
-holds on the result. **321 sites are left** (Finding 348, 2026-10-17), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,689 of 804,948 VEX
+sites -- 99.97%** -- through 203,065 detours, and every `make detour-verify` invariant
+holds on the result. **259 sites are left** (Finding 349, 2026-10-19), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           321 re-measured   (Finding 348)
+    default build                           259 re-measured   (Finding 349)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,627 of 804,948 VEX sites, 99.96%, through 203,207 detours**, and 164 further
+**804,689 of 804,948 VEX sites, 99.97%, through 203,065 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,55 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 349 -- a passenger may borrow through TLS, and a VEX form kills its destination
+
+**Starfield got past Finding 348's crash and stopped 52 seconds after load on an
+illegal instruction at `0x142437e05`**: `vmulps (%rax),%xmm1,%xmm6`, a survivor, and
+one of the 34 sites Finding 348 cost. It is four bytes between two five-byte `vmulps`
+in a chained fragment, and its forward neighbour would not ride along. Two causes,
+both fixed.
+
+**A passenger was offered a borrow only where the frame lends one.** Its memory
+operand may be unaligned, so the neighbour needs a register to `movups` into, and with
+none dead it borrows one. `swallowed_borrow` asked `borrow_offset` alone. `build_stub`
+has planted a TLS block for a borrowing forward passenger since Finding 182, but only
+when the window lends no frame slot, and nothing at collection offered one there.
+After Finding 348 a split function lends nothing, so the path mattered. Now, under
+`--spill=tls`, a forward passenger is offered a borrow where neither it nor the
+window's start lends a frame slot and two GPRs are dead across the window. The start
+has to lend nothing as well: `build_stub` takes `base` from the start, and a start that
+lends would save the passenger into the frame at an address `borrow_offset` refused.
+A preceding or hammock passenger gets no block from `build_stub`, so it is not
+offered one. Worth 19 sites, 326 -> 307, and not this one: only `rcx` is provably
+dead there.
+
+**The liveness scan counted every VEX non-destructive form as reading its
+destination.** `scratch.kills_of` knew the plain moves and the zeroing idioms. So
+`vshufps $0x88,%xmm0,%xmm1,%xmm5`, which writes `xmm5` whole from `xmm0` and `xmm1`,
+left `xmm5` live, and the same went for `xmm2` -- both dead from `0x142437e05` to
+their writes. A three-operand instruction in `lower.NDS_MNEMONICS` or a compare form now
+kills its register destination when that register is not also a source. That is the
+ISA's rule for VEX.128 and VEX.256 (`dst = op(src1, src2)`, upper bits zeroed). It is
+also the shape `lower_vex` already emits as `movaps src1,dst; op src2,dst`. A
+merge-masked EVEX operand (`{%k}`) does read the destination and is excluded.
+
+**`scratch.walk` cannot vouch for this**, because it calls the same `kills_of`. The
+rule rests on the ISA definition, not on a second implementation. The rebuilt image's
+`verify` is the check on the result.
+
+Measured 2026-10-19, both in one build:
+
+    verify, VEX in .text      804,953 -> 326   before (Finding 348)
+                              804,953 -> 307   TLS passenger borrow only
+                              804,953 -> 264   with the liveness rule
+
+`0x142437e05` converts. Of the 35 addresses that survive in Finding 348's build and
+not in Finding 347's, 24 convert now and 11 still survive -- among them `0x1406d6933`,
+the passenger after a closed stack allocation. The rest of the gain is sites that
+survived both before and after Finding 348: 264 is 28 below Finding 347's 292. No site
+that converted in Finding 348's build survives in this one. `verify` passes, with the same OPEN line
+(505 register-addressed operands, Finding 341).
 
 ### Finding 348 -- the zeroed frame pointer was a borrow into a split function's shadow
 
