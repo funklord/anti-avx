@@ -3206,6 +3206,57 @@ hundred:	.float 100.0
 
 
 
+# **A borrowing passenger behind a site that borrowed the stack.** As
+# `shadowlea`, the home space cannot lend and there is no TLS directory, so
+# the first `vsubss` spills to sixteen bytes it allocates itself. Its window
+# takes the `vmovss` after it and ends at the second `vsubss`, which is
+# aliased too and whose own window is the overlapped one; carried along, it
+# needs a slot, and the stack's had already been given back. Starfield
+# faulted at `0x14278642a`, this shape. Finding 359.
+#
+# 7 + 15 + 10 + 19 + 1 + 1, plus 50 for rbx.
+PROGRAMS["stackride"] = (103, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp		/* a frame, and no call: this is a leaf */
+	vzeroupper
+	movl	$50, %ebx
+	movq	%rbx, 0x30(%rsp)	/* the shadow's first eight bytes */
+	xorl	%ebx, %ebx
+	leaq	values(%rip), %rax
+	vmovss	three(%rip), %xmm0
+	vmovss	ten(%rip), %xmm1
+	vmovss	five(%rip), %xmm2
+	vmovss	one(%rip), %xmm3
+	vmovss	one(%rip), %xmm4
+	vmovss	one(%rip), %xmm5
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, borrows the stack: 7 */
+	vmovss	4(%rax), %xmm6		/* five bytes, 20 */
+	vsubss	%xmm2, %xmm6, %xmm2	/* aliased, the passenger: 15 */
+	vsubss	%xmm3, %xmm6, %xmm3	/* aliased again, so it cannot widen
+					   forward: 19 */
+	vaddss	%xmm2, %xmm0, %xmm0
+	vaddss	%xmm1, %xmm0, %xmm0
+	vaddss	%xmm3, %xmm0, %xmm0
+	vaddss	%xmm4, %xmm0, %xmm0
+	vaddss	%xmm5, %xmm0, %xmm0	/* 53 */
+	vcvttss2si %xmm0, %eax
+	leaq	0x28(%rsp), %r11
+	movq	0x8(%r11), %rbx		/* the epilogue's reload */
+	addl	%ebx, %eax		/* + 50, only if rbx came back */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+values:	.float 0.0, 20.0
+three:	.float 3.0
+five:	.float 5.0
+ten:	.float 10.0
+one:	.float 1.0
+""")
+
+
 # 38. The region is dead from the site onward, so the borrow is safe --
 # Finding 131. A leaf again, so only the caller's shadow can lend, and this
 # one USES its shadow: it keeps a local there, reads it back, and never

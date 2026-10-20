@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,834 of 804,948 VEX
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,838 of 804,948 VEX
 sites -- 99.99%** -- through 203,386 detours, and every `make detour-verify` invariant
-holds on the result. **114 sites are left** (Finding 358, 2026-10-20), five more rows
+holds on the result. **110 sites are left** (Finding 359, 2026-10-20), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           114 re-measured   (Finding 358)
+    default build                           110 re-measured   (Finding 359)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,834 of 804,948 VEX sites, 99.99%, through 203,386 detours**, and 164 further
+**804,838 of 804,948 VEX sites, 99.99%, through 203,386 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,36 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 359 -- a stack-borrowing site keeps its slot open for its passengers
+
+**Finding 358's build died at `0x14278642a`** about 250 seconds in, through the same
+minidump path. The site is `vminss %xmm4,%xmm0,%xmm4`, aliased, and its candidate
+widened backwards over the `vmovss` before it. That `vmovss` was already the passenger
+of `0x142786421`, whose window ends exactly at the site, so the rescue chain offered
+it -- with the rider `0x14278642e` behind it -- and both chains were refused: "the
+window will not hold one borrow displacement".
+
+`0x142786421` is a spill with neither home space nor two free GPRs, so it borrows
+sixteen bytes of stack (Finding 204), and closes them before the passengers. A
+passenger that borrows then has no slot: Finding 348 stopped it saving at `(%rsp)`,
+which is the function's frame again by then, and a second allocation would be one the
+stub's unwind code does not describe.
+
+**So the allocation stays open until the passengers are done** when one of them
+borrows, and closes just before the jump home. The brackets are sequential, so each
+passenger saves into the slot the site has already given back. It does not defer
+where a passenger names `rsp`, pushes, pops, calls or branches -- each would see the
+stack sixteen bytes off or skip the close -- nor in a forward hammock, which is
+entered at a passenger past the allocation. `DEFER_RULE` is the A/B.
+
+Fixture `stackride` is the shape: `shadowlea`'s frame, so the home space cannot lend,
+no TLS directory, and an aliased site whose own forward window is blocked by a third.
+The original and HEAD return 29 and this returns 103.
+
+**Measured on the full image:** 119 frontier rows down to 115, nothing new: both
+faulting sites and two more overlap losses, `0x1416ceca1` and `0x1422cd007`. Detours
+stay 203,386 and the swallowed count rises by four. `verify` passes.
 
 ### Finding 358 -- a short site with no window rides in its neighbour's
 

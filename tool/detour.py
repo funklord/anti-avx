@@ -1320,6 +1320,23 @@ def block_off_xmm(block, mover, home, instructions, index, address,
 
 STACK_OPEN = bytes([0x48, 0x83, 0xEC, 0x10])
 STACK_CLOSE = bytes([0x48, 0x83, 0xC4, 0x10])
+# Whether a spill site's stack slot stays open across its passengers.
+# Finding 359.
+DEFER_RULE = True
+
+
+def stack_bound(entry):
+	"""Whether a passenger would notice `rsp` sixteen bytes lower.
+
+	It names the stack pointer, moves it, or leaves the stub -- a call
+	pushes below it and a branch would skip the close. `entry` is
+	`emit_swallowed`'s shape. Finding 359.
+	"""
+	operands, mnemonic = entry[3] or "", entry[4] or ""
+	return "%rsp" in operands or "%esp" in operands or "%sp" in operands \
+		or mnemonic.startswith(("push", "pop", "call", "ret", "enter",
+		                        "leave")) \
+		or mnemonic.startswith(CONTROL_PREFIXES)
 
 
 def encode_pslld_immediate(destination, amount):
@@ -10116,6 +10133,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	borrowing register n and giving it back.
 	"""
 	kind = strategy[0] if strategy is not None else None
+	deferred = False
 	# Where a borrow in this stub saves and restores, as a displacement from
 	# `rsp`. Zero is the callee home space, which is at `(%rsp)` for every
 	# instruction in the window because the function lending it does not
@@ -10429,9 +10447,21 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["the borrowed register could not be restored"] += 1
 			return None, 0
 		body += restored
-		if SPILL == SPILL_STACK or stack_borrow:
+		# **Or keep the sixteen bytes until the passengers are done**, so a
+		# passenger that borrows saves into them too: the brackets are
+		# sequential, the site's restore has already run, and the one
+		# allocation the unwind code describes covers them all. A passenger
+		# that addresses the stack, moves it or leaves the stub would see
+		# it sixteen bytes off, and a forward hammock is entered at a
+		# passenger, past the allocation, so neither defers. `0x14278642a`
+		# and the rider after it were refused for want of this, and
+		# Starfield faulted there. Finding 359.
+		deferred = stack_borrow and DEFER_RULE and not (held and forward) \
+			and any(len(entry) > 6 and entry[6] for entry in displaced) \
+			and not any(stack_bound(entry) for entry in displaced)
+		if (SPILL == SPILL_STACK or stack_borrow) and not deferred:
 			body += STACK_CLOSE
-		if stack_borrow:
+		if stack_borrow and not deferred:
 			# **The sixteen bytes are gone once `STACK_CLOSE` gives them
 			# back**, and `base` still said zero. A passenger emitted after
 			# this saved its own borrow at `(%rsp)` -- which is the
@@ -10566,6 +10596,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["a displaced instruction will not move"] += 1
 			return None, 0
 		body += fixed
+	if deferred:
+		body += STACK_CLOSE
 	if held and forward:
 		if set(labels) != set(held):
 			if reasons is not None:
