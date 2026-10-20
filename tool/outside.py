@@ -89,6 +89,23 @@ import targets as target_set
 TERMINATORS = ("ret", "retq", "jmp", "jmpq", "ud2")
 
 
+def pads(encoding, mnemonic):
+	"""Whether a row is a `nop` of any length, however objdump spells it.
+
+	**objdump names the two-byte nop `xchg %ax,%ax`**, and the longer ones
+	behind an operand-size prefix `data16 nopw` or `data16 data16 cs
+	nopw`, so the mnemonic alone misses them: `66 90` aligning the switch
+	table after 0x1422cf7a0 was read as the function's last instruction,
+	the piece "ran off the end", and its `vmovaps` stayed VEX and faulted
+	in the game. The encoding says it plainly -- `90` or `0f 1f` behind
+	nothing but `66` and `2e` prefixes. Finding 357.
+	"""
+	if mnemonic.startswith("nop"):
+		return True
+	body = encoding.lstrip(b"\x66\x2e")
+	return body == b"\x90" or body.startswith(b"\x0f\x1f")
+
+
 def covered(starts, ranges, address):
 	i = bisect.bisect_right(starts, address) - 1
 	return i >= 0 and address < ranges[i][1]
@@ -198,7 +215,7 @@ def chunks(instructions, ranges, data=None):
 			current = [address, address, 0, 0, 0, ""]
 		current[1] = address + len(encoding)
 		current[2] += 1
-		if not mnemonic.startswith("nop"):
+		if not pads(encoding, mnemonic):
 			current[5] = mnemonic
 		if encoding[:1] in (b"\xc4", b"\xc5"):
 			current[3] += 1
@@ -295,7 +312,7 @@ def split_refused(instructions, found, known, entries=None):
 				piece = [address, address, 0, 0, 0, "", True]
 			piece[1] = address + len(encoding)
 			piece[2] += 1
-			if not mnemonic.startswith("nop"):
+			if not pads(encoding, mnemonic):
 				piece[5] = mnemonic
 			if encoding[:1] in (b"\xc4", b"\xc5"):
 				piece[3] += 1
@@ -415,10 +432,14 @@ def control():
 	        (0x3008, b"\xc3", "ret", ""),
 	        (0x3009, b"\x90", "nop", ""),
 	        (0x300a, b"\xa5\xd7\x87\x00", "(bad)", "")]
-	for name, data, want in (("named as data", {0x300a}, True),
-	                         ("not named", None, False)):
+	aligned = case[:2] + [(0x3009, b"\x66\x90", "xchg", "%ax,%ax"),
+	                      (0x300b, b"\xa5\xd7\x87\x00", "(bad)", "")]
+	for name, rows, data, want in (
+			("named as data", case, {0x300a}, True),
+			("not named", case, None, False),
+			("aligned by xchg %ax,%ax", aligned, {0x300b}, True)):
 		got = any(chunk[0] == 0x3000 and classify(chunk, {0x3000})[1]
-		          for chunk in chunks(case, [], data))
+		          for chunk in chunks(rows, [], data))
 		if got is not want:
 			raise SystemExit(
 				f"outside.py: the control failed -- a case ending in its "
@@ -487,7 +508,7 @@ def main(argv):
 
 	print(f"{'verdict':<36}{'chunks':>8}{'VEX sites':>11}   example")
 	for verdict, count in verdicts.most_common():
-		first, end, insns, vex, _bad, _last = examples[verdict]
+		first, end, insns, vex, _bad, _last = examples[verdict][:6]
 		print(f"  {verdict:<34}{count:>8,}{sites[verdict]:>11,}"
 		      f"   0x{first:x} {end - first}B {insns} insns")
 	print()

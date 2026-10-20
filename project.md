@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,741 of 804,948 VEX
-sites -- 99.97%** -- through 203,383 detours, and every `make detour-verify` invariant
-holds on the result. **207 sites are left** (Finding 356, 2026-10-20), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,751 of 804,948 VEX
+sites -- 99.98%** -- through 203,386 detours, and every `make detour-verify` invariant
+holds on the result. **197 sites are left** (Finding 357, 2026-10-20), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           207 re-measured   (Finding 356)
+    default build                           197 re-measured   (Finding 357)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,741 of 804,948 VEX sites, 99.97%, through 203,383 detours**, and 164 further
+**804,751 of 804,948 VEX sites, 99.98%, through 203,386 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,33 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 357 -- a two-byte nop spelled `xchg` is padding, not a function's end
+
+**Finding 356's build stopped at `0x1422cf7e8`**, `vmovaps %xmm2,%xmm0` in a leaf that
+switches on an operation code: seven cases of one VEX instruction and a `ret` each,
+no `.pdata`, the table straight after. Six cases were rewritten; the seventh and the
+default arm were "outside .pdata".
+
+The table is resolved and ends the chunk (Finding 338), but between the last `ret` and
+the table sits `66 90`, which objdump spells `xchg %ax,%ax`. `chunks` and
+`split_refused` skip a trailing `nop` by mnemonic, so they recorded the `xchg` as the
+last instruction, the chunk "ran off the end", and so did the recut piece holding the
+last case. `outside.pads` asks the encoding instead: `90` or `0f 1f` behind nothing but
+`66` and `2e` prefixes, which also covers `data16 nopw` and `data16 data16 cs nopw`.
+The listing holds 7,591 `xchg %ax,%ax`. `pause` (`f3 90`) is not padding. `control`
+gains the case -- a switch case aligned by `66 90` must be accepted -- and fails with
+the encoding test removed.
+
+**Measured on the full image:** 212 frontier rows down to 202, all ten from
+`outside .pdata` (30 to 20), nothing new: the six at `0x1407322c6`, `0x1413fcc2d`,
+`0x14234c575` and both at `0x1422cf7a0`. `verify` passes. Finding 343 listed
+`0x1422cf7ed` as "contains (bad)"; that was the table before it was read as data.
+
+`outside.py report` had been failing since recut pieces gained a seventh field
+(Finding 313) -- it unpacked six. It takes the first six now. Run before and after, it widens the oracle by one chunk
+(39,701 to 39,702 accepted, VEX sites unchanged): the report passes no switch data, so
+the padding matters only where a resolved table follows, which is `collect`'s case.
 
 ### Finding 356 -- a forward hammock is offered beside a backward window
 
