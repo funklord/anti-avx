@@ -3257,6 +3257,88 @@ one:	.float 1.0
 """)
 
 
+# **A stack-borrowing site that reads its own frame.** `stackride`'s frame,
+# so the borrow takes sixteen bytes of stack, and a `vshufps` whose memory
+# operand needs loading into a register first. Inside those sixteen bytes
+# `0x10(%rsp)` is what was `(%rsp)`: carried unchanged, the stub reads 1.0
+# where the original reads 9.0. Fifteen stubs in Starfield, `0x140c8dbe4`
+# among them. Finding 361.
+#
+# Lane 2 of the shuffle is the memory's lane 2, 9, plus 50 for rbx and 18.
+PROGRAMS["stackrsp"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp		/* a frame, and no call: this is a leaf */
+	vzeroupper
+	movl	$50, %ebx
+	movq	%rbx, 0x30(%rsp)	/* the shadow's first eight bytes */
+	xorl	%ebx, %ebx
+	movl	$0, 0x0(%rsp)
+	movl	$0, 0x4(%rsp)
+	movl	$0x3f800000, 0x8(%rsp)	/* 1.0, where a stale offset reads */
+	movl	$0, 0xc(%rsp)
+	movl	$0, 0x10(%rsp)
+	movl	$0, 0x14(%rsp)
+	movl	$0x41100000, 0x18(%rsp)	/* 9.0 */
+	movl	$0, 0x1c(%rsp)
+	vmovss	three(%rip), %xmm0
+	vmovss	three(%rip), %xmm1
+	vmovss	three(%rip), %xmm2
+	vmovss	three(%rip), %xmm3
+	vmovss	three(%rip), %xmm4
+	vmovss	three(%rip), %xmm5
+	vshufps	$0xee, 0x10(%rsp), %xmm1, %xmm6
+	shufps	$0xaa, %xmm6, %xmm6
+	cvttss2si %xmm6, %eax
+	addss	%xmm1, %xmm0		/* every volatile is read again */
+	addss	%xmm2, %xmm0
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0		/* 18 */
+	cvttss2si %xmm0, %ecx
+	addl	%ecx, %eax
+	leaq	0x28(%rsp), %r11
+	movq	0x8(%r11), %rbx		/* the epilogue's reload */
+	addl	%ebx, %eax		/* + 50, only if rbx came back */
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+""")
+
+
+# **`vpermilps` with its control in memory**, stored just before as four
+# selectors -- `0x142a46b34`'s shape, where Starfield faulted. There is no
+# SSE permute that takes memory; the control is loaded into a scratch and
+# the register form's `pshufb` sequence does the rest. Element 2 of
+# {1,2,3,4} in every lane: 3 + 3, plus 71. Finding 361.
+PROGRAMS["permilmem"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	movl	$2, 0x20(%rsp)
+	movl	$2, 0x24(%rsp)
+	movl	$2, 0x28(%rsp)
+	movl	$2, 0x2c(%rsp)
+	movups	source(%rip), %xmm8
+	vpermilps 0x20(%rsp), %xmm8, %xmm2
+	cvttss2si %xmm2, %eax
+	shufps	$0xff, %xmm2, %xmm2
+	cvttss2si %xmm2, %ecx
+	addl	%ecx, %eax
+	addl	$71, %eax
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 4
+source:	.float 1.0, 2.0, 3.0, 4.0
+""")
+
+
 # 38. The region is dead from the site onward, so the borrow is safe --
 # Finding 131. A leaf again, so only the caller's shadow can lend, and this
 # one USES its shadow: it keeps a local there, reads it back, and never

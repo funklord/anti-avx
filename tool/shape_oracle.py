@@ -101,15 +101,12 @@ def cases(listing, limit=None):
 		# 206 of 319 with both sides stopping at the same line. It is
 		# outside what this can check rather than a lowering fault, and
 		# `vex_oracle`'s synthesised cases are where such a shape belongs.
-		# **A lowering that is not self-contained cannot be run alone.**
-		# SSE `blendv` takes its mask in an IMPLICIT xmm0, so the bytes
-		# `lower_vex` returns for a `vblendv` clobber a register the
-		# instruction does not name -- and they are correct only inside
-		# the sequence that saves it, which is why `selftest` has "the
-		# blendv borrow skips %xmm0 and takes %xmm5". Running them here
-		# measures the missing save rather than the lowering.
-		if mnemonic.startswith("vblendv"):
-			continue
+		# **`vblendv` is run like everything else.** It was skipped here as
+		# not self-contained -- SSE takes the mask in an implicit xmm0 --
+		# but `lower_blendv` saves and restores xmm0 itself, in the
+		# scratch this harness already excludes. The skip hid the shape
+		# 1,018 sites have, mask and destination both xmm0, which the
+		# lowering got wrong. Finding 360.
 		fields = inplace.split_operands(operands or "")
 		if any(f.startswith("%") and not f.startswith(("%xmm", "%ymm"))
 		       for f in fields):

@@ -502,6 +502,14 @@ BLEND_SHAPES = [
 	("xmm0_live", 3, 2, 1, 4),
 	("src2_is_xmm0", 3, 0, 1, 4),
 	("src1_is_xmm0", 3, 2, 0, 4),
+	# **The mask is xmm0 and so is the result**, the shape of 1,018 sites:
+	# copying src1 into the destination first overwrites the mask, and the
+	# blend then selects on src1's signs. Starfield read a null grid cell
+	# through a floor computed so. And the destination as src2, 248 sites,
+	# which the same copy overwrites before it is read. Finding 360.
+	("mask_and_dst_xmm0", 0, 2, 1, 0),
+	("mask_in_xmm0_dst_is_src2", 0, 2, 1, 2),
+	("dst_is_src2", 3, 2, 1, 2),
 ]
 
 

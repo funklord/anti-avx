@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,838 of 804,948 VEX
-sites -- 99.99%** -- through 203,386 detours, and every `make detour-verify` invariant
-holds on the result. **110 sites are left** (Finding 359, 2026-10-20), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,839 of 804,948 VEX
+sites -- 99.99%** -- through 203,387 detours, and every `make detour-verify` invariant
+holds on the result. **109 sites are left** (Finding 361, 2026-10-20), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           110 re-measured   (Finding 359)
+    default build                           109 re-measured   (Finding 361)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,838 of 804,948 VEX sites, 99.99%, through 203,386 detours**, and 164 further
+**804,839 of 804,948 VEX sites, 99.99%, through 203,387 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,70 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 361 -- a memory control for `vpermilps`, and a stack spill's own `rsp` operand
+
+**Finding 359's build also faulted at `0x142a46b34`**, forty milliseconds after the
+access violation of Finding 360, on another thread: `vpermilps 0x20(%rsp),%xmm8,%xmm2`,
+whose control is four selectors stored just before it. The register form has lowered
+through `pshufb` since the start; the memory form was refused, and it is the only one in
+the binary. The control is now loaded into the scratch and the same sequence runs on it
+(`permil_select`, shared by both).
+
+**Looking at what a stack spill does to a memory operand found a silent fault.** A spill
+site with no home space and no TLS pair runs inside sixteen bytes it allocates
+(Finding 204), and an operand based on `rsp` was carried into the stub unchanged -- so it
+read sixteen bytes away from what the original read. An audit of Finding 359's stub
+section: 1,681 stack brackets, and 15 `rsp`-based loads inside them, such as
+`0x140c8dbe4`'s `vshufps $0xee,0x40(%rsp),%xmm1,%xmm7` loading what had been
+`0x30(%rsp)`. `rebase_rsp` now grows the displacement by sixteen (to 32 bits where 8 no
+longer holds it), and a site it cannot rewrite is refused.
+
+Fixtures: `stackrsp` is the frame `stackride` uses with a `vshufps` reading the frame --
+the original dies at 29, HEAD returns 69, a wrong value with no fault, and this 77.
+`permilmem` is `0x142a46b34`'s shape: 29, 29, and 77.
+
+**Measured on the result** (with Finding 360, one build): 109 sites left, 110 less
+exactly `0x142a46b34`; 203,387 detours. The audit re-run: 1,828 brackets and the same 15
+`rsp` loads in them, and the three read back against the original -- `0x140c8dbe4`,
+`0x1426cb6f5`, `0x14374f2d6` -- each carry the original displacement plus `0x10`.
+
+### Finding 360 -- `vblendv` with the mask in `xmm0` and the result there too
+
+**Finding 359's build died on an access violation at `0x14072ce97`**, a null cell pointer
+in a grid walk whose bounds come from three floors, each computed as `vcvttss2si`,
+`vcvtsi2ss`, `vsubss`, `vcmpless` and `vblendvps %xmm0,%xmm2,%xmm1,%xmm0`. The stub for the
+blend read
+
+    movaps   %xmm1,%xmm0
+    blendvps %xmm0,%xmm2,%xmm0
+
+-- the copy of src1 into the destination overwrote the mask SSE takes implicitly in
+`xmm0`, so the blend selected on src1's signs and every positive floor came out one low.
+`lower_blendv`'s cheapest branch, mask already in `xmm0`, never asked whether the
+destination was the mask, nor whether it was src2, which the same copy overwrites.
+**1,018 sites have mask and destination both `xmm0`; 248 have the destination as src2**
+(41 with the mask in `xmm0`, 207 on the general path). Every one lowered so computed a
+wrong blend with no fault.
+
+Nothing caught it because nothing ran it. `lowering_cases.BLEND_SHAPES` had five shapes
+and neither of these; `shape_oracle` skipped every `vblendv` on the belief that the
+lowering was not self-contained, which `lower_blendv`'s own save of `xmm0` had made false.
+Three shapes are added and `vex_oracle` reported each UNEXPLAINED before the fix and none
+after; `shape_oracle` runs `vblendv` now.
+
+**The fix:** with the mask in `xmm0`, a destination that is the mask or src2 blends in the
+scratch and moves back. On the general path a destination that is src2 has no second
+register, but once `xmm0` is saved it is free: `psrad $31` (and `pshufd $0xf5` for `pd`)
+widens the mask's sign bits to whole elements there, and `src1 ^ ((src1 ^ src2) & mask)`
+selects bit for bit as the blend does.
+
+**What it costs:** 583 windows that were plain now need a scratch for the blend and
+take a spill (5,355 to 5,938), 11.7 KB more stub, and no site is lost to it -- which is
+also why Finding 361's audit counts 1,828 stack brackets where Finding 359's had 1,681.
+
+Whether this explains earlier unattributed faults -- the zeroed frame pointer of
+Finding 342 among them -- is not established; it is a candidate, and the next runs say.
 
 ### Finding 359 -- a stack-borrowing site keeps its slot open for its passengers
 

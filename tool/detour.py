@@ -257,6 +257,10 @@ MEMORY = object()
 MOVAPS = b"\x0f\x28"
 BLENDVPS = b"\x0f\x38\x14"
 BLENDVPD = b"\x0f\x38\x15"
+PSRAD_IMMEDIATE = b"\x0f\x72"			# /4
+PSHUFD = b"\x0f\x70"
+XORPS = b"\x0f\x57"
+ANDPS = b"\x0f\x54"
 
 
 def lower_blendv(vex, tail, mnemonic, scratch):
@@ -286,15 +290,50 @@ def lower_blendv(vex, tail, mnemonic, scratch):
 	body = bytearray()
 	if mask == 0:
 		# Cheapest shape: the mask is already where SSE wants it.
-		if destination != source1:
+		if destination == source1:
+			body += encode_rr(0x66, opcode, destination, source2)
+			return bytes(body)
+		if destination not in (0, source2):
 			body += encode_rr(None, MOVAPS, destination, source1)
-		body += encode_rr(0x66, opcode, destination, source2)
+			body += encode_rr(0x66, opcode, destination, source2)
+			return bytes(body)
+		# **Unless the destination is the mask or src2.** Copying src1
+		# into it first overwrites the one the blend still has to read:
+		# the mask, so it selects on src1's signs -- 1,018 sites, and a
+		# floor computed so gave Starfield a null grid cell at
+		# `0x14072ce97` -- or src2, 248 sites with the general path below.
+		# So the blend runs in the scratch. Finding 360.
+		if scratch is None or scratch in (destination, source1, source2, 0):
+			return None
+		body += encode_rr(None, MOVAPS, scratch, source1)
+		body += encode_rr(0x66, opcode, scratch, source2)
+		body += encode_rr(None, MOVAPS, destination, scratch)
 		return bytes(body)
 
 	if scratch is None:
 		return None
 	if scratch in (destination, source1, source2, mask, 0):
 		return None
+	# **A destination that is src2** would be overwritten by src1 before
+	# the blend reads it, and there is no second register to stage either
+	# in -- 207 sites. But once the scratch holds xmm0, xmm0 itself is
+	# free: widen the mask's sign bits to whole elements there and select
+	# with `src1 ^ ((src1 ^ src2) & mask)`, which picks bits exactly as
+	# the blend does. Finding 360.
+	if destination == source2 and destination != source1 \
+			and destination != 0:
+		body += encode_rr(None, MOVAPS, scratch, 0)
+		body += encode_rr(None, MOVAPS, 0, mask)
+		if source1 == 0:
+			source1 = scratch
+		body += encode_rr(0x66, PSRAD_IMMEDIATE, 4, 0, 31)
+		if opcode == BLENDVPD:
+			body += encode_rr(0x66, PSHUFD, 0, 0, 0xF5)
+		body += encode_rr(None, XORPS, destination, source1)
+		body += encode_rr(None, ANDPS, destination, 0)
+		body += encode_rr(None, XORPS, destination, source1)
+		body += encode_rr(None, MOVAPS, 0, scratch)
+		return bytes(body)
 
 	if destination == 0:
 		# %xmm0 is written by the instruction, so its incoming value is
@@ -1325,6 +1364,53 @@ STACK_CLOSE = bytes([0x48, 0x83, 0xC4, 0x10])
 DEFER_RULE = True
 
 
+def rebase_rsp(encoding, delta):
+	"""`encoding` with its `rsp`-based displacement grown by `delta`, or None.
+
+	Only a VEX instruction whose memory operand has `rsp` as its base is
+	rewritten -- through a SIB byte, since `rsp` cannot be named without
+	one -- and the displacement is widened to 32 bits where 8 no longer
+	holds it, which is free in a stub. Anything else, `rip` or another
+	base, is returned unchanged: it does not move with `rsp`. None where
+	the operand cannot be read. Finding 361.
+	"""
+	vex = inplace.decode_vex(encoding)
+	if vex is None:
+		return None
+	head, tail = encoding[:vex["length"]], encoding[vex["length"]:]
+	if len(tail) < 2:
+		return None
+	modrm = tail[1]
+	mod, rm = modrm >> 6, modrm & 7
+	if mod == 3 or rm != 4:
+		return encoding
+	if len(tail) < 3:
+		return None
+	sib = tail[2]
+	if (sib & 7) != 4 or vex["B"]:
+		return encoding		# the base is not rsp
+	if mod == 0:
+		old, rest = 0, tail[3:]
+	elif mod == 1:
+		if len(tail) < 4:
+			return None
+		old, rest = struct.unpack_from("<b", tail, 3)[0], tail[4:]
+	else:
+		if len(tail) < 7:
+			return None
+		old, rest = struct.unpack_from("<i", tail, 3)[0], tail[7:]
+	new = old + delta
+	if not -(1 << 31) <= new < (1 << 31):
+		return None
+	if -128 <= new < 128:
+		modrm = (modrm & 0x3F) | 0x40
+		disp = struct.pack("<b", new)
+	else:
+		modrm = (modrm & 0x3F) | 0x80
+		disp = struct.pack("<i", new)
+	return head + bytes([tail[0], modrm, sib]) + disp + rest
+
+
 def stack_bound(entry):
 	"""Whether a passenger would notice `rsp` sixteen bytes lower.
 
@@ -1352,7 +1438,7 @@ def encode_pslld_immediate(destination, amount):
 
 
 def lower_permilps(vex, tail, operands, scratch, at, pool,
-                   clobber_control=False):
+                   clobber_control=False, address=None, encoding=None):
 	"""vpermilps, both forms.
 
 	The immediate form is a shufps and needs nothing. The variable form has
@@ -1381,11 +1467,26 @@ def lower_permilps(vex, tail, operands, scratch, at, pool,
 	if vex["L"]:
 		return None			# 256-bit needs the Y representation
 	modrm = tail[1]
-	if ((modrm >> 6) & 3) != 3:
-		return None			# memory operand; not handled here
 	destination = (vex["R"] << 3) | ((modrm >> 3) & 7)
-	control = (vex["B"] << 3) | (modrm & 7)
 	data = vex["vvvv"]
+	if ((modrm >> 6) & 3) != 3:
+		# **A control in memory is loaded into the scratch**, and from
+		# there the sequence is the register form's with the control
+		# clobbered, which the scratch is ours to do. `0x142a46b34` reads
+		# four selectors it has just stored at `0x20(%rsp)`, and Starfield
+		# faulted there. Only the variable form takes memory here: the
+		# immediate form's memory operand is the DATA. Finding 361.
+		if address is None or scratch is None \
+				or scratch in (destination, data) \
+				or any(o.startswith("$")
+				       for o in inplace.split_operands(operands)):
+			return None
+		load = encode_mem(None, b"\x0f\x10", scratch, vex, tail, address,
+		                  encoding, at)
+		if load is None:
+			return None
+		return permil_select(load, scratch, destination, data, at, pool)
+	control = (vex["B"] << 3) | (modrm & 7)
 
 	if any(o.startswith("$") for o in inplace.split_operands(operands)):
 		# Immediate control: a single-source four-element permute, which is
@@ -1405,8 +1506,17 @@ def lower_permilps(vex, tail, operands, scratch, at, pool,
 	if scratch == control and not clobber_control:
 		return None
 
-	body = bytearray()
-	body += encode_rr(None, MOVAPS, scratch, control)
+	return permil_select(encode_rr(None, MOVAPS, scratch, control), scratch,
+	                     destination, data, at, pool)
+
+
+def permil_select(start, scratch, destination, data, at, pool):
+	"""`start`, which leaves the control in `scratch`, then the permute.
+
+	Four element selectors become sixteen byte selectors and `pshufb`
+	does the rest; see `lower_permilps`.
+	"""
+	body = bytearray(start)
 	for offset, prefix, opcode in (
 			(POOL_MASK3, 0x66, b"\x0f\xdb"),		# pand  -- bits 1:0
 			(None, None, None),						# pslld $2, below
@@ -1547,7 +1657,8 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 					reasons["lower: the broadcast would not lower"] += 1
 				return out
 			if mnemonic == "vpermilps":
-				out = lower_permilps(vex, tail, operands, scratch, at, pool)
+				out = lower_permilps(vex, tail, operands, scratch, at, pool,
+				                     address=address, encoding=encoding)
 				if out is None and reasons is not None:
 					reasons["lower: vpermilps would not lower"] += 1
 				return out
@@ -10398,6 +10509,20 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			if reasons is not None:
 				reasons["the site will not hold one borrow displacement"] += 1
 			return None, 0
+		# **The site runs inside the sixteen bytes**, so an operand based
+		# on `rsp` is sixteen bytes nearer than it was, and has to say so.
+		# Carried unchanged it read the wrong slot of the frame: 15 stubs
+		# in Finding 359's image, `vshufps $0xee,0x40(%rsp),...` at
+		# `0x140c8dbe4` reading what had been `0x30(%rsp)`. Refused where
+		# the displacement cannot be rewritten. Finding 361.
+		if (SPILL == SPILL_STACK or stack_borrow) \
+				and stack_bound((site, encoding, None, operands, mnemonic)):
+			encoding = rebase_rsp(encoding, 16)
+			if encoding is None:
+				if reasons is not None:
+					reasons["a stack spill would move the site's own "
+					        "stack operand"] += 1
+				return None, 0
 		if SPILL == SPILL_STACK or stack_borrow:
 			body += STACK_OPEN
 			# Where the allocation is complete, which is what the unwind
