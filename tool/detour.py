@@ -7744,6 +7744,15 @@ HAMMOCK_FORWARD = {}
 ALTERNATE_RULE = True
 ALTERNATES = {}
 ALTERNATES_WITHDRAWN = set()
+# **Short sites with no window of their own, offered as passengers**, site ->
+# the passenger entry `rescue_seat` hands to `build_stub`. A site boxed in by
+# two neighbours that each took a window of their own -- the `vaddps`
+# between two `vextractf128` at `0x142b076ac` -- can neither widen nor be
+# carried by Finding 183's rescue, which seats only candidates. A placed
+# window ending exactly at it can still take it along. `RIDER_RULE` is the
+# A/B. Finding 358.
+RIDER_RULE = True
+RIDERS = {}
 # How far back a hammock may reach for the branches into its targets.
 HAMMOCK_REACH = 64
 # Every address reached otherwise than by a direct branch: relocations,
@@ -11624,6 +11633,7 @@ def collect(binary, listing, context=None):
 	HAMMOCK_FORWARD.clear()
 	ALTERNATES.clear()
 	ALTERNATES_WITHDRAWN.clear()
+	RIDERS.clear()
 	HAMMOCK_REFUSED.clear()
 	UNIT_REFUSED.clear()
 	UNIT_RUNG.clear()
@@ -12711,6 +12721,18 @@ def collect(binary, listing, context=None):
 				skipped[reason] += 1
 				declined[address] = reason
 				BACKWARD_REFUSED[(reason, back or "?")] += 1
+				# **Still a passenger, if a neighbour's window ends here.**
+				# It will sit inside that window, so it must not be a
+				# target, and it is lowered as a passenger is: plainly, or
+				# with the register a `spill` gives back. Finding 358.
+				if RIDER_RULE and address not in blocked \
+						and (strategy is None or strategy[0] == "spill") \
+						and inplace.covered_by(ranges, address,
+						                       len(encoding)):
+					RIDERS[address] = (
+						address, encoding, None, operands, mnemonic,
+						scratch if strategy is None else strategy[1],
+						strategy is not None)
 				for way, seen in (("forward", ahead_told),
 				                  ("backward", behind_told)):
 					if seen is None:
@@ -17426,6 +17448,13 @@ def rescue_seat(entries, i, start, reach, taken):
 		return (j, (site, other[1], None, other[2], other[3],
 		            other[6] if borrowed is None else borrowed,
 		            borrowed is not None), len(other[1]))
+	# **Or a site no window was found for.** It has no entry to mark as
+	# taken; once it rides, the window that took it has committed past it,
+	# so nothing can seat it twice. Finding 358.
+	rider = RIDERS.get(start + reach)
+	if rider is not None and all(entry[0] != rider[0]
+	                             for _index, entry, _grew in taken):
+		return (None, rider, len(rider[1]))
 	return None
 
 

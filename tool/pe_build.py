@@ -1910,6 +1910,54 @@ twenty:	.float 20.0
 """)
 
 
+# **A short site boxed in by two 256-bit neighbours.** Each `vextractf128`
+# takes a window of its own, the `vaddps` between them can widen over
+# neither, and so it had no window at all. The first neighbour's window ends
+# exactly at it and carries it along. Starfield faulted at `0x142b076ac` and
+# `0x142b47dd1`, both this shape. Finding 358.
+#
+# 10 + 5 from the upper half of the first, plus 20 from the second's, plus
+# 42.
+PROGRAMS["rider"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovups	low(%rip), %ymm3
+	vmovups	high(%rip), %ymm7
+	movss	ten(%rip), %xmm1
+	vextractf128 $1, %ymm3, %xmm0	/* six bytes, a window of its own */
+	vaddps	%xmm0, %xmm1, %xmm3	/* four bytes, 15.0 */
+	vextractf128 $1, %ymm7, %xmm1	/* six bytes, 20.0 */
+	cvttss2si %xmm3, %eax
+	cvttss2si %xmm1, %edx
+	addl	%edx, %eax
+	addl	$42, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 5
+low:	.float 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0
+high:	.float 0.0, 0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0
+ten:	.float 10.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **A 128-bit compare against a RIP-relative constant, moved into a stub.**
 # The destination is not the first source, so the lowering is
 # `movaps %xmm0,%xmm3; cmpps $4,bound(%rip),%xmm3` and has to live in a

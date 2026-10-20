@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,751 of 804,948 VEX
-sites -- 99.98%** -- through 203,386 detours, and every `make detour-verify` invariant
-holds on the result. **197 sites are left** (Finding 357, 2026-10-20), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,834 of 804,948 VEX
+sites -- 99.99%** -- through 203,386 detours, and every `make detour-verify` invariant
+holds on the result. **114 sites are left** (Finding 358, 2026-10-20), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           197 re-measured   (Finding 357)
+    default build                           114 re-measured   (Finding 358)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,751 of 804,948 VEX sites, 99.98%, through 203,386 detours**, and 164 further
+**804,834 of 804,948 VEX sites, 99.99%, through 203,386 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,36 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 358 -- a short site with no window rides in its neighbour's
+
+**Finding 357's build died at `0x142b076ac` and `0x142b47dd1`**, on two threads at
+once, 170 seconds in. Both exceptions unwound to the thread's top-level filter and
+the game's own handler wrote a minidump and exited, so wine never printed
+"Unhandled" -- the earlier run's log had them too, and they were read as handled.
+**An illegal instruction in this game is fatal whether or not wine says so**: read
+the unwind to its last frame (`call_seh_handlers` at the thread base) rather than
+looking for the word.
+
+Both are Finding 343's largest class, "next instruction will not move": a four-byte
+`vaddps` or `vmulps` between two `vextractf128`, each of which took a six-byte window
+of its own. The site cannot widen over either, because a 256-bit neighbour does not
+lower as a passenger, and Finding 183's rescue seats only candidates, which a
+declined site is not. But the window before it ends exactly at it.
+
+**`collect` now keeps such a site as a rider**, and `rescue_seat` offers it when no
+candidate seat exists: the covering window grows by the site and its stub lowers it
+as a passenger, plainly or with the register a `spill` gives back. Conditions: not a
+branch target, since it ends up inside a window, and inside the code oracle. A rider
+that will not build is dropped by the chain's own fallback, so the covering stub is
+never lost for it. `RIDER_RULE` is the A/B.
+
+**Measured on the full image:** 202 frontier rows down to 119. "Next instruction will
+not move" goes from 85 to 2, and nothing new appears; detours stay 203,386, since
+riders add no window, and the swallowed-instruction count rises by exactly 83.
+`verify` passes. Fixture `rider`: the original and HEAD both die at 29, and this
+returns 77. It needs a TLS directory, without which the 256-bit neighbours take no
+window and nothing is tested.
 
 ### Finding 357 -- a two-byte nop spelled `xchg` is padding, not a function's end
 
