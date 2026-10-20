@@ -1868,6 +1868,48 @@ hundred:	.float 100.0
 """)
 
 
+# **A forward hammock offered beside a backward one.** The second arm of an
+# if/else whose site is a branch target, so its own window is a backward
+# hammock starting on the `jne` -- and the `vmaxss` above takes that `jne`
+# into its window first. The site's window is then lost to an overlap, and
+# the forward hammock holding the join is the only seat left. Starfield
+# faulted at `0x1426aeac1`, exactly this. Finding 356.
+#
+# max(3, 20) = 20, plus 4 + 3 = 7 from the arm taken, plus 50.
+PROGRAMS["fwdalt"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	movss	three(%rip), %xmm2
+	movss	four(%rip), %xmm5
+	movss	twenty(%rip), %xmm1
+	movss	ten(%rip), %xmm3
+	movl	$1, %ecx
+	cmpl	$0, %ecx
+	vmaxss	%xmm1, %xmm2, %xmm6	/* its window takes the jne */
+	jne	site
+	vmovaps	%xmm3, %xmm4		/* the arm not taken */
+	jmp	next			/* rel8, the join */
+site:
+	vaddss	%xmm2, %xmm5, %xmm4	/* a target, four bytes, 7.0 */
+next:
+	cvttss2si %xmm4, %eax		/* a target */
+	addl	$50, %eax
+	cvttss2si %xmm6, %edx
+	addl	%edx, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+four:	.float 4.0
+ten:	.float 10.0
+twenty:	.float 20.0
+""")
+
+
 # **A 128-bit compare against a RIP-relative constant, moved into a stub.**
 # The destination is not the first source, so the lowering is
 # `movaps %xmm0,%xmm3; cmpps $4,bound(%rip),%xmm3` and has to live in a

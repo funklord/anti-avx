@@ -7737,6 +7737,13 @@ HAMMOCK_REAIM_RULE = True
 # {slot address: the target its jump names}. The rel8 itself is in
 # `HAMMOCK_REAIM` with its slot. Finding 353.
 HAMMOCK_FORWARD = {}
+# **Forward hammocks offered beside a backward window**, site ->
+# (candidate, plan), and the sites whose alternate was withdrawn because
+# another candidate shared its start. `ALTERNATE_RULE` is the A/B.
+# Finding 356.
+ALTERNATE_RULE = True
+ALTERNATES = {}
+ALTERNATES_WITHDRAWN = set()
 # How far back a hammock may reach for the branches into its targets.
 HAMMOCK_REACH = 64
 # Every address reached otherwise than by a direct branch: relocations,
@@ -11615,6 +11622,8 @@ def collect(binary, listing, context=None):
 	HAMMOCK_REAIM.clear()
 	HAMMOCK_LABELS.clear()
 	HAMMOCK_FORWARD.clear()
+	ALTERNATES.clear()
+	ALTERNATES_WITHDRAWN.clear()
 	HAMMOCK_REFUSED.clear()
 	UNIT_REFUSED.clear()
 	UNIT_RUNG.clear()
@@ -12719,6 +12728,56 @@ def collect(binary, listing, context=None):
 			continue
 		candidates.append((start, encoding, operands, mnemonic, window,
 		                   displaced, scratch, preceding, strategy))
+		# **A second way to seat it, from the site forward.** A window
+		# widened backwards starts on the instruction before the site, and
+		# a neighbour's window placed first often takes exactly that byte:
+		# `0x142295e1c` and `0x1426aeac1` were lost so, and Starfield
+		# faulted on both. Where the next instruction is a target a forward
+		# hammock can hold, it is offered too. The placer meets it after
+		# the backward window, so it is skipped as overlapped whenever that
+		# one placed. Finding 356.
+		if preceding and HAMMOCK_RULE and ALTERNATE_RULE \
+				and (strategy is None or strategy[0] == "spill") \
+				and len(encoding) < 5 \
+				and index + 1 < len(instructions) \
+				and instructions[index + 1][0] in blocked \
+				and address not in HAMMOCK and address not in HAMMOCK_REAIM:
+			ahead, plan = forward_hammock(
+				instructions, plain, index, blocked, sources, scope,
+				positions, ranges, islands)
+			if ahead is not None:
+				reach = ahead[-1][0] + len(ahead[-1][1]) - address
+				if inplace.covered_by(ranges, address, reach):
+					HAMMOCK[address], HAMMOCK_REAIM[address], \
+						HAMMOCK_FORWARD[address] = plan
+					alternate = (address, encoding, operands, mnemonic,
+					             reach, ahead, scratch, [], strategy)
+					candidates.append(alternate)
+					ALTERNATES[address] = (alternate, plan)
+	# **An alternate owns its start or is withdrawn.** The hammock state is
+	# keyed by a window's start, so another candidate starting at the same
+	# byte -- or a hammock written there after the alternate -- would be
+	# built with the alternate's labels and slots. Neither has been seen;
+	# both are refused rather than relied on.
+	if ALTERNATES:
+		starts = Counter(candidate[0] for candidate in candidates)
+		withdrawn = set()
+		for at, (alternate, plan) in ALTERNATES.items():
+			if starts[at] > 1 or HAMMOCK.get(at) is not plan[0] \
+					or HAMMOCK_REAIM.get(at) is not plan[1]:
+				withdrawn.add(id(alternate))
+				if HAMMOCK_FORWARD.get(at) is plan[2]:
+					del HAMMOCK_FORWARD[at]
+				if HAMMOCK.get(at) is plan[0]:
+					del HAMMOCK[at]
+				if HAMMOCK_REAIM.get(at) is plan[1]:
+					del HAMMOCK_REAIM[at]
+				ALTERNATES_WITHDRAWN.add(at)
+		if withdrawn:
+			candidates[:] = [candidate for candidate in candidates
+			                 if id(candidate) not in withdrawn]
+			for at in ALTERNATES_WITHDRAWN:
+				ALTERNATES.pop(at, None)
 	return patches, candidates, stats, skipped, declined, home
 
 
