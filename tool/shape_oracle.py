@@ -74,6 +74,27 @@ def patterns():
 PATTERNS = patterns()
 
 
+def register_classes(operands):
+	"""What the census's renaming throws away and a lowering can depend on.
+
+	`r0,r1,r2,r0` is one census shape whichever registers fill it, and one
+	example ran for all of them. But SSE reads xmm0 implicitly -- the
+	blend mask, `pcmpistrm`'s result -- so a lowering takes a different
+	branch when an operand IS xmm0, and the 1,018 sites of Finding 360
+	shared a shape with sites that never reached the wrong branch. A
+	register from xmm8 up needs a REX prefix the encoder writes
+	separately. So the oracle runs one example per shape per class:
+	`0` for xmm0, `h` for xmm8-15, `l` for the rest.
+	"""
+	classes = []
+	for field in inplace.split_operands(operands or ""):
+		if field.startswith(("%xmm", "%ymm")):
+			number = int(field[4:])
+			classes.append("0" if number == 0 else "h" if number >= 8
+			               else "l")
+	return " " + "".join(classes)
+
+
 def cases(listing, limit=None):
 	"""[(shape, encoding, mnemonic, operands, lowered, scratch)].
 
@@ -87,10 +108,10 @@ def cases(listing, limit=None):
 	for address, encoding, mnemonic, operands in inplace.parse_listing(
 			listing):
 		shape = shape_census.shape_of(encoding, mnemonic, operands)
-		if shape is None or "mem" in shape or shape not in seen:
-			if shape is None or "mem" in shape:
-				continue
-		seen.setdefault(shape, (address, encoding, mnemonic, operands))
+		if shape is None or "mem" in shape:
+			continue
+		seen.setdefault(shape + register_classes(operands),
+		                (address, encoding, mnemonic, operands))
 	out = []
 	for shape, (address, encoding, mnemonic, operands) in sorted(
 			seen.items()):
@@ -224,6 +245,30 @@ def run(binary, under_qemu):
 	return done.stdout.split()
 
 
+def rounding_apart(vex, low, mnemonic):
+	"""Do the two hex dumps differ only by one unit in the last place?
+
+	The FMA lowering is the one rule that is not bit-exact: a multiply and
+	an add round twice where the original rounds once, which moves an
+	element by at most one unit in the last place. A wrong register moves
+	it anywhere, so this is narrow enough to keep the oracle a witness --
+	one ulp, same sign, element by element at the mnemonic's width.
+	"""
+	width = 8 if mnemonic.endswith(("pd", "sd")) else 4
+	digits = width * 2
+	if len(vex) != len(low):
+		return False
+	for at in range(0, len(vex), digits):
+		a = int.from_bytes(bytes.fromhex(vex[at:at + digits]), "little")
+		b = int.from_bytes(bytes.fromhex(low[at:at + digits]), "little")
+		if a == b:
+			continue
+		sign = 1 << (width * 8 - 1)
+		if (a ^ b) & sign or abs(a - b) > 1:
+			return False
+	return True
+
+
 def require_oracle():
 	"""qemu present, able to start, and able to run AVX2.
 
@@ -283,6 +328,7 @@ def main():
 		return 1
 
 	agree, differ, executor = 0, collections.Counter(), collections.Counter()
+	fused = collections.Counter()
 	detail = {}
 	for c, row in enumerate(rows):
 		scratch = row[5]
@@ -308,6 +354,9 @@ def main():
 				# leaves implementation-specific.
 				executor[row[0]] += 1
 				detail.setdefault(row[0], (pname, a, b))
+			elif detour.FMA_PATTERN.match(row[2]) \
+					and rounding_apart(a, b, row[2]):
+				fused[row[0]] += 1
 			else:
 				differ[row[0]] += 1
 				detail.setdefault(row[0], (pname, a, b))
@@ -320,6 +369,10 @@ def main():
 		for shape, count in executor.most_common(10):
 			print(f"     {shape}  ({count} pattern(s), "
 			      f"{detail[shape][0]})")
+	if fused:
+		print(f"   {sum(fused.values())} FMA comparison(s) differ by one "
+		      f"rounding in the last place, the two roundings a multiply "
+		      f"and an add make where the original makes one (Finding 4)")
 	for shape, count in differ.most_common(12):
 		pname, a, b = detail[shape]
 		print(f"   DIFFER {shape}  ({count} pattern(s), e.g. {pname})",

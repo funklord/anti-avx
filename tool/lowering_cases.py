@@ -510,6 +510,12 @@ BLEND_SHAPES = [
 	("mask_and_dst_xmm0", 0, 2, 1, 0),
 	("mask_in_xmm0_dst_is_src2", 0, 2, 1, 2),
 	("dst_is_src2", 3, 2, 1, 2),
+	# **src2 and the result both xmm0**, the mask elsewhere: loading the
+	# mask overwrote src2 before the blend read it, 52 sites. Found by
+	# `shape_oracle` once it told xmm0 from the other registers, which is
+	# what this list had needed a person to think of. Finding 362.
+	("dst_and_src2_xmm0", 3, 0, 1, 0),
+	("sources_equal", 3, 2, 2, 1),
 ]
 
 

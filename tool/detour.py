@@ -314,6 +314,24 @@ def lower_blendv(vex, tail, mnemonic, scratch):
 		return None
 	if scratch in (destination, source1, source2, mask, 0):
 		return None
+	if source1 == source2:
+		# Either choice is the same register, so the mask decides nothing.
+		return encode_rr(None, MOVAPS, destination, source1)
+	if destination == 0 and source2 == 0:
+		# **src2 and the result both in xmm0**, the mask elsewhere: the
+		# branch below loads the mask over the src2 the blend still reads
+		# -- 52 sites. Keep src2 in the scratch and select there, as the
+		# branch after this one does. Finding 362.
+		body += encode_rr(None, MOVAPS, scratch, 0)
+		body += encode_rr(None, MOVAPS, 0, mask)
+		body += encode_rr(0x66, PSRAD_IMMEDIATE, 4, 0, 31)
+		if opcode == BLENDVPD:
+			body += encode_rr(0x66, PSHUFD, 0, 0, 0xF5)
+		body += encode_rr(None, XORPS, scratch, source1)
+		body += encode_rr(None, ANDPS, scratch, 0)
+		body += encode_rr(None, XORPS, scratch, source1)
+		body += encode_rr(None, MOVAPS, 0, scratch)
+		return bytes(body)
 	# **A destination that is src2** would be overwritten by src1 before
 	# the blend reads it, and there is no second register to stage either
 	# in -- 207 sites. But once the scratch holds xmm0, xmm0 itself is

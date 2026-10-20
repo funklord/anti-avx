@@ -14163,6 +14163,53 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 362 -- `shape_oracle` tells xmm0 apart, and finds 52 more wrong blends
+
+**Finding 361's build died on an access violation at `0x142a7fc80`**, about four
+minutes in: a loop over eight `0x70`-byte records whose count, read from `+0x404` of
+an object the caller passes as its fourth argument, held `0x44f30567` -- a float, so the
+loop ran off the object. The pointer is the caller's ordinary game data and nothing in
+the faulting function touches the home slot it is saved in; no stub in the function
+uses home space, and its two stack brackets are Finding 360's blends, which are right.
+So the object was written wrongly earlier, by something this log does not show. **It
+is not explained.**
+
+**What it prompted was the question of why Finding 360 needed a person to find it.**
+`shape_census.shape_of` renames registers to `r0`, `r1`, ... so that sixteen
+assignments make one shape, and `shape_oracle` ran one example per shape. But SSE reads
+xmm0 implicitly, so a lowering branches on whether an operand IS xmm0 -- and the
+1,018 sites of Finding 360 shared their shape with sites that never took the wrong
+branch. Un-skipping `vblendv` did not make the oracle able to see them. The oracle now
+keys on the shape and a class per register -- `0` for xmm0, `h` for xmm8-15 (a REX
+prefix the encoder writes separately), `l` otherwise -- and runs **1,594 shapes where
+it ran 306**.
+
+Against the lowering before Finding 360 it reports every one of Finding 360's shapes.
+Against Finding 361's it reports two that were still wrong, and one that is not:
+
+    vblendvps 128 r0,r1,r2,r1 l0l0    49 sites  vblendvps %xmm2,%xmm0,%xmm3,%xmm0
+    vblendvps 128 r0,r1,r2,r1 l0h0     3 sites
+    vfmadd231ps 128 r0,r1,r2 l0l       6 sites  one ulp in one element
+
+**The blend:** src2 and the result both xmm0 with the mask elsewhere. The branch for a
+result in xmm0 loaded the mask over the src2 the blend still read. It now keeps src2 in
+the scratch and selects with the widened mask, as Finding 360's `dst_is_src2` branch
+does. Blends whose two sources are one register are a move. `BLEND_SHAPES` gains
+`dst_and_src2_xmm0` and `sources_equal`; `vex_oracle` reports the first UNEXPLAINED
+against Finding 361's lowering and nothing after. None of the 52 sites is in a function
+on the stack of the crash above.
+
+**The FMA** is Finding 4's two roundings, measured rather than assumed: of the four
+elements, one moves by one unit in the last place, and it is the one where an exact
+rational evaluation puts the two-rounding result 0.54 ulp from the true value. `shape_oracle` now counts an FMA
+difference of at most one ulp, same sign, at the element width, as that and reports it
+apart -- narrow enough that a wrong register, which moves an element anywhere, still
+fails.
+
+**Still unchecked by any run of the real instructions: memory forms.** `shape_oracle`
+runs register operands only, and `vex_oracle`'s memory cases are written by hand -- the
+same position the blend was in. Open.
+
 ### Finding 361 -- a memory control for `vpermilps`, and a stack spill's own `rsp` operand
 
 **Finding 359's build also faulted at `0x142a46b34`**, forty milliseconds after the
