@@ -37,6 +37,11 @@ REACH = 256
 
 def pdata_starts(path):
 	"""Every function start the exception directory names, as addresses."""
+	return {begin for begin, _end in pdata_ranges(path)}
+
+
+def pdata_ranges(path):
+	"""(begin, end) of every function the exception directory names."""
 	data = open(path, "rb").read()
 	pe = struct.unpack_from("<I", data, 0x3C)[0]
 	opt = pe + 24
@@ -54,8 +59,69 @@ def pdata_starts(path):
 			at = raw + rva - va
 	if at is None:
 		return set()
-	return {base + struct.unpack_from("<I", data, at + i * 12)[0]
-	        for i in range(size // 12)}
+	out = []
+	for i in range(size // 12):
+		begin, end = struct.unpack_from("<II", data, at + i * 12)
+		if end > begin:
+			out.append((base + begin, base + end))
+	return sorted(out)
+
+
+def branch_starts(binary):
+	"""Leaf function starts that a direct branch names, as addresses.
+
+	**A function with no unwind data can follow data too**, and the sweep
+	runs into it the same way: `0x140e43c40`, after a switch table, had
+	its first instruction read as part of the table's last row, so the
+	listing began the function three bytes in, `outside` found nothing
+	calling that, and none of its five VEX sites was converted. Starfield
+	died on one. Three branches name it.
+
+	So a target counts where a `call` or `jmp rel32` names it from inside
+	a `.pdata` function -- code the binary itself vouches for, since a
+	branch decoded out of data is noise (Finding 8) -- the target lies
+	outside every `.pdata` function, and it is sixteen-byte aligned, as
+	MSVC places a function. 18 in Starfield. Finding 365.
+	"""
+	ranges = pdata_ranges(binary)
+	begins = [begin for begin, _end in ranges]
+
+	def described(address):
+		k = bisect.bisect_right(begins, address) - 1
+		return k >= 0 and address < ranges[k][1]
+
+	sweep = subprocess.Popen([OBJDUMP, "-d", "-j", ".text", binary],
+	                         stdout=subprocess.PIPE, text=True,
+	                         errors="replace")
+	found = set()
+	low = high = None
+	for line in sweep.stdout:
+		parts = line.split("\t")
+		if len(parts) < 3:
+			continue
+		head = parts[0]
+		colon = head.rfind(":")
+		try:
+			address = int(head[:colon].strip(), 16)
+		except ValueError:
+			continue
+		low = address if low is None else low
+		high = address
+		code = parts[1].split()
+		if not code or code[0] not in ("e8", "e9") or len(code) != 5:
+			continue
+		field = parts[2].split()
+		if len(field) < 2 or not field[1].startswith("0x"):
+			continue
+		target = int(field[1], 16)
+		if target % 16 == 0 and not described(target) \
+				and described(address):
+			found.add(target)
+	if sweep.wait() != 0:
+		raise Unresolved("objdump failed reading the branches")
+	if low is None:
+		return set()
+	return {t for t in found if low <= t <= high}
 
 
 def rows(lines):
@@ -123,7 +189,7 @@ class Unresolved(Exception):
 	"""A function start the fresh decode could not reconcile."""
 
 
-def resync(binary, lines, report=None, skip=frozenset()):
+def resync(binary, lines, report=None, skip=frozenset(), branches=True):
 	"""Yield the listing `lines` with every `.pdata` start on a boundary.
 
 	`lines` is objdump's output for `binary`, line by line. Raises
@@ -137,8 +203,13 @@ def resync(binary, lines, report=None, skip=frozenset()):
 	inside that window's `jmp`, and a fresh decode from it reads the jump's
 	displacement as an instruction that swallows the code after the window.
 	Finding 364.
+
+	`branches` adds `branch_starts`, which is a second sweep of the
+	binary. Finding 365.
 	"""
 	starts = pdata_starts(binary) - set(skip)
+	if branches:
+		starts |= branch_starts(binary) - set(skip)
 	order = sorted(starts)
 	seen, spliced = set(), set()
 	low = high = None

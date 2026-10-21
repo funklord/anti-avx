@@ -3451,6 +3451,37 @@ out:	.float	0.0
 """)
 
 
+# **A leaf whose first instruction the sweep runs over.** Fifteen zero
+# bytes pad it to sixteen, and the last pairs with its `mov %rcx,%r9`, so
+# objdump reads `00 4c 8b c9` as one `add` and the listing begins the leaf
+# three bytes in: nothing calls that address, and `outside` would not take
+# it. `0x140e43c40` in Starfield, after a switch table, where it died on
+# the `vxorps` it held. 38.5 doubled. Finding 365.
+PROGRAMS["leafsync"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	val(%rip), %rcx
+	call	leaf
+	cvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+	.byte	0x90
+	.p2align 4, 0
+leaf:
+	movq	%rcx, %r9		/* the instruction the sweep runs over */
+	vmovss	(%r9), %xmm0
+	vaddss	%xmm0, %xmm0, %xmm0
+	ret
+	.p2align 4, 0xcc
+val:	.float	38.5
+""")
+
+
 # **`vpermilps` with its control in memory**, stored just before as four
 # selectors -- `0x142a46b34`'s shape, where Starfield faulted. There is no
 # SSE permute that takes memory; the control is loaded into a scratch and

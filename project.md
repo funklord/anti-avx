@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,848 of 804,948 VEX
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,856 of 804,948 VEX
 sites -- 99.99%** -- through 203,387 detours, and every `make detour-verify` invariant
-holds on the result. **100 sites are left** (Finding 364, 2026-10-21), five more rows
+holds on the result. **92 sites are left** (Finding 365, 2026-10-21), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           100 re-measured   (Finding 364)
+    default build                            92 re-measured   (Finding 365)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,848 of 804,948 VEX sites, 99.99%, through 203,387 detours**, and 164 further
+**804,856 of 804,948 VEX sites, 99.99%, through 203,387 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,42 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 365 -- a leaf that a switch table runs into is put back on its boundary
+
+**Finding 364's build died at `0x140e43c68`**, an illegal instruction: a `vxorps` the
+frontier listed as `outside .pdata`. Its function, `0x140e43c40`, has no unwind data
+and follows a switch table, and the sweep read the table's last byte with the
+function's first instruction -- `00 4c 8b c9` as one `add` -- so the listing began the
+function three bytes in. `outside` saw nothing branch to `0x140e43c43` and called the
+chunk "uncalled, ends in a transfer", which Finding 230 had set aside as unprovable.
+It is not uncalled: a `call` and two `jmp`s name `0x140e43c40`, a boundary the listing
+did not have.
+
+That is Finding 347's desync, which `resync` repairs at `.pdata` starts only. **It now
+also restarts at `branch_starts`**: a `call` or `jmp rel32` target named from inside a
+`.pdata` function -- code the binary vouches for, since a branch decoded out of data is
+noise (Finding 8) -- lying outside every `.pdata` function and sixteen-byte aligned.
+Measured over the listing, 19 direct targets named that way were not instruction
+starts; 18 lie outside `.pdata`, every one aligned, and `branch_starts` names exactly
+those 18. The one inside `.pdata`, `0x141e9cf3f`, is unaligned and named by one `jmp`,
+and is left. The regenerated listing differs in 18 hunks, each the table's last byte
+becoming a `(bad)` row and the function's first instruction appearing; 183 starts are
+spliced where there were 165.
+
+**Fixture listings go through `resync` now**, as the game's does, so a fixture can stand
+where the sweep runs out of step. `leafsync` pads a leaf with fifteen zero bytes so the
+last swallows its `mov %rcx,%r9`: the original dies at 29, a plain `objdump` listing
+loses the leaf and dies at 29, and through `resync` it answers 77.
+
+The other two chunks Finding 230 set aside, at `0x1407c7570` and `0x1407c7590`, are
+named only by RVAs in an `.rdata` table, so their caller is indirect and stays
+unproven.
+
+**Measured on the full image**: 105 surviving rows to 97, 100 sites to 92 -- the five in
+`0x140e43c40` and the three in `0x1414c3e80`, the second leaf the same desync hid, all
+of them in-place patches, so detours stay at 203,387. `verify` passes, now over
+1,191,258 direct branch targets where it read 1,191,239.
 
 ### Finding 364 -- a passenger borrows the stack, and a chained record is not an entry
 

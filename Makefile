@@ -918,7 +918,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
              mxcsr splatrun splatop extract shadowspill regionlive \
-             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim fwdhammock fwdspill shadowlea fwdalt rider stackride stackrsp permilmem stackflags stackpass chainstore
+             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim fwdhammock fwdspill shadowlea fwdalt rider stackride stackrsp permilmem stackflags stackpass chainstore leafsync
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
@@ -985,8 +985,12 @@ $(BUILD_DIR)/pe-%-320.exe: tool/pe_build.py | $(BUILD_DIR)
 $(BUILD_DIR)/pe-%.exe: tool/pe_build.py | $(BUILD_DIR)
 	$(PYTHON) tool/pe_build.py sample $* $@
 
-$(BUILD_DIR)/pe-%.asm: $(BUILD_DIR)/pe-%.exe
-	objdump -d -j .text $< > $@
+# Through `resync`, as the game's listing is, so that a fixture can stand
+# where the sweep runs out of step -- `leafsync`. Finding 365.
+$(BUILD_DIR)/pe-%.asm: $(BUILD_DIR)/pe-%.exe tool/resync.py
+	set -o pipefail; objdump -d -j .text $< | \
+		$(PYTHON) tool/resync.py $< > $@.tmp
+	mv $@.tmp $@
 
 $(BUILD_DIR)/sse-%.exe: $(BUILD_DIR)/pe-%.exe $(BUILD_DIR)/pe-%.asm \
                            tool/detour.py tool/patch.py tool/outside.py \
