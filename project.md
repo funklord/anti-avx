@@ -14163,6 +14163,73 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 363 -- the stack bracket wrote the flags, and `function_oracle` runs the stubs
+
+**Finding 362's build died at `0x142a7fc80` again**, two minutes in this time, with the
+same float, `0x44f30567`, as the loop count -- so it is deterministic and not a race.
+The object is a list of 0x70-byte records written by `0x1429a5e37`: each record goes
+in at `count * 0x70` and the count at `+0x404` is incremented after, with no bound in
+the code. Nine records fit before `0x3f0`; a tenth lands across the count, and its
+bytes 0x14..0x17 are a float. So the list was given more entries than the original
+would give it. Both crashes followed "TERRAIN: Loaded 81 material slots" in the
+game's debug output. The entries pass through a filter, `0x1429a2890`, which builds
+six planes (`0x142ccc0c0`) and tests a box against them (`0x142cccd80`); both were run
+in a harness on 200 inputs and agree with the original.
+
+**That harness is `function_oracle` now**, and it is the first check here that runs
+what `apply` placed rather than a lowering out of context. `function_sweep.c` maps a
+PE image at its preferred base in a Linux process, with a TEB behind `%gs`, and calls
+a function through the Windows ABI on seeded inputs -- small floats, raw bits, and
+pointers back into its buffers -- printing `rax`, `xmm0` and a hash of every buffer it
+could have written. Buffers, stack and TEB sit at fixed addresses, so a stored pointer
+compares equal. The rewrite's load-time placeholders are filled as its TLS callback
+would. **Both images run under qemu**: the first sweep ran the rewrite natively and
+reported qemu's approximate reciprocals and NaN choices as differences, two of them,
+both identical once one executor ran both sides.
+
+Over the 37,598 functions holding a VEX site, three trials each: 15,721 calls agree,
+97,018 fault on both sides -- following a pointer the synthetic inputs did not
+supply, typically -- and
+**5,928 functions run to the end at least once**. Five differ, each confirmed alone:
+
+    0x1411383a0  returns a bool from a squared distance -- off by one
+    0x1411383f0  0x141144020  0x141147a00  a float in xmm0
+    0x142347010  a buffer it writes
+
+**The first is a stub that is right instruction by instruction.** `0x141117360`, a
+point-to-box squared distance, has `vcomiss`, `vaddss`, `jae`. The `vaddss` has no
+scratch and borrows sixteen bytes of stack (Finding 204), and the bracket closed with
+`add $0x10,%rsp` -- which writes CF. The `jae` then read the `add`'s carry rather than
+the compare's. Every lowering of a VEX instruction is flag-neutral, so the bracket was
+the only thing in a stub that wrote flags; of 1,828 brackets, **69 are followed by a
+flag read** -- a `jcc`, `setcc` or `cmov` inside the stub or at the code it jumps back
+to -- before anything writes them again. `STACK_OPEN` and `STACK_CLOSE` are now
+`lea -0x10(%rsp),%rsp` and `lea 0x10(%rsp),%rsp`, a byte longer each and
+flag-preserving.
+
+Fixture: `stackflags`, the frame `stackride` uses with the bracket between a
+`vcomiss` and its `jae` -- the original dies at 29, Finding 362's tool returns 13 for
+the wrong branch, and this 77.
+
+**Four of the five were that.** With the `lea` bracket they agree. The fifth,
+`0x142347010`, differed through `0x142333340` and a 256-bit sin whose large-argument
+path holds `0x14374e4f8`, a `vcmpgt_oqpd` the rewrite declines and leaves as VEX. qemu
+ran it on real ymm registers whose upper halves the rewrite keeps in TLS, so the
+harness was mixing two representations: found by restoring original bytes over chosen
+ranges of the rewrite (a hybrid qemu can run) and by a per-instruction register trace
+of both sides, whose first differing source was the caller reading sin's upper half.
+Only upper-lane arguments past the slow-path threshold reach it (`b = 1e9` does,
+`a = 1e9` does not). On the target that site is an illegal instruction, not a wrong
+answer, so the oracle now makes every surviving VEX instruction a `ud2` -- 109, the
+five switch-table rows that decode as VEX excepted -- and counts a call that reaches
+one apart: 14 calls. **With both changes the oracle passes on this build** and fails
+on Finding 362's with the four flag functions.
+
+What this does **not** settle is the crash. The terrain list's overflow is still
+unexplained; 5,929 functions is a sixth of those holding a VEX site, and the ones the
+harness cannot run -- most, because they follow pointers into game state -- are where
+it may be.
+
 ### Finding 362 -- `shape_oracle` tells xmm0 apart, and finds 52 more wrong blends
 
 **Finding 361's build died on an access violation at `0x142a7fc80`**, about four

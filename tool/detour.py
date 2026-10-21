@@ -1375,8 +1375,15 @@ def block_off_xmm(block, mover, home, instructions, index, address,
 	        home_used + 2 * 8)
 
 
-STACK_OPEN = bytes([0x48, 0x83, 0xEC, 0x10])
-STACK_CLOSE = bytes([0x48, 0x83, 0xC4, 0x10])
+# **`lea`, not `sub` and `add`.** A window can sit between a compare and
+# the branch that reads it -- `vcomiss`, a `vaddss`, then `jae` -- and the
+# lowering of everything VEX is flag-neutral, so nothing else in a stub
+# writes the flags. `add $0x10,%rsp` does: 69 brackets of Finding 361's
+# build wrote CF and ZF where a jump, `setcc` or `cmov` read them next,
+# one of them a point-to-box distance that took the wrong branch. `lea`
+# moves rsp the same and leaves the flags alone. Finding 363.
+STACK_OPEN = bytes([0x48, 0x8D, 0x64, 0x24, 0xF0])	# lea -0x10(%rsp),%rsp
+STACK_CLOSE = bytes([0x48, 0x8D, 0x64, 0x24, 0x10])	# lea 0x10(%rsp),%rsp
 # Whether a spill site's stack slot stays open across its passengers.
 # Finding 359.
 DEFER_RULE = True

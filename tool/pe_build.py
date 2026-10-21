@@ -3309,6 +3309,57 @@ three:	.float 3.0
 """)
 
 
+# **A stack-borrowing site between a compare and its branch.** `stackride`'s
+# frame again, so the aliased `vsubss` takes sixteen bytes of stack -- and
+# it sits after a `vcomiss` and before the `jae` that reads it. Closed with
+# `add $0x10,%rsp`, the bracket wrote CF and the branch went the other way:
+# `0x1411173d7` in Starfield, a point-to-box distance, and 69 brackets in
+# all. 1.0 is below 2.0, so the branch falls through: 0 + 3 * 5 + 12, plus
+# 50 for rbx. The wrong way returns 13. Finding 363.
+PROGRAMS["stackflags"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp		/* a frame, and no call: this is a leaf */
+	vzeroupper
+	movl	$50, %ebx
+	movq	%rbx, 0x30(%rsp)	/* the shadow's first eight bytes */
+	xorl	%ebx, %ebx
+	vmovss	three(%rip), %xmm0
+	vmovss	three(%rip), %xmm1
+	vmovss	three(%rip), %xmm2
+	vmovss	three(%rip), %xmm3
+	vmovss	three(%rip), %xmm4
+	vmovss	three(%rip), %xmm5
+	vmovss	one(%rip), %xmm6
+	vmovss	two(%rip), %xmm7
+	vcomiss	%xmm7, %xmm6		/* 1 < 2: CF set */
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, borrows the stack: 0 */
+	jae	wrong
+	addss	%xmm1, %xmm0		/* every volatile is read again */
+	addss	%xmm2, %xmm0
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0		/* 15 */
+	cvttss2si %xmm0, %eax
+	addl	$12, %eax
+	leaq	0x28(%rsp), %r11
+	movq	0x8(%r11), %rbx		/* the epilogue's reload */
+	addl	%ebx, %eax		/* + 50, only if rbx came back */
+	addq	$40, %rsp
+	ret
+wrong:
+	movl	$13, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4
+one:	.float 1.0
+two:	.float 2.0
+three:	.float 3.0
+""")
+
+
 # **`vpermilps` with its control in memory**, stored just before as four
 # selectors -- `0x142a46b34`'s shape, where Starfield faulted. There is no
 # SSE permute that takes memory; the control is loaded into a scratch and

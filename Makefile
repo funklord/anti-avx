@@ -75,7 +75,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
         census spans gprs shapes cost-bench cost status probe why check-shadow check-shadow-pe check-run-borrow check-spill check-tls check-unwind check-vex check-liveness \
-        check-lanes check-span check-shapes \
+        check-lanes check-span check-shapes check-functions \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -886,6 +886,16 @@ shapes: $(LISTING)
 check-shapes: $(LISTING)
 	$(PYTHON) tool/shape_oracle.py $(LISTING) $(BUILD_DIR)
 
+# Whole functions of the original and of the rewrite, both under qemu, on
+# seeded inputs -- the one check that runs the stubs `apply` placed rather
+# than a lowering out of context. Finding 363's bracket wrote the flags a
+# branch read, inside stubs whose every instruction was right. Needs the
+# game binary and qemu, and takes about ten minutes on eight shards, so it
+# is not a prerequisite of `check`.
+check-functions: $(DETOURED) $(LISTING)
+	$(PYTHON) tool/function_oracle.py $(TARGET) $(DETOURED) $(LISTING) \
+	          $(BUILD_DIR)
+
 # What a closed 256-bit span could reach, which is not what Finding 133's
 # capacity figure suggests. A measurement, not a gate: it always exits 0.
 spans: $(LISTING) $(DETOURED)
@@ -908,7 +918,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
              mxcsr splatrun splatop extract shadowspill regionlive \
-             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim fwdhammock fwdspill shadowlea fwdalt rider stackride stackrsp permilmem
+             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim fwdhammock fwdspill shadowlea fwdalt rider stackride stackrsp permilmem stackflags
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
