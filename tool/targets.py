@@ -127,35 +127,218 @@ def from_reloc(data, sections, base, opt, text):
 	return targets
 
 
+def file_offset(sections, base, rva):
+	"""Where an RVA's bytes are in the file, or None."""
+	for _n, (vaddr, vsize, raddr, rsize) in sections.items():
+		if vaddr <= base + rva < vaddr + vsize and raddr \
+				and base + rva - vaddr < rsize:
+			return raddr + (base + rva - vaddr)
+	return None
+
+
 def from_pdata(data, sections, base, text):
-	"""Function starts, and the handler addresses their unwind info names."""
+	"""Function starts, the handler addresses their unwind info names, and
+	what the C++ handlers' data names.
+
+	Returns `(starts, handlers, chained, cxx)`. `chained` is the begins of
+	`UNW_FLAG_CHAININFO` records whose function the C++ parse vouches for:
+	its root carries no handler, or one `cxx_targets` read cleanly. Those
+	are in `starts` too -- they are still where something MAY arrive, for
+	every caller that asks that -- and `collect` reports them as a group of
+	their own so that `detour` can tell them apart. Finding 364.
+	"""
 	if ".pdata" not in sections:
-		return set(), set()
+		return set(), set(), set(), set()
 	_vaddr, _vsize, raddr, rsize = sections[".pdata"]
 	starts, handlers = set(), set()
+	parent, carried = {}, {}
 	for i in range(rsize // 12):
 		begin, end, unwind = struct.unpack_from("<III", data, raddr + i * 12)
 		if end <= begin:
 			continue
 		starts.add(base + begin)
-		# The unwind info may carry an exception handler RVA after the
-		# unwind codes; a funclet's handler is a branch target.
-		for _n, (vaddr, vsize, xraddr, _xrsize) in sections.items():
-			if vaddr <= base + unwind < vaddr + vsize and xraddr:
-				at = xraddr + (base + unwind - vaddr)
-				if at + 4 > len(data):
+		at = file_offset(sections, base, unwind)
+		if at is None or at + 4 > len(data):
+			continue
+		version_flags, _prologue, codes, _frame = data[at:at + 4]
+		flags = version_flags >> 3
+		after = at + 4 + ((codes + 1) & ~1) * 2
+		if flags & 0x4 and after + 12 <= len(data):	# CHAININFO
+			parent[begin] = struct.unpack_from("<III", data, after)
+		elif flags & 0x3 and after + 4 <= len(data):	# E- or UHANDLER
+			# The unwind info carries an exception handler RVA after the
+			# unwind codes; a funclet's handler is a branch target.
+			handler = struct.unpack_from("<I", data, after)[0]
+			if in_text(base + handler, text):
+				handlers.add(base + handler)
+			handlers |= scope_targets(data, after + 4, base, text)
+			carried[begin] = (handler, after + 4)
+	cxx, vouched = cxx_targets(data, sections, base, text, carried)
+	chained = set()
+	for begin in parent:
+		root, depth = parent[begin], 0
+		while root[0] in parent and depth < 32:
+			root, depth = parent[root[0]], depth + 1
+		if root[0] not in parent and (root[0] not in carried
+		                              or root[0] in vouched):
+			chained.add(base + begin)
+	return starts, handlers, chained, cxx
+
+
+def read_unsigned(data, at):
+	"""FH4's compressed unsigned integer at `at`: (value, next offset).
+
+	The low bits of the first byte say how long it is -- a clear bit 0 for
+	one byte, `01` for two, `011` for three, `0111` for four, `1111` for a
+	whole dword after the tag byte -- and the value is the rest.
+	"""
+	tag = data[at]
+	if tag & 1 == 0:
+		return tag >> 1, at + 1
+	if tag & 3 == 1:
+		return struct.unpack_from("<H", data, at)[0] >> 2, at + 2
+	if tag & 7 == 3:
+		return (struct.unpack_from("<I", data, at)[0] & 0xFFFFFF) >> 3, at + 3
+	if tag & 15 == 7:
+		return struct.unpack_from("<I", data, at)[0] >> 4, at + 4
+	return struct.unpack_from("<I", data, at + 1)[0], at + 5
+
+
+def read_int(data, at):
+	return struct.unpack_from("<i", data, at)[0], at + 4
+
+
+def funcinfo3(data, sections, base, at):
+	"""RVAs a `FuncInfo` names: unwind actions and catch funclets.
+
+	The 32-bit-era layout, `__CxxFrameHandler3`'s, recognised by its magic.
+	A catch funclet here returns its continuation in `rax`, so the
+	continuation is named by code rather than by data.
+	"""
+	_magic, states, unwind, tries, try_map = struct.unpack_from(
+		"<IiIiI", data, at)
+	out = set()
+	if unwind:
+		where = file_offset(sections, base, unwind)
+		for i in range(states):
+			out.add(struct.unpack_from("<iI", data, where + 8 * i)[1])
+	if tries:
+		where = file_offset(sections, base, try_map)
+		for i in range(tries):
+			catches, array = struct.unpack_from("<iI", data,
+			                                    where + 20 * i + 12)
+			table = file_offset(sections, base, array)
+			for j in range(catches):
+				out.add(struct.unpack_from("<i", data,
+				                           table + 20 * j + 12)[0])
+	return out - {0}
+
+
+def funcinfo4(data, sections, base, at, begin):
+	"""RVAs a `FuncInfo4` names: unwind actions, catch funclets, and the
+	continuations a catch resumes at.
+
+	`__CxxFrameHandler4`'s compressed form. **A continuation is where
+	control arrives after a catch, and nothing but this data names it**:
+	measured on Starfield, every catch funclet that returns gives back 0 in
+	`rax`, which tells the runtime to read the address from here. One
+	stored function-relative is relative to the record's own `begin`.
+	"""
+	header = data[at]
+	at += 1
+	if header & 0x04:		# BBT flags
+		_bbt, at = read_unsigned(data, at)
+	unwind = try_map = None
+	if header & 0x08:
+		unwind, at = read_int(data, at)
+	if header & 0x10:
+		try_map, at = read_int(data, at)
+	out = set()
+	if unwind:
+		where = file_offset(sections, base, unwind)
+		count, where = read_unsigned(data, where)
+		for _ in range(count):
+			kind, where = read_unsigned(data, where)
+			if kind & 3 in (1, 2):		# a destructor and its object
+				action, where = read_int(data, where)
+				_object, where = read_unsigned(data, where)
+				out.add(action)
+			elif kind & 3 == 3:		# an unwind funclet
+				action, where = read_int(data, where)
+				out.add(action)
+	if try_map:
+		where = file_offset(sections, base, try_map)
+		count, where = read_unsigned(data, where)
+		for _ in range(count):
+			for _field in range(3):		# try low, try high, catch high
+				_value, where = read_unsigned(data, where)
+			array, where = read_int(data, where)
+			table = file_offset(sections, base, array)
+			catches, table = read_unsigned(data, table)
+			for _ in range(catches):
+				kind = data[table]
+				table += 1
+				if kind & 0x01:
+					_adjectives, table = read_unsigned(data, table)
+				if kind & 0x02:
+					_type, table = read_int(data, table)
+				if kind & 0x04:
+					_object, table = read_unsigned(data, table)
+				funclet, table = read_int(data, table)
+				out.add(funclet)
+				for _ in range((kind >> 4) & 3):
+					if kind & 0x08:
+						resume, table = read_int(data, table)
+					else:
+						resume, table = read_unsigned(data, table)
+						resume += begin
+					out.add(resume)
+	return out
+
+
+def cxx_targets(data, sections, base, text, carried):
+	"""(addresses, vouched begins) from every C++ handler's data.
+
+	**A handler routine counts as C++ only if every one of its functions
+	parses**, and every address read lands in `.text`. Nothing here knows
+	the routines' names, and the data after a handler RVA means something
+	else for each: `__GSHandlerCheck`'s is a cookie offset, which read as a
+	`FuncInfo4` happened to parse for 8 of its 264 functions and produced
+	2,732 addresses outside the image. Judged per routine, the C++ ones
+	parse 85,593 of 85,593 and the others are refused whole. Measured on
+	Starfield: 489 catch funclets -- the count Finding 112 enumerated by
+	other means, all of them `.pdata` primaries -- and 18 continuations,
+	each an instruction start. Finding 364.
+	"""
+	by_routine = {}
+	for begin, (handler, at) in carried.items():
+		by_routine.setdefault(handler, []).append((begin, at))
+	found, vouched = set(), set()
+	for handler, users in by_routine.items():
+		names, ok = set(), True
+		for begin, at in users:
+			try:
+				info = struct.unpack_from("<I", data, at)[0]
+				where = file_offset(sections, base, info)
+				if where is None or in_text(base + info, text):
+					ok = False
 					break
-				version_flags, _prologue, codes, _frame = data[at:at + 4]
-				flags = version_flags >> 3
-				if flags & 0x3:			# EHANDLER or UHANDLER
-					after = at + 4 + ((codes + 1) & ~1) * 2
-					if after + 4 <= len(data):
-						handler = base + struct.unpack_from("<I", data, after)[0]
-						if in_text(handler, text):
-							handlers.add(handler)
-						handlers |= scope_targets(data, after + 4, base, text)
+				if struct.unpack_from("<I", data, where)[0] & ~3 \
+						== 0x19930520:
+					read = funcinfo3(data, sections, base, where)
+				else:
+					read = funcinfo4(data, sections, base, where, begin)
+			except (struct.error, TypeError, IndexError):
+				ok = False
 				break
-	return starts, handlers
+			if not all(in_text(base + rva, text) for rva in read):
+				ok = False
+				break
+			names |= read
+		if ok:
+			found |= {base + rva for rva in names}
+			vouched |= {begin for begin, _at in users}
+	return found, vouched
 
 
 def scope_targets(data, at, base, text):
@@ -222,7 +405,7 @@ def collect(path):
 	text = sections[".text"]
 
 	reloc = from_reloc(data, sections, base, opt, text)
-	starts, handlers = from_pdata(data, sections, base, text)
+	starts, handlers, chained, cxx = from_pdata(data, sections, base, text)
 	# **No switch tables here any more; see `detour.switch_targets`.**
 	# `from_switch_tables` looked for runs of `table + value`, which is the
 	# MSVC x86 form, and this x64 binary holds RVAs. It found 14,789
@@ -239,8 +422,10 @@ def collect(path):
 	# 3 of the real targets are in its set. Findings 174 and 177.
 	return {
 		"reloc (absolute pointers)": reloc,
-		"pdata (function starts)": starts,
+		"pdata (function starts)": starts - chained,
+		"pdata (chained fragments)": chained,
 		"xdata (EH handlers)": handlers,
+		"xdata (C++ EH)": cxx,
 	}
 
 

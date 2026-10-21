@@ -3360,6 +3360,97 @@ three:	.float 3.0
 """)
 
 
+# **A window that borrows nothing, carrying a site that does.** The two
+# `vmulss` each need a copy first and share one window; the function is
+# reached only through a pointer, so nothing widens backwards over it.
+# The aliased `vsubss` after them cannot take the next instruction, which
+# borrows too, and its window back over the second `vmulss` overlaps the
+# first -- so the rescue offers it to the window that ends at it, as a
+# passenger that borrows, with the home space in use. Before, that
+# passenger had a frame slot or a block or nothing, and the site was
+# lost: `0x1426dbd74` in Starfield, where it died. 0 + 3 + 6 - 3 + 3 + 3
+# + 2, plus 50 for rbx and 13. Finding 364.
+PROGRAMS["stackpass"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	vmovss	three(%rip), %xmm0
+	vmovss	three(%rip), %xmm1
+	vmovss	three(%rip), %xmm2
+	vmovss	three(%rip), %xmm3
+	vmovss	three(%rip), %xmm4
+	vmovss	three(%rip), %xmm5
+	vmovss	two(%rip), %xmm6
+	vmovss	three(%rip), %xmm7
+	leaq	site(%rip), %rax
+	call	*%rax
+	addq	$40, %rsp
+	ret
+	.p2align 4
+site:
+	vmulss	%xmm7, %xmm6, %xmm2	/* 6, plain, and an indirect target */
+	vmulss	%xmm7, %xmm6, %xmm3	/* 6, plain, in the same window */
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, rescued: 0 */
+	vsubss	%xmm3, %xmm4, %xmm3	/* aliased: -3 */
+	movl	$50, %ebx
+	movq	%rbx, 0x8(%rsp)		/* the home space is the function's */
+	xorl	%ebx, %ebx
+	addss	%xmm1, %xmm0		/* every volatile is read again */
+	addss	%xmm2, %xmm0
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0
+	addss	%xmm6, %xmm0		/* 14 */
+	cvttss2si %xmm0, %eax
+	movq	0x8(%rsp), %rbx
+	addl	%ebx, %eax		/* + 50, only if rbx came back */
+	addl	$13, %eax
+	ret
+func_end:
+	.p2align 4
+two:	.float 2.0
+three:	.float 3.0
+""")
+
+
+
+# **A store that begins a chained `.pdata` record**, skipped by the `je`
+# above it -- `0x141aa4ff9` in Starfield, a function's epilogue storing
+# its outputs through two pointers that may be null. The record put the
+# store in `INDIRECT_TARGETS`, so no hammock would hold it; the next
+# instruction is the `je`'s target, and the forward hammock meets the
+# second `je`. Nothing arrives at a chained record's first byte, and the
+# function has no handler whose data could say otherwise. The store left
+# in VEX form dies at 29. Finding 364.
+PROGRAMS["chainstore"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	out(%rip), %rax
+	xorl	%ebx, %ebx
+	vmovss	val(%rip), %xmm8
+	testq	%rax, %rax
+	je	skip
+chain:
+	vmovss	%xmm8, (%rax)		/* four bytes, and a chained record */
+skip:
+	testq	%rbx, %rbx
+	je	done
+	vmovss	%xmm8, (%rbx)		/* never: rbx is null */
+done:
+	cvttss2si out(%rip), %eax
+	addq	$40, %rsp
+	ret
+func_end:
+val:	.float	77.0
+out:	.float	0.0
+""")
+
+
 # **`vpermilps` with its control in memory**, stored just before as four
 # selectors -- `0x142a46b34`'s shape, where Starfield faulted. There is no
 # SSE permute that takes memory; the control is loaded into a scratch and
@@ -6143,6 +6234,15 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 	else:
 		xdata = struct.pack("<BBBB", 1 | (1 << 3), prologue, count, 0) \
 			+ codes + struct.pack("<I", SECTION_ALIGNMENT + handler)
+	# **A `chain` label splits the function's `.pdata` in two**, a primary
+	# record up to the label and an `UNW_FLAG_CHAININFO` one from it to
+	# `func_end`, which names the primary as its parent -- the shape MSVC
+	# gives a function's later fragments. The parent's `RUNTIME_FUNCTION`
+	# holds the `.xdata` RVA, which is known only once the sections are
+	# laid out, so the chained block is appended there. Finding 364.
+	chain = symbols.get("chain") if symbols else None
+	xdata = xdata + b"\0" * (-len(xdata) % 4)
+	chained_at = len(xdata)
 
 	sections = []
 	rva = SECTION_ALIGNMENT
@@ -6166,12 +6266,23 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 		# the assertion below is what says so rather than assuming it.
 		wanted.append((b".idata", import_table(imports, 0), DATA))
 	for name, body, flags in wanted:
+		if name == b".xdata" and chain is not None:
+			text_rva = sections[0][1]
+			body = body + struct.pack("<BBBB", 1 | (4 << 3), 0, 0, 0) \
+				+ struct.pack("<III", text_rva, text_rva + chain, rva)
 		if name == b".pdata":
 			# RUNTIME_FUNCTION: begin, end, unwind info -- all RVAs.
 			text_rva = sections[0][1]
 			xdata_rva = sections[1][1]
-			body = struct.pack("<III", text_rva, text_rva + code_size,
-			                   xdata_rva)
+			if chain is None:
+				body = struct.pack("<III", text_rva, text_rva + code_size,
+				                   xdata_rva)
+			else:
+				body = struct.pack("<III", text_rva, text_rva + chain,
+				                   xdata_rva) \
+					+ struct.pack("<III", text_rva + chain,
+					              text_rva + code_size,
+					              xdata_rva + chained_at)
 		if name == b".idata":
 			body = import_table(imports, rva)
 			if len(body) != len(wanted[-1][1]):

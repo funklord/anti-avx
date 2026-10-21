@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,839 of 804,948 VEX
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,848 of 804,948 VEX
 sites -- 99.99%** -- through 203,387 detours, and every `make detour-verify` invariant
-holds on the result. **109 sites are left** (Finding 361, 2026-10-20), five more rows
+holds on the result. **100 sites are left** (Finding 364, 2026-10-21), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                           109 re-measured   (Finding 361)
+    default build                           100 re-measured   (Finding 364)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,839 of 804,948 VEX sites, 99.99%, through 203,387 detours**, and 164 further
+**804,848 of 804,948 VEX sites, 99.99%, through 203,387 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,99 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 364 -- a passenger borrows the stack, and a chained record is not an entry
+
+**Finding 363's build got past the terrain crash** -- "TERRAIN: Loaded 81 material
+slots" twice, about fifty seconds further -- and stopped on two illegal instructions,
+on two threads, both among the 109 survivors:
+
+    0x1426dbd74  vmulss %xmm2,%xmm6,%xmm2   lost to an overlap
+    0x141aa4ff9  vmovss %xmm8,(%rax)        next instruction is a branch target
+
+So the frontier is now what the game runs into, and both were traced through
+`collect` and `place_stubs` with the stages wrapped, as Finding 356's were.
+
+**`0x1426dbd74` sits between two windows**: `[d6c,d74)` holds the two `vmulss`
+before it and `[d78,d81)` the `vsubss` after. Finding 183's rescue offers it to the
+window that ends at it, as a passenger, and the passenger is aliased -- `dst == src2`
+-- so it must borrow a register. `emit_swallowed` could save that into a frame slot or
+a TLS block, and this window had neither: the start lends no frame, and fewer than two
+GPRs are free for a block. A spill SITE has had the stack since Finding 204; a site
+that borrows nothing never opened it. **Now the sixteen bytes open just before the
+first borrowing passenger and close after the last**, the one allocation the stub's
+unwind code describes at `prologue`, under the conditions Finding 359 set for a spill
+site's: no passenger that names or moves `rsp` or leaves the stub, and no forward
+hammock. `PASSENGER_STACK_RULE` is the A/B. Fixture `stackpass`, the rescue's shape
+with the home space in use: the original dies at 29, the rule off loses the site and
+dies at 29, and this answers 77.
+
+**`0x141aa4ff9` begins a chained `.pdata` record.** `test %rax,%rax; je +4` skips
+it, and the next instruction is the `je`'s target, so the window has to hold a target
+either way. The backward hammock `[4ff7,4ffd)` refused because the site was in
+`INDIRECT_TARGETS` -- every `.pdata` begin is -- and the forward one because the
+instruction after the target is another `je`. Its twin four bytes on, the same store
+through `%rbx`, is not a record begin and was placed. Finding 112 priced taking chained
+begins out of the set at eleven sites and declined it until the catch funclets were
+named by something other than `.pdata`.
+
+**`targets.cxx_targets` names them now.** It reads `__CxxFrameHandler3`'s `FuncInfo`
+and `__CxxFrameHandler4`'s compressed `FuncInfo4`: unwind actions, catch funclets, and
+the continuations a catch resumes at. The handler routines are not known by name, so
+**a routine counts as C++ only if every one of its functions parses** with every
+address inside `.text`: `__GSHandlerCheck`'s data is a cookie offset, which read as a
+`FuncInfo4` parsed for 8 of its 264 functions and produced 2,732 addresses outside the
+image, so that routine is refused whole. Measured:
+
+    catch funclets                              489   every one a .pdata primary, the
+                                                      count Finding 112 enumerated
+    continuations                                18   each an instruction start
+    every address read                       35,430   each an instruction start
+    of them in no group before               26,727   destructors and unwind funclets
+
+The catch funclets that return, 13 of them, all return `movabs $0x0,%rax`, which tells
+the runtime to read the continuation from the metadata -- so this binary names its
+continuations in data, and nothing else names them. **The 26,727 were a hole**: code
+the exception runtime enters that nothing in `blocked` covered.
+
+A chained begin then stays in `blocked`, where every other question still sees it, and
+leaves `INDIRECT_TARGETS` when its function's handler was read or it has none -- 55,855
+of 56,269; the other 414 all belong to functions whose handler is `__GSHandlerCheck`,
+and are kept. `verify`'s swallowed-target check asks the same question.
+`CHAINED_RULE` is the A/B.
+
+**That was half of it.** The hammock then met `covered_by`, which wants a window
+inside one `.pdata` record, and this one starts in the record above. A chained record
+is the same function, not a new one, so the bytes are still code; what changes at the
+boundary is the unwind description -- here the left record chains through one that
+saves xmm registers and the right one does not, because the epilogue has restored
+them. **`crossing_window` lets a window cross vouched begins** when everything it takes
+from beyond the site's own record cannot raise -- no memory operand but `lea`, no
+divide, trap, call, push or pop -- and the stub's unwind data is taken from the SITE's
+record rather than the window start's, recorded in `CROSSING`. The `je` is all it takes
+here. `pe_build` gains a `chain` label, which splits a fixture's `.pdata` into a
+primary and a chained record; fixture `chainstore` is Starfield's shape: the original
+dies at 29, the rule off at 29, and this answers 77.
+
+**`verify` then failed once, and the image was right.** `0x1423b7cc2`, the target
+of a `ja`, was reported lost. The hammock `[cbc,cc2)` holds the `ja` and a `vmaxss` at
+`cbe`, which begins a chained record -- and `resync` restarts the decode at every
+`.pdata` begin, so it decoded from `cbe`, inside the window's `jmp`, read
+`bc 9b 06 90 90` as a `mov $imm,%esp` and ran over `cc2`. Decoded from the window's
+start the image is what it should be. **A record begin a window covers is not a
+boundary any more**, so `covered_starts` finds them in the image -- an instruction of
+the original starting up to four bytes before the begin is now a new `jmp rel32`
+leaving `.text` -- and `resync` is told to skip them. New, because the original has
+its own: `0x1434bcf10` is a switch table whose bytes read as such a jump with a
+chained begin after it, and the first version of the check counted it. Ten begins
+are covered, all chained and vouched; none in Finding 363's image.
+
+**Measured on the full image**: 114 surviving rows to 105, which is 109 sites to 100
+with the five switch-table rows set aside. Nine sites leave and none arrive -- seven
+lost to an overlap (37 to 30) and two declined for a branch target (7 to 5), both
+crash sites among them. Detours stay at 203,387; the nine ride in windows that were
+already placed. `verify` passes, and `function_oracle` passes with the 100 survivors
+made `ud2`: 15,726 calls agree and 5,928 functions run to the end.
 
 ### Finding 363 -- the stack bracket wrote the flags, and `function_oracle` runs the stubs
 

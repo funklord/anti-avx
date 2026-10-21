@@ -807,8 +807,11 @@ def verify(original, patched):
 	return 1 if problems else 0
 
 
-def disassemble(path):
+def disassemble(path, skip=frozenset()):
 	"""(instruction start addresses, VEX start addresses) for .text.
+
+	`skip` is passed to `resync`: function starts the image no longer
+	begins an instruction at, on purpose.
 
 	**A VEX start address is one that DECODES**, and until 2026-09-19 it was
 	any row whose first byte is `c4` or `c5`. A `(bad)` row has three
@@ -838,7 +841,7 @@ def disassemble(path):
 	done = subprocess.Popen(["objdump", "-d", "-j", ".text", path],
 	                        stdout=subprocess.PIPE, text=True, errors="replace")
 	bounds, vex, undecoded = set(), set(), set()
-	lines = (line for chunk in resync.resync(path, done.stdout)
+	lines = (line for chunk in resync.resync(path, done.stdout, skip=skip)
 	         for line in chunk.splitlines())
 	for line in lines:
 		parts = line.split("\t")

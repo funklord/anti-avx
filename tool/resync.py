@@ -123,7 +123,7 @@ class Unresolved(Exception):
 	"""A function start the fresh decode could not reconcile."""
 
 
-def resync(binary, lines, report=None):
+def resync(binary, lines, report=None, skip=frozenset()):
 	"""Yield the listing `lines` with every `.pdata` start on a boundary.
 
 	`lines` is objdump's output for `binary`, line by line. Raises
@@ -131,8 +131,14 @@ def resync(binary, lines, report=None):
 	start in the swept range is still off a boundary -- **the proof, rather
 	than the claim**. `report`, when given, is called with the count of
 	starts spliced.
+
+	`skip` is starts that are no longer boundaries on purpose: in a
+	rewritten image, a chained record's begin a placed window covers sits
+	inside that window's `jmp`, and a fresh decode from it reads the jump's
+	displacement as an instruction that swallows the code after the window.
+	Finding 364.
 	"""
-	starts = pdata_starts(binary)
+	starts = pdata_starts(binary) - set(skip)
 	order = sorted(starts)
 	seen, spliced = set(), set()
 	low = high = None

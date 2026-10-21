@@ -58,6 +58,7 @@ import lower
 import isa_guard
 import outside
 import patch as inplace
+import resync
 import scratch as scratch_finder
 import targets as target_set
 
@@ -1387,6 +1388,71 @@ STACK_CLOSE = bytes([0x48, 0x8D, 0x64, 0x24, 0x10])	# lea 0x10(%rsp),%rsp
 # Whether a spill site's stack slot stays open across its passengers.
 # Finding 359.
 DEFER_RULE = True
+# Whether a site that borrows nothing opens the slot for a passenger that
+# does. Finding 364.
+PASSENGER_STACK_RULE = True
+# Whether a chained `.pdata` record the C++ parse vouches for is left out
+# of `INDIRECT_TARGETS`, so a hammock may hold it. Finding 364.
+CHAINED_GROUP = "pdata (chained fragments)"
+CHAINED_RULE = True
+# Those records' begins, from `analysis_context`, and the windows that
+# cross one: `{(start, window): site}`, so the stub's unwind data is taken
+# from the record the site is in. See `crossing_window`. Finding 364.
+CHAINED_STARTS = set()
+CROSSING = {}
+# What a window may take from a record other than its site's: nothing that
+# can raise, because the stub is described as the site's record and an
+# exception there would unwind with the wrong one.
+RAISING = ("div", "idiv", "int", "ud", "hlt", "call", "ret", "push", "pop",
+           "syscall", "enter", "leave", "iret", "bound")
+
+
+def crossing_window(ranges, instructions, positions, start, window, address,
+                    length):
+	"""Whether a window `covered_by` refuses may cross a chained record.
+
+	**A chained `.pdata` record is the same function**, not a new one: it
+	is where the frame's description changes, typically an epilogue whose
+	saved registers have been put back. So a window across the boundary is
+	still code, and the only question left is unwinding. The stub is
+	described by the record the SITE is in, which is right for the site;
+	everything the window takes from beyond that record must then be
+	unable to raise, since it would unwind with a description that is not
+	its own. A `je` is the case that matters -- `0x141aa4ff9`, a store
+	skipped by the branch just above it in the previous record.
+
+	Every boundary crossed must be a begin `targets.cxx_targets` vouches
+	for, and the records must be contiguous. Finding 364.
+	"""
+	i = bisect.bisect_right(ranges, (address, 1 << 62)) - 1
+	if i < 0 or address + length > ranges[i][1]:
+		return False
+	low, high = ranges[i]
+	end = start + window
+	j = i
+	while ranges[j][0] > start:
+		if j == 0 or ranges[j - 1][1] != ranges[j][0] \
+				or ranges[j][0] not in CHAINED_STARTS:
+			return False
+		j -= 1
+	k = i
+	while ranges[k][1] < end:
+		if k + 1 >= len(ranges) or ranges[k + 1][0] != ranges[k][1] \
+				or ranges[k + 1][0] not in CHAINED_STARTS:
+			return False
+		k += 1
+	at = positions.get(start)
+	if at is None:
+		return False
+	while at < len(instructions) and instructions[at][0] < end:
+		row = instructions[at]
+		if not low <= row[0] < high:
+			mnemonic, operands = row[2], row[3] or ""
+			if ("(" in operands and mnemonic != "lea") or "*" in operands \
+					or mnemonic.startswith(RAISING):
+				return False
+		at += 1
+	return True
 
 
 def rebase_rsp(encoding, delta):
@@ -10724,6 +10790,23 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				body += encode_tls_base(ordered[0], ordered[1], tls[0],
 				                        stub_address + len(body))
 				passenger_block = ordered[0]
+	# **Or the stack, where the window has neither a frame slot nor two
+	# free registers for a block.** A spill site has had the sixteen bytes
+	# since Finding 204 and kept them open for its passengers since 359; a
+	# site that borrows nothing never opened them, so its passenger was
+	# refused here. They open just before the first borrowing passenger
+	# and close after the last, which is the one allocation the unwind
+	# code describes at `prologue`. Nothing that names or moves `rsp` or
+	# leaves the stub may ride inside, and a forward hammock is entered
+	# at a passenger, past the allocation. `0x1426dbd74`, a `vmulss`
+	# between two windows, was refused for want of this, and Starfield
+	# died there on its illegal instruction. Finding 364.
+	passenger_stack = base is None and passenger_block is None \
+		and not prologue and PASSENGER_STACK_RULE \
+		and SPILL == SPILL_TLS and FALLBACK_RULE == FALLBACK_ON \
+		and not (held and forward) \
+		and any(len(entry) > 6 and entry[6] for entry in displaced) \
+		and not any(stack_bound(entry) for entry in displaced)
 	# **A forward hammock's labels are known as its passengers go down**:
 	# the site's lowering is already in `body`, and nothing before a held
 	# passenger may be something a branch into the middle would skip -- a
@@ -10737,6 +10820,11 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	for entry in displaced:
 		if held and forward and entry[0] in held:
 			labels[entry[0]] = len(body)
+		if passenger_stack and base is None and len(entry) > 6 \
+				and entry[6]:
+			body += STACK_OPEN
+			prologue = len(body)
+			base = 0
 		fixed = emit_swallowed(entry, body, stub_address, pool,
 		                       spill_base, reasons, base,
 		                       block=passenger_block,
@@ -10746,7 +10834,7 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 				reasons["a displaced instruction will not move"] += 1
 			return None, 0
 		body += fixed
-	if deferred:
+	if deferred or passenger_stack:
 		body += STACK_CLOSE
 	if held and forward:
 		if set(labels) != set(held):
@@ -11438,8 +11526,24 @@ def analysis_context(binary, listing):
 	blocked = set()
 	for values in groups.values():
 		blocked |= values
+	# **A chained `.pdata` record is not an entry**, it is where the frame's
+	# description changes, so it stays in `blocked` -- still somewhere a
+	# window must not bury -- but nothing arrives there that a hammock
+	# could not re-aim. Finding 112 declined this until the funclets were
+	# named by something other than `.pdata`; `targets.cxx_targets` names
+	# them and every continuation a catch resumes at, and keeps a record
+	# whose function it cannot read in the other group. `0x141aa4ff9`, a
+	# store skipped by the `je` above it, began such a record, and
+	# Starfield died on it. Finding 364.
+	indirect = set()
+	for name, values in groups.items():
+		if name != CHAINED_GROUP or not CHAINED_RULE:
+			indirect |= values
 	INDIRECT_TARGETS.clear()
-	INDIRECT_TARGETS.update(blocked)
+	INDIRECT_TARGETS.update(indirect)
+	CHAINED_STARTS.clear()
+	if CHAINED_RULE:
+		CHAINED_STARTS.update(groups.get(CHAINED_GROUP, ()))
 	instructions = list(parse_with_comments(listing))
 	# The liveness scan wants the plain four-field shape.
 	plain = [(a, e, m, o) for a, e, m, o, _c in instructions]
@@ -11817,6 +11921,7 @@ def collect(binary, listing, context=None):
 	ALTERNATES_WITHDRAWN.clear()
 	RIDERS.clear()
 	HAMMOCK_REFUSED.clear()
+	CROSSING.clear()
 	UNIT_REFUSED.clear()
 	UNIT_RUNG.clear()
 	UNIT_EXAMPLES.clear()
@@ -12927,9 +13032,14 @@ def collect(binary, listing, context=None):
 				continue
 
 		if not inplace.covered_by(ranges, start, window):
-			skipped["outside .pdata"] += 1
-			declined[address] = "outside .pdata"
-			continue
+			if CHAINED_RULE and crossing_window(
+					ranges, plain, positions, start, window, address,
+					len(encoding)):
+				CROSSING[(start, window)] = address
+			else:
+				skipped["outside .pdata"] += 1
+				declined[address] = "outside .pdata"
+				continue
 		candidates.append((start, encoding, operands, mnemonic, window,
 		                   displaced, scratch, preceding, strategy))
 		# **A second way to seat it, from the site forward.** A window
@@ -18230,10 +18340,12 @@ def apply_all(binary, listing, output):
 	# the primary's own entry, which is a `.text` address.
 	extents, prologues = [], []
 	ordered = sorted(placed, key=lambda item: item[2])
-	for site, _window, stub_address, length, prologue in ordered:
+	for site, window, stub_address, length, prologue in ordered:
+		# A window across a chained record is described as its site's.
+		# See `crossing_window`. Finding 364.
 		extents.append((stub_address - image_base,
 		                stub_address + length - image_base,
-		                site - image_base))
+		                CROSSING.get((site, window), site) - image_base))
 		prologues.append(prologue)
 	xdata_rva = next_section_rva(image)
 	xdata, pdata = stub_unwind(extents, prologues, image_base,
@@ -18564,6 +18676,36 @@ def stub_gpr_problems(text, placed, home, base, size,
 	return problems
 
 
+def covered_starts(original, patched, bounds):
+	"""`.pdata` starts inside a `jmp rel32` the rewrite wrote into `.text`.
+
+	Only the images are read: a start is covered where an instruction of
+	the original begins one to four bytes before it, and the patched image
+	holds a new `e9` there whose destination is outside `.text`. **New**,
+	because the original has its own: `0x1434bcf10` is a switch table in
+	`.text` whose bytes read as one, and a chained begin follows it. See
+	`verify`. Finding 364.
+	"""
+	data = open(patched, "rb").read()
+	before = open(original, "rb").read()
+	low, offset, size = inplace.text_mapping(patched)
+	if inplace.text_mapping(original) != (low, offset, size):
+		return set()
+	out = set()
+	for start in resync.pdata_starts(original):
+		for at in range(start - 4, start):
+			if at not in bounds or not low <= at < low + size - 5:
+				continue
+			where = offset + at - low
+			if data[where] != 0xE9 \
+					or data[where:where + 5] == before[where:where + 5]:
+				continue
+			target = at + 5 + struct.unpack_from("<i", data, where + 1)[0]
+			if not low <= target < low + size:
+				out.add(start)
+	return out
+
+
 def verify(original, patched, listing=None):
 	a = open(original, "rb").read()
 	b = open(patched, "rb").read()
@@ -18705,7 +18847,19 @@ def verify(original, patched, listing=None):
 		problems += isa_guard.check(original, patched, listing)
 
 	before_bounds, before_vex, before_bad = inplace.disassemble(original)
-	after_bounds, after_vex, after_bad = inplace.disassemble(patched)
+	# **A record begin a window covers is not a boundary any more**, and
+	# `resync` must not restart there: it would decode the window's jump
+	# displacement as an instruction and swallow what follows -- reported
+	# as `0x1423b7cc2` lost, a branch target the decode ran over, behind a
+	# chained begin a hammock holds. Read from the image rather than the
+	# plan: an instruction of the original starting within four bytes
+	# before the begin is now a `jmp rel32` leaving `.text`. Finding 364.
+	buried = covered_starts(original, patched, before_bounds)
+	if buried:
+		print(f"verify: {len(buried):,} .pdata start(s) lie inside a placed "
+		      f"window's jump, and the patched image is decoded past them")
+	after_bounds, after_vex, after_bad = inplace.disassemble(patched,
+	                                                         skip=buried)
 	print(f"verify: VEX in .text {len(before_vex):,} -> {len(after_vex):,}"
 	      f"  ({len(before_vex) - len(after_vex):,} removed, "
 	      f"{100.0 * (len(before_vex) - len(after_vex)) / len(before_vex):.1f}%)")
@@ -18831,8 +18985,9 @@ def verify(original, patched, listing=None):
 		tls_pair_of(tls_for(original)))
 	groups = target_set.collect(original)
 	reachable = set()
-	for values in groups.values():
-		reachable |= values
+	for name, values in groups.items():
+		if name != CHAINED_GROUP or not CHAINED_RULE:
+			reachable |= values
 
 	unexplained = lost - swallowed
 	# **A boundary inside the TLS directory is not a boundary.** The
