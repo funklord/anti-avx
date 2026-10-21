@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,856 of 804,948 VEX
-sites -- 99.99%** -- through 203,387 detours, and every `make detour-verify` invariant
-holds on the result. **92 sites are left** (Finding 365, 2026-10-21), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,858 of 804,948 VEX
+sites -- 99.99%** -- through 203,389 detours, and every `make detour-verify` invariant
+holds on the result. **90 sites are left** (Finding 366, 2026-10-21), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                            92 re-measured   (Finding 365)
+    default build                            90 re-measured   (Finding 366)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,856 of 804,948 VEX sites, 99.99%, through 203,387 detours**, and 164 further
+**804,858 of 804,948 VEX sites, 99.99%, through 203,389 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,33 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 366 -- a forward hammock may end on the branch after it
+
+**Finding 365's build died at `0x1427122c4`**, `vminss %xmm7,%xmm0,%xmm7` in a loop,
+declined because its next instruction is a branch target. Every road was shut:
+
+  * the site is aliased, `dst == src2`, so it borrows -- a spill -- and Finding 336's
+    backward hammock takes plain sites only;
+  * the site is itself a target, a `jae` from above, so it cannot widen backwards;
+  * the forward hammock (Findings 353 and 354) holds the `vcomiss` after it, which two
+    `je rel8` reach, and so needs a slot: ten bytes, where the site and the `vcomiss`
+    give nine. The next instruction is the loop's `jb`, and a passenger that transfers
+    control was refused outright.
+
+That refusal guarded the middle of the stub -- a branch arriving at a label must not
+skip what the stub set up before it -- and says nothing about a branch at its END.
+**A direct `j*` may now close a forward hammock**, as its last passenger: re-emitted as
+rel32, taken goes where it went and not taken falls into the jump home, which is
+Finding 87's forward swallow. It must not be a target itself, `swallowable_transfer`
+must accept it, and the window must be long enough with it, so nothing follows it.
+`BRANCH_CLOSES` is the A/B. Fixture `closejcc` is the shape: the original dies at 29,
+the rule off at 29, and this answers 77.
+
+**Measured on the full image**: 97 surviving rows to 95, 92 sites to 90 -- the crash
+site and `0x140f8f277`, the same clamp whose next instruction a `je` reaches, closed
+by its own `je` -- and none arrive. Detours 203,387 to 203,389. `verify` passes with
+110 re-aimed jumps landing in their stubs.
 
 ### Finding 365 -- a leaf that a switch table runs into is put back on its boundary
 

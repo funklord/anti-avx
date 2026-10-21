@@ -3482,6 +3482,65 @@ val:	.float	38.5
 """)
 
 
+# **A forward hammock closed by a branch.** The aliased `vminss` borrows,
+# and the `jmp` above makes it a target, so nothing widens backwards over
+# it. The `vcomiss` after it is reached by two short `je`s, so the window
+# needs a slot and ten bytes, and the `vcomiss` gives nine: the `jb` after
+# it has to ride along. `0x1427122c4` in Starfield, a clamp in a loop,
+# where it died. min(4, 3) is 3, not below 2, so 3 * 6 + 3 + 50 + 6; the
+# wrong way returns 13. Finding 366.
+PROGRAMS["closejcc"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	movl	$50, %ebx
+	movq	%rbx, 0x30(%rsp)	/* the shadow's first eight bytes */
+	xorl	%ebx, %ebx
+	vmovss	three(%rip), %xmm0
+	vmovss	three(%rip), %xmm1
+	vmovss	three(%rip), %xmm2
+	vmovss	three(%rip), %xmm3
+	vmovss	three(%rip), %xmm4
+	vmovss	three(%rip), %xmm5
+	vmovss	four(%rip), %xmm7
+	vmovss	two(%rip), %xmm9
+	movl	$1, %ecx
+	cmpl	$5, %ecx
+	je	join			/* never taken; one way in */
+	testl	%ecx, %ecx
+	je	join			/* never taken; the second */
+	jmp	site			/* names the site a target */
+site:
+	vminss	%xmm7, %xmm1, %xmm7	/* aliased, borrows: 3 */
+join:
+	vcomiss	%xmm9, %xmm7		/* 3 against 2 */
+	jb	wrong
+	addss	%xmm1, %xmm0		/* every volatile is read again */
+	addss	%xmm2, %xmm0
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0
+	addss	%xmm7, %xmm0		/* 21 */
+	cvttss2si %xmm0, %eax
+	leaq	0x28(%rsp), %r11
+	movq	0x8(%r11), %rbx		/* the epilogue's reload */
+	addl	%ebx, %eax		/* + 50, only if rbx came back */
+	addl	$6, %eax
+	addq	$40, %rsp
+	ret
+wrong:
+	movl	$13, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+two:	.float 2.0
+three:	.float 3.0
+four:	.float 4.0
+""")
+
+
 # **`vpermilps` with its control in memory**, stored just before as four
 # selectors -- `0x142a46b34`'s shape, where Starfield faulted. There is no
 # SSE permute that takes memory; the control is loaded into a scratch and

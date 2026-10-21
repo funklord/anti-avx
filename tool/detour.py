@@ -1388,6 +1388,9 @@ STACK_CLOSE = bytes([0x48, 0x8D, 0x64, 0x24, 0x10])	# lea 0x10(%rsp),%rsp
 # Whether a spill site's stack slot stays open across its passengers.
 # Finding 359.
 DEFER_RULE = True
+# Whether a direct branch may be a forward hammock's last passenger.
+# Finding 366.
+BRANCH_CLOSES = True
 # Whether a site that borrows nothing opens the slot for a passenger that
 # does. Finding 364.
 PASSENGER_STACK_RULE = True
@@ -11785,8 +11788,23 @@ def forward_hammock(instructions, plain, index, blocked, sources, scope,
 		at, moved, mnemonic, operands, comment = instructions[k]
 		if at != end:
 			return None, "next not adjacent"
+		closing = False
 		if mnemonic.startswith(CONTROL_PREFIXES):
-			return None, "a passenger transfers control"
+			# **A direct branch may close the window**, as the last thing
+			# the stub does before its jump home: re-emitted as a rel32,
+			# taken goes where it went and not taken falls into the jump
+			# home, which is Finding 87's forward swallow. Nothing follows
+			# it, so no label sits past it, and it is no target itself.
+			# `0x1427122c4`, a `vminss` whose next instruction two `je`s
+			# reach, needed the slot's five bytes and had only nine before
+			# its `jb`; Starfield died there. Finding 366.
+			if not BRANCH_CLOSES or not mnemonic.startswith("j") \
+					or at in blocked \
+					or at + len(moved) - address < need \
+					or not swallowable_transfer(moved, mnemonic, operands,
+					                            comment, at):
+				return None, "a passenger transfers control"
+			closing = True
 		if not moved or moved[:1] == b"\x62":
 			return None, "a passenger is not movable"
 		if at in blocked:
@@ -11822,6 +11840,8 @@ def forward_hammock(instructions, plain, index, blocked, sources, scope,
 		displaced.append(passenger)
 		end = at + len(moved)
 		k += 1
+		if closing:
+			break
 	if not held:
 		return None, "nothing to hold"
 	slots = {slot: target for _o, (target, _l, slot) in outer.items()
