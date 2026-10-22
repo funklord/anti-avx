@@ -50,6 +50,26 @@ class LexerModel(unittest.TestCase):
 		self.assertEqual(tabs("void f(void) {\n\tif (x)\n\t\tg();\n}\n"),
 		                 [0, 1, 2, 0])
 
+	def test_a_body_on_its_heads_line_continues_at_that_line(self):
+		"""beerssh, 2026-10-09: `else e = v ? a` with `: b;` aligned under
+		the `?` was reported a tab too shallow. The braceless level opened
+		on the head's line stayed open across the continuation, so the
+		model put it one deeper than the line the statement began on --
+		which is right only at the tab width it was computed for. Inside
+		parens this was already handled; outside them it was not, and
+		fuzzypickles had two `.arg()` continuations pushed a tab deeper
+		to get past it. `if (...)` and `do` take the same path, and the
+		statement after must come back to the head's level.
+		"""
+		for head in ("else", "if (y)", "do"):
+			src = ("void f(void) {\n"
+			       "\t" + head + " e = v ? a\n"
+			       "\t                : b;\n"
+			       "\tg();\n"
+			       "}\n")
+			with self.subTest(head=head):
+				self.assertEqual(tabs(src), [0, 1, 1, 1, 0])
+
 	def test_braceless_loop_keeps_its_body_past_an_inner_block(self):
 		"""qtty, 2026-08-27: a braceless loop whose body is a block
 		containing another block lost the outer body at the inner closing
@@ -1133,6 +1153,65 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		                     "project.md": "# One\n## Two\n### Three\n#### Four\n"})
 		self.assertIn("1 heading(s)", few)
 		self.assertIn("4 heading(s)", many)
+
+	def test_the_verdict_carries_the_document_SIZE(self):
+		"""Measured 2026-10-09: thirteen of twenty-one private trees have a
+		`project.md` larger than a context window, so the figure a reader
+		needs is how long the thing is, not only how much of it was
+		inspected."""
+		_, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                    "project.md": "# One\n## Two\n"})
+		self.assertIn("2 line(s)", out)
+		# "token" rather than "tokens": the estimate reads `token(s)` below
+		# a thousand and `k tokens` above it, and this test is about the
+		# figure being present rather than about which form it took.
+		self.assertIn("token", out)
+
+	def test_the_document_size_moves_with_the_document(self):
+		"""The control. A constant, or a figure read from the wrong file,
+		passes the test above and fails this one -- which is the only way
+		to tell a measurement from a sentence that looks like one."""
+		_, small = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                      "project.md": "# One\n"})
+		_, big = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                    "project.md": "# One\n" + "filler prose\n" * 400})
+		self.assertIn("1 line(s)", small)
+		self.assertIn("401 line(s)", big)
+		# and the estimate crosses into thousands rather than staying put.
+		# Asserted as the crossing rather than as an exact count: pinning
+		# the arithmetic would make this test fail the next time the
+		# estimate is divided differently, which is a change to how it is
+		# reported and not to whether it is measured.
+		self.assertNotIn("k tokens", small)
+		self.assertIn("k tokens", big)
+
+	def test_a_final_line_without_a_newline_still_counts(self):
+		"""`count("\\n")` alone loses the last line of a document that does
+		not end in one, which is how a figure goes quietly wrong by one."""
+		_, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                    "project.md": "# One\n## Two"})
+		self.assertIn("2 line(s)", out)
+
+	def test_a_FAILING_document_still_reports_its_size(self):
+		"""The mode returns on the first problem, so before this the trees
+		with something wrong in them were the only ones that never saw
+		their own figure -- and those are the ones worth measuring.
+		Measured 2026-10-09: tde was the one red tree of twenty-one."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
+		                     "project.md": "# One\n# One\n"})
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("heading repeats", out)
+		self.assertIn("2 line(s)", out)
+
+	def test_a_MISSING_document_reports_no_size_and_does_not_crash(self):
+		"""The other side of the same line: there is nothing to measure, so
+		it says nothing rather than reporting zero, which would read as a
+		document that exists and is empty."""
+		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n"})
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("no such file", out)
+		self.assertNotIn("line(s)", out)
+		self.assertNotIn("token", out)
 
 	def test_a_repeated_section_NUMBER_is_reported(self):
 		"""A number is an identifier, and the repeat check above cannot

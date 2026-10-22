@@ -48,10 +48,11 @@ TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # workaround is to describe a path instead of writing it, making the log
 # vaguer exactly where it is trying to be exact.
 #
-# What is spared is exactly four NAMES: the directory `.claude`, written
+# What is spared is exactly five NAMES: the directory `.claude`, written
 # with its leading dot; the file `CLAUDE.md`; `claude-guidelines`, the
-# repository the guidelines live in; and `claude-<digits>`, the per-uid
-# session scratch directory under /tmp. None is a plausible spelling of
+# repository the guidelines live in; `claude-<digits>`, the per-uid
+# session scratch directory under /tmp; and `claude-statusline`, the
+# status line in this tree's own tool/. None is a plausible spelling of
 # attribution -- nobody credits a tool as ".claude" or signs off as
 # "claude-1001" -- while all four are unavoidable when writing about these
 # files. The bare vendor word on its own is untouched and still refused.
@@ -72,6 +73,17 @@ TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # than attribution, which `CLAUDE.md` already permits, and it cannot reach
 # a trailer -- the attribution check below reads the RAW message, so no
 # addition here can let a signed-off-by through.
+#
+# THE FIFTH ARRIVED THE SAME WAY, 2026-10-17: a commit explaining that a
+# saturating report had been grouped could not name the file whose COUNT
+# is the precedent for doing so, and said "the status line in this tree"
+# instead -- the vaguer log again, in the sentence carrying the argument.
+# It is spared on the same test as the other four: nobody credits a
+# generator as "claude-statusline", and the name is unavoidable when
+# writing about that file. The trailer check below still reads the RAW
+# message, so sparing it here cannot let `Co-developed-by:
+# claude-statusline` through, and `generated with` remains its own
+# alternative and is untouched.
 #
 # The third arrived the way the first two did: a commit reconciling a
 # project style file against its source could not name the repository the
@@ -99,7 +111,7 @@ TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
 # here makes the line longer than the one somebody wrote.
 body=$(sed -e '/^#.*>8/,$d' -e '/^#/d' -e '/[^[:space:]]/,$!d' "$msg")
 prose=$(printf '%s\n' "$body" \
-	| sed -E 's#claude-guidelines#tooling-guidelines#g; s#claude-([0-9]+)#tooling-\1#g; s#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
+	| sed -E 's#claude-guidelines#tooling-guidelines#g; s#claude-statusline#tooling-statusline#g; s#claude-([0-9]+)#tooling-\1#g; s#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
 
 # 1. No AI or tooling attribution. The single deviation from kernel practice,
 #    and it is absolute. Human co-authors and reviewers are fine; a generator

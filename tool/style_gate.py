@@ -1127,6 +1127,8 @@ def convert_c(text: str, width: int,
 	namespace_spec = False		# saw `namespace`, awaiting the `{`
 	await_body = False		# an `else`/`do` whose body shape is not yet known
 	stmt_level = 0			# level of the line the current statement began on
+	inline_body = False		# a braceless body began on its head's line
+	fresh_head = False		# a head closed this line; body not yet seen
 
 	def case_extra(frames: list[Frame]) -> int:
 		"""The level a switch's statements take below its labels.
@@ -1293,8 +1295,15 @@ def convert_c(text: str, width: int,
 			# statement at the head's indentation while its depth is one
 			# deeper, and using the depth would break the alignment at every
 			# tab width except the one it was computed for.
+			#
+			# The same holds outside parens once such a body has begun:
+			# `else e = v ? a` with `: b;` aligned under the `?` continues
+			# the statement on the head's line, and the open braceless
+			# level would put it a tab deeper. Reported from beerssh
+			# 2026-10-09, where that shape was rewritten with braces to
+			# get past the gate.
 			base_paren = stack[-1].paren if stack else 0
-			if paren > base_paren:
+			if paren > base_paren or inline_body:
 				level = stmt_level
 			else:
 				stmt_level = level
@@ -1326,6 +1335,10 @@ def convert_c(text: str, width: int,
 		i, n = 0, len(line)
 		while i < n:
 			c = line[i]
+			if (fresh_head and state == "normal" and not c.isspace()
+			        and c not in "{;" and line[i:i + 2] not in ("//", "/*")):
+				inline_body = True
+				fresh_head = False
 			if state == "raw":
 				# A raw string ends only at `)delim"`. Nothing inside it is
 				# code: hydra embeds whole JavaScript programs this way, and
@@ -1358,6 +1371,7 @@ def convert_c(text: str, width: int,
 							# `else`/`do` followed by a statement rather than
 							# a block: that statement is the body.
 							virtual += 1
+							inline_body = True
 					if linkage_spec:
 						# `extern "C" JNIEXPORT void f(...) { ... }` is a
 						# linkage specifier on one declaration, and that
@@ -1412,6 +1426,7 @@ def convert_c(text: str, width: int,
 						# the head is complete; whatever follows is its body
 						virtual += 1
 						head_paren = None
+						fresh_head = True
 				elif counting and c == "{":
 					# The brace takes the level the braceless body would
 					# have had, rather than adding a second one on top of
@@ -1436,6 +1451,8 @@ def convert_c(text: str, width: int,
 					if virtual > body_floor:
 						virtual -= 1
 					await_body = False
+					inline_body = False
+					fresh_head = False
 					# Remember the paren depth this block opened at. A C++
 					# lambda passed as an argument -- `connect(x, [this] {`
 					# -- runs its whole body at paren depth 1, so a statement
@@ -1522,6 +1539,8 @@ def convert_c(text: str, width: int,
 						stack.pop()
 					virtual = stack[-1].virtual if stack else 0
 					await_body = False
+					inline_body = False
+					fresh_head = False
 					linkage_extern = False
 					linkage_spec = False
 					namespace_spec = False
@@ -1533,6 +1552,8 @@ def convert_c(text: str, width: int,
 					pending_switch = False
 					virtual = stack[-1].virtual if stack else 0
 					await_body = False
+					inline_body = False
+					fresh_head = False
 					# `extern "C" int f(void);` declares rather than opens.
 					linkage_extern = False
 					linkage_spec = False
@@ -1570,6 +1591,7 @@ def convert_c(text: str, width: int,
 			elif ident in ("else", "do"):
 				await_body = True
 		ident = ""
+		fresh_head = False		# the body, if any, is on a later line
 		if state in ("string", "char") and not line.endswith("\\"):
 			state = "normal"
 		if pp_cont or (state_at_start == "normal" and rest[:1] == "#"):
@@ -1862,6 +1884,23 @@ def doc_paths(text: str) -> list[tuple[int, str]]:
 	return found
 
 
+def doc_size(counts: dict[str, int]) -> str:
+	"""The document's length, for the counts line in `docs` mode.
+
+	Characters over four rather than bytes over four: a tokenizer reads
+	characters, and the text is already decoded here. It is an estimate
+	good enough for "is this bigger than a context window" and for
+	nothing finer, so it is written with a tilde and never compared
+	against a limit.
+	"""
+	if "doc_lines" not in counts:
+		return ""
+	tokens = counts.get("doc_chars", 0) // 4
+	size = (f"~{tokens // 1000}k tokens" if tokens >= 1000
+	        else f"~{tokens} token(s)")
+	return f", {counts['doc_lines']} line(s), {size}"
+
+
 def check_docs(root: Path, cfg: Config,
                counts: dict[str, int] | None = None) -> list[Problem]:
 	"""Hold the design document to the tree it describes.
@@ -1893,6 +1932,24 @@ def check_docs(root: Path, cfg: Config,
 			"which is a broken doc_file rather than a clean tree"))
 		return problems
 	text = doc.read_text(encoding="utf-8", errors="replace")
+	# The document's own size, taken from the same read the checks below
+	# use, so the figure cannot drift from what was actually inspected.
+	#
+	# REPORTED, NEVER CAPPED, and the reason is not timidity. Measured
+	# 2026-10-09 across twenty-one private trees: thirteen have a
+	# `project.md` larger than a 200,000-token context window, fuzznet at
+	# four times one, and six grew by 14,000 to 28,000 lines in thirty
+	# days -- so a document these guidelines call authoritative over the
+	# code cannot be read by the session it adjudicates for. One
+	# threshold over trees of that spread would go red first for the
+	# oldest and busiest, which is this workspace's
+	# one-threshold-two-populations finding, and a gate carrying a long
+	# ignore list has been switched off by instalments. A number somebody
+	# reads is what was missing; `CLAUDE.md` already asks that nothing
+	# grow without anybody noticing.
+	counts["doc_lines"] = text.count("\n") + (
+		1 if text and not text.endswith("\n") else 0)
+	counts["doc_chars"] = len(text)
 
 	seen: dict[str, int] = {}
 	# A NUMBER is an identifier, and two sections may carry the same one
@@ -2046,7 +2103,17 @@ def main(argv: list[str]) -> int:
 		for problem in problems:
 			print(problem, file=sys.stderr)
 		if problems:
-			print(f"\n{len(problems)} documentation inconsistency(ies)", file=sys.stderr)
+			# The size goes on the FAILURE line too, and that is the whole
+			# point rather than a nicety: this mode returns here, so a tree
+			# with an inconsistency never reached the report below and never
+			# saw its own figure. The documents most worth measuring are the
+			# ones with something wrong in them -- measured 2026-10-09, tde
+			# was the one red tree of twenty-one and the only one the new
+			# figure could not reach.
+			size = doc_size(counts).lstrip(", ")
+			where = f"{cfg['doc_file']}" + (f" ({size})" if size else "")
+			print(f"\n{len(problems)} documentation inconsistency(ies) "
+			      f"in {where}", file=sys.stderr)
 			return 1
 		# The population, for the same reason `check` prints its file count
 		# and refuses a collapsed list: a verdict with no count cannot tell
@@ -2059,7 +2126,8 @@ def main(argv: list[str]) -> int:
 		# not have changed by a word. Now the number moves.
 		scanned = (f" ({counts.get('headings', 0)} heading(s)"
 		           + (f", {counts['paths']} path(s)" if "paths" in counts
-		              else ", paths not checked") + ")")
+		              else ", paths not checked")
+		           + doc_size(counts) + ")")
 		print(f"style-gate: {cfg['doc_file']}{scanned} says nothing twice and names no "
 		      f"missing file; {counts['rust']} rust file(s) have a summary "
 		      f"line on every doc comment")
