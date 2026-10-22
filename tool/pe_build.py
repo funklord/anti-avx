@@ -2847,14 +2847,15 @@ hundred:	.float 100.0
 FRAMES = {"rspcopy": 104, "shadowspill": 40, "regionlive": 40,
           "regioncarry": 72, "swallowcall": 40, "condswallow": 40,
           "regionread": 40, "tlsspill": 40, "spanblock": 72,
-          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "ripstore": 56, "runborrow": 56, "regmove": 56, "nonvol": 72, "nonvolbad": 72, "unwindsave": 72, "memsrc": 56}
+          "dataisland": 40, "repairdrop": 40, "conservative": 40, "switchtable": 40, "laneregadd": 40, "crossregion": 40, "laneswap": 40, "lanemem": 40, "bcast": 40, "permmem": 40, "permil": 40, "onegpr": 40, "nogpr": 56, "noxmm": 56, "ripstore": 56, "runborrow": 56, "regmove": 56, "nonvol": 72, "nonvolbad": 72, "savedstash": 72, "unwindsave": 72, "memsrc": 56}
 
 # **Samples whose prologue saves a non-volatile xmm**, as `(register,
 # offset from rsp)`. The sample must really do the save in its code AND
 # carry a `prologue_end` label, because the unwind codes below are a claim
 # about the instructions rather than a decoration. Finding 255.
 SAVES = {"nonvol": ((6, 0x20), (7, 0x30)),
-         "unwindsave": ((6, 0x20), (7, 0x30))}
+         "unwindsave": ((6, 0x20), (7, 0x30)),
+         "savedstash": ((6, 0x20), (7, 0x30))}
 
 # Samples whose `.text` is mapped without IMAGE_SCN_MEM_WRITE, so that a
 # constant in it is one. See `build`.
@@ -5259,6 +5260,79 @@ source:	.long 0, 0, 0, 0
 	.p2align 5
 sink:	.long 0, 0, 0, 0
 	.long 0, 0, 0, 0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# **The same saved pair with no home space, and the volatiles NAMED.**
+# `nonvol` borrows xmm6 into the callee home space; here the caller's
+# shadow is read again after the site, so neither lends anything and the
+# borrow falls to the block's scratch slots, which took only volatile
+# registers no member touches. Here the window -- the `vaddpd`, a branch
+# target so it cannot widen backwards, and the `addss` that makes it five
+# bytes -- names xmm0-4, so one volatile is
+# loose where `lanereg3` wants two helpers. xmm6 and xmm7, which the
+# prologue saves, are the rest. `0x14374e622` in Starfield, a packed `sin`
+# saving xmm6-15. 4 + 2 + 3 + 3 = 12 from the scalars, the last two only
+# if the stash gave them back, and 30 + 35 = 65 from the upper lane.
+# Finding 368.
+PROGRAMS["savedstash"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	movups	%xmm6, 0x20(%rsp)	/* the prologue saves, and the unwind */
+	movups	%xmm7, 0x30(%rsp)	/* codes say so -- see SAVES */
+prologue_end:
+	movq	%rbx, 0x50(%rsp)	/* the caller's shadow, read again */
+					/* below, so it lends nothing */
+	leaq	source(%rip), %rsi
+	leaq	sink(%rip), %rdi
+	movss	three(%rip), %xmm6	/* LIVE across the site */
+	movss	three(%rip), %xmm7
+	vmovupd	(%rsi), %ymm2
+	vmovupd	0x20(%rsi), %ymm3
+	movss	two(%rip), %xmm1
+	movss	two(%rip), %xmm4
+	movss	two(%rip), %xmm5
+	jmp	site			/* a target cannot widen backwards */
+site:
+	vaddpd	%ymm2, %ymm3, %ymm0	/* lanereg3: wants two helpers */
+	addss	%xmm4, %xmm1		/* the window's fifth byte: xmm1, xmm4 */
+	vmovupd	%ymm0, (%rdi)
+	addss	%xmm5, %xmm1		/* 6 */
+	addss	%xmm6, %xmm1		/* + 3, only if xmm6 came back */
+	addss	%xmm7, %xmm1		/* + 3, only if xmm7 came back */
+	cvttss2si %xmm1, %eax		/* 12 */
+	cvttsd2si 24(%rdi), %ecx	/* the upper lane: 30 + 35 */
+	addl	%ecx, %eax
+	movq	0x50(%rsp), %rbx	/* the shadow's reader */
+	movups	0x20(%rsp), %xmm6
+	movups	0x30(%rsp), %xmm7
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 4
+two:	.float 2.0
+three:	.float 3.0
+	.p2align 5
+source:	.double 1.0, 1.0, 1.0, 30.0
+	.double 1.0, 1.0, 1.0, 35.0
+	.p2align 5
+sink:	.quad 0, 0, 0, 0
 	.p2align 4
 tls_raw:
 	.long	0x55667788, 0x11223344

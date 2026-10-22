@@ -235,7 +235,7 @@ check-shadow-pe:
 	            fmamem fma231 fma132 fmareg fmareg213 fmareg132 \
 	            fmasub fmaas fmasa fnmreg fnmmem blendv blendv0 blendvx0 \
 	            cmpconst cmpreg maskgpr pshufb1 fnm1 staleslot partslot \
-	            unaligned256 tramp256; do \
+	            unaligned256 tramp256 savedstash; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \

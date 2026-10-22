@@ -1394,6 +1394,9 @@ BRANCH_CLOSES = True
 # Whether a packed greater-than compare between registers is read as the
 # less-than with its sources exchanged. Finding 367.
 EXCHANGE_RULE = True
+# Whether a unit's helper may be a non-volatile xmm the function saves,
+# stashed in the block like a volatile one. Finding 368.
+SAVED_STASH = True
 # Whether a site that borrows nothing opens the slot for a passenger that
 # does. Finding 364.
 PASSENGER_STACK_RULE = True
@@ -8830,6 +8833,18 @@ def unit_candidate(instructions, plain, index, blocked, home,
 				return refuse("no non-volatile xmm this function saves")
 			spare = [i for i in range(TLS_SLOTS) if i not in claimed]
 			loose = [n for n in VOLATILE_XMM if n not in touched]
+			# **And a non-volatile the function saves, once the volatile
+			# ones run out.** The home-space borrow above already takes
+			# such a register on Finding 255's argument -- the unwinder
+			# restores the caller's value from the function's own slot --
+			# and that argument says nothing about where the borrow keeps
+			# it. It is the home space that binds there: a frame with none
+			# offered nothing, and the block's scratch slots sat unused.
+			# `0x14374e622`, a packed `sin` saving xmm6-15 whose members
+			# touch five of the six volatile registers, died there.
+			# Finding 368.
+			if SAVED_STASH:
+				loose += sorted(usable - set(loose))
 			if len(loose) < need or len(spare) < need:
 				return refuse("no volatile xmm and scratch slot to stash it")
 			# **Mode True is rewritten HERE, not forty lines below.** The

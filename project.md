@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,867 of 804,948 VEX
-sites -- 99.99%** -- through 203,385 detours, and every `make detour-verify` invariant
-holds on the result. **81 sites are left** (Finding 367, 2026-10-22), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,903 of 804,948 VEX
+sites -- 99.99%** -- through 203,248 detours, and every `make detour-verify` invariant
+holds on the result. **45 sites are left** (Finding 368, 2026-10-23), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                            81 re-measured   (Finding 367)
+    default build                            45 re-measured   (Finding 368)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,858 of 804,948 VEX sites, 99.99%, through 203,389 detours**, and 164 further
+**804,903 of 804,948 VEX sites, 99.99%, through 203,248 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,42 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 368 -- a unit window may stash a helper in a register its function saves
+
+**Finding 367's build died at `0x14374e622`**, `vaddpd` a few instructions on in the
+same packed `sin`. A unit window (`--shadow-regs=all`) needs two helper xmm registers,
+borrowed and given back. The function lends no home space, and the fallback -- stash
+the helpers in the per-thread scratch -- would only take a volatile register the
+members do not touch, `VOLATILE_XMM` 0-5, of which the members there use five. Every
+forward rung at `622` and `639` was refused "no volatile xmm and scratch slot to
+stash it", the back rung-1 window overlapped the unit at `611`, and the rescue seats
+no 256-bit passenger (Finding 183). So the site stayed VEX.
+
+**A register the function saves in its prologue is as safe to stash as a volatile
+one**, by Finding 255's argument for the home-space borrow: the stub gives it back
+before the jump home, and an unwind from inside the stub restores the caller's value
+from the function's own save slot. So the stash now takes the function's saved xmm
+not touched by the members, after the volatile ones. `SAVED_STASH` is the A/B.
+Fixture `savedstash` is the shape: xmm6 and xmm7 saved and live across the site, the
+caller's home space made unlendable by a store and reload, and the site a branch
+target so it cannot widen backwards. The original dies at 29, `--shadow-regs=off` at
+29, the rule off at 29, and this answers 77.
+
+**Measured on the full image**: 86 surviving rows to 50, 81 sites to 45, and none
+arrive. All 36 were 256-bit packed arithmetic, 27 "lost to an overlap" and 9 "lost to
+a refused stub": a unit that had to shorten for want of a helper overlapped a
+neighbour or was refused. Unit windows at the full 12 forward went from 35,101 to
+35,598 of 35,847, refused stubs from 13 to 2, and 256-bit sites lowered through a slot
+from 35,783 to 35,819 of 35,842. Detours fell from 203,385 to 203,248, because a
+longer unit holds sites that had each been a window of their own. `verify` passes.
+`0x14374e704`, in the same function, survives for another reason: forward, a
+`vfmadd213pd` neighbour has no legacy form, and the back window overlaps the one at
+`6fb`.
+
+**`frontier` used its whole 30-minute bound on this run** where Finding 367's took
+27 minutes, with the site list written 20 seconds before the kill and the report
+complete. The machine was loaded by other work; it was slow, not hung.
 
 ### Finding 367 -- a greater-than between registers is the less-than exchanged
 
