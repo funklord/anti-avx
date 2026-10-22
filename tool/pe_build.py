@@ -3541,6 +3541,57 @@ four:	.float 4.0
 """)
 
 
+# **A 256-bit greater-than**, which SSE has no predicate for:
+# `vcmpgt_oqpd %ymm11,%ymm6,%ymm7` is `0x14374e4f8` in Starfield, a packed
+# `sin`'s large-argument test, where it died. {1, 5, NaN, 3} > {2, 2, 2, 3}
+# is lane 1 alone, so 78 - 1 = 77. Lane 0 weighs 2 and lane 2 weighs 4:
+# with the sources left in place it is a less-than and 76, and read as
+# NLE the NaN lane is set too and it is 73. `cmpreg`'s shape. Finding 367.
+PROGRAMS["cmpgt"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$72, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	vmovupd	(%rsi), %ymm6		/* {1, 5, NaN, 3} */
+	vmovupd	32(%rsi), %ymm11	/* {2, 2, 2, 3} */
+	vcmpgt_oqpd %ymm11, %ymm6, %ymm7
+	movq	%rsp, %rdi
+	vmovupd	%ymm7, (%rdi)
+	movl	8(%rdi), %eax		/* lane 1: 5 > 2 -> -1 */
+	movl	(%rdi), %ecx		/* lane 0: 1 > 2 -> 0 */
+	addl	%ecx, %ecx
+	addl	%ecx, %eax
+	movl	16(%rdi), %ecx		/* lane 2: NaN > 2 -> 0 */
+	shll	$2, %ecx
+	addl	%ecx, %eax
+	addl	$78, %eax
+	addq	$72, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.double 1.0, 5.0
+	.quad	0x7ff8000000000000	/* a quiet NaN */
+	.double 3.0
+	.double 2.0, 2.0, 2.0, 3.0
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **`vpermilps` with its control in memory**, stored just before as four
 # selectors -- `0x142a46b34`'s shape, where Starfield faulted. There is no
 # SSE permute that takes memory; the control is loaded into a scratch and

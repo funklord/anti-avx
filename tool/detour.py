@@ -1391,6 +1391,9 @@ DEFER_RULE = True
 # Whether a direct branch may be a forward hammock's last passenger.
 # Finding 366.
 BRANCH_CLOSES = True
+# Whether a packed greater-than compare between registers is read as the
+# less-than with its sources exchanged. Finding 367.
+EXCHANGE_RULE = True
 # Whether a site that borrows nothing opens the slot for a passenger that
 # does. Finding 364.
 PASSENGER_STACK_RULE = True
@@ -10873,8 +10876,8 @@ def parse_with_comments(listing):
 				pass
 			continue
 		if pending is not None:
-			yield (pending[0], bytes(pending[1]), pending[2], pending[3],
-			       pending[4])
+			yield (pending[0],) + exchanged(bytes(pending[1]), pending[2],
+			                                pending[3]) + (pending[4],)
 			pending = None
 		if len(parts) < 3:
 			continue
@@ -10917,7 +10920,75 @@ def parse_with_comments(listing):
 			operands = rest[1] if len(rest) > 1 else ""
 		pending = [address, bytearray(encoding), mnemonic, operands, comment]
 	if pending is not None:
-		yield (pending[0], bytes(pending[1]), pending[2], pending[3], pending[4])
+		yield (pending[0],) + exchanged(bytes(pending[1]), pending[2],
+		                                pending[3]) + (pending[4],)
+
+
+# Each greater-than predicate and the less-than that is the same compare
+# with the sources exchanged, which SSE has. The signalling sense is kept:
+# GT_OS becomes LT_OS, GT_OQ becomes LT_OQ, NGT_US becomes NLT_US.
+EXCHANGED_PREDICATES = {
+	0x0E: (0x01, "lt"), 0x0D: (0x02, "le"),
+	0x1E: (0x11, "lt_oq"), 0x1D: (0x12, "le_oq"),
+	0x0A: (0x05, "nlt"), 0x09: (0x06, "nle"),
+	0x1A: (0x15, "nlt_uq"), 0x19: (0x16, "nle_uq"),
+}
+
+
+def exchanged(encoding, mnemonic, operands):
+	"""A packed greater-than compare as the less-than it equals.
+
+	**SSE has no greater-than predicate**, and `sse_encoding` refuses one
+	rather than let `0F C2` read imm8[2:0] as a different compare. That
+	left every `vcmpgt` in Starfield as VEX -- eight, all 256-bit, the
+	last fatal one at `0x14374e4f8` on the large-argument path of a packed
+	`sin`. Between registers the cure needs no strategy of its own:
+	`vcmpgt_oqpd %ymm11,%ymm6,%ymm7` IS `vcmplt_oqpd %ymm6,%ymm11,%ymm7`,
+	the two sources trading the vvvv and r/m fields, and every path that
+	already lowers `vcmple_oqpd` then takes it.
+
+	Packed forms only: a scalar compare copies src1's upper lanes into
+	the destination, so exchanging the sources changes the result. And
+	registers only, since a memory source cannot move into vvvv. The
+	length never changes -- a two-byte VEX has no B bit, so it is taken
+	only when the vvvv register fits r/m without one. Finding 367.
+	"""
+	if not EXCHANGE_RULE or not mnemonic.startswith("vcmp") \
+			or mnemonic[-2:] not in ("ps", "pd") or "(" in operands:
+		return encoding, mnemonic, operands
+	vex = inplace.decode_vex(encoding)
+	if vex is None or vex["map"] != 1:
+		return encoding, mnemonic, operands
+	at = vex["length"]
+	if len(encoding) != at + 3 or encoding[at] != 0xC2 \
+			or encoding[at + 1] >> 6 != 3:
+		return encoding, mnemonic, operands
+	predicate = encoding[at + 2]
+	if predicate not in EXCHANGED_PREDICATES:
+		return encoding, mnemonic, operands
+	sources = operands.split(",")
+	if len(sources) != 3:
+		return encoding, mnemonic, operands
+	out = bytearray(encoding)
+	modrm = encoding[at + 1]
+	if encoding[0] == 0xC4:
+		vvvv = (~encoding[2] >> 3) & 15
+		rm = (modrm & 7) | ((~encoding[1] >> 5) & 1) << 3
+		out[1] = (encoding[1] & ~0x20) | ((~vvvv >> 3) & 1) << 5
+		out[2] = (encoding[2] & ~0x78) | ((~rm & 15) << 3)
+	elif encoding[0] == 0xC5:
+		vvvv = (~encoding[1] >> 3) & 15
+		rm = modrm & 7
+		if vvvv > 7:
+			return encoding, mnemonic, operands
+		out[1] = (encoding[1] & ~0x78) | ((~rm & 15) << 3)
+	else:
+		return encoding, mnemonic, operands
+	out[at + 1] = (modrm & ~7) | (vvvv & 7)
+	value, name = EXCHANGED_PREDICATES[predicate]
+	out[at + 2] = value
+	return (bytes(out), "vcmp" + name + mnemonic[-2:],
+	        ",".join((sources[1], sources[0], sources[2])))
 
 
 def relocate(encoding, old_address, new_address, rip_target):

@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,858 of 804,948 VEX
-sites -- 99.99%** -- through 203,389 detours, and every `make detour-verify` invariant
-holds on the result. **90 sites are left** (Finding 366, 2026-10-21), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,867 of 804,948 VEX
+sites -- 99.99%** -- through 203,385 detours, and every `make detour-verify` invariant
+holds on the result. **81 sites are left** (Finding 367, 2026-10-22), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,7 +11912,7 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                            90 re-measured   (Finding 366)
+    default build                            81 re-measured   (Finding 367)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
@@ -14163,7 +14163,37 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
-### Finding 366 -- a forward hammock may end on the branch after it
+### Finding 367 -- a greater-than between registers is the less-than exchanged
+
+**Finding 366's build died at `0x14374e4f8`**, `vcmpgt_oqpd %ymm11,%ymm6,%ymm7` on the
+large-argument path of a packed `sin` -- the site Finding 339's blame chains and the
+function oracle's one difference had both ended at. SSE has no greater-than predicate,
+and `sse_encoding` refuses one rather than let `0F C2` read imm8[2:0] as another
+compare (Finding 334), so **every `vcmpgt` in the binary survived**: eight, all 256-bit,
+four in the half-float decoder at `0x142dc3d20` and four in the packed maths library.
+The `vcmple_oqpd` beside the crash site was lowered through the shadow slots like any
+lane-wise op; only the predicate stood in the way.
+
+Between registers the exchange is an identity, not a lowering:
+`vcmpgt_oqpd %ymm11,%ymm6,%ymm7` IS `vcmplt_oqpd %ymm6,%ymm11,%ymm7`, the sources
+trading the vvvv and r/m fields. So `parse_with_comments` reads a packed greater-than
+(GT/GE, OS/OQ, and the negated NGT/NGE) as the less-than it equals, encoding and
+operand text both, and every path that already takes `vcmplt` takes it. Packed only --
+a scalar compare copies src1's upper lanes, so exchanging changes the result -- and
+registers only. The length never changes: a two-byte VEX is taken only when the vvvv
+register fits r/m without a B bit. All eight rewritten encodings were read back through
+objdump and decode as intended. `EXCHANGE_RULE` is the A/B; fixture `cmpgt` is the
+shape with a NaN lane, weighted so that a less-than answers 76 and an NLE 73. The
+original dies at 29, the rule off at 29, and this answers 77.
+
+`lower.py`'s own exchange for the 128-bit path copied src2 into the destination before
+comparing, which overwrites src1 when the two are one register; it now refuses that
+case. No such site exists in Starfield, so the image does not move for it.
+
+**Measured on the full image**: 95 surviving rows to 86, 90 sites to 81 -- the eight
+compares and the `vorps` at `0x142dc3d39` whose source they held -- and none arrive.
+Detours 203,389 to 203,385. `verify` passes.
+
 
 **Finding 365's build died at `0x1427122c4`**, `vminss %xmm7,%xmm0,%xmm7` in a loop,
 declined because its next instruction is a branch target. Every road was shut:

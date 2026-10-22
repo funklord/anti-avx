@@ -613,6 +613,12 @@ def lower_sequence(mnemonic, operands, notes):
 				notes.append("operands exchanged to reverse the comparison")
 				if dst == src2:
 					return [f"{sse} {src1},{dst}"], "D/predicate", notes
+				# Copying src2 into dst first would overwrite src1 when
+				# they are one register, and the compare would read src2
+				# against itself. That needs a scratch. Finding 367.
+				if dst == src1:
+					return None, "SEQUENCE", notes + [
+						"dst is src1, so src2 cannot be copied into it"]
 				return [f"movaps {src2},{dst}", f"{sse} {src1},{dst}"], \
 					"D/predicate", notes
 
