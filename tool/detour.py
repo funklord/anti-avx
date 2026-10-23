@@ -1397,6 +1397,12 @@ EXCHANGE_RULE = True
 # Whether a unit's helper may be a non-volatile xmm the function saves,
 # stashed in the block like a volatile one. Finding 368.
 SAVED_STASH = True
+# Whether a passenger borrows only when its lowering needs a register.
+# Finding 369.
+NEEDED_BORROW = True
+# Whether a stub whose jump home lands on the next stub's window falls
+# through into that stub instead. Finding 370.
+FALL_THROUGH = True
 # Whether a site that borrows nothing opens the slot for a passenger that
 # does. Finding 364.
 PASSENGER_STACK_RULE = True
@@ -3410,6 +3416,16 @@ def swallowed_borrow(plain, address, encoding, operands, mnemonic, home,
 	block and passes None. Finding 349.
 	"""
 	if SPILL not in HOME_SPILLS:
+		return None
+	# **And only where the lowering needs one.** `swallowed_scratch`
+	# answers None both for a passenger that lowers without a scratch and
+	# for one with nothing dead, and every caller came here on either, so a
+	# plain `vmulss` rode with a save and a restore of a register it never
+	# named. In the sincos polynomial at `0x1404a7f90`, the hottest stub
+	# function in a profile of play, that was half the instructions of
+	# most windows. Finding 369.
+	if NEEDED_BORROW and lower_vex(address, encoding, operands, mnemonic,
+	                               address) is not None:
 		return None
 	# **And only where the window's START lends nothing either.**
 	# `build_stub` takes `base` from the start alone, and plants the block
@@ -17960,6 +17976,31 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			chain.append(seat)
 			reach += seat[2]
 
+		# **Fall into the next stub rather than bounce through `.text`.**
+		# A stub's last five bytes are its jump home, and where home is
+		# where this window starts, that jump lands on a jump straight
+		# back out to the stub about to be written here -- two taken
+		# branches and a trip to another page for nothing. 94,197 of
+		# 203,456 stubs ended that way, and in the sincos polynomial at
+		# `0x1404a7f90`, the hottest stub function in a profile of play,
+		# every window did. So the jump is dropped and this stub begins
+		# where it stood. Arriving from `.text` is unchanged, and the stub
+		# before closed whatever it opened before its jump, which is the
+		# state this one is entered in either way. Put back if this one is
+		# not placed. Finding 370.
+		dropped = None
+		if FALL_THROUGH and placed:
+			last_start, last_window, last_at, last_size, last_prologue = \
+				placed[-1]
+			end = stub_base + len(blob)
+			if last_start + last_window == start \
+					and last_at + last_size == end \
+					and last_size > 5 and last_prologue <= last_size - 5 \
+					and bytes(blob[-5:]) == encode_jump(end, start):
+				dropped = bytes(blob[-5:])
+				del blob[-5:]
+				placed[-1] = (last_start, last_window, last_at,
+				              last_size - 5, last_prologue)
 		stub_address = stub_base + len(blob)
 		body, prologue = None, 0
 		# **Longest chain first, then shorter, then none.** A chain that
@@ -18011,6 +18052,10 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 					                 list(preceding), list(displaced),
 					                 strategy[0] if strategy else "plain")
 		if body is None:
+			if dropped is not None:
+				blob += dropped
+				placed[-1] = (last_start, last_window, last_at, last_size,
+				              last_prologue)
 			refused.add(start)
 			continue
 		# **A re-aimed jump has to stay where it is.** A window that moved
@@ -18026,6 +18071,10 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 				       or inside_spans(spans, one) for one in outer):
 			if reasons is not None:
 				reasons["a re-aimed jump sits in another window"] += 1
+			if dropped is not None:
+				blob += dropped
+				placed[-1] = (last_start, last_window, last_at, last_size,
+				              last_prologue)
 			refused.add(start)
 			continue
 		for one in outer:

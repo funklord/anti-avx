@@ -14163,6 +14163,51 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 370 -- a stub falls into the next stub instead of bouncing through `.text`
+
+**A profile of play put the cost of the rewrite at 5.8% of the process's samples at
+most.** `perf record -e cpu-clock -F 499` on the running game for 180 seconds, f368
+installed, 387,849 samples, about 4.3 cores busy: 68.0% in `.text`, 26.2% outside the
+image (wine, DXVK, the driver), 5.8% in `.avxsse`. A stub sample includes the work the
+original instruction would have done anyway, so that is a ceiling on the overhead
+rather than the overhead. It sits in a few functions: `0x1404a7f90` spent 78% of its
+samples in stubs, `0x14221d940` 75%, `0x140617dd0` 72%, `0x140368fc0` and `0x140e4b7b0`
+69%, and no single site held more than 0.25% of the samples.
+
+**The hottest of them, a scalar sincos polynomial, was seven windows back to back.**
+Each stub ended with its jump home, and home was the next window's jump straight back
+out to the stub emitted right after it: two taken branches per window, and a trip to
+another page, for nothing. Measured on the f368 image, 94,197 of 203,456 stubs ended
+that way. `place_stubs` now drops that jump when the previous stub is the last thing
+written and its home is this window's start, so the previous stub falls through into
+this one. Arriving from `.text` is unchanged, and the previous stub has closed
+everything it opened before its jump, which is the state the next stub is entered in
+either way. The jump goes back if the next stub is refused. `FALL_THROUGH` is the A/B.
+
+### Finding 369 -- a passenger borrows only when its lowering needs a register
+
+The same polynomial's stubs saved `%xmm0` to the stack and restored it around a
+`mulss` that never names it. `swallowed_scratch` answers None both for a passenger that
+lowers without a scratch register and for one with nothing dead, and every caller read
+None as "needs one" and went on to `swallowed_borrow`, which borrows the first register
+the lowering accepts. A lowering that needs none accepts any. So a plain three-operand
+scalar neighbour rode with a save and a restore, and where the window lent no frame
+slot it also planted a TLS block pointer for them: two loads and two GPR stashes.
+`swallowed_borrow` now returns None when the passenger lowers without a scratch.
+`NEEDED_BORROW` is the A/B.
+
+**Measured on the full image, both together**: the stub section went from 5,714,514
+to 4,390,764 bytes, and `jmp` instructions in it from 204,467 to 110,257. No stub now
+ends in a jump onto the next stub, against 94,197 before. Stubs that look up the TLS
+index dropped from 50,565 to 27,065, and plain stubs from 15.0 to 9.6 bytes per site.
+The surviving set is the same 50 rows, detours are the same 203,248, and `verify`
+passes. The polynomial is now one run of 22 SSE instructions and one jump home,
+where it had seven stubs, fourteen taken jumps and five save-and-restore pairs. The
+fall-through accounts for about 471 KB of the saving (five bytes per jump), and
+the borrows for the rest. Neither changes what any site computes, so no fixture can
+tell them apart by its answer. The function oracle on the full image is what
+exercises both.
+
 ### Finding 368 -- a unit window may stash a helper in a register its function saves
 
 **Finding 367's build died at `0x14374e622`**, `vaddpd` a few instructions on in the
