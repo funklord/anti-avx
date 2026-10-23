@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,903 of 804,948 VEX
-sites -- 99.99%** -- through 203,248 detours, and every `make detour-verify` invariant
-holds on the result. **45 sites are left** (Finding 368, 2026-10-23), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,915 of 804,948 VEX
+sites -- 99.99%** -- through 203,252 detours, and every `make detour-verify` invariant
+holds on the result. **33 sites are left** (Finding 371, 2026-10-23), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                            45 re-measured   (Finding 368)
+    default build                            33 re-measured   (Finding 371)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,903 of 804,948 VEX sites, 99.99%, through 203,248 detours**, and 164 further
+**804,915 of 804,948 VEX sites, 99.99%, through 203,252 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14162,6 +14162,70 @@ number that is easy to compute is not thereby the number the claim needs.
 
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
+
+### Finding 371 -- a table of function RVAs is evidence that its leaves are entered
+
+**Twelve of the 45 sites left were two leaf functions nothing was known to call.**
+`0x1407c7570` and `0x1407c7590` each compute a two-dimensional length -- two loads,
+two `vmulss`, a `vaddss`, a `vsqrtss`, `ret` -- and carry no `.pdata` entry, as leaves
+need not. `outside.leaf_ranges` recovers such a chunk only when its start is a known
+branch target, and neither address is the target of any branch: the code reaches
+them through a table of RVAs at `0x1458564a8`, which names each once in a run of 97
+code RVAs, 65 of them `.pdata` function starts.
+
+**A run of RVAs alone proves nothing, which was measured long ago**: Findings 174
+and 177 scanned for them and got 14,789 addresses for 3 real targets. What makes a
+run a function table is that most of it is already known to be functions.
+`rva_table_entries` takes runs of at least 8 consecutive `.rdata` dwords inside
+`.text`, at least half of them `.pdata` starts, and nominates the rest as entry
+points. Over the image that is 143 runs naming 207 addresses `.pdata` does not, 103 of
+them outside every described function. They only nominate: the chunk must still
+start after `int3` padding, end in a transfer and decode cleanly. `RVA_TABLE_RULE` is
+the A/B.
+
+**Measured on the full image: 50 rows to 38, and the twelve are exactly the two
+leaves' sites**, with none arriving -- the rest of the set is address for address
+the same. Detours went from 203,248 to 203,252 and in-place patches from 519,516 to
+519,522; `verify` passes. The new entries also join the blocked set, which can only
+split a window, never merge one, and the frontier shows no site lost to it.
+
+**`rvatable` is the fixture**: a leaf after the function's end, bracketed by `int3`,
+reached only by an indirect call, and named in an `.rdata` table of eight RVAs that
+alternates it with `_start`, so exactly half are `.pdata` starts. It returns 77 with
+the rule, and 29, the illegal-instruction death, without it and on the original.
+`pe_build.py` gained `RVA_TABLES` to emit the table, which is the only `.rdata` any
+fixture carries.
+
+#### 24 of the 33 left are behind a SIMD gate, and 9 can run
+
+**Asked of each survivor's function: does anything choose it on this host?**
+Three choosers turned up in Wwise, beside the CRT and checksum ones of Finding 5:
+
+- `0x142dc0200`, in the vtable beside `AkPartitionedConvolutionEngine.cpp`, installs the
+  convolution kernels `0x142dc3a30`, `0x142dc3c60` and `0x142dc3db0` only when its
+  capability argument has `0x60` or `0xc0` set, over SSE kernels at `0x142dc3590`,
+  `0x142dc37f0` and `0x142dc3740`. Those three hold the 13 F16C and `vptest` sites.
+- `0x142d65400` installs `0x142d8b820`, `0x142d8b990` and `0x142d8bc20` over SSE
+  defaults only when `GetSIMDSupport(0x80)` answers true. `0x142d8b990` holds the three
+  `vmulps` lost to an overlap.
+- `0x142e270a0` installs the thunk to `0x142e2f8d0`, holding the two `vfnmadd213ss` and a
+  `vmovups`, on the same `GetSIMDSupport(0x80)`.
+
+**The two in-game profiles of Finding 370 say the gates stay shut here.** Of 610,378
+samples, the SSE convolution kernels took 1,045 and the SSE conversion defaults 37,
+while every gated kernel took none -- and `0x142d8e960`, loaded beside the gated three
+but installed on both paths, took 9, so the sampling does reach this code. A function
+taking no samples would prove nothing alone: all 33 survivors' functions took none,
+including `0x14374e650`, which Finding 367's crash shows does run. What separates the
+gated ones is their sibling being chosen instead.
+
+So **24 sites sit behind a gate this host fails**: the 19 above and the five `vpermd`
+and `kmov` of Finding 5. Which CPUID bits feed the two Wwise masks is not traced; what is
+measured is that this host answers no, and the kernels they select need AVX2 or FMA
+natively, so a host that could pass them would not need this image. The F16C routine of
+`src/f16c.c` stays unwired for this reason. The nine that can run are `0x140f919ee`,
+`0x140fb4fde`, `0x1410e87b0`, `0x141b5758d`, `0x141df312d`, `0x141e33717`,
+`0x14272125f`, `0x142baa477` and `0x14374e704`.
 
 ### Finding 370 -- a stub falls into the next stub instead of bouncing through `.text`
 

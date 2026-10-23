@@ -2861,6 +2861,13 @@ SAVES = {"nonvol": ((6, 0x20), (7, 0x30)),
 # constant in it is one. See `build`.
 READONLY = {"constant", "constloop"}
 
+# Samples that carry an `.rdata` section holding a table of RVAs, one per
+# symbol named here in order. The table is the program's statement that
+# those addresses are entered, and the only one: a fixture testing a leaf
+# reached through such a table must not also name it any other way.
+# Finding 371.
+RVA_TABLES = {"rvatable": ("_start", "leaf") * 4}
+
 
 # 24. A 256-bit load and store too far apart for one window, carried by a
 # reserved register.
@@ -3480,6 +3487,46 @@ leaf:
 	ret
 	.p2align 4, 0xcc
 val:	.float	38.5
+""")
+
+
+# **A leaf entered only through a table of RVAs.** It has no `.pdata`
+# entry, as a leaf need not, and nothing calls or jumps to it directly or
+# takes its address with a `lea`: the call goes through an absolute
+# immediate, which no target source reads. Its one statement of being code
+# is the `.rdata` table in `RVA_TABLES`, whose other half is `_start` --
+# a `.pdata` start -- so the table is half known functions. `0x1407c7570`
+# in Starfield, a two-dimensional length, is this shape. 46.5 and 62 are
+# a 3-4-5 triangle scaled, so the length is exactly 77.5 and truncates to
+# 77. Finding 371.
+PROGRAMS["rvatable"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	val(%rip), %rcx
+	movabsq	$0x140001000 + (leaf - _start), %rax
+	call	*%rax
+	cvttss2si %xmm0, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4, 0xcc
+	int3
+	.p2align 4, 0xcc
+leaf:
+	vmovss	(%rcx), %xmm0
+	vmovss	4(%rcx), %xmm1
+	vmulss	%xmm0, %xmm0, %xmm2
+	vmulss	%xmm1, %xmm1, %xmm1
+	vaddss	%xmm1, %xmm2, %xmm2
+	vsqrtss	%xmm2, %xmm2, %xmm0
+	ret
+	.p2align 4, 0xcc
+	int3
+	.p2align 4, 0xcc
+val:	.float	46.5, 62.0
 """)
 
 
@@ -6389,7 +6436,7 @@ def import_table(dlls, base_rva):
 
 
 def build(path, text, code_size, handler=None, frame=0, readonly=False,
-          symbols=None, saves=(), saves_end=0, imports=None):
+          symbols=None, saves=(), saves_end=0, imports=None, rdata=None):
 	"""Write a PE whose entry point is the start of `text`.
 
 	`saves` is `[(xmm register, byte offset from rsp)]` for a sample whose
@@ -6480,6 +6527,8 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 		# rva 0 gives the length, which does not depend on the base;
 		# the assertion below is what says so rather than assuming it.
 		wanted.append((b".idata", import_table(imports, 0), DATA))
+	if rdata:
+		wanted.append((b".rdata", rdata, DATA))
 	for name, body, flags in wanted:
 		if name == b".xdata" and chain is not None:
 			text_rva = sections[0][1]
@@ -6649,10 +6698,14 @@ def main(argv):
 	expected, source = PROGRAMS[name]
 	text, symbols = assemble(source)
 	code_size = symbols["func_end"]
+	# `.text` is the first section, at SECTION_ALIGNMENT, so a symbol's
+	# RVA is known before the image is laid out.
+	rdata = b"".join(struct.pack("<I", SECTION_ALIGNMENT + symbols[one])
+	                 for one in RVA_TABLES.get(name, ()))
 	sections = build(output, text, code_size, symbols.get("handler"),
 	                 FRAMES.get(name, 0), name in READONLY, symbols,
 	                 SAVES.get(name, ()), symbols.get("prologue_end", 0),
-	                 IMPORTS.get(name))
+	                 IMPORTS.get(name), rdata)
 	print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
 	      f"function is {code_size} of them, expected exit code {expected}")
 	return 0

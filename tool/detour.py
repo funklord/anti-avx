@@ -11098,6 +11098,62 @@ STALE_REPAIR = False
 # Whether a refused leaf chunk is recut only at entry points rather than at
 # every branch target. Finding 338.
 LEAF_ENTRIES = True
+# Whether the entries of an RVA function table in `.rdata` count as entry
+# points for leaf recovery. Finding 371.
+RVA_TABLE_RULE = True
+# A run of `.text` RVAs this long, at least this share of them `.pdata`
+# function starts, is taken as a table of functions. Finding 371.
+RVA_TABLE_RUN = 8
+RVA_TABLE_SHARE = 0.5
+
+
+def rva_table_entries(binary):
+	"""Addresses an RVA function table names that `.pdata` does not.
+
+	**A leaf reached only through a table of RVAs had no evidence of being
+	entered**, and leaf recovery wants that evidence before it will call a
+	chunk code. `0x1407c7570` and `0x1407c7590`, a two-dimensional length
+	each, are named once apiece in a run of 97 code RVAs at `0x1458564a8`,
+	65 of them `.pdata` starts -- a table of functions, of which these are
+	two of the leaves that carry no unwind data.
+
+	An earlier scan for runs of RVAs found 14,789 addresses and 3 real
+	targets (Findings 174 and 177), so the run alone proves nothing. What
+	makes a run a table here is that most of it is known function starts.
+	Measured over the image: 143 runs of at least 8 qualify, naming 207
+	addresses `.pdata` does not, 118 of them on an instruction boundary --
+	so these only NOMINATE a chunk. `outside.leaf_ranges` still requires it
+	to start after `int3` padding, end in a transfer and decode cleanly.
+	"""
+	with open(binary, "rb") as image:
+		data = image.read()
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	count = struct.unpack_from("<H", data, pe + 6)[0]
+	optional = struct.unpack_from("<H", data, pe + 20)[0]
+	base = struct.unpack_from("<Q", data, pe + 24 + 24)[0]
+	rdata = text = None
+	for i in range(count):
+		at = pe + 24 + optional + 40 * i
+		name = data[at:at + 8].rstrip(b"\0")
+		vsize, rva, rsize, raw = struct.unpack_from("<IIII", data, at + 8)
+		if name == b".rdata":
+			rdata = (raw, min(vsize, rsize))
+		elif name == b".text":
+			text = (rva, rva + vsize)
+	if rdata is None or text is None:
+		return set()
+	starts = {begin for begin, _end, _unwind in existing_pdata(data)}
+	words = struct.unpack_from(f"<{rdata[1] // 4}I", data, rdata[0])
+	found, run = set(), []
+	for word in words + (0,):
+		if text[0] <= word < text[1]:
+			run.append(word)
+			continue
+		if len(run) >= RVA_TABLE_RUN and sum(
+				one in starts for one in run) >= RVA_TABLE_SHARE * len(run):
+			found.update(base + one for one in run if one not in starts)
+		run = []
+	return found
 # The rows `switch_data_rows` turned to `(bad)`, which `data_islands` keeps
 # out of its clustering and adds back as the exact table spans.
 SWITCH_TURNED = set()
@@ -12080,6 +12136,16 @@ def collect(binary, listing, context=None):
 			[row for row in plain if row[2].startswith("call")])
 		data = {row[0] for row in plain if row[2] == "(bad)"
 		        and in_switch_data(row[0], row[0] + len(row[1]))}
+	# **And a leaf an RVA function table names**, as an entry and so as a
+	# target: nothing may widen across it. Only those outside every
+	# described function, which is the only place leaf recovery looks.
+	# Finding 371.
+	if RVA_TABLE_RULE:
+		tabled = {address for address in rva_table_entries(binary)
+		          if not inplace.covered_by(described, address, 1)}
+		blocked |= tabled
+		if entries is not None:
+			entries |= tabled
 	ranges = sorted(described + outside.leaf_ranges(plain, described, blocked,
 	                                                entries, data))
 	# What each function never touches, for the sites the forward scan
