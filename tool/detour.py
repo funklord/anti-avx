@@ -1421,6 +1421,9 @@ GAP_RUNS = []
 # re-aimed in that window's stub, rebuilt with its branch aimed at the
 # hammock's label, rather than costing the hammock. Finding 374.
 STUB_REAIM_RULE = True
+# Whether a backward hammock may hold a site that borrows a register.
+# Finding 375.
+HAMMOCK_SPILL_RULE = True
 # {target: address} a branch re-emitted by `moved_branch` is aimed at
 # instead, set only while an earlier stub is rebuilt. Finding 374.
 STUB_REAIM = {}
@@ -10586,7 +10589,11 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			reasons["a hammock with a strategy"] += 1
 		return None, 0
 	if held and not forward:
-		if kind is not None:
+		# **A spill is emitted after every preceding instruction**, so the
+		# site's label is where its bracket opens: a branch to it runs the
+		# save, the site and the restore, exactly as falling into it does.
+		# Finding 375.
+		if kind is not None and not (kind == "spill" and HAMMOCK_SPILL_RULE):
 			if reasons is not None:
 				reasons["a hammock with a strategy"] += 1
 			return None, 0
@@ -13196,7 +13203,9 @@ def collect(binary, listing, context=None):
 			# back over those branches and the stub re-aims them at its own
 			# copy of the site. Plain lowerings only: the internal labels
 			# are worked out in `build_stub`'s plain path. Finding 336.
-			if reason is not None and HAMMOCK_RULE and strategy is None:
+			if reason is not None and HAMMOCK_RULE and (
+					strategy is None or (HAMMOCK_SPILL_RULE
+					                     and strategy[0] == "spill")):
 				swallow, held = hammock_window(instructions, plain, index,
 				                               blocked, sources, scope, home,
 				                               positions, ranges, islands)

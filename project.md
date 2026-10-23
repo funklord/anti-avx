@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,917 of 804,948 VEX
-sites -- 99.99%** -- through 203,253 detours, and every `make detour-verify` invariant
-holds on the result. **31 sites are left** (Finding 374, 2026-10-23), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,919 of 804,948 VEX
+sites -- 99.99%** -- through 203,245 detours, and every `make detour-verify` invariant
+holds on the result. **29 sites are left** (Finding 375, 2026-10-23), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                            31 re-measured   (Finding 374)
+    default build                            29 re-measured   (Finding 375)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,917 of 804,948 VEX sites, 99.99%, through 203,253 detours**, and 164 further
+**804,919 of 804,948 VEX sites, 99.99%, through 203,245 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14163,6 +14163,35 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 375 -- a backward hammock may hold a site that borrows
+
+**Two more of the runnable sites were declined only because they borrow.**
+`0x141b5758d` is a `vmaxss` whose result replaces its second source, so it needs a
+scratch register, and with none dead it borrows one; `0x141df312d`, a `vaddss` of
+the same shape, likewise. Each is the target of a short branch just above it, with a
+branch target after it, so the only window is a backward hammock reaching back over
+that branch -- and the collector asked for one only where the site had no strategy,
+while `build_stub` refused "a hammock with a strategy" for a backward one. Called
+directly, `hammock_window` builds both.
+
+**The refusal was broader than its reason.** Every preceding instruction is emitted
+before the spill bracket opens, so the label a held branch aims at for the site is
+where the bracket begins: arriving by the branch runs the save, the site and the
+restore exactly as falling into it does. A forward hammock already allowed a spill on
+the converse argument, that its bracket closes before the first label.
+`HAMMOCK_SPILL_RULE` is the A/B.
+
+**Measured on the full image: 36 rows to 34, exactly the two, none arriving**;
+`verify` passes. Detours fall from 203,253 to 203,245 and in-place patches by 41,
+because hammocks now taken elsewhere are wider windows that swallow neighbours which
+used to be separate.
+
+**`hammockspill` is the fixture**: `vcomiss; jbe` over a `vdivss` arm joining on that
+`vmaxss`, every xmm live, run through both arms -- 77 with the rule, 29 without. Its
+first version answered 77 both ways, because an `addss` after the join gave a
+forward hammock the ten bytes it needs; Starfield has a two-byte `je` there, which
+the fixture now copies.
+
 ### Finding 374 -- a hammock's way in inside an earlier stub is re-aimed there
 
 **Two of the nine runnable sites were refused for one reason**: "a re-aimed jump sits
@@ -14357,7 +14386,8 @@ measured is that this host answers no, and the kernels they select need AVX2 or 
 natively, so a host that could pass them would not need this image. The F16C routine of
 `src/f16c.c` stays unwired for this reason. The nine that can run were `0x140f919ee`,
 `0x140fb4fde`, `0x1410e87b0`, `0x141b5758d`, `0x141df312d`, `0x141e33717`,
-`0x14272125f`, `0x142baa477` and `0x14374e704`; Finding 374 takes two of them.
+`0x14272125f`, `0x142baa477` and `0x14374e704`; Findings 374 and 375 take two
+each.
 
 ### Finding 370 -- a stub falls into the next stub instead of bouncing through `.text`
 

@@ -3530,6 +3530,80 @@ val:	.float	46.5, 62.0
 """)
 
 
+# **A backward hammock whose site borrows.** `0x141b5758d` in Starfield:
+# `vcomiss; jbe` over a `vdivss` arm, joining on a `vmaxss` whose result
+# replaces its second source, so it needs a scratch -- and with every xmm
+# live, a spill. The site is the `jbe`'s target and the `test` after it
+# another's, so the window can only reach back over the `jbe`, holding
+# the site. Pass 0 falls through, 6/2 then max(3, 2); pass 1 jumps,
+# max(6, 2): 9 * 8 + 5. Left alone the `vmaxss` faults with 29.
+# Finding 375.
+PROGRAMS["hammockspill"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	val(%rip), %rsi
+	xorps	%xmm0, %xmm0
+	xorps	%xmm2, %xmm2
+	xorps	%xmm4, %xmm4
+	xorps	%xmm5, %xmm5
+	xorps	%xmm8, %xmm8
+	xorps	%xmm9, %xmm9
+	xorps	%xmm10, %xmm10
+	xorps	%xmm11, %xmm11
+	xorps	%xmm12, %xmm12
+	xorps	%xmm13, %xmm13
+	xorps	%xmm14, %xmm14
+	xorps	%xmm15, %xmm15
+	movss	0(%rsi), %xmm6
+	xorl	%ebx, %ebx
+	xorl	%r9d, %r9d
+	xorl	%r8d, %r8d
+pass:
+	movss	4(%rsi), %xmm3
+	movss	8(%rsi), %xmm7
+	movss	12(%rsi,%r8,4), %xmm1
+	testl	%r9d, %r9d
+	jne	after
+	vcomiss	%xmm6, %xmm1
+	jbe	join
+	vdivss	%xmm1, %xmm3, %xmm3
+join:
+	vmaxss	%xmm7, %xmm3, %xmm7
+after:
+	testq	%rbx, %rbx
+	jne	after		/* never taken; closes the forward window short */
+	addss	%xmm7, %xmm9
+	incl	%r8d
+	cmpl	$2, %r8d
+	jb	pass
+	addss	%xmm0, %xmm9
+	addss	%xmm2, %xmm9
+	addss	%xmm4, %xmm9
+	addss	%xmm5, %xmm9
+	addss	%xmm8, %xmm9
+	addss	%xmm10, %xmm9
+	addss	%xmm11, %xmm9
+	addss	%xmm12, %xmm9
+	addss	%xmm13, %xmm9
+	addss	%xmm14, %xmm9
+	addss	%xmm15, %xmm9
+	cvttss2si %xmm9, %eax
+	leal	5(,%rax,8), %eax
+	addq	$40, %rsp
+	ret
+	/* No padding within a rel8's reach, as in Starfield. */
+	.fill	140, 1, 0x90
+func_end:
+	.p2align 4, 0xcc
+	int3
+	.p2align 4, 0xcc
+val:	.float	1.0, 6.0, 2.0, 2.0, 0.5
+""")
+
+
 # **A hammock's join, reached only from inside it.** The diamond is
 # `0x140fb4fb7` in Starfield: a backward hammock holds the three
 # `vmulss` arms, and the `vsubss` they join on is short with a target
