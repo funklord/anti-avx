@@ -3530,6 +3530,44 @@ val:	.float	46.5, 62.0
 """)
 
 
+# **Two windows with integer code between them, which the first stub now
+# runs itself rather than returning to `.text` for.** Each `vaddss` and
+# `vmulss` is exactly five bytes and three-operand, so both detour without
+# widening, and the `addl`/`imull` between is the gap. Over three passes
+# eax is (0+3)*3, (9+2)*3, (33+1)*3 = 102 and xmm1 is 6, 24, 78, so the
+# answer is 102 + 78 - 103. Skipping the gap gives -25, running it twice
+# something else again. Finding 373.
+PROGRAMS["gaprun"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	val(%rip), %rcx
+	movl	$3, %edx
+	xorps	%xmm1, %xmm1
+	xorl	%eax, %eax
+	.p2align 4
+again:
+	vaddss	0(%rcx), %xmm1, %xmm2
+	addl	%edx, %eax
+	imull	$3, %eax, %eax
+	vmulss	4(%rcx), %xmm2, %xmm1
+	decl	%edx
+	jnz	again
+	cvttss2si %xmm1, %ecx
+	addl	%ecx, %eax
+	subl	$103, %eax
+	addq	$40, %rsp
+	ret
+func_end:
+	.p2align 4, 0xcc
+	int3
+	.p2align 4, 0xcc
+val:	.float	2.0, 3.0
+""")
+
+
 # **A forward hammock closed by a branch.** The aliased `vminss` borrows,
 # and the `jmp` above makes it a target, so nothing widens backwards over
 # it. The `vcomiss` after it is reached by two short `je`s, so the window

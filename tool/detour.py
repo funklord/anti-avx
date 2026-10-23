@@ -1406,6 +1406,17 @@ FALL_THROUGH = True
 # Whether a borrowed block pointer leaves the index register alone when
 # the index is a constant. Finding 372.
 SPARE_INDEX_RULE = True
+# Whether a stub whose jump home lands, within `GAP_RUN` bytes, on the
+# next stub's window runs the instructions between itself and falls
+# through. Finding 373.
+GAP_RULE = True
+GAP_RUN = 32
+# `apply_all` sets this to `gap_source(...)`; None means no gap is run,
+# which is what every other caller of `place_stubs` wants, since they read
+# window positions and not the stub layout. Finding 373.
+GAP_SOURCE = None
+# (home, start) of every gap the last `place_stubs` ran in a stub.
+GAP_RUNS = []
 # Whether a site that borrows nothing opens the slot for a passenger that
 # does. Finding 364.
 PASSENGER_STACK_RULE = True
@@ -17975,6 +17986,76 @@ def inside_spans(spans, address):
 	return at >= 0 and spans[at][0] <= address < spans[at][1]
 
 
+# Operand-size, address-size, segment, lock and rep prefixes, and REX.
+LEGACY_PREFIXES = frozenset((0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E,
+                             0x26, 0x64, 0x65)) | frozenset(range(0x40, 0x50))
+GAP_REFUSED = ("j", "call", "ret", "loop", "int", "syscall", "sysenter",
+               "push", "pop", "enter", "leave", "iret", "hlt", "ud",
+               "(bad)", "lock", "rep", "xbegin", "xend", "xabort")
+
+
+def gap_movable(mnemonic, operands):
+	"""Whether an instruction runs the same from a stub as from `.text`.
+
+	Nothing that transfers control, because its target or its return
+	address would be the stub's; nothing RIP-relative, because the
+	displacement is measured from where it sits; and nothing that writes
+	`rsp`, because a stub's unwind data is its function's after the
+	prologue and an exception mid-gap must still find the frame. A memory
+	operand based on `rsp` is fine: the stub runs on the same stack.
+	"""
+	if mnemonic.startswith(GAP_REFUSED) or "%rip" in operands:
+		return False
+	bare = re.sub(r"\([^)]*\)", "", operands)
+	return re.search(r"%(rsp|esp|sp|spl)\b", bare) is None
+
+
+def vex_encoded(encoding):
+	"""Whether an encoding is VEX, EVEX or XOP after its legacy prefixes."""
+	at = 0
+	while at < len(encoding) and encoding[at] in LEGACY_PREFIXES:
+		at += 1
+	return at < len(encoding) and encoding[at] in (0xC4, 0xC5, 0x62, 0x8F) \
+		and not (encoding[at] == 0x8F and at + 1 < len(encoding)
+		         and (encoding[at + 1] >> 3) & 7 == 0)
+
+
+def gap_source(instructions, data, vaddr, raddr, patched):
+	"""(home, start) -> the final bytes of `.text` between, or None.
+
+	**The bytes are the patched ones, the decision the original's.** An
+	in-place patch keeps its instruction's length but not always its
+	boundaries -- `0x1426b20c0` is a `nopl` and a `movsd` where the
+	original had one `vmovsd` -- so the gap is copied whole, between two
+	addresses that are boundaries in both. What the decision needs is
+	preserved by a lowering: control flow, RIP-relativity and `rsp`. An
+	original VEX row qualifies only where it was patched, because nothing
+	VEX may reach the stub section. Finding 373.
+	"""
+	addresses = [row[0] for row in instructions]
+
+	def run(home, start):
+		if not 0 < start - home <= GAP_RUN:
+			return None
+		i = bisect.bisect_left(addresses, home)
+		at = home
+		while at < start:
+			if i >= len(addresses) or addresses[i] != at:
+				return None
+			_a, encoding, mnemonic, operands, _c = instructions[i]
+			if not gap_movable(mnemonic, operands):
+				return None
+			if vex_encoded(encoding) and at not in patched:
+				return None
+			at += len(encoding)
+			i += 1
+		if at != start or any(low < start and home < high
+		                      for low, high in SWITCH_DATA):
+			return None
+		return bytes(data[raddr + home - vaddr:raddr + start - vaddr])
+	return run
+
+
 def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
                 detail=None, home=None, tls=None):
 	"""Choose and build the stubs. (placed, blob, swallowed, overlap, refused)
@@ -18001,6 +18082,7 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 	# 16-byte alignment SSE memory operands need comes free.
 	blob = bytearray(PERMIL_POOL)
 	pool = stub_base
+	GAP_RUNS.clear()
 	placed, swallowed = [], set()
 	# Sets rather than counters: a tally cannot say WHICH sites these were,
 	# and that is the question census has to answer.
@@ -18074,19 +18156,37 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 		# before closed whatever it opened before its jump, which is the
 		# state this one is entered in either way. Put back if this one is
 		# not placed. Finding 370.
-		dropped = None
+		#
+		# **And where home is a few instructions short of this window, the
+		# stub runs them itself.** Lowering in place leaves short runs of
+		# legacy SSE and integer code between windows, and each one cost a
+		# trip back to `.text` and straight out again: in `0x1426b2018`,
+		# the hottest stub function of a profile of f372, eight trips per
+		# pass of its loop. `.text` keeps those bytes, so a branch into the
+		# gap still finds them. Finding 373.
+		dropped, gap = None, b""
 		if FALL_THROUGH and placed:
 			last_start, last_window, last_at, last_size, last_prologue = \
 				placed[-1]
 			end = stub_base + len(blob)
-			if last_start + last_window == start \
+			home_at = last_start + last_window
+			if home_at < start and GAP_RULE and GAP_SOURCE is not None:
+				gap = GAP_SOURCE(home_at, start)
+			if (home_at == start or gap) \
 					and last_at + last_size == end \
 					and last_size > 5 and last_prologue <= last_size - 5 \
-					and bytes(blob[-5:]) == encode_jump(end, start):
+					and bytes(blob[-5:]) == encode_jump(end, home_at):
 				dropped = bytes(blob[-5:])
 				del blob[-5:]
+				# The control: fall through WITHOUT the gap, so the
+				# fixture's answer has to change. Finding 373.
+				blob += b"" if CODE_SABOTAGE == "gaprun" else gap
 				placed[-1] = (last_start, last_window, last_at,
-				              last_size - 5, last_prologue)
+				              last_size - 5 + (0 if CODE_SABOTAGE == "gaprun"
+				                               else len(gap)),
+				              last_prologue)
+			else:
+				gap = b""
 		stub_address = stub_base + len(blob)
 		body, prologue = None, 0
 		# **Longest chain first, then shorter, then none.** A chain that
@@ -18139,6 +18239,8 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 					                 strategy[0] if strategy else "plain")
 		if body is None:
 			if dropped is not None:
+				if gap and CODE_SABOTAGE != "gaprun":
+					del blob[-len(gap):]
 				blob += dropped
 				placed[-1] = (last_start, last_window, last_at, last_size,
 				              last_prologue)
@@ -18158,6 +18260,8 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			if reasons is not None:
 				reasons["a re-aimed jump sits in another window"] += 1
 			if dropped is not None:
+				if gap and CODE_SABOTAGE != "gaprun":
+					del blob[-len(gap):]
 				blob += dropped
 				placed[-1] = (last_start, last_window, last_at, last_size,
 				              last_prologue)
@@ -18167,6 +18271,8 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			bisect.insort(reserved, one)
 		spans.append((start, start + window))
 		placed.append((start, window, stub_address, len(body), prologue))
+		if gap:
+			GAP_RUNS.append((placed[-2][0] + placed[-2][1], start))
 		committed_to = start + window
 		blob += body
 		# Every boundary strictly inside the window disappears. The window's
@@ -18295,10 +18401,19 @@ def apply_all(binary, listing, output):
 	# covered, which can make a reader that was inside it survive and
 	# expose a producer of its own. Bounded: each round drops at least one
 	# candidate or stops, and the list only shrinks. Finding 197.
-	placed, blob, overlapped, refused, dropped, swallowed = \
-		repaired_placement(instructions, blocked, sources, candidates,
-		                   set(undo), stub_base, spill_base, stub_reasons,
-		                   home, tls_pair_of(tls_here))
+	# The gaps a stub may run are read from `data` as it stands now, every
+	# in-place patch applied. A revert below changes a gap's bytes, which
+	# is why it is checked against `GAP_RUNS` there. Finding 373.
+	global GAP_SOURCE
+	GAP_SOURCE = gap_source(instructions, data, vaddr, raddr, set(undo))
+	try:
+		placed, blob, overlapped, refused, dropped, swallowed = \
+			repaired_placement(instructions, blocked, sources, candidates,
+			                   set(undo), stub_base, spill_base,
+			                   stub_reasons, home, tls_pair_of(tls_here))
+	finally:
+		GAP_SOURCE = None
+	gaps_run = list(GAP_RUNS)
 	del swallowed
 	if dropped:
 		print(f"apply: {len(dropped):,} window(s) not placed, each having "
@@ -18470,6 +18585,23 @@ def apply_all(binary, listing, output):
 		# and the difference was visible nowhere until `verify` read the
 		# image. Findings 194 and 197.
 		stuck.append((reader, field, producer))
+	# **A revert inside a gap a stub runs would split the two copies**:
+	# `.text` back to VEX, the stub still running the lowered bytes it was
+	# given. The reverted producers are a few dozen and gaps hold no window,
+	# so this has not happened; if it does, the build stops rather than
+	# ship two programs. Finding 373.
+	gap_starts = sorted(gaps_run)
+	for producer in sorted(reverted):
+		where = bisect.bisect_right(gap_starts, (producer, float("inf"))) - 1
+		if where >= 0 and producer < gap_starts[where][1]:
+			raise SystemExit(
+				f"apply: 0x{producer:x} was reverted inside the gap "
+				f"0x{gap_starts[where][0]:x}-0x{gap_starts[where][1]:x} a "
+				f"stub runs; set GAP_RULE off or exclude it.")
+	if gaps_run:
+		print(f"apply: {len(gaps_run):,} stub(s) run the instructions "
+		      f"between their home and the next window themselves, "
+		      f"{sum(b - a for a, b in gaps_run):,} bytes")
 	# **Two different failures were being reported as one sentence.** A
 	# producer inside a window is a repair that did not finish; a producer
 	# that is not an in-place patch at all is a site no mechanism here
@@ -18784,7 +18916,7 @@ for _name, _number in GPR_NUMBERS.items():
 
 
 def stub_gpr_problems(text, placed, home, base, size,
-                      instructions):
+                      instructions, gaps=()):
 	"""Registers a stub clobbers that the site was still using.
 
 	**The one class every other check in this file is blind to.** `verify`
@@ -18843,6 +18975,7 @@ def stub_gpr_problems(text, placed, home, base, size,
 	rows_by_site = {a: (m, o) for a, _e, m, o, *_r in instructions}
 
 	problems = []
+	gap_end = dict(gaps)
 	for site, window, stub_at, stub_size, _prologue in placed:
 		if not (base <= stub_at < base + size):
 			continue
@@ -18899,9 +19032,12 @@ def stub_gpr_problems(text, placed, home, base, size,
 		# almost every stub. That took the first control to 20,502 of
 		# 33,215, and the reading of one stub to explain.
 		preserved = {n for n in saved if saved[n] & restored[n]}
-		# What the ORIGINAL window wrote, which the stub re-emits.
+		# What the ORIGINAL window wrote, which the stub re-emits -- and
+		# the gap after it where the stub runs that too, which writes
+		# what the program wrote there. Finding 373.
 		lo_o = bisect.bisect_left(sites, site)
-		hi_o = bisect.bisect_left(sites, site + window)
+		hi_o = bisect.bisect_left(sites, gap_end.get(site + window,
+		                                             site + window))
 		theirs = set()
 		for address in sites[lo_o:hi_o]:
 			mnemonic, operands = rows_by_site[address]
@@ -19219,11 +19355,26 @@ def verify(original, patched, listing=None):
 	# The repair takes the FULL patch set, as apply does when it decides,
 	# because the question is which windows apply withheld; the stale check
 	# below then reads the image. Finding 197.
-	placed, _blob, _over, _refused, _dropped, swallowed = repaired_placement(
-		instructions, blocked, sources, candidates,
-		set(row[0] for row in patch_rows),
-		stub_base_of(open(original, "rb").read()), 0, Counter(), home,
-		tls_pair_of(tls_for(original)))
+	# **The gaps apply ran, read back from the image.** Apply took them
+	# from its own buffer before writing it, and the bytes between two
+	# windows are not touched after that unless a revert lands there, which
+	# apply refuses. Without them this model lays the stubs out shorter
+	# than the image and every check keyed by a stub's address is measured
+	# against the wrong stub. Finding 373.
+	global GAP_SOURCE
+	gv, gr, _gs = inplace.text_mapping(patched)
+	GAP_SOURCE = gap_source(instructions, b, gv, gr,
+	                        set(row[0] for row in patch_rows))
+	try:
+		placed, _blob, _over, _refused, _dropped, swallowed = \
+			repaired_placement(
+				instructions, blocked, sources, candidates,
+				set(row[0] for row in patch_rows),
+				stub_base_of(open(original, "rb").read()), 0, Counter(),
+				home, tls_pair_of(tls_for(original)))
+	finally:
+		GAP_SOURCE = None
+	gaps_run = list(GAP_RUNS)
 	groups = target_set.collect(original)
 	reachable = set()
 	for name, values in groups.items():
@@ -19660,7 +19811,7 @@ def verify(original, patched, listing=None):
 	if stubs is not None and placed:
 		where = struct.unpack_from("<Q", b, pe + 24 + 24)[0] + stubs[0]
 		loose = stub_gpr_problems(done.stdout, placed, home, where,
-		                          stubs[1], instructions)
+		                          stubs[1], instructions, gaps_run)
 		if loose:
 			print(f"verify: FAILED -- {len(loose):,} stub(s) clobber a "
 			      f"general-purpose register the site was still using",

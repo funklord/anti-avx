@@ -14163,6 +14163,58 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 373 -- a stub runs the few instructions before the next window
+
+**A 600-second profile of f372 kept the stubs at 6.2% of samples** (255,712 samples,
+64.6% `.text`, 29.2% outside), with the census of Finding 372 unchanged: the cost is
+in getting in and out. Its hottest real kernel, `0x1426b2018`, showed why. Lowering
+in place leaves short runs of legacy SSE and integer code between windows -- a
+`movsd`, a `movups` to the stack, `mov`/`shr`/`add` -- and each one sent the stub
+back to `.text` to run a few bytes and straight out again to the next stub: eight
+round trips per pass of its loop. (The hottest site of the profile, `0x1428d3ece`,
+is not overhead: it sits in a spin-wait on the performance counter, and its samples
+are time the game was waiting anyway.)
+
+**So Finding 370's fall-through now also crosses a gap.** Where a stub's home is
+within `GAP_RUN` (32) bytes short of the next window, the next stub is written right
+after it, and every instruction between runs the same from anywhere, the stub copies
+those bytes in place of its jump home and falls through. `.text` keeps them, so a
+branch into the gap still finds them. "The same from anywhere" is decided from the
+original's rows, because a lowering in place keeps what matters -- control flow,
+RIP-relativity, `rsp` -- but not always the boundaries (`0x1426b20c0` is a `nopl` and
+a `movsd` where the original had one `vmovsd`); the bytes copied are the patched
+ones, between two addresses that are boundaries in both. Refused in a gap: any
+transfer, a RIP-relative operand, a write to `rsp` (a fault mid-gap is unwound with
+the function's post-prologue data), anything still VEX, and switch-table bytes.
+Measured over f372 against its profile: 30,794 of 59,879 near gaps qualified and
+their jumps home held 921 samples, before counting the entry skid of the stub after.
+
+**Measured on the full image: 41,610 stubs run 384,549 bytes of gap.** Jumps in the
+stub section go from 110,261 to 68,651, exactly that many fewer, and the section
+from 4,362,014 to 4,538,513 bytes. Placement is unchanged. `GAP_RULE` is the A/B.
+
+**Verify failed five checks the first time, and every one was its model.** It
+recomputes the placement to know where each stub is, and that model did not know
+the gaps, so it laid the stubs out shorter than the image: 110 re-aimed jumps "not
+in their stub", 1,320 RIP stores "outside their window", 68 branch targets judged
+against the wrong hammocks. Verify now reads the same gaps back from the finished
+image -- apply takes them from its buffer before writing, and nothing after touches
+the bytes between two windows except a revert, which apply refuses inside a gap. The
+fifth, 39,824 stubs "clobbering" a live GPR, was the gap's own integer code: the
+check allows what the original window wrote, and now what the gap wrote too, since
+the same instructions write the same registers in `.text`. With both, every check
+passes, over all 1,191,258 branch targets and 203,252 windows.
+
+A stub's scratch register needed no new reasoning: liveness after a window already
+includes the gap's reads, because the gap was always what ran next, and every
+restore sits before the dropped jump.
+
+**`check-gaprun` is the gate**, on a fixture whose two windows straddle an
+`addl`/`imull` and whose answer is 77 with the rule on and off alike -- so the answer
+alone proves nothing. The target asserts one jump back to `.text` in the stub
+section (two without the rule) and then that a build falling through WITHOUT the gap,
+`ANTI_AVX_SABOTAGE=gaprun`, answers something else: 237.
+
 ### Finding 372 -- a borrowed block pointer saves one register, not two
 
 **A 600-second profile of f371 put the stubs at 5.8% of samples again**: 190,570

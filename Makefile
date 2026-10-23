@@ -735,6 +735,55 @@ check-teb-auto: tool/pe_build.py tool/detour.py | $(BUILD_DIR)
 	echo "check-teb-auto: a TlsAlloc slot carried a block pointer's"; \
 	echo "                borrow; unpatched, the same stub died with $$bad"
 
+# **A stub runs the gap between its home and the next window.** `gaprun`
+# answers 77 with the rule on and with it off, so the answer alone cannot
+# tell whether the gap ran in the stub: the target asserts the stub holds
+# exactly one jump back to `.text` -- two without the rule -- and then
+# that a build which falls through WITHOUT the gap answers something
+# else. Finding 373.
+check-gaprun: tool/pe_build.py tool/detour.py | $(BUILD_DIR)
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-gaprun: wine is not installed"; exit 1; }
+	@set -e; \
+	mkdir -p $(PE_PREFIX); \
+	$(PYTHON) tool/pe_build.py sample gaprun \
+		$(BUILD_DIR)/pe-gaprun.exe 320 >/dev/null; \
+	objdump -d -j .text $(BUILD_DIR)/pe-gaprun.exe \
+		> $(BUILD_DIR)/pe-gaprun.asm; \
+	for kind in none gaprun; do \
+		ANTI_AVX_SABOTAGE=$$kind $(PYTHON) tool/detour.py \
+			--shadow-regs=all apply \
+			$(BUILD_DIR)/pe-gaprun.exe $(BUILD_DIR)/pe-gaprun.asm \
+			$(BUILD_DIR)/sse-gaprun-$$kind.exe > /dev/null; \
+	done; \
+	n=`objdump -d -j .avxsse $(BUILD_DIR)/sse-gaprun-none.exe | \
+	   grep -cE "jmp +0x1400010" || true`; \
+	if [ "$$n" -ne 1 ]; then \
+		echo "check-gaprun: the stub section holds $$n jump(s) back"; \
+		echo "              to .text, wanting 1 -- the gap was not run"; \
+		exit 1; \
+	fi; \
+	good=0; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-gaprun-none.exe \
+		> /dev/null 2>&1 || good=$$?; \
+	pkill -x wineserver >/dev/null 2>&1 || true; \
+	bad=0; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-gaprun-gaprun.exe \
+		> /dev/null 2>&1 || bad=$$?; \
+	pkill -x wineserver >/dev/null 2>&1 || true; \
+	if [ "$$good" != "77" ]; then \
+		echo "check-gaprun: the build returned $$good, want 77"; \
+		exit 1; \
+	fi; \
+	if [ "$$bad" = "77" ]; then \
+		echo "check-gaprun: falling through without the gap also"; \
+		echo "              returned 77, so the gap is not what the"; \
+		echo "              answer depends on"; \
+		exit 1; \
+	fi; \
+	echo "check-gaprun: one stub ran the gap and fell through; without"; \
+	echo "              the gap the same stub answered $$bad"
+
 check-liveness: $(LISTING)
 	@set -e; \
 	echo "check-liveness: building a deliberately broken image"; \
@@ -919,7 +968,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
              mxcsr splatrun splatop extract shadowspill regionlive \
-             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim fwdhammock fwdspill shadowlea fwdalt rider stackride stackrsp permilmem stackflags stackpass chainstore leafsync closejcc cmpgt rvatable
+             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim fwdhammock fwdspill shadowlea fwdalt rider stackride stackrsp permilmem stackflags stackpass chainstore leafsync closejcc cmpgt rvatable gaprun
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)
