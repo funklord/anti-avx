@@ -5,9 +5,9 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,915 of 804,948 VEX
-sites -- 99.99%** -- through 203,252 detours, and every `make detour-verify` invariant
-holds on the result. **33 sites are left** (Finding 371, 2026-10-23), five more rows
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,917 of 804,948 VEX
+sites -- 99.99%** -- through 203,253 detours, and every `make detour-verify` invariant
+holds on the result. **31 sites are left** (Finding 374, 2026-10-23), five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -11912,12 +11912,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                            33 re-measured   (Finding 371)
+    default build                            31 re-measured   (Finding 374)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,915 of 804,948 VEX sites, 99.99%, through 203,252 detours**, and 164 further
+**804,917 of 804,948 VEX sites, 99.99%, through 203,253 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14163,6 +14163,39 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 374 -- a hammock's way in inside an earlier stub is re-aimed there
+
+**Two of the nine runnable sites were refused for one reason**: "a re-aimed jump sits
+in another window". `0x140fb4fde` is the `vsubss` that a diamond of three `vmulss`
+arms joins on, four bytes long, with a branch target after it; `0x14272125f` is a
+`vminss` with the same shape. A forward hammock holds the target after each and
+re-aims its ways in -- but those, a `jne` and a `jmp` at `0x140fb4fc6`/`fcc` and a
+`jmp` at `0x14272125d`, sit inside the backward hammock placed just before, whose
+stub re-emits them as rel32 jumps aimed at the target in `.text`. A probe of the two
+placements found every candidate built and these two refused at placement.
+
+**The ways in exist only as copies in the earlier stub, so that is where they are
+re-aimed.** Placement keeps what every committed stub was built from; when a hammock
+has a way in inside an earlier window, the earlier stub is built again at its own
+address with `STUB_REAIM` mapping the target to the new stub's label, which
+`moved_branch` honours. A re-emitted branch is a rel32 whatever it names, so the
+rebuild must come out the same length, and it must differ, or there was nothing to
+aim; either failure stops the build. Only the bytes before the old jump home are
+replaced, since a fall-through or a gap may have changed what follows it. `apply`
+writes no `.text` re-aim for such a jump, whose bytes are the earlier window's, and
+`verify` counts it aimed -- its stub-section check is the guard, because a rebuilt
+stub still naming the target in `.text` lands inside the hammock past its jump.
+`STUB_REAIM_RULE` is the A/B.
+
+**Measured on the full image: 38 rows to 36, exactly the two, none arriving**, and
+`apply` refuses no stub for the first time. 115 re-aimed jumps land in their stubs.
+
+**`stubreaim` is the fixture**, the diamond at `0x140fb4fb7` rebuilt, run through all
+five of its paths: 77 with the rule, and without it the same refusal as Starfield and
+the stranded `vsubss` faulting with 29. It needs 140 bytes of `nop` after its `ret`:
+the first version found `int3` padding within a rel8's reach and took Finding 331's
+trampolines instead, returning 77 either way and testing nothing.
+
 ### Finding 373 -- a stub runs the few instructions before the next window
 
 **A 600-second profile of f372 kept the stubs at 6.2% of samples** (255,712 samples,
@@ -14322,9 +14355,9 @@ So **24 sites sit behind a gate this host fails**: the 19 above and the five `vp
 and `kmov` of Finding 5. Which CPUID bits feed the two Wwise masks is not traced; what is
 measured is that this host answers no, and the kernels they select need AVX2 or FMA
 natively, so a host that could pass them would not need this image. The F16C routine of
-`src/f16c.c` stays unwired for this reason. The nine that can run are `0x140f919ee`,
+`src/f16c.c` stays unwired for this reason. The nine that can run were `0x140f919ee`,
 `0x140fb4fde`, `0x1410e87b0`, `0x141b5758d`, `0x141df312d`, `0x141e33717`,
-`0x14272125f`, `0x142baa477` and `0x14374e704`.
+`0x14272125f`, `0x142baa477` and `0x14374e704`; Finding 374 takes two of them.
 
 ### Finding 370 -- a stub falls into the next stub instead of bouncing through `.text`
 

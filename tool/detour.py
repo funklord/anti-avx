@@ -1417,6 +1417,16 @@ GAP_RUN = 32
 GAP_SOURCE = None
 # (home, start) of every gap the last `place_stubs` ran in a stub.
 GAP_RUNS = []
+# Whether a hammock's way in that sits inside an earlier window is
+# re-aimed in that window's stub, rebuilt with its branch aimed at the
+# hammock's label, rather than costing the hammock. Finding 374.
+STUB_REAIM_RULE = True
+# {target: address} a branch re-emitted by `moved_branch` is aimed at
+# instead, set only while an earlier stub is rebuilt. Finding 374.
+STUB_REAIM = {}
+# (hammock start, jump) for every way in re-aimed inside a stub by the last
+# `place_stubs`, which `apply` must not also re-aim in `.text`.
+STUB_REAIMED = set()
 # Whether a site that borrows nothing opens the slot for a passenger that
 # does. Finding 364.
 PASSENGER_STACK_RULE = True
@@ -3589,6 +3599,10 @@ def moved_branch(moved, mnemonic, operands, comment, address, at,
 	# to where the stub emits it. See `HAMMOCK`. Finding 336.
 	if internal and target in internal:
 		target = internal[target]
+	# **Or a later hammock's copy**, where that hammock holds the target
+	# and this branch is one of its ways in. Finding 374.
+	elif target in STUB_REAIM:
+		target = STUB_REAIM[target]
 	# rel32 is measured from the END of the instruction, which is five bytes
 	# for `e9`/`e8` and SIX for the two-byte conditional opcode. Getting that
 	# wrong lands every conditional one byte short of its target.
@@ -18056,6 +18070,51 @@ def gap_source(instructions, data, vaddr, raddr, patched):
 	return run
 
 
+def window_holding(spans, address):
+	"""The (low, high) span in sorted `spans` holding `address`."""
+	at = bisect.bisect_right(spans, (address, float("inf"))) - 1
+	return spans[at]
+
+
+def reaim_in_stubs(start, stub_address, outer, instub, spans, built, blob,
+                   stub_base, home, tls):
+	"""Build each earlier stub holding a way in again, aimed at the label.
+
+	The rebuilt stub must be the same length -- a re-emitted branch is a
+	rel32 whatever it names -- and only the bytes before its jump home are
+	replaced, because a fall-through or a gap may have changed what
+	follows it since. False if either cannot be done. Finding 374.
+	"""
+	by_window = defaultdict(dict)
+	for one in instub:
+		target = outer[one][0]
+		by_window[window_holding(spans, one)[0]][target] = \
+			stub_address + HAMMOCK_LABELS[start][target]
+	for low, aims in by_window.items():
+		(encoding, operands, mnemonic, window, displaced, at, scratch, pool,
+		 preceding, strategy, spill_base, length) = built[low]
+		saved = HAMMOCK_LABELS.get(low)
+		STUB_REAIM.clear()
+		STUB_REAIM.update(aims)
+		try:
+			body, _prologue = build_stub(
+				low, encoding, operands, mnemonic, window, displaced, at,
+				scratch, pool, preceding, strategy, spill_base, None, home,
+				tls)
+		finally:
+			STUB_REAIM.clear()
+			if saved is not None:
+				HAMMOCK_LABELS[low] = saved
+		if body is None or len(body) != length:
+			return False
+		offset = at - stub_base
+		old = bytes(blob[offset:offset + length - 5])
+		if old == bytes(body[:length - 5]):
+			return False		# nothing was aimed: the branch is not there
+		blob[offset:offset + length - 5] = body[:length - 5]
+	return True
+
+
 def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
                 detail=None, home=None, tls=None):
 	"""Choose and build the stubs. (placed, blob, swallowed, overlap, refused)
@@ -18083,6 +18142,10 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 	blob = bytearray(PERMIL_POOL)
 	pool = stub_base
 	GAP_RUNS.clear()
+	STUB_REAIMED.clear()
+	# What each placed stub was built from, so an earlier one can be built
+	# again with a later hammock's label in it. Finding 374.
+	built = {}
 	placed, swallowed = [], set()
 	# Sets rather than counters: a tally cannot say WHICH sites these were,
 	# and that is the question census has to answer.
@@ -18253,10 +18316,21 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 		# `spans` is sorted. Finding 351.
 		outer = reaimed_jumps(start) \
 			if preceding or start in HAMMOCK_FORWARD else {}
+		# **A way in inside an earlier window is that window's stub's
+		# business.** Its stub re-emits the jump as a rel32 aimed at the
+		# target in `.text`, which this window is about to pad, so the
+		# stub is built again below with the jump aimed at this one's
+		# label. `0x140fb4fde` and `0x14272125f` were refused for want of
+		# it: each sits just past a hammock whose stub holds every way
+		# into what follows. Finding 374.
+		instub = {one for one in outer if inside_spans(spans, one)
+		          and window_holding(spans, one)[0] in built} \
+			if STUB_REAIM_RULE else set()
 		low = bisect.bisect_left(reserved, start)
 		if (low < len(reserved) and reserved[low] < start + window) \
 				or any(start <= one < start + window
-				       or inside_spans(spans, one) for one in outer):
+				       or (inside_spans(spans, one) and one not in instub)
+				       for one in outer):
 			if reasons is not None:
 				reasons["a re-aimed jump sits in another window"] += 1
 			if dropped is not None:
@@ -18275,6 +18349,16 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 			GAP_RUNS.append((placed[-2][0] + placed[-2][1], start))
 		committed_to = start + window
 		blob += body
+		built[start] = (encoding, operands, mnemonic, window,
+		                list(displaced), stub_address, scratch, pool,
+		                preceding, strategy, spill_base, len(body))
+		if instub:
+			if not reaim_in_stubs(start, stub_address, outer, instub,
+			                      spans, built, blob, stub_base, home, tls):
+				raise SystemExit(
+					f"place_stubs: 0x{start:x} could not re-aim its ways "
+					f"in inside earlier stubs; set STUB_REAIM_RULE off.")
+			STUB_REAIMED.update((start, one) for one in instub)
 		# Every boundary strictly inside the window disappears. The window's
 		# first byte keeps its boundary, because the jump is written there.
 		offset = 0
@@ -18671,6 +18755,8 @@ def apply_all(binary, listing, output):
 			data[there:offset + window] = inplace.nop_padding(
 				site + window - tail)
 		for one, (target, length, slot) in reaimed_jumps(site).items():
+			if (site, one) in STUB_REAIMED:
+				continue	# re-aimed in the stub that holds it. Finding 374.
 			label = stub_address + HAMMOCK_LABELS[site][target]
 			if slot is not None:
 				# A rel8 cannot reach the stub; it reaches the slot, whose
@@ -19375,6 +19461,7 @@ def verify(original, patched, listing=None):
 	finally:
 		GAP_SOURCE = None
 	gaps_run = list(GAP_RUNS)
+	stub_reaimed = set(STUB_REAIMED)
 	groups = target_set.collect(original)
 	reachable = set()
 	for name, values in groups.items():
@@ -19502,6 +19589,14 @@ def verify(original, patched, listing=None):
 	for window_at, window_len, stub_at, stub_len, _prologue in placed:
 		for one, (target, length, slot) in \
 				reaimed_jumps(window_at).items():
+			# **Re-aimed inside the stub of the window holding it**, whose
+			# `.text` bytes are that window's now. A rebuilt stub that
+			# still names the target in `.text` lands inside this window
+			# past its jump, which the stub-section check below fails.
+			# Finding 374.
+			if (window_at, one) in stub_reaimed:
+				aimed.add(one)
+				continue
 			low, high = one - tv, one - tv + length
 			field = 1 if slot is not None else 4
 			now = one + length + int.from_bytes(

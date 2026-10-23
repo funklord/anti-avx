@@ -3530,6 +3530,72 @@ val:	.float	46.5, 62.0
 """)
 
 
+# **A hammock's join, reached only from inside it.** The diamond is
+# `0x140fb4fb7` in Starfield: a backward hammock holds the three
+# `vmulss` arms, and the `vsubss` they join on is short with a target
+# after it, whose two ways in -- the `jne` and the `jmp` -- sit inside the
+# first window. Its forward hammock re-aims them inside the first stub.
+# Paths for ecx 0..4 give 8, 7, 6, 9 and 9, so 39 * 2 - 1; left alone
+# the `vsubss` faults with 29. Finding 374.
+PROGRAMS["stubreaim"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	val(%rip), %rsi
+	movss	0(%rsi), %xmm1
+	movss	4(%rsi), %xmm2
+	movss	8(%rsi), %xmm3
+	movss	12(%rsi), %xmm4
+	movss	16(%rsi), %xmm6
+	xorps	%xmm9, %xmm9
+	xorps	%xmm0, %xmm0
+	xorl	%r8d, %r8d
+next:
+	movl	%r8d, %ecx
+	movss	0(%rsi), %xmm7
+	testl	%ecx, %ecx
+	je	arm_da
+	subl	$1, %ecx
+	je	arm_d4
+	subl	$1, %ecx
+	je	arm_ce
+	cmpl	$1, %ecx
+	jne	join_e2
+	vsubss	%xmm1, %xmm6, %xmm0
+	jmp	join_e2
+arm_ce:
+	vmulss	%xmm4, %xmm1, %xmm0
+	jmp	join_de
+arm_d4:
+	vmulss	%xmm3, %xmm1, %xmm0
+	jmp	join_de
+arm_da:
+	vmulss	%xmm2, %xmm1, %xmm0
+join_de:
+	vsubss	%xmm0, %xmm6, %xmm0
+join_e2:
+	vmulss	%xmm0, %xmm7, %xmm7
+	addss	%xmm7, %xmm9
+	incl	%r8d
+	cmpl	$5, %r8d
+	jb	next
+	cvttss2si %xmm9, %eax
+	leal	-1(%rax,%rax), %eax
+	addq	$40, %rsp
+	ret
+	/* No padding within a rel8's reach, as in Starfield, or the arms
+	   take Finding 331's trampolines instead and nothing is tested. */
+	.fill	140, 1, 0x90
+func_end:
+	.p2align 4, 0xcc
+	int3
+	.p2align 4, 0xcc
+val:	.float	1.0, 2.0, 3.0, 4.0, 10.0
+""")
+
+
 # **Two windows with integer code between them, which the first stub now
 # runs itself rather than returning to `.text` for.** Each `vaddss` and
 # `vmulss` is exactly five bytes and three-operand, so both detour without
