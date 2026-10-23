@@ -7,7 +7,10 @@ Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 
 **Status:** the rewriter works. `tool/detour.py` rewrites **804,919 of 804,948 VEX
 sites -- 99.99%** -- through 203,245 detours, and every `make detour-verify` invariant
-holds on the result. **29 sites are left** (Finding 375, 2026-10-23), five more rows
+holds on the result. **29 sites are left** (Finding 375, 2026-10-23): 25 behind CPU
+gates that open only where the CPU runs them natively, so converting them is worth
+nothing, and 4 that can run here (*24 of the 33 left are behind a SIMD gate*, re-read
+2026-10-23). Five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
 (Findings 290, 347). All four figures come from the same run; the denominator and the 164
@@ -14376,18 +14379,30 @@ Three choosers turned up in Wwise, beside the CRT and checksum ones of Finding 5
 samples, the SSE convolution kernels took 1,045 and the SSE conversion defaults 37,
 while every gated kernel took none -- and `0x142d8e960`, loaded beside the gated three
 but installed on both paths, took 9, so the sampling does reach this code. A function
-taking no samples would prove nothing alone: all 33 survivors' functions took none,
-including `0x14374e650`, which Finding 367's crash shows does run. What separates the
-gated ones is their sibling being chosen instead.
+taking no samples would prove nothing alone: all 33 survivors' functions took none.
+What separates the gated ones is their sibling being chosen instead.
 
-So **24 sites sit behind a gate this host fails**: the 19 above and the five `vpermd`
-and `kmov` of Finding 5. Which CPUID bits feed the two Wwise masks is not traced; what is
-measured is that this host answers no, and the kernels they select need AVX2 or FMA
-natively, so a host that could pass them would not need this image. The F16C routine of
-`src/f16c.c` stays unwired for this reason. The nine that can run were `0x140f919ee`,
+~~`0x14374e650` runs, by Finding 367's crash.~~ **It is gated too**, re-read
+2026-10-23: that crash was at `0x14374e4f8`, inside `0x14374dda0` (`.pdata` ends it at
+`0x14374e64e`), and the only way into `0x14374e650` is the dispatcher at `0x14374dcc0`,
+`cmpl $0x5,__isa_available; jge` -- the CRT's AVX2 level. So `0x14374e704` is a
+gated site, not a runnable one.
+
+**The Wwise masks are now traced.** `0x142d64540` builds them from CPUID: `0x20` is
+leaf 1 ECX bit 28 (AVX), `0x40` bit 29 (F16C), and `0x80` is leaf 7 EBX bit 5 (AVX2),
+below SSE through SSE4.1 in `0x1`-`0x10`. The convolution gate's `0x60` is AVX with
+F16C and `0xc0` F16C with AVX2. Every gate therefore asks for at least what its
+kernel's surviving instructions use: the half-float conversions and `vptest` need
+AVX and F16C, the `vmulps` AVX, the `vfnmadd213ss` FMA under an AVX2 gate (every AVX2
+part has FMA), the `vpermd` and `kmov` AVX2 and AVX-512 under Finding 5's checks.
+
+So **25 sites sit behind a gate this host fails**, and converting them is worth
+nothing on any host: wherever a gate opens, the CPU runs what it guards natively.
+That includes an AVX-without-AVX2 host such as Ivy Bridge, which does need this image
+-- it passes the `0x60` gate and executes F16C itself. The F16C routine of
+`src/f16c.c` stays unwired for this reason. The runnable ones were `0x140f919ee`,
 `0x140fb4fde`, `0x1410e87b0`, `0x141b5758d`, `0x141df312d`, `0x141e33717`,
-`0x14272125f`, `0x142baa477` and `0x14374e704`; Findings 374 and 375 take two
-each.
+`0x14272125f` and `0x142baa477`; Findings 374 and 375 take two each, leaving four.
 
 ### Finding 370 -- a stub falls into the next stub instead of bouncing through `.text`
 
