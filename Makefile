@@ -625,11 +625,12 @@ detour: $(DETOURED)
 #
 # Termination: two bounded invocations over a fixed input, each under a
 # timeout. Roughly an hour, so it is not part of `check`.
-# Mode "teb" stands the block pointer up with two segment-prefixed absolute
-# saves instead of the callee home space, so it needs nothing from the
-# caller and moves no `rsp`. It is reached on Starfield where `lent is
-# None`, a frame state Finding 268 established cannot be built by hand --
-# so the path is FORCED here, on a fixture that would otherwise take mode
+# Mode "teb" stands the block pointer up with a segment-prefixed absolute
+# save instead of the callee home space -- one since Finding 372, the index
+# being a constant -- so it needs nothing from the caller and moves no
+# `rsp`. It is reached on Starfield where `lent is None`, a frame state
+# Finding 268 established cannot be built by hand -- so the path is
+# FORCED here, on a fixture that would otherwise take mode
 # "home", and the emission is asserted before the answer is believed.
 #
 # **The assertion is the point.** A fixture that answers 77 through mode
@@ -657,9 +658,9 @@ check-teb: $(BUILD_DIR)/pe-nogpr-320.exe
 	fi; \
 	saves=`objdump -d -j .avxsse $(BUILD_DIR)/sse-nogpr-teb.exe | \
 	       grep -cE "mov +%r[a-z0-9]+,%gs:0x"`; \
-	if [ "$$saves" -lt 2 ]; then \
+	if [ "$$saves" -lt 1 ]; then \
 		echo "check-teb: the stub holds $$saves segment-prefixed save(s),"; \
-		echo "           wanting 2 -- so the block did not stand up"; \
+		echo "           wanting 1 -- so the block did not stand up"; \
 		echo "           through the TEB and a 77 below means nothing"; \
 		exit 1; \
 	fi; \
@@ -677,8 +678,8 @@ check-teb: $(BUILD_DIR)/pe-nogpr-320.exe
 		echo "check-teb: the forced build returned $$got, want 77"; \
 		exit 1; \
 	fi; \
-	echo "check-teb: a block stood up on two segment-prefixed absolute"; \
-	echo "           saves, moved no rsp, and the answer survived"
+	echo "check-teb: a block stood up on a segment-prefixed absolute"; \
+	echo "           save, moved no rsp, and the answer survived"
 
 # **`--teb-scratch=auto` end to end, with the control that makes the 77
 # mean something.** The good image returns 77; the same build with the
@@ -705,9 +706,9 @@ check-teb-auto: tool/pe_build.py tool/detour.py | $(BUILD_DIR)
 	for kind in teb tebconst; do \
 		n=`objdump -d -j .avxsse $(BUILD_DIR)/sse-tebauto-$$kind.exe | \
 		   grep -c "gs:0x5b5b5b" || true`; \
-		if [ "$$n" -ne 4 ]; then \
+		if [ "$$n" -ne 2 ]; then \
 			echo "check-teb-auto: the $$kind build holds $$n TEB"; \
-			echo "                scratch reference(s), wanting 4 --"; \
+			echo "                scratch reference(s), wanting 2 --"; \
 			echo "                so it is not the path under test"; \
 			exit 1; \
 		fi; \
@@ -731,7 +732,7 @@ check-teb-auto: tool/pe_build.py tool/detour.py | $(BUILD_DIR)
 		echo "                what makes the good one work"; \
 		exit 1; \
 	fi; \
-	echo "check-teb-auto: two TlsAlloc slots carried a block pointer's"; \
+	echo "check-teb-auto: a TlsAlloc slot carried a block pointer's"; \
 	echo "                borrow; unpatched, the same stub died with $$bad"
 
 check-liveness: $(LISTING)

@@ -1403,6 +1403,9 @@ NEEDED_BORROW = True
 # Whether a stub whose jump home lands on the next stub's window falls
 # through into that stub instead. Finding 370.
 FALL_THROUGH = True
+# Whether a borrowed block pointer leaves the index register alone when
+# the index is a constant. Finding 372.
+SPARE_INDEX_RULE = True
 # Whether a site that borrows nothing opens the slot for a passenger that
 # does. Finding 364.
 PASSENGER_STACK_RULE = True
@@ -6099,11 +6102,18 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# bytes are. Both borrow two live registers and give them
 			# back, and the sequence between is identical. Finding 280.
 			keep = encode_gpr_home if mode == "home" else encode_gpr_teb
+			# **The index only where the chain reads one.** With the
+			# index a constant the chain is `block` alone, and saving and
+			# restoring the second register around it was two memory
+			# operations at 1,613 stubs for nothing. Finding 372.
+			index_saved = not (INDEX_CONST and SPARE_INDEX_RULE)
 			body += keep(block[0], True, block[4])
-			body += keep(block[1], True, block[4] + 8)
+			if index_saved:
+				body += keep(block[1], True, block[4] + 8)
 			body += encode_tls_base(block[0], block[1], block[2],
 			                        at + len(body))
-			body += keep(block[1], False, block[4] + 8)
+			if index_saved:
+				body += keep(block[1], False, block[4] + 8)
 		else:
 			body += encode_tls_base(block[0], block[1], block[2], at,
 			                        helper if mode else None)
@@ -17542,7 +17552,17 @@ def index_payload(data, blob, stub_base):
 			# this the 77 it returns is a green light with no shown
 			# ability to be anything else. Finding 297.
 			low, high = [], []
-		if len(low) != len(high):
+		# **Unless the index is a constant**, when the block is the one
+		# register saved and nothing may sit eight bytes above it: a
+		# high displacement then means an index save the rule should
+		# have dropped. Finding 372.
+		if INDEX_CONST and SPARE_INDEX_RULE:
+			if high:
+				raise SystemExit(
+					f"apply: {len(high):,} high TEB scratch "
+					f"displacement(s) with a constant index, which "
+					f"saves the block alone.")
+		elif len(low) != len(high):
 			raise SystemExit(
 				f"apply: {len(low):,} low and {len(high):,} high TEB "
 				f"scratch displacements; they are saved in pairs.")

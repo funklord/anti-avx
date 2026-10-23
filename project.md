@@ -14163,6 +14163,53 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 372 -- a borrowed block pointer saves one register, not two
+
+**A 600-second profile of f371 put the stubs at 5.8% of samples again**: 190,570
+samples, 62.1% in `.text`, 32.1% outside the image, 11,088 in `.avxsse`, about 0.6 of
+a core busy, so a lighter scene than Finding 370's. The packed `sin`/`cos` at
+`0x14374dda0` is new at the top, 96% of its 642 samples in stubs, then `0x1426b2018`
+at 84% and `0x1406fd53b` at 47%. No site holds more than 0.21%.
+
+**Classified by what each sampled stub instruction does, the cost is at the edges.**
+
+    copy opening a three-operand lowering   37.2%    211,725 instructions
+    real work                               26.6%    373,870
+    jumps                                   20.3%    110,261
+    stack saves and spills                   4.8%
+    upper halves moved through a GPR         4.5%
+    block pointer                            3.0%
+    slot loads and stores                    2.7%
+    TEB saves of a GPR                       0.9%
+
+A timer sample lands on the instruction after the one that stalled, so the copy that
+opens a stub carries the cost of the jump into it, from `.text` megabytes away. About
+57% is getting in and out; what the stubs do inside is mostly the work itself.
+**Reloads of a slot the register still holds** were the other suspect, in a Horner
+chain where the reload puts a store-forward on the critical path: 398 in the whole
+image and 16 samples, not worth a mechanism.
+
+**What was waste is the index register's save.** Where no GPR is dead, modes "home"
+and "teb" borrow two live ones and give them back, because the block pointer used to
+need a second register for the index. Since the index became a constant (Findings
+293 and 295) the chain is `block` alone, yet both were still saved and restored --
+two memory operations at 1,613 stubs, the `sin` among them. `SPARE_INDEX_RULE` drops
+the second pair. The stub section goes from 4,390,822 to 4,362,014 bytes, which is
+1,500 TEB pairs of 18 bytes and 113 home-space pairs of 16; the TEB index table
+loses its 3,000 high entries; every placement count is unchanged and `verify` passes.
+
+The structural witness that apply carried for the TEB tables -- low and high the same
+length, because a block saved two registers -- now asserts the opposite: with a
+constant index any high displacement is a save the rule missed, and apply refuses.
+`check-teb` wants one segment-prefixed save, `check-teb-auto` two references, and
+the auto control still dies with 5 unpatched. `nogpr` holds every GPR live, so its 77
+is also the witness that the unsaved register comes through intact.
+
+**The gain is about 0.03% of the process**, the TEB saves' whole share being 98
+samples. It is recorded because it was free and because the census above says where
+the rest is: the remaining lever is fewer round trips in the hot loops, which is
+placement design, not a peephole.
+
 ### Finding 371 -- a table of function RVAs is evidence that its leaves are entered
 
 **Twelve of the 45 sites left were two leaf functions nothing was known to call.**
