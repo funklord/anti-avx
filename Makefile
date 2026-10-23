@@ -235,7 +235,7 @@ check-shadow-pe:
 	            fmamem fma231 fma132 fmareg fmareg213 fmareg132 \
 	            fmasub fmaas fmasa fnmreg fnmmem blendv blendv0 blendvx0 \
 	            cmpconst cmpreg maskgpr pshufb1 fnm1 staleslot partslot \
-	            unaligned256 tramp256 savedstash; do \
+	            unaligned256 tramp256 savedstash unithammock unitpassenger; do \
 		$(PYTHON) tool/pe_build.py sample $$name \
 			$(BUILD_DIR)/pe-$$name-320.exe 320 >/dev/null; \
 		objdump -d -j .text $(BUILD_DIR)/pe-$$name-320.exe \
@@ -968,7 +968,7 @@ PE_NAMES   = aliasing memory branch ymm zerofill unrolled crossblock riprel \
              twostore loopcopy lowwrite zerorun loophead zerochain \
              swallowjmp condbefore rspcopy longpair splat constant constloop \
              mxcsr splatrun splatop extract shadowspill regionlive \
-             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim fwdhammock fwdspill shadowlea fwdalt rider stackride stackrsp permilmem stackflags stackpass chainstore leafsync closejcc cmpgt rvatable gaprun stubreaim hammockspill
+             tlsspill spanblock regioncarry swallowcall condswallow dataisland repairdrop conservative switchtable memsrc varshift lanealias tramp cmpimm hammock unaligned ripstore reaim fwdhammock fwdspill shadowlea fwdalt rider stackride stackrsp permilmem stackflags stackpass chainstore leafsync closejcc cmpgt rvatable gaprun stubreaim hammockspill fwdborrow swallowicall
 PE_SOURCES = $(PE_NAMES:%=$(BUILD_DIR)/pe-%.exe)
 PE_LISTINGS= $(PE_NAMES:%=$(BUILD_DIR)/pe-%.asm)
 PE_FIXED   = $(PE_NAMES:%=$(BUILD_DIR)/sse-%.exe)

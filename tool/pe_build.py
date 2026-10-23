@@ -1868,6 +1868,211 @@ hundred:	.float 100.0
 """)
 
 
+# **A forward hammock whose passenger borrows.** `fwdspill` with a second
+# aliased scalar between the site and the target, as at Starfield's
+# `0x141e33717`: `vminss` then `vmaxss`, each dst == src2, ahead of the
+# loop's join. Nothing is dead under the indirect jump, so the passenger
+# borrows too, and its bracket must close before `next`'s label. 10 - 3
+# = 7, plus 100 from the register the site borrows, plus 20 - 8 = 12 from
+# the passenger, plus a loop count of 20 taken back off: 119. Finding 376.
+PROGRAMS["fwdborrow"] = (119, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	movss	ten(%rip), %xmm1
+	movss	three(%rip), %xmm0
+	movss	hundred(%rip), %xmm2	/* the register the spill will borrow */
+	movss	twenty(%rip), %xmm6
+	movss	eight(%rip), %xmm5
+	xorl	%ecx, %ecx
+site:
+	vsubss	%xmm0, %xmm1, %xmm0	/* aliased, four bytes, 7.0 */
+	vsubss	%xmm5, %xmm6, %xmm5	/* aliased passenger, 12.0 */
+next:
+	addl	$10, %ecx		/* a target */
+	cltd
+	cmpl	$20, %ecx
+	jb	again
+	leaq	after(%rip), %rax
+	jmp	*%rax			/* indirect: nothing forward is provable */
+after:
+	addss	%xmm2, %xmm0
+	addss	%xmm5, %xmm0
+	addss	%xmm6, %xmm0
+	cvttss2si %xmm0, %eax
+	addl	%ecx, %eax
+	subl	$40, %eax
+	addq	$40, %rsp
+	ret
+again:
+	jmp	next			/* rel8, from below the window */
+	jmp	site			/* never run; a rel8 naming `site` from
+					   below, so no window may reach back */
+func_end:
+	.p2align 4
+three:	.float 3.0
+eight:	.float 8.0
+ten:	.float 10.0
+twenty:	.float 20.0
+hundred:	.float 100.0
+""")
+
+
+# **A 256-bit store held by a forward hammock.** The site is a target,
+# a conditional jump before it, so no window reaches back; the next
+# instruction is a target too, reached by a rel8 from below, so no unit
+# window reaches forward. As at Starfield's `0x140f919ee`, the store of
+# a register loaded at a loop's head. The load puts the upper half in
+# its slot and the store must read it from there: 64 + 8 from the upper
+# half, 1 from the lower, plus a loop count of 2 doubled. Finding 377.
+PROGRAMS["unithammock"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$136, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rcx
+	xorl	%edx, %edx
+	vmovups	(%rsi), %ymm2		/* the upper half goes to its slot */
+	testl	%edx, %edx
+	je	site			/* rel8: the site is a target */
+site:
+	vmovups	%ymm2, (%rcx)		/* four bytes */
+next:
+	addl	$1, %edx		/* a target */
+	cltq
+	cmpl	$2, %edx
+	jb	again
+	movl	16(%rcx), %eax		/* 64 */
+	addl	28(%rcx), %eax		/* 8 */
+	addl	(%rcx), %eax		/* 1 */
+	addl	%edx, %eax
+	addl	%edx, %eax
+	addq	$136, %rsp
+	ret
+again:
+	jmp	next			/* rel8, from below the window */
+	jmp	site			/* never run; a rel8 naming `site` from
+					   below, so no window may reach back */
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 64, 6, 7, 8
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
+# **A window that swallows an indirect call.** The site follows `call
+# *%rax` and its next instruction is a target, reached by a rel8 from
+# below, with a `jmp` too soon after it for a forward hammock's slot:
+# Starfield's `0x1410e87b0`, a `vdivss` after `call *0x8(%rax)`. Only
+# widening back over the call places it, so the call runs in the stub and
+# returns there. The callee doubles 3 to 6, the site adds 4, and the loop
+# runs twice: 10 + 2 + 65 = 77. Finding 378.
+PROGRAMS["swallowicall"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+	vzeroupper
+	leaq	double(%rip), %rax
+	movss	three(%rip), %xmm1
+	movss	four(%rip), %xmm2
+	xorl	%ecx, %ecx
+	call	*%rax			/* two bytes; doubles xmm1 */
+site:
+	vaddss	%xmm2, %xmm1, %xmm0	/* four bytes, 10.0 */
+next:
+	incl	%ecx			/* a target */
+	jmp	tail			/* closes a forward window too short */
+tail:
+	cmpl	$2, %ecx
+	jb	again
+	cvttss2si %xmm0, %eax
+	addl	%ecx, %eax
+	addl	$65, %eax
+	addq	$40, %rsp
+	ret
+again:
+	jmp	next			/* rel8, from below */
+double:
+	addss	%xmm1, %xmm1
+	ret
+func_end:
+	.p2align 4
+three:	.float 3.0
+four:	.float 4.0
+""")
+
+
+# **A forward hammock holding a 256-bit passenger.** Two arms load `ymm0`
+# and join at a 256-bit store, as at Starfield's `0x142baa477`: the second
+# arm's load is a target after a `jmp`, so nothing reaches back, and the
+# join is a target the first arm's short `jmp` reaches. The window takes
+# the store as a span of its own behind its label. The second arm runs:
+# 64 + 8 from the upper half, 1 from the lower, plus 4. Finding 379.
+PROGRAMS["unitpassenger"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$136, %rsp
+	vzeroupper
+	leaq	source(%rip), %rsi
+	movq	%rsp, %rcx
+	xorl	%edx, %edx
+	testl	%edx, %edx
+	je	site			/* taken */
+	vmovups	32(%rsi), %ymm0		/* the other arm, never run */
+	jmp	next			/* rel8: the join is a target */
+site:
+	vmovups	(%rsi), %ymm0		/* four bytes, a target */
+next:
+	vmovups	%ymm0, (%rcx)		/* four bytes, the join */
+	movl	16(%rcx), %eax		/* 64 */
+	addl	28(%rcx), %eax		/* 8 */
+	addl	(%rcx), %eax		/* 1 */
+	addl	$4, %eax
+	addq	$136, %rsp
+	ret
+func_end:
+	.p2align 5
+source:	.long 1, 2, 3, 4
+	.long 64, 6, 7, 8
+	.long 9, 9, 9, 9
+	.long 9, 9, 9, 9
+	.p2align 4
+tls_raw:
+	.long	0x55667788, 0x11223344
+	.long	0, 0
+tls_raw_end:
+tls_index:
+	.long	0
+	.long	0
+tls_callbacks:
+	.quad	0
+	.p2align 3
+tls_directory:
+	.quad	0, 0, 0, 0
+	.long	0, 0
+""")
+
+
 # **A forward hammock offered beside a backward one.** The second arm of an
 # if/else whose site is a branch target, so its own window is a backward
 # hammock starting on the `jne` -- and the `vmaxss` above takes that `jne`

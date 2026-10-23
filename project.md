@@ -5,11 +5,11 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
-**Status:** the rewriter works. `tool/detour.py` rewrites **804,919 of 804,948 VEX
-sites -- 99.99%** -- through 203,245 detours, and every `make detour-verify` invariant
-holds on the result. **29 sites are left** (Finding 375, 2026-10-23): 25 behind CPU
-gates that open only where the CPU runs them natively, so converting them is worth
-nothing, and 4 that can run here (*24 of the 33 left are behind a SIMD gate*, re-read
+**Status:** the rewriter works. `tool/detour.py` rewrites **804,923 of 804,948 VEX
+sites -- 99.99%** -- through 202,983 detours, and every `make detour-verify` invariant
+holds on the result. **25 sites are left** (Finding 379, 2026-10-23), every one behind
+a CPU gate that opens only where the CPU runs it natively, so converting them is worth
+nothing and none can run here (*24 of the 33 left are behind a SIMD gate*, re-read
 2026-10-23). Five more rows
 that read as VEX are switch-table bytes and not instructions, and 164
 further VEX-prefixed byte sequences decode to nothing and are not instructions
@@ -11915,12 +11915,12 @@ code quickly.
 
 ### Where it stands, 2026-10-09
 
-    default build                            29 re-measured   (Finding 375)
+    default build                            25 re-measured   (Finding 379)
     with --teb-scratch=off                2,337 as of 09-22    (Finding 309)
     with --teb-scratch=<offset>           2,526 as measured   (see below)
     previous default (--shadow-regs=off)  5,691 as measured   (see below)
 
-**804,919 of 804,948 VEX sites, 99.99%, through 203,245 detours**, and 164 further
+**804,923 of 804,948 VEX sites, 99.99%, through 202,983 detours**, and 164 further
 VEX-prefixed sequences decode to nothing and are not instructions. All nineteen
 `verify` checks pass. The one that asked whether a surviving 256-bit read takes an
 upper half the rewrite left stale is skipped by default since Finding 340, and says so. Re-derive the share from `build/text.asm` rather than
@@ -14166,6 +14166,60 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Findings 376 to 379 -- the last four sites that can run here
+
+**Four rules, one site each, and the frontier now holds only gated code.** Measured
+together on the full image (f379, 2026-10-23): 34 rows to 30, exactly the four, none
+arriving; detours 203,245 to 202,983. The 25 left all sit behind a CPU gate this host
+fails (*24 of the 33 left are behind a SIMD gate*). Each rule has an A/B switch and a
+fixture that answers right with it and 29 without; the image figures are the four
+together, attributed by which site each removes.
+
+**Finding 376, `PASSENGER_FALLBACK_RULE` -- a forward passenger may borrow through the
+stack.** `0x141e33717` is a `vminss` at a branch target whose next instruction, an
+aliased `vmaxss`, has nothing dead and no frame or TLS pair to borrow through.
+`build_stub` already opens sixteen bytes for such a passenger (Findings 359 and 364),
+but the collector asked only `swallowed_borrow`, which knows the frame and the TLS
+block and not the stack, so the passenger was refused before the emitter was asked.
+It is now offered the register its own spill would take, wherever the site has no
+strategy or a spill, and not where it addresses the stack. A first attempt went the
+long way, through the forward hammock, before it was clear the window only had to
+reach the join and hold nothing. Fixture `fwdborrow`, 119.
+
+**Finding 377, `UNIT_HAMMOCK_RULE` -- a 256-bit site may take a forward hammock.**
+`0x140f919ee` stores `ymm2` at a loop's exit: a target after a `jb`, with a target after
+it that a `jmp rel32` reaches. Its frontier reason, `ymm value has no known upper half`,
+was a reason carried from an older path; the upper half is in its slot, written by the
+load at `0x140f917e0`. What refused it was placement, since a hammock took no strategy
+but a spill. A unit span closes its block bracket before anything after it runs, which
+is Finding 354's argument for a spill, so `unit_candidate` builds the site alone with
+the hammock's passengers after the span, asking its GPR questions of the whole window
+and its helpers of the site. Fixture `unithammock` under `check-shadow-pe`, 77.
+
+**Finding 378, `INDIRECT_SWALLOW_RULE` -- a call through a register may be swallowed.**
+`0x1410e87b0` is a `vdivss` after `call *0x8(%rax)`, whose next instruction four branches
+reach, with no padding in reach. `moved_branch` refused anything indirect; through a
+register nothing depends on where the instruction sits, so a `call` or `jmp` that names
+no `%rip` is copied as it stands and the window widens back over it. The image runs 46
+such calls in stubs, against none before, beside 397 direct ones. **The open risk is the
+class Finding 86 opened**: a C++ exception thrown through such a call meets a return
+address in a stub, where `__CxxFrameHandler4` looks the state up by IP, and nothing here
+has measured what it finds. Fixture `swallowicall`, 77.
+
+**Finding 379, `UNIT_PASSENGER_RULE` -- a forward hammock may carry a 256-bit
+passenger.** `0x142baa477` is the second arm of a diamond that loads `ymm0`, and the join,
+a 256-bit store, is a target the first arm's `jmp rel8` reaches; nothing else fits
+between the two placed windows. The store is lowered as a span of its own, as
+`unit_candidate` lowers a site alone (`alone=True`), and emitted where the passenger
+goes, so the hammock's label sits in front of its block bracket and a branch in runs
+all of it. Fixture `unitpassenger` under `check-shadow-pe`, 77.
+
+**A verify of one build must run the code that built it.** The first image, f376, was
+applied with Finding 376 alone and verified an hour later, after 377 to 379 had been
+written, and `verify` failed nine checks: its model placed windows the image did not
+have. Nothing was wrong with the image. The build script runs apply and verify as
+separate processes, each importing the tree as it then is.
+
 ### Finding 375 -- a backward hammock may hold a site that borrows
 
 **Two more of the runnable sites were declined only because they borrow.**
@@ -14402,7 +14456,8 @@ That includes an AVX-without-AVX2 host such as Ivy Bridge, which does need this 
 -- it passes the `0x60` gate and executes F16C itself. The F16C routine of
 `src/f16c.c` stays unwired for this reason. The runnable ones were `0x140f919ee`,
 `0x140fb4fde`, `0x1410e87b0`, `0x141b5758d`, `0x141df312d`, `0x141e33717`,
-`0x14272125f` and `0x142baa477`; Findings 374 and 375 take two each, leaving four.
+`0x14272125f` and `0x142baa477`; Findings 374 and 375 take two each, and Findings
+376 to 379 one each, leaving none.
 
 ### Finding 370 -- a stub falls into the next stub instead of bouncing through `.text`
 

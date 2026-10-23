@@ -1424,6 +1424,19 @@ STUB_REAIM_RULE = True
 # Whether a backward hammock may hold a site that borrows a register.
 # Finding 375.
 HAMMOCK_SPILL_RULE = True
+# Whether a forward passenger with nothing dead and no frame or TLS pair
+# to borrow through is offered the stack. Finding 376.
+PASSENGER_FALLBACK_RULE = True
+# Whether a short 256-bit site whose next instruction is a target may
+# take a forward hammock, its unit span shut before the first label.
+# Finding 377.
+UNIT_HAMMOCK_RULE = True
+# Whether a `call` or `jmp` through a register or non-RIP memory may be
+# swallowed, copied as it stands. Finding 378.
+INDIRECT_SWALLOW_RULE = True
+# Whether a forward hammock may carry a 256-bit passenger, lowered as a
+# span of its own where it goes. Finding 379.
+UNIT_PASSENGER_RULE = True
 # {target: address} a branch re-emitted by `moved_branch` is aimed at
 # instead, set only while an earlier stub is rebuilt. Finding 374.
 STUB_REAIM = {}
@@ -3594,6 +3607,17 @@ def moved_branch(moved, mnemonic, operands, comment, address, at,
 			target = None
 	elif comment is not None and "*" in operands:
 		return None		# indirect: relocate's business, not this one
+	elif first.startswith("*") and "(%rip)" not in operands \
+			and mnemonic in ("call", "callq", "jmp", "jmpq") \
+			and INDIRECT_SWALLOW_RULE:
+		# **Through a register, nothing depends on where it sits**, so it
+		# copies across as it stands: the target is computed from the
+		# registers and memory the original reads, and a call pushes the
+		# stub's address, which the stub's chained unwind entry describes
+		# as it does for Finding 86's `call rel32`. `0x1410e87b0`, a
+		# `vdivss` after `call *0x8(%rax)` whose next instruction four
+		# branches reach. Finding 378.
+		return bytes(moved)
 	if target is None:
 		return None
 	# **A target inside the same window is the stub's copy of it.** The
@@ -8378,7 +8402,8 @@ def seat_unit(lone, slots):
 
 
 def unit_candidate(instructions, plain, index, blocked, home,
-                   ranges, scope, tls=None, limit=12, back=False):
+                   ranges, scope, tls=None, limit=12, back=False,
+                   ahead=None, alone=False):
 	"""A candidate lowering ONE 256-bit instruction, or None.
 
 	**The strategy none of the others is.** Every lowering above this one
@@ -8585,6 +8610,18 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# address nothing may reach.
 	last = index + 1
 	window = first_member
+	# **Or the site alone, with a forward hammock's passengers after it.**
+	# They are emitted after the span, whose block bracket is shut by
+	# then, so a branch to a label they hold skips nothing still open --
+	# Finding 354's argument for a spill. The window, and so every GPR and
+	# home-space question below, covers them; the helpers are asked of the
+	# site alone, since the span is over before the first passenger runs.
+	# See `UNIT_HAMMOCK_RULE`. Finding 377.
+	if ahead is not None or alone:
+		if back:
+			return refuse("a unit hammock reaches forward only")
+		window += sum(len(entry[1]) for entry in ahead or ())
+		limit = 0
 	while last - index < limit and last < len(instructions):
 		nxt_address, nxt_encoding, nxt_mnemonic, nxt_operands, _nc = \
 			instructions[last]
@@ -8644,7 +8681,8 @@ def unit_candidate(instructions, plain, index, blocked, home,
 				members.append(("plain", last, None))
 		window += len(nxt_encoding)
 		last += 1
-	if window < 5 and not unit_trampoline(back, last - index, address):
+	if window < 5 and not alone \
+			and not unit_trampoline(back, last - index, address):
 		return refuse("too short to place, nothing follows")
 
 	if not inplace.covered_by(ranges, window_start, window):
@@ -9016,7 +9054,8 @@ def unit_candidate(instructions, plain, index, blocked, home,
 	# boundaries lost that were not swallowed on purpose, every one a
 	# four-byte `vmovups %ymm0,(%rax)` behind a four-byte `vpxor`.
 	# Finding 277.
-	return (window_start, encoding, operands, mnemonic, window, [], None,
+	return (window_start, encoding, operands, mnemonic, window,
+	        list(ahead) if ahead is not None else [], None,
 	        [carried] if carried is not None else [],
 	        ("unit", (entries, first, block, base, second)))
 
@@ -10584,7 +10623,8 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	# that is already shut. A passenger that would borrow is refused in
 	# `forward_hammock`, so no block pointer is planted after it either.
 	# Finding 354.
-	if held and forward and kind not in (None, "spill"):
+	if held and forward and kind not in (None, "spill") \
+			and not (kind == "unit" and UNIT_HAMMOCK_RULE):
 		if reasons is not None:
 			reasons["a hammock with a strategy"] += 1
 		return None, 0
@@ -10904,10 +10944,23 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 			body += STACK_OPEN
 			prologue = len(body)
 			base = 0
-		fixed = emit_swallowed(entry, body, stub_address, pool,
-		                       spill_base, reasons, base,
-		                       block=passenger_block,
-		                       slot=tls[1] if tls is not None else 0)
+		if len(entry) > 7 and entry[7] is not None:
+			# A 256-bit passenger's own span. See `forward_hammock`.
+			# Finding 379.
+			wide_members, wide_helper, wide_block, wide_base, \
+				wide_second = entry[7][1]
+			fixed = lower_ymm_span(wide_members, wide_base, wide_helper,
+			                       stub_address + len(body), pool,
+			                       wide_block, wide_second)
+			if fixed is None:
+				if reasons is not None:
+					reasons["a 256-bit passenger will not lower"] += 1
+				return None, 0
+		else:
+			fixed = emit_swallowed(entry, body, stub_address, pool,
+			                       spill_base, reasons, base,
+			                       block=passenger_block,
+			                       slot=tls[1] if tls is not None else 0)
 		if fixed is None:
 			if reasons is not None:
 				reasons["a displaced instruction will not move"] += 1
@@ -11964,7 +12017,8 @@ def short_jump(instructions, positions, one, target, ranges, islands):
 
 
 def forward_hammock(instructions, plain, index, blocked, sources, scope,
-                    positions, ranges, islands, limit=4):
+                    positions, ranges, islands, limit=4, home=None,
+                    tls=None):
 	"""(displaced, held, outer, slots) for a window from the site forward.
 
 	The site is short and its next instruction is a branch target. The
@@ -12032,6 +12086,32 @@ def forward_hammock(instructions, plain, index, blocked, sources, scope,
 						return None, "a rel8 way in does not reach a slot"
 					outer[one] = (at, 2, slot)
 			held.append(at)
+		# **A 256-bit passenger is a span of its own.** It cannot be moved
+		# as it stands, so it is lowered as `unit_candidate` lowers the
+		# site alone, and `build_stub` emits that span where the passenger
+		# goes: its block bracket opens after any label in front of it and
+		# shuts before the next, so a branch in runs all of it. Its GPR and
+		# helper questions are asked of its own extent. `0x142baa477`, a
+		# 256-bit load whose next instruction, the store joining the two
+		# arms, a short jump reaches. Finding 379.
+		wide = inplace.decode_vex(moved)
+		if wide is not None and wide["L"] and UNIT_PASSENGER_RULE \
+				and home is not None and tls is not None:
+			kept = UNIT_REFUSED.copy(), {
+				why: list(seen) for why, seen in UNIT_EXAMPLES.items()}
+			unit = unit_candidate(instructions, plain, k, blocked, home,
+			                      ranges, scope, tls, alone=True)
+			UNIT_REFUSED.clear()
+			UNIT_REFUSED.update(kept[0])
+			UNIT_EXAMPLES.clear()
+			UNIT_EXAMPLES.update(kept[1])
+			if unit is None or unit[5] or unit[7]:
+				return None, "a 256-bit passenger will not lower"
+			displaced.append((at, moved, comment, operands, mnemonic, None,
+			                  False, unit[8]))
+			end = at + len(moved)
+			k += 1
+			continue
 		taken = swallowed_scratch(plain, k, at, moved, operands, mnemonic,
 		                          scope)
 		passenger = (at, moved, comment, operands, mnemonic, taken, False)
@@ -12125,6 +12205,7 @@ def collect(binary, listing, context=None):
 	and holds 16.5 million rows twice; the second copy is what ran `verify`
 	out of memory before it was noticed. One build, shared.
 	"""
+	global UNIT_REFUSED, UNIT_EXAMPLES
 	# A run reports its own numbers, not the previous one's.
 	OVERLAP_REFUSED.clear()
 	SAVED_XMM.clear()
@@ -12327,6 +12408,36 @@ def collect(binary, listing, context=None):
 			if lone is not None:
 				candidates.append(lone)
 				continue
+			# **Or hold what comes after it**, as a plain site's forward
+			# hammock does: the site is short, the next instruction is a
+			# target, and every rung refused. `0x140f919ee`, a 256-bit
+			# store at a loop's exit whose next instruction a `jmp` from
+			# above reaches, and whose own address a `jae` does. The
+			# refusal it would otherwise leave is the one already counted.
+			# Finding 377.
+			if UNIT_HAMMOCK_RULE and HAMMOCK_RULE and len(encoding) < 5 \
+					and index + 1 < len(instructions) \
+					and instructions[index + 1][0] in blocked:
+				ahead, plan = forward_hammock(
+					instructions, plain, index, blocked, sources, scope,
+					positions, ranges, islands, home=home,
+					tls=tls_slot_offset)
+				if ahead is not None:
+					kept = UNIT_REFUSED.copy(), {
+						why: list(seen)
+						for why, seen in UNIT_EXAMPLES.items()}
+					lone = unit_candidate(instructions, plain, index,
+					                      blocked, home, ranges, scope,
+					                      tls_slot_offset, ahead=ahead)
+					UNIT_REFUSED, UNIT_EXAMPLES = kept
+					if lone is not None and inplace.covered_by(
+							ranges, address, lone[4]):
+						HAMMOCK[address], HAMMOCK_REAIM[address], \
+							HAMMOCK_FORWARD[address] = plan
+						candidates.append(lone)
+						continue
+				else:
+					HAMMOCK_REFUSED["unit forward: " + plan] += 1
 		# **A slot-clearing writer has one way in.** Every other strategy
 		# would lower it without the clear, so it is offered as a unit
 		# window or not at all. See `CLEARING_WRITERS`.
@@ -13066,6 +13177,32 @@ def collect(binary, listing, context=None):
 							nxt_mnemonic, home,
 							None if tls_slot_offset is None
 							else (address, window + len(nxt_encoding)))
+					# **Or the stack, as the site itself would.** Neither
+					# the frame nor a TLS pair has to lend: `build_stub`
+					# opens sixteen bytes for a borrowing passenger where
+					# the site borrows nothing (Finding 364) and keeps the
+					# site's own open for it where the site spills to the
+					# stack (Finding 359). Only this collector never
+					# offered the borrow, so the passenger was refused
+					# first. Not for a passenger that addresses the stack,
+					# which both of those refuse. `0x141e33717`, a
+					# `vminss` whose next instruction is an aliased
+					# `vmaxss` and whose own address is a target. Finding
+					# 376.
+					if taken is None and borrow is None \
+							and PASSENGER_FALLBACK_RULE \
+							and SPILL == SPILL_TLS \
+							and FALLBACK_RULE == FALLBACK_ON \
+							and (strategy is None or strategy[0] == "spill") \
+							and not stack_bound((nxt_address, nxt_encoding,
+							                     nxt_comment, nxt_operands,
+							                     nxt_mnemonic)) \
+							and lower_vex(nxt_address, nxt_encoding,
+							              nxt_operands, nxt_mnemonic,
+							              nxt_address) is None:
+						borrow = borrow_that_lowers(
+							nxt_address, nxt_encoding, nxt_operands,
+							nxt_mnemonic, nxt_address)
 					passenger = (nxt_address, nxt_encoding, nxt_comment,
 					             nxt_operands, nxt_mnemonic,
 					             taken if borrow is None else borrow,
@@ -13226,7 +13363,8 @@ def collect(binary, listing, context=None):
 					and instructions[index + 1][0] in blocked:
 				ahead, plan = forward_hammock(
 					instructions, plain, index, blocked, sources, scope,
-					positions, ranges, islands)
+					positions, ranges, islands, home=home,
+					tls=tls_slot_offset)
 				if ahead is not None:
 					reason = None
 					displaced, preceding = ahead, []
@@ -13290,7 +13428,8 @@ def collect(binary, listing, context=None):
 				and address not in HAMMOCK and address not in HAMMOCK_REAIM:
 			ahead, plan = forward_hammock(
 				instructions, plain, index, blocked, sources, scope,
-				positions, ranges, islands)
+				positions, ranges, islands, home=home,
+				tls=tls_slot_offset)
 			if ahead is not None:
 				reach = ahead[-1][0] + len(ahead[-1][1]) - address
 				if inplace.covered_by(ranges, address, reach):
