@@ -14184,6 +14184,33 @@ this one. Arriving from `.text` is unchanged, and the previous stub has closed
 everything it opened before its jump, which is the state the next stub is entered in
 either way. The jump goes back if the next stub is refused. `FALL_THROUGH` is the A/B.
 
+**Timed per call, natively, the hot functions run two to three times faster.**
+Both images were loaded at their base by `function_sweep.c`'s loader, with
+placeholders filled as `function_oracle` fills them and xmm0-3 set as float
+arguments. Each function ran in batches of 2,000 calls on seeded inputs, pinned to
+one core, and the table keeps the fastest of 100 batches over five alternating
+rounds. The figures are f368 then f369:
+`0x140316a50` 116.5 to 36.0 ns, `0x140617dd0` 253.0 to 80.2,
+`0x142bd5000` 124.0 to 43.6, `0x140368fc0` 116.2 to 44.7, the sincos
+`0x1404a7f90` 81.3 to 34.9, and `0x140e4b7b0` 225.8 to 110.5. `0x14221d940` and
+`0x142bd87c0` did not move, at 16 and 11 ns, which on synthetic inputs probably
+means an early return rather than their hot path. Nine of the seventeen hottest
+functions fault on synthetic inputs in both images alike. A second profile of play
+put the stubs at 3.7% of samples, but it was a lighter scene (222,529 samples
+against 387,849), so the two profiles do not compare.
+
+**The game hangs on exit, and the rewrite is not what holds it.** Snapshots of
+the hung process, per-thread CPU time with ten seconds of `perf` between, give
+the same picture for f369 and for f368 from before Findings 369 and 370. The main
+thread loops on `PeekMessage`, yield and sleep. A dozen job threads spin in the
+game's own barrier at `0x1424042b6`-`0x1424042e6`, a `pause` and `Sleep(0)`/`Sleep(1)`
+loop on a counter at `0x208(%rdi)`, which is byte-identical to the original. 34 of
+9,109 and 59 of 11,031 samples fall in `.avxsse`, and the log shows no exception in
+the game process. Hangs on exit are a known Starfield-under-Proton complaint, and
+killing the game from Steam is the workaround. What this cannot exclude is a
+lowering earlier in the session that left a job unfinished. The test that would
+settle it, exiting the original, needs a CPU with AVX.
+
 ### Finding 369 -- a passenger borrows only when its lowering needs a register
 
 The same polynomial's stubs saved `%xmm0` to the stack and restored it around a
