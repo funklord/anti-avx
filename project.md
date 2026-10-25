@@ -14220,6 +14220,14 @@ written, and `verify` failed nine checks: its model placed windows the image did
 have. Nothing was wrong with the image. The build script runs apply and verify as
 separate processes, each importing the tree as it then is.
 
+**f379 played without a crash, 2026-10-25.** Installed as built, `cmp`-identical,
+launched through Steam and closed by the player after about 23 minutes (the Wine trace
+spans 13:14 to 13:37). The only exceptions in the trace are `DBG_PRINTEXCEPTION_C`
+from the game, which is debug output, and two RPC codes from Wine's plug-and-play
+service during shutdown -- none in `.avxsse`. A short session proves only the paths it
+ran: the indirect calls of Finding 378 under a C++ throw are still unmeasured, and longer
+play over loading, combat and saving is what would reach them.
+
 ### Finding 375 -- a backward hammock may hold a site that borrows
 
 **Two more of the runnable sites were declined only because they borrow.**
