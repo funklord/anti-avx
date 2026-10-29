@@ -2,47 +2,77 @@
 
 Ahead-of-time AVX to SSE binary translation for x86-64 PE executables.
 
-Modern MSVC builds routinely set a whole-program `/arch:AVX2` baseline. The
-compiler then emits VEX-encoded instructions everywhere -- including for
-ordinary scalar float maths that has nothing to do with vectorisation -- so
-the binary will not start on a pre-2011 CPU, and there is no fallback path for
-runtime CPU detection to select. `anti-avx` rewrites those instructions
-statically, once, offline, so the result runs natively rather than under
-emulation.
+A program compiled with a whole-program `/arch:AVX2` baseline will not start
+on a processor without AVX. The compiler is told it may assume the newer
+instructions everywhere. So it uses their encoding (VEX) for nearly every
+floating-point operation, scalar maths included, and not only in the
+code that benefits from wide vectors. There is no second copy of that
+code for older processors to fall back on. The first instruction an older
+CPU cannot decode raises an illegal-instruction fault, and the process dies
+in the first seconds of loading. Such processors, Westmere and earlier, are
+still fast enough to run much of that software.
 
-The driving case is Starfield on a Xeon X5675 (Westmere, SSE4.2, no AVX). The
-measured instruction mix says a translated binary should cost about **+1.34%
-in instruction count** and run within a few percent of native -- the
-performance argument against this approach does not hold.
+`anti-avx` rewrites the executable once, offline, so that it runs on such a
+machine natively. It disassembles the whole image and finds every VEX
+instruction. It replaces each with an equivalent sequence of the SSE
+instructions the older CPU does have, and writes a new executable that
+runs at full speed with no emulator underneath it. Most instructions have a
+direct older form. The rest need real work: the 256-bit registers have no
+older equivalent, so their upper halves are kept in per-thread memory.
+Instructions that grow too long to fit in place are moved out to stubs
+that jump back afterwards. The function tables Windows uses to unwind the
+stack and dispatch exceptions are extended, so that a fault or a C++ throw
+inside a moved instruction is handled exactly as it would have been in place.
 
-**Status: it rewrites. 99.7% of 804,951 VEX sites, and that is not enough.**
+The driving case is Starfield on a Xeon X5675 (Westmere, SSE4.2, no AVX).
+The unmodified game dies four seconds in. The rewritten one has been played
+through Steam under Proton, most recently for 23 minutes without a crash
+(2026-10-25).
 
-A translated binary that is 99.99% correct is worthless: the remaining 0.01%
-is a crash at an unpredictable moment. So the number to watch is not how much
-is translated but how much is left, and 2,687 sites are left.
+## What it does that the alternatives do not
 
-**Starfield has now been run, under Proton, and each run names the next site
-to work on.** The original dies on the first AVX instruction it executes.
-Wine's unwinder walked the rebuilt function table and produced a call stack
-identical to the original's for all eleven frames -- see `project.md`,
-Finding 74. The rewritten binary loaded 305 modules before it stopped, and
-each run has named the next piece of work -- five in a row. That is a
-frontier moving, not a game starting.
+What people do today without it is emulate, or give up.
 
-Those runs were made against an older default, `--shadow-regs=off`, which
-left 5,691 sites where the current one leaves 2,687. Nobody has run the
-new build under Proton, so the module count and the frontier address
-above describe a binary this tree no longer produces -- and the current
-one runs code of its own at load time, which that one did not.
+- **Intel SDE** runs an unmodified AVX program on any x86 CPU by
+  instrumenting it as it runs. It is the usual answer, and for games it has
+  been reported at around a frame a minute. anti-avx pays the cost of the
+  translation once, offline. In a 600-second profile of play, the rewritten
+  code accounted for 6.2% of the process's samples.
+- **Trap-and-emulate shims** catch each illegal-instruction fault and
+  interpret the one instruction. That costs a kernel round trip per
+  instruction executed, and Starfield has 804,948 VEX sites. anti-avx leaves no faults to catch:
+  804,923 of the 804,948 are rewritten. The 25 that remain sit behind the
+  program's own CPU checks, which take that path only on a processor that
+  can run it.
+- **QEMU, FEX-Emu and Box64** translate dynamically, and FEX and Box64 solve
+  the same 256-to-2x128 problem for ARM hosts. None targets the x86-to-x86
+  case. All of them translate again on every run, and none produces an
+  executable that runs without them.
+- **Static rewriters such as Egalito, Multiverse and RetroWrite** work on
+  ELF and do not lower instruction sets. anti-avx works on Windows PE. It
+  rebuilds `.pdata` and the unwind information as it moves code, which is
+  what lets Wine's unwinder produce the same eleven-frame call stack
+  through a rewritten image as through the original.
+- **Recompiling** needs the source, and a game ships without it.
 
-Nothing here is Starfield-specific except a Makefile default. The tools take
-the binary as an argument, read its PE headers, `.pdata` and relocations, and
-have been exercised end to end on thirty-three small PEs this project builds
-itself. Starfield is the corpus, not the target.
+**What it proves rather than assumes.** Each lowering is checked
+bit-for-bit, all sixteen registers, against the original instruction
+executed under qemu, since this machine cannot run the original itself.
+71 small PEs built by the tool itself must crash unmodified and run
+correctly once rewritten. A structural verifier re-derives every detour
+from the finished image.
 
-Read [`project.md`](project.md). It is the authoritative record of intent and
-wins over the code, and its "Picking this up again" section is written for
-someone starting cold.
+**What it does not do.** FMA becomes a multiply and an add, which rounds
+twice where the hardware rounds once (421 sites in Starfield). Bundled DLLs
+are not rewritten. A Steam executable has to be unpacked with Steamless
+first, because its DRM section disassembles as code that is not there.
+Nothing in the tool is specific to Starfield. It takes the binary as an
+argument and reads the PE headers, `.pdata` and relocations, so a game
+update means a fresh unpack and a rebuild.
+
+Read [`project.md`](project.md). It is the authoritative record of intent
+and wins over the code, and its "Picking this up again" section is written
+for someone starting cold.
 
 ## What exists
 
@@ -97,7 +127,7 @@ binary. `make clean` removes what it wrote, by name.
 
 ```sh
 make check        the gate: style, the lowering proof, and the C tests
-make check-pe     thirty-three PEs built here, rewritten, under wine
+make check-pe     seventy-one PEs built here, rewritten, under wine
 make check-spill  the four ways a stub can get a scratch register
 make check-tls    whether the loader gives us per-thread bytes if asked
 make check-unwind whether an exception can be dispatched from inside a stub
