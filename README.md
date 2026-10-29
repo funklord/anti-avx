@@ -25,9 +25,10 @@ stack and dispatch exceptions are extended, so that a fault or a C++ throw
 inside a moved instruction is handled exactly as it would have been in place.
 
 The driving case is Starfield on a Xeon X5675 (Westmere, SSE4.2, no AVX).
-The unmodified game dies four seconds in. The rewritten one has been played
-through Steam under Proton, most recently for 23 minutes without a crash
-(2026-10-25).
+The unmodified game dies four seconds in, and the rewritten one is played
+through Steam under Proton. Nothing in the tool is specific to it, though:
+the aim is any `/arch:AVX` or `/arch:AVX2` PE, with every VEX instruction
+the older CPU can reach rewritten.
 
 ## What it does that the alternatives do not
 
@@ -36,14 +37,14 @@ What people do today without it is emulate, or give up.
 - **Intel SDE** runs an unmodified AVX program on any x86 CPU by
   instrumenting it as it runs. It is the usual answer, and for games it has
   been reported at around a frame a minute. anti-avx pays the cost of the
-  translation once, offline. In a 600-second profile of play, the rewritten
-  code accounted for 6.2% of the process's samples.
+  translation once, offline. Profiles of play put the time spent in the
+  rewritten code at a few per cent.
 - **Trap-and-emulate shims** catch each illegal-instruction fault and
   interpret the one instruction. That costs a kernel round trip per
-  instruction executed, and Starfield has 804,948 VEX sites. anti-avx leaves no faults to catch:
-  804,923 of the 804,948 are rewritten. The 25 that remain sit behind the
-  program's own CPU checks, which take that path only on a processor that
-  can run it.
+  instruction executed, and Starfield has about 805,000 VEX sites.
+  anti-avx leaves no faults to catch. The only VEX code it leaves in place
+  sits behind the program's own CPU checks, which take that path only on a
+  processor that can run it.
 - **QEMU, FEX-Emu and Box64** translate dynamically, and FEX and Box64 solve
   the same 256-to-2x128 problem for ARM hosts. None targets the x86-to-x86
   case. All of them translate again on every run, and none produces an
@@ -58,17 +59,18 @@ What people do today without it is emulate, or give up.
 **What it proves rather than assumes.** Each lowering is checked
 bit-for-bit, all sixteen registers, against the original instruction
 executed under qemu, since this machine cannot run the original itself.
-71 small PEs built by the tool itself must crash unmodified and run
-correctly once rewritten. A structural verifier re-derives every detour
+Small PEs built by the project itself, one per hazard found, must crash
+unmodified and run correctly once rewritten. A structural verifier re-derives every detour
 from the finished image.
 
 **What it does not do.** FMA becomes a multiply and an add, which rounds
 twice where the hardware rounds once (421 sites in Starfield). Bundled DLLs
 are not rewritten. A Steam executable has to be unpacked with Steamless
 first, because its DRM section disassembles as code that is not there.
-Nothing in the tool is specific to Starfield. It takes the binary as an
-argument and reads the PE headers, `.pdata` and relocations, so a game
-update means a fresh unpack and a rebuild.
+The tool takes the binary as an argument and reads the PE headers,
+`.pdata` and relocations, so a game update means a fresh unpack and a
+rebuild. A new build can contain shapes of code no earlier one had, and
+each of those is new work for the rewriter.
 
 Read [`project.md`](project.md). It is the authoritative record of intent
 and wins over the code, and its "Picking this up again" section is written
@@ -127,7 +129,7 @@ binary. `make clean` removes what it wrote, by name.
 
 ```sh
 make check        the gate: style, the lowering proof, and the C tests
-make check-pe     seventy-one PEs built here, rewritten, under wine
+make check-pe     the PEs built here, rewritten, under wine
 make check-spill  the four ways a stub can get a scratch register
 make check-tls    whether the loader gives us per-thread bytes if asked
 make check-unwind whether an exception can be dispatched from inside a stub
