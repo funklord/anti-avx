@@ -23237,6 +23237,16 @@ starting from Capstone. Ddisasm produces *reassembleable* disassembly with an ex
 IR designed for rewriting passes, and handles x64 PE. Steps 1 and 4 are the bulk of
 the difficulty and are exactly what it exists to solve.
 
+**A bare `make` compiles `src/` and runs nothing** (2026-10-29, the holder's rule that
+a bare make builds the software and nothing else). Until then `all` was `check`, so it
+ran the style gate, `lower.py verify` and the whole suite. The rewriter is Python and
+has no build step, and the four objects from `src/` are the only compiled code the
+tree has, so they are what `all` builds; nothing links them into the rewritten image.
+The gates are `make check`.
+The product, the rewritten image, is `make detour`, which needs the game binary that
+is not in the repository and takes about an hour. Both stay out of the default for
+those reasons.
+
 ---
 
 ## Lowering rules

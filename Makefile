@@ -8,6 +8,11 @@
 # `scan` -- the target that reproduces every figure in project.md from the
 # binary itself.
 #
+# A bare `make` compiles src/ and runs nothing. The rewriter is Python and
+# needs no build, so those four objects are the only software here a build
+# can produce; the gates are `check`, and the rewritten image is `detour`,
+# which needs the game binary and about an hour.
+#
 # `scan` is the only target here that does real work, and it is deliberately
 # not part of `all` or `check`: it needs a 102 MB game binary that is not in
 # the repository, and it writes about 0.9 GB. Both are reasons to ask for it
@@ -79,7 +84,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         detour-plan detour-verify hooks clean \
         distclean help
 
-all: check
+all: $(OBJS)
 
 # `check` is what must pass before committing. There is no test suite yet,
 # so it is the gate alone -- and it deliberately does not depend on `scan`,
@@ -1667,6 +1672,7 @@ distclean: clean
 
 help:
 	@echo 'Targets:'
+	@echo '  all         (default) compile src/; runs nothing'
 	@echo '  check       the style gate -- what must pass before committing'
 	@echo '  style       indentation, whitespace and document checks'
 	@echo '  verify      assemble every lowering rule; prove no VEX survives'
