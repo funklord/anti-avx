@@ -1097,6 +1097,7 @@ class Frame:
 	opened_on_label: bool		# the opening line was itself a label
 	access_shift: int | None	# the class's access style, once learned
 	line_no: int			# where it opened
+	stmt_level: int			# the statement level in force when it opened
 
 
 def convert_c(text: str, width: int,
@@ -1505,7 +1506,8 @@ def convert_c(text: str, width: int,
 						                   else shifts.get(line_no)),
 						opened_on_label = line_is_label,
 						access_shift    = None,
-						line_no         = line_no))
+						line_no         = line_no,
+						stmt_level      = stmt_level))
 					pending_switch = False
 					linkage_extern = False
 					linkage_spec = False
@@ -1535,8 +1537,15 @@ def convert_c(text: str, width: int,
 					# reading the spaces as alignment. The tool rejected
 					# correct code, the code was bent to satisfy the tool,
 					# and the tool went quiet.
+					# And it gives back the statement level it found. A braced
+					# initialiser inside a call's parens -- `g(a == QList<int>{1,`
+					# with `2}` and then `&& b);` -- starts a line of its own
+					# inside the brace, which takes the brace's level as the
+					# statement's; without this the continuation after the
+					# `}` kept it and was reported a tab too shallow.
+					# Reported from raidcfgd 2026-11-02.
 					if stack:
-						stack.pop()
+						stmt_level = stack.pop().stmt_level
 					virtual = stack[-1].virtual if stack else 0
 					await_body = False
 					inline_body = False

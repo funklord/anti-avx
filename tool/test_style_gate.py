@@ -547,6 +547,21 @@ class BracedInitialiser(unittest.TestCase):
 		self.assertEqual(self.gate(
 			"void f(void)\n{\n\tconst int a[] = {1,\n\t\t2};\n}\n"), 0)
 
+	# raidcfgd 2026-11-02: an initialiser as a call argument. The line after
+	# its `}` continues the call, and was reported a tab too shallow because
+	# the brace's inner line had taken over the statement's level.
+	def test_a_continuation_after_an_initialiser_argument_is_accepted(self):
+		self.assertEqual(self.gate(
+			"void f(void)\n{\n\tint n = g(a\n\t          == h{1,\n"
+			"\t               2}\n\t        && b);\n}\n"), 0)
+
+	# And the level given back is the statement's, not any level: the same
+	# continuation a tab deeper is still wrong.
+	def test_a_continuation_after_an_initialiser_still_holds_its_level(self):
+		self.assertNotEqual(self.gate(
+			"void f(void)\n{\n\tint n = g(a\n\t          == h{1,\n"
+			"\t               2}\n\t\t\t&& b);\n}\n"), 0)
+
 	# The control the first attempt chose, and it was the wrong one: it is
 	# drawn from the construct being IMITATED rather than the one being
 	# changed, so it could not catch a regression in brace handling. Kept
