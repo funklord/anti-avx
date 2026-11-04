@@ -55,7 +55,7 @@ import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, NoReturn
+from typing import Any, Iterator, NoReturn
 
 try:
 	import tomllib as _tomllib
@@ -1780,7 +1780,7 @@ def fix_file(path: Path, cfg: Config, write: bool) -> tuple[bool, str | None]:
 _DOC_TOKEN = re.compile(r"`([A-Za-z0-9._/-]+)`")
 
 
-def outside_fences(text: str):
+def outside_fences(text: str) -> Iterator[tuple[int, str]]:
 	"""(number, line) for every line not inside a CLOSED fenced block.
 
 	Both document checks read prose, and neither could tell prose from a

@@ -38,19 +38,19 @@ def tabs(source: str, width: int = 8) -> list[int]:
 class LexerModel(unittest.TestCase):
 	"""convert_c is the model; the checker compares tab counts against it."""
 
-	def test_plain_nesting(self):
+	def test_plain_nesting(self) -> None:
 		self.assertEqual(tabs("int f(void) {\n\tif (x) {\n\t\tg();\n\t}\n}\n"),
 		                 [0, 1, 2, 1, 0])
 
-	def test_switch_case_bodies_sit_one_deeper(self):
+	def test_switch_case_bodies_sit_one_deeper(self) -> None:
 		src = "void f(void) {\n\tswitch (x) {\n\tcase 1:\n\t\tg();\n\t}\n}\n"
 		self.assertEqual(tabs(src), [0, 1, 1, 2, 1, 0])
 
-	def test_braceless_body_is_a_level(self):
+	def test_braceless_body_is_a_level(self) -> None:
 		self.assertEqual(tabs("void f(void) {\n\tif (x)\n\t\tg();\n}\n"),
 		                 [0, 1, 2, 0])
 
-	def test_a_body_on_its_heads_line_continues_at_that_line(self):
+	def test_a_body_on_its_heads_line_continues_at_that_line(self) -> None:
 		"""beerssh, 2026-10-09: `else e = v ? a` with `: b;` aligned under
 		the `?` was reported a tab too shallow. The braceless level opened
 		on the head's line stayed open across the continuation, so the
@@ -70,7 +70,7 @@ class LexerModel(unittest.TestCase):
 			with self.subTest(head=head):
 				self.assertEqual(tabs(src), [0, 1, 1, 1, 0])
 
-	def test_braceless_loop_keeps_its_body_past_an_inner_block(self):
+	def test_braceless_loop_keeps_its_body_past_an_inner_block(self) -> None:
 		"""qtty, 2026-08-27: a braceless loop whose body is a block
 		containing another block lost the outer body at the inner closing
 		brace, and every following line was reported a tab too deep.
@@ -94,7 +94,7 @@ class LexerModel(unittest.TestCase):
 		       "}\n")
 		self.assertEqual(tabs(src), [0, 1, 2, 3, 4, 3, 3, 2, 1, 0])
 
-	def test_a_brace_that_serves_a_braceless_body_ends_it(self):
+	def test_a_brace_that_serves_a_braceless_body_ends_it(self) -> None:
 		"""The other side of the same restore, and the reason it is the
 		ENCLOSING frame's floor rather than the popped frame's: once the
 		block that was the braceless body closes, that body is over.
@@ -130,7 +130,7 @@ class LexerModel(unittest.TestCase):
 		       "}\n")
 		self.assertEqual(tabs(src), [0, 1, 2, 3, 1, 2, 2, 2, 1, 0])
 
-	def test_extern_c_block_opens_no_level(self):
+	def test_extern_c_block_opens_no_level(self) -> None:
 		"""fuzznet, 2026-08-20: a linkage block inflated the level for the
 		whole header, surfacing as scattered findings on any line carrying
 		alignment -- 79 residual lines across seven headers once fixed."""
@@ -140,7 +140,7 @@ class LexerModel(unittest.TestCase):
 		       "}\n")
 		self.assertEqual(tabs(src), [0, 0, 0, 0])
 
-	def test_extern_c_on_a_definition_still_indents(self):
+	def test_extern_c_on_a_definition_still_indents(self) -> None:
 		"""hydra, 2026-08-23: the first fix marked ANY brace after the
 		linkage string transparent, and 47 JNI entry points -- extern "C"
 		JNIEXPORT void f(...) { ... } -- were reported at the wrong depth.
@@ -152,7 +152,7 @@ class LexerModel(unittest.TestCase):
 		       "}\n")
 		self.assertEqual(tabs(src)[3:], [1, 0])
 
-	def test_namespace_block_opens_no_level(self):
+	def test_namespace_block_opens_no_level(self) -> None:
 		"""qtty, 2026-08-27: code-style.md's own worked example for this
 		rule conformed when saved verbatim and reported two violations when
 		a namespace was wrapped round it, nothing else changed. A namespace
@@ -172,7 +172,7 @@ class LexerModel(unittest.TestCase):
 		       "}\n")
 		self.assertEqual(tabs(src), [0, 0, 0, 1, 1, 1, 0, 0])
 
-	def test_namespace_variants_all_open_no_level(self):
+	def test_namespace_variants_all_open_no_level(self) -> None:
 		"""Anonymous, nested-name and inline namespaces are the same brace.
 		The name sits between the keyword and the brace and is an
 		identifier, so -- unlike extern "C" -- an identifier must NOT clear
@@ -186,7 +186,7 @@ class LexerModel(unittest.TestCase):
 			       "}\n")
 			self.assertEqual(tabs(src), [0, 0, 1, 1, 0, 0], head)
 
-	def test_namespace_without_a_block_leaves_the_next_brace_alone(self):
+	def test_namespace_without_a_block_leaves_the_next_brace_alone(self) -> None:
 		"""`using namespace std;` and `namespace x = a::b;` both name a
 		namespace and open nothing. If the pending state survived the
 		semicolon the NEXT brace in the file would be made transparent,
@@ -202,7 +202,7 @@ class LexerModel(unittest.TestCase):
 			       "};\n")
 			self.assertEqual(tabs(src), [0, 0, 1, 2, 2, 1, 0], head)
 
-	def test_define_continuation_is_alignment_not_structure(self):
+	def test_define_continuation_is_alignment_not_structure(self) -> None:
 		"""fuzznet, 2026-08-14: a multi-line CHECK macro was reported as
 		mis-indented because the lexer rewrote a backslash-continued
 		directive's lines to the structural level around it."""
@@ -217,14 +217,14 @@ class LexerModel(unittest.TestCase):
 		       "}\n")
 		self.assertEqual(tabs(src), [0, 1, 2, 3, 1, 0, 0, 1, 0])
 
-	def test_raw_string_contents_are_not_code(self):
+	def test_raw_string_contents_are_not_code(self) -> None:
 		"""hydra embeds whole JavaScript programs in raw strings; walking
 		into one once produced 775 findings in four files, none real."""
 		src = ('const char *js = R"( { if (x) { } } )";\n'
 		       "int f(void) {\n\tg();\n}\n")
 		self.assertEqual(tabs(src), [0, 0, 1, 0])
 
-	def test_conversion_is_whitespace_only(self):
+	def test_conversion_is_whitespace_only(self) -> None:
 		"""The reindent proof used for every spread of the lexer fix:
 		content must be identical once leading whitespace is stripped."""
 		src = ('extern "C" {\n'
@@ -240,28 +240,28 @@ class Floor(unittest.TestCase):
 	"""The collapse floor, redesigned 2026-08-26 after decaying to between
 	22% and 80% of the real count across fourteen projects."""
 
-	def test_fraction_passes_a_healthy_tree(self):
+	def test_fraction_passes_a_healthy_tree(self) -> None:
 		self.assertFalse(sg.collapse(8, 10, {"floor": 0.5}))
 
-	def test_fraction_fires_on_a_collapse(self):
+	def test_fraction_fires_on_a_collapse(self) -> None:
 		self.assertTrue(sg.collapse(2, 10, {"floor": 0.5}))
 
-	def test_absolute_form_still_works(self):
+	def test_absolute_form_still_works(self) -> None:
 		self.assertTrue(sg.collapse(1, 10, {"floor": 2}))
 		self.assertFalse(sg.collapse(3, 10, {"floor": 2}))
 
-	def test_floor_of_one_point_zero_is_refused(self):
+	def test_floor_of_one_point_zero_is_refused(self) -> None:
 		"""1.0 reads as the old default and would demand every raw path be
 		gated; the validator refuses it rather than reinterpreting it."""
 		problems = sg.type_problems({"floor": 1.0})
 		self.assertTrue(any("floor" in p for p in problems))
 
-	def test_valid_shapes_are_accepted(self):
+	def test_valid_shapes_are_accepted(self) -> None:
 		self.assertEqual(sg.type_problems({"floor": 0.4}), [])
 		self.assertEqual(sg.type_problems({"floor": 30}), [])
 		self.assertTrue(sg.type_problems({"floor": True}))
 
-	def test_raw_of_zero_fires_before_either_shape(self):
+	def test_raw_of_zero_fires_before_either_shape(self) -> None:
 		"""raidcfgd, 2026-08-26: `count < floor * 0` is `0 < 0`, which is
 		False, so the fractional floor passed total collapse -- strictly
 		weaker there than the absolute form it replaced. Zero raw is judged
@@ -269,7 +269,7 @@ class Floor(unittest.TestCase):
 		self.assertTrue(sg.collapse(0, 0, {"floor": 0.4}))
 		self.assertTrue(sg.collapse(0, 0, {"floor": 1}))
 
-	def test_floor_count_computes_files_for_both_shapes(self):
+	def test_floor_count_computes_files_for_both_shapes(self) -> None:
 		"""The collapse message used to print the raw fraction -- "expected
 		at least 0.35" -- the right number in the wrong unit. floor_count
 		is the one place the threshold is computed in files."""
@@ -280,21 +280,42 @@ class Floor(unittest.TestCase):
 
 
 class LineRules(unittest.TestCase):
-	def test_trailing_whitespace_and_space_before_tab(self):
+	def test_trailing_whitespace_and_space_before_tab(self) -> None:
 		problems = sg.check_text("int x; \n \tint y;\n", Path("t.c"))
 		kinds = {p.message for p in problems}
 		self.assertTrue(any("trailing" in k for k in kinds))
 		self.assertTrue(any("space before tab" in k for k in kinds))
 
-	def test_clean_text_reports_nothing(self):
+	def test_clean_text_reports_nothing(self) -> None:
 		self.assertEqual(sg.check_text("int x;\n\tint y;\n", Path("t.c"),
 		                               heuristic=False), [])
+
+
+def gate_rc(files: dict[str, str], config: str) -> int:
+	"""The gate's exit status over `files` in a scratch tree.
+
+	A function rather than a method borrowed by assignment, which is what
+	five classes did -- `run_gate = None` at class level, then
+	`Cls.run_gate = EndToEnd.run_gate` below it -- and which no type
+	checker can follow.
+	"""
+	with tempfile.TemporaryDirectory() as d:
+		root = Path(d)
+		(root / ".style-gate.toml").write_text(config)
+		for name, text in files.items():
+			path = root / name
+			path.parent.mkdir(parents=True, exist_ok=True)
+			path.write_text(text)
+		gate = Path(__file__).resolve().parent / "style_gate.py"
+		return subprocess.run(
+			[sys.executable, str(gate), "check"],
+			cwd=root, capture_output=True).returncode
 
 
 class EndToEnd(unittest.TestCase):
 	"""The gate as a subprocess, the way fourteen Makefiles run it."""
 
-	def run_gate_err(self, files: dict[str, str], config: str):
+	def run_gate_err(self, files: dict[str, str], config: str) -> tuple[int, str]:
 		with tempfile.TemporaryDirectory() as d:
 			root = Path(d)
 			(root / ".style-gate.toml").write_text(config)
@@ -308,29 +329,19 @@ class EndToEnd(unittest.TestCase):
 			return r.returncode, r.stderr
 
 	def run_gate(self, files: dict[str, str], config: str) -> int:
-		with tempfile.TemporaryDirectory() as d:
-			root = Path(d)
-			(root / ".style-gate.toml").write_text(config)
-			for name, text in files.items():
-				path = root / name
-				path.parent.mkdir(parents=True, exist_ok=True)
-				path.write_text(text)
-			gate = Path(__file__).resolve().parent / "style_gate.py"
-			return subprocess.run(
-				[sys.executable, str(gate), "check"],
-				cwd=root, capture_output=True).returncode
+		return gate_rc(files, config)
 
-	def test_conformant_tree_passes(self):
+	def test_conformant_tree_passes(self) -> None:
 		rc = self.run_gate({"a.c": "int f(void) {\n\treturn 0;\n}\n"},
 		                   "floor = 0.1\n")
 		self.assertEqual(rc, 0)
 
-	def test_violation_fails(self):
+	def test_violation_fails(self) -> None:
 		rc = self.run_gate({"a.c": "int f(void) {\n        return 0;\n}\n"},
 		                   "floor = 0.1\n")
 		self.assertNotEqual(rc, 0)
 
-	def test_unlexable_file_reports_its_byte_finding_alone(self):
+	def test_unlexable_file_reports_its_byte_finding_alone(self) -> None:
 		"""situ's suite pinned this when the shadow fix overshot: a file
 		the tokeniser refuses is checked as bytes, and that one finding
 		must stand alone -- the later checks lean on literal exemptions
@@ -341,7 +352,7 @@ class EndToEnd(unittest.TestCase):
 		findings = [l for l in err.splitlines() if l.startswith("a.py:")]
 		self.assertEqual(len(findings), 1, findings)
 
-	def test_lexable_python_ascii_is_checked_through_the_tokeniser(self):
+	def test_lexable_python_ascii_is_checked_through_the_tokeniser(self) -> None:
 		"""fuzznet, 2026-09-05: wiring this suite into `make check` and
 		then sabotaging it. Neutering `python_ascii_problems` to return
 		no findings silenced the gate on a VALID Python file whose em
@@ -368,7 +379,7 @@ class EndToEnd(unittest.TestCase):
 		self.assertRegex(err, r"non-ASCII")
 		self.assertIn("a.py:1:", err)
 
-	def test_ascii_finding_does_not_shadow_indent_findings(self):
+	def test_ascii_finding_does_not_shadow_indent_findings(self) -> None:
 		"""hembygd, 2026-08-26: check_file returned at the ASCII block,
 		so one em dash suppressed every indentation finding in the file --
 		371 findings across 7 files became 3347 across 48 once the dashes
@@ -384,7 +395,7 @@ class EndToEnd(unittest.TestCase):
 		self.assertRegex(err, r"structure says|space-indented")
 		self.assertRegex(err, r"ASCII|ascii|U\+2014|0xe2")
 
-	def test_exclude_glob_matches_per_component(self):
+	def test_exclude_glob_matches_per_component(self) -> None:
 		"""bbq-predictor, 2026-08-28: an ABI-suffixed build directory
 		needed one literal exclude per ABI, and hydra carried a stale
 		unsuffixed literal for weeks. A glob entry covers every ABI and
@@ -396,7 +407,7 @@ class EndToEnd(unittest.TestCase):
 			'floor = 0.1\nexclude = ["build-android-*"]\n')
 		self.assertEqual(rc, 0)
 
-	def test_exclude_literal_still_exact(self):
+	def test_exclude_literal_still_exact(self) -> None:
 		"""A literal must not become a prefix match: excluding "build"
 		may not swallow build-android. Proven by a violation planted
 		inside build-android that must still be REPORTED -- a conformant
@@ -407,7 +418,7 @@ class EndToEnd(unittest.TestCase):
 			'floor = 0.1\nexclude = ["build"]\n')
 		self.assertNotEqual(rc, 0)
 
-	def test_exclude_collapse_fails_not_passes(self):
+	def test_exclude_collapse_fails_not_passes(self) -> None:
 		"""The floor's whole purpose: an exclude that swallows the sources
 		must be a red run, not a clean one."""
 		files = {f"src/f{i}.c": "int f%d(void) {\n\treturn %d;\n}\n" % (i, i)
@@ -431,9 +442,10 @@ class GitDiscovery(unittest.TestCase):
 	def make_repo(self, root: Path) -> None:
 		env = dict(os.environ,
 		           GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
-		run = lambda *args: subprocess.run(
-			["git", "-C", str(root)] + list(args),
-			env=env, capture_output=True, check=True)
+
+		def run(*args: str) -> None:
+			subprocess.run(["git", "-C", str(root)] + list(args),
+			               env=env, capture_output=True, check=True)
 		run("init", "-q")
 		(root / ".style-gate.toml").write_text("floor = 0.1\n")
 		(root / "a.c").write_text("int f(void) {\n\treturn 0;\n}\n")
@@ -441,19 +453,19 @@ class GitDiscovery(unittest.TestCase):
 		run("-c", "user.name=t", "-c", "user.email=t@t.invalid",
 		    "commit", "-q", "-m", "t")
 
-	def run_gate(self, root: Path) -> subprocess.CompletedProcess:
+	def run_gate(self, root: Path) -> subprocess.CompletedProcess[str]:
 		gate = Path(__file__).resolve().parent / "style_gate.py"
 		return subprocess.run([sys.executable, str(gate), "check"],
 		                      cwd=root, capture_output=True, text=True)
 
-	def test_healthy_repository_still_passes(self):
+	def test_healthy_repository_still_passes(self) -> None:
 		with tempfile.TemporaryDirectory() as d:
 			root = Path(d)
 			self.make_repo(root)
 			out = self.run_gate(root)
 			self.assertEqual(out.returncode, 0, out.stderr)
 
-	def test_truncated_index_is_a_broken_instrument_not_a_pass(self):
+	def test_truncated_index_is_a_broken_instrument_not_a_pass(self) -> None:
 		with tempfile.TemporaryDirectory() as d:
 			root = Path(d)
 			self.make_repo(root)
@@ -481,7 +493,7 @@ class GitDiscovery(unittest.TestCase):
 	# place and both make rev-parse exit 128 with "not a git repository",
 	# which is the whole of what the caller can see.
 	@unittest.skipIf(os.geteuid() == 0, "root ignores the mode bits")
-	def test_unreadable_repository_is_not_a_tree_without_one(self):
+	def test_unreadable_repository_is_not_a_tree_without_one(self) -> None:
 		with tempfile.TemporaryDirectory() as d:
 			root = Path(d)
 			self.make_repo(root)
@@ -500,7 +512,7 @@ class GitDiscovery(unittest.TestCase):
 	# rev-parse too, with the same message, and it must still walk. That is
 	# the case the fallback was built for and refusing it would break every
 	# tree that has not been initialised yet.
-	def test_a_tree_with_no_git_still_walks(self):
+	def test_a_tree_with_no_git_still_walks(self) -> None:
 		with tempfile.TemporaryDirectory() as d:
 			root = Path(d)
 			(root / ".style-gate.toml").write_text("floor = 0.1\n")
@@ -529,35 +541,33 @@ class BracedInitialiser(unittest.TestCase):
 	change must not touch.
 	"""
 
-	def gate(self, body):
-		return self.run_gate({"a.c": body}, "floor = 0.1\n")
+	def gate(self, body: str) -> int:
+		return gate_rc({"a.c": body}, "floor = 0.1\n")
 
-	run_gate = None		# bound below, to reuse EndToEnd's helper
-
-	def test_an_aligned_brace_continuation_is_accepted(self):
+	def test_an_aligned_brace_continuation_is_accepted(self) -> None:
 		self.assertEqual(self.gate(
 			"void f(void)\n{\n\tconst int a[] = {1,\n\t                 2};\n}\n"), 0)
 
-	def test_a_designated_initialiser_aligns_the_same_way(self):
+	def test_a_designated_initialiser_aligns_the_same_way(self) -> None:
 		self.assertEqual(self.gate(
 			"void f(void)\n{\n\tstruct s v = {.x = 1,\n\t              .y = 2};\n}\n"), 0)
 
 	# raidcfgd's form. The first attempt broke exactly this, in 764 places.
-	def test_a_tab_indented_brace_continuation_is_still_accepted(self):
+	def test_a_tab_indented_brace_continuation_is_still_accepted(self) -> None:
 		self.assertEqual(self.gate(
 			"void f(void)\n{\n\tconst int a[] = {1,\n\t\t2};\n}\n"), 0)
 
 	# raidcfgd 2026-11-02: an initialiser as a call argument. The line after
 	# its `}` continues the call, and was reported a tab too shallow because
 	# the brace's inner line had taken over the statement's level.
-	def test_a_continuation_after_an_initialiser_argument_is_accepted(self):
+	def test_a_continuation_after_an_initialiser_argument_is_accepted(self) -> None:
 		self.assertEqual(self.gate(
 			"void f(void)\n{\n\tint n = g(a\n\t          == h{1,\n"
 			"\t               2}\n\t        && b);\n}\n"), 0)
 
 	# And the level given back is the statement's, not any level: the same
 	# continuation a tab deeper is still wrong.
-	def test_a_continuation_after_an_initialiser_still_holds_its_level(self):
+	def test_a_continuation_after_an_initialiser_still_holds_its_level(self) -> None:
 		self.assertNotEqual(self.gate(
 			"void f(void)\n{\n\tint n = g(a\n\t          == h{1,\n"
 			"\t               2}\n\t\t\t&& b);\n}\n"), 0)
@@ -566,14 +576,14 @@ class BracedInitialiser(unittest.TestCase):
 	# drawn from the construct being IMITATED rather than the one being
 	# changed, so it could not catch a regression in brace handling. Kept
 	# because it must still hold, not because it discriminates.
-	def test_a_paren_continuation_is_unaffected(self):
+	def test_a_paren_continuation_is_unaffected(self) -> None:
 		self.assertEqual(self.gate(
 			"void f(void)\n{\n\tg(1,\n\t  2);\n}\n"), 0)
 
 	# The one that stops this being a general loosening. Accepting "either
 	# of two levels" must not become "any level": a continuation one level
 	# deeper than the indented form is still wrong and still reported.
-	def test_a_continuation_deeper_than_either_form_is_still_reported(self):
+	def test_a_continuation_deeper_than_either_form_is_still_reported(self) -> None:
 		self.assertNotEqual(self.gate(
 			"void f(void)\n{\n\tconst int a[] = {1,\n\t\t\t2};\n}\n"), 0)
 
@@ -588,7 +598,7 @@ class BracedInitialiser(unittest.TestCase):
 	# that marked every brace, proving nothing. This body is one tab plus
 	# alignment: shallow by exactly one, and carrying columns enough to be
 	# reported at all rather than falling into the flush-line branch.
-	def test_a_brace_with_no_content_after_it_is_not_dual(self):
+	def test_a_brace_with_no_content_after_it_is_not_dual(self) -> None:
 		src = ("void f(void)\n{\n\tconst int a[] = {\n"
 		       "\t                 1,\n\t};\n}\n")
 		self.assertNotEqual(self.gate(src), 0)
@@ -609,7 +619,7 @@ class BracedInitialiser(unittest.TestCase):
 	# continuation is accepted now, and a bare block was not disturbed
 	# getting there. The synthetic test above pins the second property
 	# from the other direction, by sabotage; this pins it by construction.
-	def test_the_construct_that_produced_the_report(self):
+	def test_the_construct_that_produced_the_report(self) -> None:
 		self.assertEqual(self.gate(
 			"void f(void)\n"
 			"{\n"
@@ -621,8 +631,6 @@ class BracedInitialiser(unittest.TestCase):
 			"\t}\n"
 			"}\n"), 0)
 
-
-BracedInitialiser.run_gate = EndToEnd.run_gate
 
 
 class LambdaInBracelessBody(unittest.TestCase):
@@ -649,9 +657,9 @@ class LambdaInBracelessBody(unittest.TestCase):
 	"""
 
 	def gate(self, src: str) -> int:
-		return self.run_gate({"a.cpp": src}, "floor = 0.1\n")
+		return gate_rc({"a.cpp": src}, "floor = 0.1\n")
 
-	def test_the_fault_correct_code_is_accepted(self):
+	def test_the_fault_correct_code_is_accepted(self) -> None:
 		src = ("void f(int n)\n{\n"
 		       "\tfor (int y = 0; y < n; ++y)\n"
 		       "\t\tfor (int x = 0; x < n; ++x) {\n"
@@ -662,7 +670,7 @@ class LambdaInBracelessBody(unittest.TestCase):
 		       "\t\t}\n}\n")
 		self.assertEqual(self.gate(src), 0)
 
-	def test_the_shape_the_bug_demanded_is_now_rejected(self):
+	def test_the_shape_the_bug_demanded_is_now_rejected(self) -> None:
 		"""qtty's real construct, as the bug deformed it.
 
 		Reduced from src/graphics/graphics.cpp, which is where this was
@@ -688,7 +696,7 @@ class LambdaInBracelessBody(unittest.TestCase):
 		       "\t\t}\n}\n")
 		self.assertNotEqual(self.gate(src), 0)
 
-	def test_the_braced_control_still_conforms(self):
+	def test_the_braced_control_still_conforms(self) -> None:
 		"""qtty's control: the identical lambda under a BRACED loop.
 
 		It conformed before the fix and must still, or the fix has moved
@@ -703,7 +711,7 @@ class LambdaInBracelessBody(unittest.TestCase):
 		       "\t}\n}\n")
 		self.assertEqual(self.gate(src), 0)
 
-	def test_a_lambda_that_is_the_braceless_body_is_unmoved(self):
+	def test_a_lambda_that_is_the_braceless_body_is_unmoved(self) -> None:
 		"""The case the first attempt broke, in the shape twelve trees write.
 
 		The lambda's call IS the braceless `if`'s body, so its brace does
@@ -718,7 +726,7 @@ class LambdaInBracelessBody(unittest.TestCase):
 		       "\t});\n}\n")
 		self.assertEqual(self.gate(src), 0)
 
-	def test_a_brace_that_is_the_braceless_body_still_takes_its_level(self):
+	def test_a_brace_that_is_the_braceless_body_still_takes_its_level(self) -> None:
 		"""The rule the fix must not undo, from the shipped fix's own case."""
 		src = ("void f(int n)\n{\n"
 		       "\tfor (int i = 0; i < n; i++)\n"
@@ -728,20 +736,18 @@ class LambdaInBracelessBody(unittest.TestCase):
 		       "\t\t}\n}\n")
 		self.assertEqual(self.gate(src), 0)
 
-	def test_an_aligned_continuation_under_a_braceless_body(self):
+	def test_an_aligned_continuation_under_a_braceless_body(self) -> None:
 		"""What the await_body attempt broke: a continued argument."""
 		src = ("void f(void)\n{\n\tif (a)\n"
 		       "\t\tg(\"x\"\n\t\t  \"y\");\n}\n")
 		self.assertEqual(self.gate(src), 0)
 
-	def test_a_lambda_argument_with_no_braceless_level_anywhere(self):
+	def test_a_lambda_argument_with_no_braceless_level_anywhere(self) -> None:
 		"""No pending body at all: the decrement was never in play."""
 		src = ("void f(void)\n{\n\tsingle(1, [&] {\n"
 		       "\t\tg();\n\t});\n}\n")
 		self.assertEqual(self.gate(src), 0)
 
-
-LambdaInBracelessBody.run_gate = EndToEnd.run_gate
 
 
 class UnderIndentation(unittest.TestCase):
@@ -761,29 +767,29 @@ class UnderIndentation(unittest.TestCase):
 	"""
 
 	def gate(self, src: str, cfg: str = "floor = 0.1\n") -> int:
-		return self.run_gate({"a.cpp": src}, cfg)
+		return gate_rc({"a.cpp": src}, cfg)
 
 	# --- the blindness itself, which is what this closes -------------
-	def test_a_short_line_is_reported(self):
+	def test_a_short_line_is_reported(self) -> None:
 		self.assertNotEqual(self.gate(
 			"void f(void)\n{\n\tif (a) {\n\tg();\n\t}\n}\n"), 0)
 
-	def test_a_file_with_no_tabs_at_all_is_reported(self):
+	def test_a_file_with_no_tabs_at_all_is_reported(self) -> None:
 		"""It reported that it conformed. Nothing else in the suite asks."""
 		self.assertNotEqual(self.gate(
 			"void f(void)\n{\nif (a) {\ng();\n}\n}\n"), 0)
 
-	def test_a_whole_block_short_by_one_is_reported(self):
+	def test_a_whole_block_short_by_one_is_reported(self) -> None:
 		self.assertNotEqual(self.gate(
 			"void f(void)\n{\n\tif (a) {\n\t\tif (b) {\n"
 			"\t\tg();\n\t\t}\n\t}\n}\n"), 0)
 
-	def test_correct_code_stays_clean(self):
+	def test_correct_code_stays_clean(self) -> None:
 		self.assertEqual(self.gate(
 			"void f(void)\n{\n\tif (a) {\n\t\tg();\n\t}\n}\n"), 0)
 
 	# --- the switch model the blindness was hiding -------------------
-	def test_a_braced_case_body_is_one_level_below_its_label(self):
+	def test_a_braced_case_body_is_one_level_below_its_label(self) -> None:
 		"""Not two. The brace and `case_extra` were both counted.
 
 		Invisible before, because counting twice can only ask for MORE
@@ -793,33 +799,33 @@ class UnderIndentation(unittest.TestCase):
 			"void f(int a)\n{\n\tswitch (a) {\n\t\tcase 1: {\n"
 			"\t\t\tg();\n\t\t}\n\t}\n}\n"), 0)
 
-	def test_labels_at_the_switch_level_conform(self):
+	def test_labels_at_the_switch_level_conform(self) -> None:
 		"""2815 switches in this workspace, against 108 the other way."""
 		self.assertEqual(self.gate(
 			"void f(int a)\n{\n\tswitch (a) {\n\tcase 1:\n"
 			"\t\tg();\n\t\tbreak;\n\t}\n}\n"), 0)
 
-	def test_labels_one_deeper_conform_too(self):
+	def test_labels_one_deeper_conform_too(self) -> None:
 		"""Both styles are legal; the model learns, it does not rule."""
 		self.assertEqual(self.gate(
 			"void f(int a)\n{\n\tswitch (a) {\n\t\tcase 1:\n"
 			"\t\t\tg();\n\t\t\tbreak;\n\t}\n}\n"), 0)
 
-	def test_a_switch_indented_two_ways_is_reported(self):
+	def test_a_switch_indented_two_ways_is_reported(self) -> None:
 		"""Learning a style is not standing down: the switch must keep it."""
 		self.assertNotEqual(self.gate(
 			"void f(int a)\n{\n\tswitch (a) {\n\tcase 1:\n\t\tg();\n"
 			"\t\tbreak;\n\t\tcase 2:\n\t\tg();\n\t\tbreak;\n"
 			"\t}\n}\n"), 0)
 
-	def test_a_comment_introducing_a_label_sits_with_the_label(self):
+	def test_a_comment_introducing_a_label_sits_with_the_label(self) -> None:
 		"""157 lines in one qtty file were reported for this alone."""
 		self.assertEqual(self.gate(
 			"int f(int m)\n{\n\tswitch (m) {\n"
 			"\t// why the next one is what it is\n"
 			"\tcase 1:\n\t\treturn 1;\n\t}\n}\n"), 0)
 
-	def test_a_comment_before_the_first_label_does_not_crash(self):
+	def test_a_comment_before_the_first_label_does_not_crash(self) -> None:
 		"""It did. The learning pass had nothing to add yet and added None.
 
 		The sweep that should have caught it counted findings by grepping,
@@ -831,14 +837,14 @@ class UnderIndentation(unittest.TestCase):
 			"\tcase 1:\n\t\treturn 1;\n\t}\n}\n"), 0)
 
 	# --- labels on a block rather than a switch ----------------------
-	def test_access_specifiers_conform_either_way(self):
+	def test_access_specifiers_conform_either_way(self) -> None:
 		"""732 level with the members, 642 one out."""
 		self.assertEqual(self.gate(
 			"class X {\npublic:\n\tX();\nprivate:\n\tint m_a;\n};\n"), 0)
 		self.assertEqual(self.gate(
 			"class Y {\n\tpublic:\n\tY();\n};\n"), 0)
 
-	def test_goto_labels_conform_either_way(self):
+	def test_goto_labels_conform_either_way(self) -> None:
 		"""3689 level with the statement, 48 one out."""
 		self.assertEqual(self.gate(
 			"int f(void)\n{\n\tint r = 0;\n\tgoto out;\nout:\n"
@@ -847,13 +853,11 @@ class UnderIndentation(unittest.TestCase):
 			"int g(void)\n{\n\tint r = 0;\n\tgoto out;\n\tout:\n"
 			"\treturn r;\n}\n"), 0)
 
-	def test_a_member_short_of_the_class_level_is_still_reported(self):
+	def test_a_member_short_of_the_class_level_is_still_reported(self) -> None:
 		"""The label may move. What follows it may not."""
 		self.assertNotEqual(self.gate(
 			"class X {\npublic:\n\tX();\nvoid f();\n};\n"), 0)
 
-
-UnderIndentation.run_gate = EndToEnd.run_gate
 
 
 class PythonStructuralDepth(unittest.TestCase):
@@ -877,47 +881,47 @@ class PythonStructuralDepth(unittest.TestCase):
 	"""
 
 	def gate(self, src: str) -> int:
-		return self.run_gate({"a.py": src}, "floor = 0.1\nindent_width = 4\n")
+		return gate_rc({"a.py": src}, "floor = 0.1\nindent_width = 4\n")
 
-	def test_a_block_over_indented_as_a_whole_is_reported(self):
+	def test_a_block_over_indented_as_a_whole_is_reported(self) -> None:
 		"""Valid Python, and the case the sabotage control was built on."""
 		self.assertNotEqual(self.gate(
 			"def f(a):\n\tif a:\n\t\t\tx = 1\n\t\t\treturn x\n"
 			"\treturn 0\n"), 0)
 
-	def test_a_statement_under_indented_is_reported(self):
+	def test_a_statement_under_indented_is_reported(self) -> None:
 		self.assertNotEqual(self.gate("def f(a):\n\tif a:\n\treturn 1\n"), 0)
 
-	def test_correct_code_stays_clean(self):
+	def test_correct_code_stays_clean(self) -> None:
 		self.assertEqual(self.gate(
 			"def f(a):\n\tif a:\n\t\treturn 1\n\treturn 0\n"), 0)
 
-	def test_space_before_tab_is_still_caught(self):
+	def test_space_before_tab_is_still_caught(self) -> None:
 		self.assertNotEqual(self.gate(
 			"def f(a, b):\n\treturn g(a,\n \t       b)\n"), 0)
 
 	# --- continuations, which this must NOT hold to a depth -----------
-	def test_an_aligned_continuation_conforms(self):
+	def test_an_aligned_continuation_conforms(self) -> None:
 		self.assertEqual(self.gate(
 			"def f(a, b):\n\treturn g(a,\n\t         b)\n"), 0)
 
-	def test_a_hanging_indent_conforms(self):
+	def test_a_hanging_indent_conforms(self) -> None:
 		"""20998 continuation rows in this workspace are hung one tab."""
 		self.assertEqual(self.gate(
 			"def f(a, b):\n\treturn g(a,\n\t\tb)\n"), 0)
 
-	def test_a_deeper_hanging_indent_conforms(self):
+	def test_a_deeper_hanging_indent_conforms(self) -> None:
 		"""2847 are hung two, 424 three, 64 four. None of them is wrong."""
 		self.assertEqual(self.gate(
 			"def f(a, b):\n\treturn g(a,\n\t\t\tb)\n"), 0)
 
-	def test_a_nested_literal_conforms(self):
+	def test_a_nested_literal_conforms(self) -> None:
 		"""Nesting varies the tab count WITHIN one logical line, which is
 		why per-logical-line consistency cannot be the rule either."""
 		self.assertEqual(self.gate(
 			'X = {\n\t"k": {\n\t\t"a": 1,\n\t},\n}\n'), 0)
 
-	def test_a_comment_inside_a_continuation_is_left_alone(self):
+	def test_a_comment_inside_a_continuation_is_left_alone(self) -> None:
 		"""It has no structural depth, so its own column decides -- and
 		deciding means leaving it, not dividing its column by the width.
 		Dividing reported 43 lines across four trees, all of them right."""
@@ -925,7 +929,7 @@ class PythonStructuralDepth(unittest.TestCase):
 			"def f(s):\n\treturn [e for e in s\n\t        if e\n"
 			"\t        # why this one is excluded\n\t        and e.ok]\n"), 0)
 
-	def test_alignment_carried_in_tabs_is_NOT_caught(self):
+	def test_alignment_carried_in_tabs_is_NOT_caught(self) -> None:
 		"""The limit, pinned, because the entry that asked for this
 		expected it to be the whole job.
 
@@ -941,8 +945,6 @@ class PythonStructuralDepth(unittest.TestCase):
 		self.assertEqual(self.gate(
 			"def f(a, b):\n\treturn g(a,\n\t\t\t     b)\n"), 0)
 
-
-PythonStructuralDepth.run_gate = EndToEnd.run_gate
 
 
 class RustIsGated(unittest.TestCase):
@@ -967,26 +969,26 @@ class RustIsGated(unittest.TestCase):
 	"""
 
 	def gate(self, src: str, name: str = "a.rs") -> int:
-		return self.run_gate({name: src}, "floor = 0.1\nascii_only = true\n")
+		return gate_rc({name: src}, "floor = 0.1\nascii_only = true\n")
 
-	def test_clean_rust_passes(self):
+	def test_clean_rust_passes(self) -> None:
 		self.assertEqual(self.gate("fn main() {\n\tlet x = 1;\n}\n"), 0)
 
-	def test_rust_is_inspected_at_all(self):
+	def test_rust_is_inspected_at_all(self) -> None:
 		"""The whole finding: it was in no list, so nothing read it."""
 		self.assertNotEqual(self.gate("fn main() {\n\tlet x = 1;   \n}\n"), 0)
 
-	def test_space_before_tab_is_caught(self):
+	def test_space_before_tab_is_caught(self) -> None:
 		self.assertNotEqual(self.gate("fn main() {\n \tlet x = 1;\n}\n"), 0)
 
-	def test_missing_final_newline_is_caught(self):
+	def test_missing_final_newline_is_caught(self) -> None:
 		self.assertNotEqual(self.gate("fn main() {\n\tlet x = 1;\n}"), 0)
 
-	def test_non_ascii_is_caught(self):
+	def test_non_ascii_is_caught(self) -> None:
 		self.assertNotEqual(self.gate(
 			"fn main() {\n\t// an em dash \u2014 here\n}\n"), 0)
 
-	def test_the_column_rule_is_stood_down(self):
+	def test_the_column_rule_is_stood_down(self) -> None:
 		"""The deliberate miss, pinned.
 
 		A space-indented Rust line is NOT reported, because the rule that
@@ -997,12 +999,10 @@ class RustIsGated(unittest.TestCase):
 		"""
 		self.assertEqual(self.gate("fn main() {\n    let x = 1;\n}\n"), 0)
 
-	def test_usage_text_in_a_literal_is_not_a_finding(self):
+	def test_usage_text_in_a_literal_is_not_a_finding(self) -> None:
 		self.assertEqual(self.gate(
 			'fn main() {\n\tlet h = "usage:\\n    -v  verbose\\n";\n}\n'), 0)
 
-
-RustIsGated.run_gate = EndToEnd.run_gate
 
 
 class RetabColumnArithmetic(unittest.TestCase):
@@ -1031,7 +1031,7 @@ class RetabColumnArithmetic(unittest.TestCase):
 	implementation happens to return.
 	"""
 
-	def test_a_tab_advances_to_the_next_stop_not_by_a_whole_width(self):
+	def test_a_tab_advances_to_the_next_stop_not_by_a_whole_width(self) -> None:
 		for line, width, want in (
 			("  \tx", 8, 8),		# 2 spaces then a tab: 8, not 10
 			("   \tx", 8, 8),		# beerssh's case: 8, not 11
@@ -1045,7 +1045,7 @@ class RetabColumnArithmetic(unittest.TestCase):
 			                 "%r at width %d" % (line, width))
 			self.assertEqual(rest, "x")
 
-	def test_the_remainder_is_the_line_after_the_indent(self):
+	def test_the_remainder_is_the_line_after_the_indent(self) -> None:
 		"""The other half of the pair it returns, which nothing else
 		asserts either."""
 		col, rest = sg.split_leading_ws("\t\treturn 0\n", 8)
@@ -1087,12 +1087,12 @@ class ColumnHeuristicIsReached(unittest.TestCase):
 			                   capture_output=True, text=True)
 			return r.returncode, r.stdout + r.stderr
 
-	def test_a_space_indented_line_is_refused_where_there_is_no_fixer(self):
+	def test_a_space_indented_line_is_refused_where_there_is_no_fixer(self) -> None:
 		rc, out = self.gate("function f()\n    return 0\nend\n", "a.lua")
 		self.assertNotEqual(rc, 0, out)
 		self.assertIn("space-indented line; use tabs", out)
 
-	def test_the_same_file_tab_indented_passes(self):
+	def test_the_same_file_tab_indented_passes(self) -> None:
 		"""The other half of the pair, and it is not decoration: a gate
 		that refused every `.lua` would satisfy the case above and be
 		useless. Only the pair says the rule reads the indent."""
@@ -1132,25 +1132,25 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 			                   capture_output=True, text=True, timeout=120)
 			return r.returncode, r.stdout + r.stderr
 
-	def test_a_missing_document_is_refused(self):
+	def test_a_missing_document_is_refused(self) -> None:
 		"""The whole finding: this used to pass, and name the file."""
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n"})
 		self.assertNotEqual(rc, 0, out)
 		self.assertIn("no such file", out)
 
-	def test_a_missing_document_is_not_called_clean(self):
+	def test_a_missing_document_is_not_called_clean(self) -> None:
 		"""The words matter here more than the exit code, because the
 		sentence is what a reader takes away."""
 		_, out = self.docs({".style-gate.toml": "floor = 0.1\n"})
 		self.assertNotIn("says nothing twice", out)
 
-	def test_a_present_document_still_passes(self):
+	def test_a_present_document_still_passes(self) -> None:
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
 		                     "project.md": "# One\n\nsome prose\n"})
 		self.assertEqual(rc, 0, out)
 		self.assertIn("says nothing twice", out)
 
-	def test_the_verdict_carries_a_population(self):
+	def test_the_verdict_carries_a_population(self) -> None:
 		"""A verdict with no count cannot tell a clean document from one
 		nothing looked at -- which is the argument `check` already makes
 		one mode over, with its file count and its floor."""
@@ -1158,7 +1158,7 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		                    "project.md": "# One\n## Two\n### Three\n"})
 		self.assertIn("3 heading(s)", out)
 
-	def test_the_population_moves_with_the_document(self):
+	def test_the_population_moves_with_the_document(self) -> None:
 		"""Pinning the half that would otherwise rot silently: if the count
 		were a constant, or the extractor stopped matching, this is the
 		test that notices."""
@@ -1169,7 +1169,7 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		self.assertIn("1 heading(s)", few)
 		self.assertIn("4 heading(s)", many)
 
-	def test_the_verdict_carries_the_document_SIZE(self):
+	def test_the_verdict_carries_the_document_SIZE(self) -> None:
 		"""Measured 2026-10-09: thirteen of twenty-one private trees have a
 		`project.md` larger than a context window, so the figure a reader
 		needs is how long the thing is, not only how much of it was
@@ -1182,7 +1182,7 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		# figure being present rather than about which form it took.
 		self.assertIn("token", out)
 
-	def test_the_document_size_moves_with_the_document(self):
+	def test_the_document_size_moves_with_the_document(self) -> None:
 		"""The control. A constant, or a figure read from the wrong file,
 		passes the test above and fails this one -- which is the only way
 		to tell a measurement from a sentence that looks like one."""
@@ -1200,14 +1200,14 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		self.assertNotIn("k tokens", small)
 		self.assertIn("k tokens", big)
 
-	def test_a_final_line_without_a_newline_still_counts(self):
+	def test_a_final_line_without_a_newline_still_counts(self) -> None:
 		"""`count("\\n")` alone loses the last line of a document that does
 		not end in one, which is how a figure goes quietly wrong by one."""
 		_, out = self.docs({".style-gate.toml": "floor = 0.1\n",
 		                    "project.md": "# One\n## Two"})
 		self.assertIn("2 line(s)", out)
 
-	def test_a_FAILING_document_still_reports_its_size(self):
+	def test_a_FAILING_document_still_reports_its_size(self) -> None:
 		"""The mode returns on the first problem, so before this the trees
 		with something wrong in them were the only ones that never saw
 		their own figure -- and those are the ones worth measuring.
@@ -1218,7 +1218,7 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		self.assertIn("heading repeats", out)
 		self.assertIn("2 line(s)", out)
 
-	def test_a_MISSING_document_reports_no_size_and_does_not_crash(self):
+	def test_a_MISSING_document_reports_no_size_and_does_not_crash(self) -> None:
 		"""The other side of the same line: there is nothing to measure, so
 		it says nothing rather than reporting zero, which would read as a
 		document that exists and is empty."""
@@ -1228,7 +1228,7 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		self.assertNotIn("line(s)", out)
 		self.assertNotIn("token", out)
 
-	def test_a_repeated_section_NUMBER_is_reported(self):
+	def test_a_repeated_section_NUMBER_is_reported(self) -> None:
 		"""A number is an identifier, and the repeat check above cannot
 		see one: two sections carrying 130 with different titles are
 		different headings. Two sessions appending to one document pick
@@ -1241,7 +1241,7 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		self.assertNotEqual(rc, 0, out)
 		self.assertIn("section 1 repeats", out)
 
-	def test_a_number_restarting_under_a_new_parent_is_not_a_repeat(self):
+	def test_a_number_restarting_under_a_new_parent_is_not_a_repeat(self) -> None:
 		"""The case that decides the rule's shape, and the reason it is
 		keyed by parent rather than by number alone: several of these
 		documents write a bare `### 1.` under each `##`, and fuzznet has
@@ -1252,14 +1252,14 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		                                   "\n## 2. B\n\n### 1. y\n"})
 		self.assertEqual(rc, 0, out)
 
-	def test_an_unnumbered_document_is_untouched(self):
+	def test_an_unnumbered_document_is_untouched(self) -> None:
 		"""Three of the sixteen number no sections at all, so the check
 		has to be silent rather than merely correct there."""
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
 		                     "project.md": "# T\n\n## One\n\n## Two\n"})
 		self.assertEqual(rc, 0, out)
 
-	def test_a_repeated_heading_is_still_reported(self):
+	def test_a_repeated_heading_is_still_reported(self) -> None:
 		"""The rule the mode exists for, unmoved by the fix."""
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
 		                     "project.md": "# One\n\n# One\n"})
@@ -1273,7 +1273,7 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 	# source, five were already caught -- but this one and the interior
 	# carriage return below were real, and are theirs.
 
-	def test_a_document_naming_a_missing_file_is_refused(self):
+	def test_a_document_naming_a_missing_file_is_refused(self) -> None:
 		"""Reaching this rule takes three things at once, and a fixture
 		missing any of them passes while proving nothing: the path must
 		sit in a TABLE ROW, it must contain a slash, and its directory
@@ -1295,7 +1295,7 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 		# and the named token is the tell for this one.
 		self.assertIn("names a missing file: sub/gone.md", out)
 
-	def test_a_path_under_a_missing_directory_is_read_as_a_layout(self):
+	def test_a_path_under_a_missing_directory_is_read_as_a_layout(self) -> None:
 		"""The guard's other half, pinned so it is a decision rather than
 		a surprise. The count proves the token was extracted and then
 		deliberately not reported, which is what separates this from a
@@ -1331,16 +1331,16 @@ class CarriageReturnIsActuallyChecked(unittest.TestCase):
 			return subprocess.run([sys.executable, str(gate), "check"],
 			                      cwd=root, capture_output=True).returncode
 
-	def test_crlf_in_c_is_reported(self):
+	def test_crlf_in_c_is_reported(self) -> None:
 		self.assertNotEqual(self.gate(b"int main(void) {\r\n\treturn 0;\n}\n"), 0)
 
-	def test_crlf_in_python_is_reported(self):
+	def test_crlf_in_python_is_reported(self) -> None:
 		self.assertNotEqual(self.gate(b"def f():\r\n\treturn 1\n", "a.py"), 0)
 
-	def test_crlf_in_rust_is_reported(self):
+	def test_crlf_in_rust_is_reported(self) -> None:
 		self.assertNotEqual(self.gate(b"fn main() {\r\n\tlet x = 1;\n}\n", "a.rs"), 0)
 
-	def test_an_interior_carriage_return_is_reported(self):
+	def test_an_interior_carriage_return_is_reported(self) -> None:
 		"""The two carriage-return rules are not one rule twice. The
 		line-ending check REMOVES the byte it reports, so that trailing
 		whitespace cannot report the same character under a name that
@@ -1350,10 +1350,10 @@ class CarriageReturnIsActuallyChecked(unittest.TestCase):
 		self.assertNotEqual(
 			self.gate(b"int main(void) {\n\treturn\r0;\n}\n"), 0)
 
-	def test_unix_line_endings_pass(self):
+	def test_unix_line_endings_pass(self) -> None:
 		self.assertEqual(self.gate(b"int main(void) {\n\treturn 0;\n}\n"), 0)
 
-	def test_a_crlf_line_is_not_also_called_trailing_whitespace(self):
+	def test_a_crlf_line_is_not_also_called_trailing_whitespace(self) -> None:
 		"""One fault, one name. The carriage return is consumed before the
 		trailing-whitespace rule sees the line, or every CRLF line would be
 		reported twice, once under a name that hides what it is."""
@@ -1393,7 +1393,7 @@ class CommitMsgHook(unittest.TestCase):
 	                         Path(__file__).resolve().parent / "hooks" / "commit-msg")
 	             if c.is_file()), Path(__file__).resolve().parent / "commit-msg")
 
-	def run_hook(self, message: str) -> subprocess.CompletedProcess:
+	def run_hook(self, message: str) -> subprocess.CompletedProcess[str]:
 		with tempfile.NamedTemporaryFile("w", suffix=".txt",
 		                                 delete=False) as handle:
 			handle.write(message)
@@ -1404,7 +1404,7 @@ class CommitMsgHook(unittest.TestCase):
 		finally:
 			os.unlink(name)
 
-	def test_leading_blank_lines_do_not_hide_the_subject(self):
+	def test_leading_blank_lines_do_not_hide_the_subject(self) -> None:
 		"""Proven at the boundary rather than by acceptance alone: the
 		real subject at exactly 75 columns passes and at 76 is refused,
 		which only a hook reading the right line can do -- the old one
@@ -1416,7 +1416,7 @@ class CommitMsgHook(unittest.TestCase):
 		self.assertEqual(refused.returncode, 1, refused.stderr)
 		self.assertIn("subject is 76 columns", refused.stderr)
 
-	def test_leading_comment_does_not_switch_the_hook_off(self):
+	def test_leading_comment_does_not_switch_the_hook_off(self) -> None:
 		"""The `#` on line 1 used to be a quiet exit 0 -- the whole
 		incident. A comment above a valid message must be skipped, not
 		obeyed."""
@@ -1428,14 +1428,14 @@ class CommitMsgHook(unittest.TestCase):
 		self.assertEqual(refused.returncode, 1, refused.stderr)
 		self.assertIn("subject is 76 columns", refused.stderr)
 
-	def test_wrapped_subject_still_refused(self):
+	def test_wrapped_subject_still_refused(self) -> None:
 		"""fuzznet's finding must survive the fix: a subject wrapped onto
 		a second line before the blank is still joined and refused."""
 		out = self.run_hook("core: fix the\nlength check\n\nsome body.\n")
 		self.assertEqual(out.returncode, 1, out.stderr)
 		self.assertIn("wrapped", out.stderr)
 
-	def test_subject_running_into_body_still_refused(self):
+	def test_subject_running_into_body_still_refused(self) -> None:
 		"""No blank line after the subject reads as a wrapped subject,
 		because to git it is one."""
 		out = self.run_hook("core: fix the check\nthe body follows.\n")
@@ -1450,7 +1450,7 @@ class CommitMsgHook(unittest.TestCase):
 	# passes against a hook that spares everything, and only the refusals
 	# say the scrub is still narrow.
 
-	def test_the_spared_names_pass(self):
+	def test_the_spared_names_pass(self) -> None:
 		"""All four, in one message. `claude-<digits>` is the per-uid
 		scratch directory under /tmp: a commit saying which directory
 		held eleven gigabytes could not name it before this."""
@@ -1462,7 +1462,7 @@ class CommitMsgHook(unittest.TestCase):
 			self.assertEqual(out.returncode, 0,
 			                 "%s was refused: %s" % (name, out.stderr))
 
-	def test_the_bare_vendor_word_is_still_refused(self):
+	def test_the_bare_vendor_word_is_still_refused(self) -> None:
 		"""The control. Every case above passes against a hook whose
 		scrub forgives everything, so without this the suite would go on
 		passing after the check had been widened into uselessness."""
@@ -1470,7 +1470,7 @@ class CommitMsgHook(unittest.TestCase):
 		self.assertEqual(out.returncode, 1, out.stderr)
 		self.assertIn("tooling reference", out.stderr)
 
-	def test_a_persons_trailer_is_accepted(self):
+	def test_a_persons_trailer_is_accepted(self) -> None:
 		"""The boundary the vendor cases cannot show, reported by beerssh
 		2026-09-05 after their own control confused them for a minute.
 
@@ -1487,7 +1487,7 @@ class CommitMsgHook(unittest.TestCase):
 			self.assertEqual(out.returncode, 0,
 			                 "%s was refused: %s" % (trailer, out.stderr))
 
-	def test_a_spared_name_does_not_carry_a_sign_off_past_the_check(self):
+	def test_a_spared_name_does_not_carry_a_sign_off_past_the_check(self) -> None:
 		"""The case that would show the fourth exemption had opened a
 		bypass: one message holding both the newly spared path and a
 		vendor sign-off. beerssh's, and stronger than testing either
@@ -1497,7 +1497,7 @@ class CommitMsgHook(unittest.TestCase):
 		                    "<noreply@example.invalid>\n")
 		self.assertEqual(out.returncode, 1, out.stderr)
 
-	def test_an_attribution_trailer_is_still_refused(self):
+	def test_an_attribution_trailer_is_still_refused(self) -> None:
 		"""And it is refused for a reason no scrub can reach: the
 		attribution check reads the raw message rather than the scrubbed
 		prose, so adding a name above cannot let a sign-off through."""
@@ -1531,15 +1531,17 @@ class NonAsciiFilenameIsChecked(unittest.TestCase):
 	def repo(self, root: Path, bad: str, good: str) -> None:
 		env = dict(os.environ,
 		           GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
-		run = lambda *a: subprocess.run(["git", "-C", str(root)] + list(a),
-		                                env=env, capture_output=True, check=True)
+
+		def run(*a: str) -> None:
+			subprocess.run(["git", "-C", str(root)] + list(a),
+			               env=env, capture_output=True, check=True)
 		run("init", "-q")
 		(root / ".style-gate.toml").write_text("floor = 0.1\n")
 		(root / bad).write_text("x = 1   \n", encoding="utf-8")
 		(root / good).write_text("y = 2\n", encoding="utf-8")
 		run("add", "-A")
 
-	def test_a_violation_in_a_non_ascii_name_is_found(self):
+	def test_a_violation_in_a_non_ascii_name_is_found(self) -> None:
 		with tempfile.TemporaryDirectory() as d:
 			root = Path(d)
 			self.repo(root, "caf\u00e9.py", "plain.py")
@@ -1547,7 +1549,7 @@ class NonAsciiFilenameIsChecked(unittest.TestCase):
 			self.assertEqual(rc, 1, f"the violation was not found:\n{out}")
 			self.assertIn("trailing whitespace", out)
 
-	def test_the_file_is_in_the_set_at_all(self):
+	def test_the_file_is_in_the_set_at_all(self) -> None:
 		"""The count, because exit 1 alone could come from the other file."""
 		with tempfile.TemporaryDirectory() as d:
 			root = Path(d)
@@ -1555,7 +1557,7 @@ class NonAsciiFilenameIsChecked(unittest.TestCase):
 			_, out = self.gate(root, "list")
 			self.assertIn("caf\u00e9.py", out, f"not enumerated:\n{out}")
 
-	def test_control_the_same_violation_in_an_ascii_name(self):
+	def test_control_the_same_violation_in_an_ascii_name(self) -> None:
 		with tempfile.TemporaryDirectory() as d:
 			root = Path(d)
 			self.repo(root, "plain.py", "caf\u00e9.py")
@@ -1593,20 +1595,20 @@ class FencedBlocksAreNotProse(unittest.TestCase):
 	FENCED_COMMENTS = ("# Title\n\n```sh\n# build the thing\nmake all\n"
 	                   "# build the thing\nmake test\n```\n")
 
-	def test_a_repeated_comment_in_a_fence_is_not_a_repeated_heading(self):
+	def test_a_repeated_comment_in_a_fence_is_not_a_repeated_heading(self) -> None:
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
 		                     "project.md": self.FENCED_COMMENTS})
 		self.assertEqual(rc, 0, f"fenced comment read as a heading:\n{out}")
 		self.assertNotIn("heading repeats", out)
 
-	def test_a_real_repeated_heading_is_still_caught(self):
+	def test_a_real_repeated_heading_is_still_caught(self) -> None:
 		"""The control: the check must still be able to fire."""
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
 		                     "project.md": "# Title\n\n# Title\n"})
 		self.assertEqual(rc, 1, f"the check cannot fire at all:\n{out}")
 		self.assertIn("heading repeats", out)
 
-	def test_a_path_in_a_fenced_table_is_not_an_inventory_entry(self):
+	def test_a_path_in_a_fenced_table_is_not_an_inventory_entry(self) -> None:
 		doc = ("# Title\n\n```markdown\n| file | note |\n|---|---|\n"
 		       "| `tool/nope.py` | an illustration |\n```\n")
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
@@ -1618,7 +1620,7 @@ class FencedBlocksAreNotProse(unittest.TestCase):
 		# pass. Caught by this test failing against a correct gate.
 		self.assertNotIn("names a missing file", out)
 
-	def test_a_lone_marker_does_not_swallow_the_rest_of_the_file(self):
+	def test_a_lone_marker_does_not_swallow_the_rest_of_the_file(self) -> None:
 		"""fuzznet's `~~~~` is a horizontal rule, and the first fix ate 993
 		headings behind it. An unmatched marker must be ordinary text."""
 		doc = ("# Title\n\n~~~~\n\n## After the rule\n\n"
@@ -1629,14 +1631,14 @@ class FencedBlocksAreNotProse(unittest.TestCase):
 		self.assertEqual(rc, 1, f"everything after the rule was skipped:\n{out}")
 		self.assertIn("names a missing file", out)
 
-	def test_headings_after_a_lone_marker_are_still_counted(self):
+	def test_headings_after_a_lone_marker_are_still_counted(self) -> None:
 		"""The count, because the path half alone could hide a smaller loss."""
 		doc = "# One\n\n~~~~\n\n## Two\n\n### Three\n"
 		_, out = self.docs({".style-gate.toml": "floor = 0.1\n",
 		                    "project.md": doc})
 		self.assertIn("3 heading(s)", out, f"headings lost behind a rule:\n{out}")
 
-	def test_a_real_missing_inventory_entry_is_still_caught(self):
+	def test_a_real_missing_inventory_entry_is_still_caught(self) -> None:
 		"""The control, and it must fail through the path half."""
 		doc = "# Title\n\n| file | note |\n|---|---|\n| `tool/nope.py` | real |\n"
 		rc, out = self.docs({".style-gate.toml": "floor = 0.1\n",
@@ -1660,7 +1662,7 @@ class ReportsItsScope(unittest.TestCase):
 	and a reader who believes it will not trust a finding the gate makes.
 	"""
 
-	def test_the_fixer_still_never_adds_indentation(self):
+	def test_the_fixer_still_never_adds_indentation(self) -> None:
 		"""Unchanged, and deliberate: `fix` must not reindent a tree.
 
 		Its proof is that expanding leading tabs reproduces the original
@@ -1671,11 +1673,11 @@ class ReportsItsScope(unittest.TestCase):
 		src = "void f(void) {\n\tif (a) {\n\tg();\n\t}\n}\n"
 		self.assertEqual(tabs(src), [0, 1, 1, 1, 0])
 
-	def test_over_indentation_is_caught(self):
+	def test_over_indentation_is_caught(self) -> None:
 		src = "void f(void) {\n\tif (a) {\n\t\t\t\tg();\n\t}\n}\n"
 		self.assertNotEqual(tabs(src)[2], 4)
 
-	def test_the_success_line_claims_both_directions_now(self):
+	def test_the_success_line_claims_both_directions_now(self) -> None:
 		"""Asserted on the gate's OUTPUT, not on its source.
 
 		The first version grepped the source for `files conform"` and
@@ -1740,7 +1742,7 @@ class RustDocCommentsHaveASummary(unittest.TestCase):
 			                   capture_output=True, text=True, timeout=120)
 			return r.returncode, r.stdout + r.stderr
 
-	def test_a_bare_opening_line_is_reported_by_file_and_line(self):
+	def test_a_bare_opening_line_is_reported_by_file_and_line(self) -> None:
 		"""The finding itself, and where it is."""
 		rc, out = self.docs({"src/lib.rs":
 		                     "///\n/// # Errors\n///\n/// Never.\n"
@@ -1748,13 +1750,13 @@ class RustDocCommentsHaveASummary(unittest.TestCase):
 		self.assertNotEqual(rc, 0, out)
 		self.assertIn("src/lib.rs:1:1: doc comment has no summary line", out)
 
-	def test_a_summary_line_passes(self):
+	def test_a_summary_line_passes(self) -> None:
 		rc, out = self.docs({"src/lib.rs":
 		                     "/// Does the thing.\n///\n/// # Errors\n"
 		                     "///\n/// Never.\npub fn f() {}\n"})
 		self.assertEqual(rc, 0, out)
 
-	def test_a_paragraph_break_inside_a_doc_comment_is_not_an_opening(self):
+	def test_a_paragraph_break_inside_a_doc_comment_is_not_an_opening(self) -> None:
 		"""The same bare `///`, one line down, is the blank line between
 		the summary and the body -- the shape every documented function
 		with an `# Errors` section has. A check that fired on it would
@@ -1764,17 +1766,17 @@ class RustDocCommentsHaveASummary(unittest.TestCase):
 		self.assertEqual(rc, 0, out)
 		self.assertNotIn("no summary line", out)
 
-	def test_four_slashes_are_a_separator_not_a_doc_comment(self):
+	def test_four_slashes_are_a_separator_not_a_doc_comment(self) -> None:
 		rc, out = self.docs({"src/lib.rs": "////\nfn f() {}\n"})
 		self.assertEqual(rc, 0, out)
 
-	def test_only_the_line_that_opens_is_named(self):
+	def test_only_the_line_that_opens_is_named(self) -> None:
 		"""One finding per comment, not one per blank `///` in it."""
 		_, out = self.docs({"src/lib.rs":
 		                    "///\n///\n/// late summary\nfn f() {}\n"})
 		self.assertEqual(out.count("no summary line"), 1, out)
 
-	def test_the_population_is_the_gates_own(self):
+	def test_the_population_is_the_gates_own(self) -> None:
 		"""The copy this came from walked rglob and named `target` by
 		hand. Here a `.rs` under an excluded directory is not looked at
 		because discover() never kept it -- so the count says 1, not 2,
@@ -1784,7 +1786,7 @@ class RustDocCommentsHaveASummary(unittest.TestCase):
 		self.assertEqual(rc, 0, out)
 		self.assertIn("1 rust file(s)", out)
 
-	def test_the_verdict_counts_rust_files_and_says_zero_when_there_are_none(self):
+	def test_the_verdict_counts_rust_files_and_says_zero_when_there_are_none(self) -> None:
 		"""A verdict with no count cannot tell a clean tree from one
 		nothing looked at; and a tree with no Rust says so rather than
 		staying silent about a check that ran over nothing."""
