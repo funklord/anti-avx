@@ -1445,6 +1445,12 @@ EH_SEGMENT_RULE = True
 # progress appends its moved calls to. Finding 380.
 STUB_CALLS = {}
 BUILDING_CALLS = None
+# Whether a stub that gives its sixteen bytes back before it ends gets a
+# second `.pdata` record from there, with no allocation. Finding 381.
+CLOSE_SPLIT_RULE = True
+# {stub address: offset just past its `STACK_CLOSE`} for every stub
+# `build_stub` last built there that opened the stack. Finding 381.
+STUB_CLOSES = {}
 # {target: address} a branch re-emitted by `moved_branch` is aimed at
 # instead, set only while an earlier stub is rebuilt. Finding 374.
 STUB_REAIM = {}
@@ -10462,14 +10468,17 @@ def build_stub(start, encoding, operands, mnemonic, window, displaced,
 	what the last build there emitted. Finding 380.
 	"""
 	global BUILDING_CALLS
+	STUB_CLOSES.pop(stub_address, None)
 	outer, BUILDING_CALLS = BUILDING_CALLS, []
 	try:
 		out = build_one(start, encoding, operands, mnemonic, window,
 		                displaced, stub_address, *rest, **named)
 	finally:
 		calls, BUILDING_CALLS = BUILDING_CALLS, outer
-	if out is not None:
+	if out is not None and out[0] is not None:
 		STUB_CALLS[stub_address] = (start, calls)
+	else:
+		STUB_CLOSES.pop(stub_address, None)
 	return out
 
 
@@ -10647,6 +10656,7 @@ def build_one(start, encoding, operands, mnemonic, window, displaced,
 
 	body = bytearray()
 	prologue = 0
+	closed = None
 	# Hoisted, because the displaced loop asks whether the site's own spill
 	# already planted a block pointer it can share. Inside the spill branch
 	# alone it is undefined everywhere else.
@@ -10839,6 +10849,7 @@ def build_one(start, encoding, operands, mnemonic, window, displaced,
 			and not any(stack_bound(entry) for entry in displaced)
 		if (SPILL == SPILL_STACK or stack_borrow) and not deferred:
 			body += STACK_CLOSE
+			closed = len(body)
 		if stack_borrow and not deferred:
 			# **The sixteen bytes are gone once `STACK_CLOSE` gives them
 			# back**, and `base` still said zero. A passenger emitted after
@@ -11011,6 +11022,7 @@ def build_one(start, encoding, operands, mnemonic, window, displaced,
 		body += fixed
 	if deferred or passenger_stack:
 		body += STACK_CLOSE
+		closed = len(body)
 	if held and forward:
 		if set(labels) != set(held):
 			if reasons is not None:
@@ -11021,6 +11033,8 @@ def build_one(start, encoding, operands, mnemonic, window, displaced,
 	# Back to the instruction after the WINDOW, which is not the instruction
 	# after the original once the window has been widened.
 	body += encode_jump(stub_address + len(body) + 5, start + window)
+	if prologue:
+		STUB_CLOSES[stub_address] = closed
 	return bytes(body), prologue
 
 
@@ -13676,7 +13690,10 @@ def eh_segments(data, stubs, existing, at_rva):
 	the original's. Its unwind block is copied with the new `FuncInfo4`,
 	and the stubs chain to the copy. Nothing in `.rdata` is written.
 
-	`stubs` is [(stub rva, site rva, stub address)]. Finding 380.
+	`stubs` is [(record begin rva, record end rva, site rva, stub
+	address)], a stub that releases its stack being two records (Finding
+	381), each with its own segment and the calls that return inside it.
+	Finding 380.
 	"""
 	slot = iat_rva(data, "__CxxFrameHandler4")
 	starts = [begin for begin, _e, _u in existing]
@@ -13684,7 +13701,7 @@ def eh_segments(data, stubs, existing, at_rva):
 	image_base = struct.unpack_from("<Q", data, pe + 24 + 24)[0]
 	counts = Counter()
 	owners = defaultdict(list)
-	for stub_rva, site_rva, stub_address in stubs:
+	for stub_rva, stub_end, site_rva, stub_address in stubs:
 		position = bisect.bisect_right(starts, site_rva) - 1
 		if position < 0 or site_rva >= existing[position][1]:
 			continue
@@ -13705,7 +13722,7 @@ def eh_segments(data, stubs, existing, at_rva):
 					"<i", data, thunk + 2)[0] != slot:
 			counts["stubs in a function another handler handles"] += 1
 			continue
-		owners[primary].append((stub_rva, stub_address))
+		owners[primary].append((stub_rva, stub_end, stub_address))
 	blob, replace = bytearray(), {}
 	for primary, held in sorted(owners.items()):
 		begin = primary[0]
@@ -13733,7 +13750,7 @@ def eh_segments(data, stubs, existing, at_rva):
 			continue
 		states = ip_states(data, ipmap)
 		segments = [(begin, ipmap)]
-		for stub_rva, stub_address in held:
+		for stub_rva, stub_end, stub_address in held:
 			start, calls = STUB_CALLS.get(stub_address, (None, []))
 			if start is None:
 				counts["stubs with no record of their build"] += 1
@@ -13741,8 +13758,16 @@ def eh_segments(data, stubs, existing, at_rva):
 			entries = [(0, state_at(states, start - image_base - begin))]
 			# A build can emit the same call twice at one address, 15 times
 			# in f380; the pair is the same, so count it once.
+			piece = image_base + stub_rva
 			for back, original in sorted(set(calls)):
-				entries.append((back - stub_address,
+				# A stub that falls into the next (Finding 370) can end with
+				# its call, whose return is then the next stub's first byte:
+				# that record's entry 0 is the state there, and the right one.
+				if back == image_base + stub_end:
+					counts["moved calls returning into the next record"] += 1
+				if not piece <= back < image_base + stub_end:
+					continue
+				entries.append((back - piece,
 				                state_at(states, original - image_base - begin)))
 				counts["moved calls given their state"] += 1
 			body, previous, kept = bytearray(), 0, []
@@ -19148,11 +19173,26 @@ def apply_all(binary, listing, output):
 	for site, window, stub_address, length, prologue in ordered:
 		# A window across a chained record is described as its site's.
 		# See `crossing_window`. Finding 364.
-		extents.append((stub_address - image_base,
-		                stub_address + length - image_base,
-		                CROSSING.get((site, window), site) - image_base))
-		prologues.append(prologue)
-		held.append((extents[-1][0], extents[-1][2], stub_address))
+		described = CROSSING.get((site, window), site) - image_base
+		begin = stub_address - image_base
+		end = begin + length
+		# **What follows the stack's release is described without it.** An
+		# unwind code applies from its offset to the end of the record, and
+		# wine applies a chained record's own codes: a call after
+		# `STACK_CLOSE` returned into a frame the unwinder took to be
+		# sixteen bytes deeper, read its caller's return address from the
+		# wrong slot, and an exception through it never arrived. So the
+		# record ends at the release and a second one, with no allocation,
+		# holds the rest. Finding 381.
+		closed = STUB_CLOSES.get(stub_address) if prologue else None
+		pieces = [(begin, end, prologue)]
+		if CLOSE_SPLIT_RULE and closed is not None and closed < length:
+			pieces = [(begin, begin + closed, prologue),
+			          (begin + closed, end, 0)]
+		for piece_begin, piece_end, piece_prologue in pieces:
+			extents.append((piece_begin, piece_end, described))
+			prologues.append(piece_prologue)
+			held.append((piece_begin, piece_end, described, stub_address))
 	xdata_rva = next_section_rva(image)
 	# **The C++ EH state of every stub, ahead of the chains that name it.**
 	# A function with a stub gets a copied unwind block whose `FuncInfo4`
@@ -20222,6 +20262,61 @@ def verify(original, patched, listing=None):
 		problems += 1
 	else:
 		print("verify: every instruction in the stub section decodes")
+
+	# **The stack a record describes is the stack the stub has**, at every
+	# instruction. An unwind code applies from its offset to the record's
+	# end, so one stub that released its sixteen bytes and then called out
+	# told the unwinder its frame was sixteen bytes deeper than it was, and
+	# an exception through the call never arrived. 18 calls in f380 were
+	# that. Finding 381.
+	image_base = struct.unpack_from("<Q", b, pe + 24 + 24)[0]
+	stub_records = []
+	if stubs is not None:
+		stub_records = [entry for entry in table
+		                if stubs[0] <= entry[0] < stubs[0] + stubs[1]]
+	record_begins = [begin for begin, _e, _u in stub_records]
+	record, actual, mismatched = None, 0, []
+	for line in done.stdout.splitlines():
+		parts = line.split("\t")
+		if len(parts) < 3 or not parts[0].strip().endswith(":"):
+			continue
+		address = int(parts[0].strip()[:-1], 16)
+		rva = address - image_base
+		position = bisect.bisect_right(record_begins, rva) - 1
+		here = stub_records[position] if position >= 0 \
+			and rva < stub_records[position][1] else None
+		if here != record:
+			record, actual = here, 0
+			allocation = None
+			if here is not None:
+				info = rva_to_offset(b, here[2])
+				for k in range(b[info + 2]):
+					offset, op = b[info + 4 + 2 * k], b[info + 5 + 2 * k]
+					if op & 0x0F == UWOP_ALLOC_SMALL:
+						allocation = (offset, ((op >> 4) + 1) * 8)
+		if record is None:
+			continue
+		declared = allocation[1] if allocation is not None \
+			and rva - record[0] >= allocation[0] else 0
+		if declared != actual:
+			mismatched.append((address, declared, actual))
+		encoding = bytes.fromhex(parts[1].replace(" ", ""))
+		if encoding == STACK_OPEN:
+			actual += 16
+		elif encoding == STACK_CLOSE:
+			actual -= 16
+	if mismatched:
+		print(f"verify: FAILED -- {len(mismatched):,} stub instruction(s) "
+		      f"run with a stack their unwind record does not describe",
+		      file=sys.stderr)
+		for address, declared, actual in mismatched[:8]:
+			print(f"    {address:#x}: record says {declared}, stub holds "
+			      f"{actual}", file=sys.stderr)
+		problems += 1
+	else:
+		print(f"verify: every stub instruction runs with the stack its "
+		      f"unwind record describes, across {len(stub_records):,} "
+		      f"record(s)")
 
 	# **A TEB bracket is not reentrant, and the property that keeps it safe
 	# was asserted rather than checked.** Mode "teb" saves the block's two

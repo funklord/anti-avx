@@ -2021,19 +2021,10 @@ four:	.float 4.0
 """)
 
 
-# **A call in a stub, in a function `__CxxFrameHandler4` handles.** `F` is
-# `swallowicall`'s shape, so the call runs in the stub and returns there.
-# Its `FuncInfo4` says state 0 from the call's return address, `site`, and
-# -1 before it, so the window opens in -1 and only the call's own entry in
-# the stub's segment says 0. State 0's unwind action is `D`, which sets
-# `marker`. The callee raises; `H`, the
-# entry's own handler, catches that code alone -- the original still dies
-# on its first VEX instruction -- and unwinds, which passes `F` and runs
-# `D` if and only if the handler finds state 0 at the stub's return
-# address. 77 if it did, 40 if not, and not 29, which is what the
-# illegal-instruction fault exits with. The tables are `build_eh`'s.
-# Finding 380.
-PROGRAMS["ehstate"] = (77, """
+# The entry `O`, the raiser `T`, the handler `H` that catches `T`'s code
+# and unwinds to `resume`, state 0's action `D`, and the data `build_eh`'s
+# import table fills. Finding 380.
+EH_ENTRY = """
 	.text
 	.globl _start
 _start:
@@ -2055,24 +2046,8 @@ resume:
 	ret
 O_end:
 
-F:
-	subq	$40, %rsp
-F_prolog:
-	call	*%rax			/* two bytes; raises */
-site:
-	vaddss	%xmm2, %xmm1, %xmm0	/* four bytes */
-next:
-	incl	%ecx			/* a target */
-	jmp	tail			/* closes a forward window too short */
-tail:
-	cmpl	$2, %ecx
-	jb	again
-	addq	$40, %rsp
-	ret
-again:
-	jmp	next			/* rel8, from below */
-F_end:
-
+"""
+EH_REST = """
 T:
 	subq	$40, %rsp
 T_prolog:
@@ -2121,7 +2096,85 @@ marker:	.byte	0
 iat_fh4: .quad	0, 0
 iat_raise: .quad 0
 iat_unwind: .quad 0, 0
-""")
+"""
+
+
+def eh_program(function):
+	"""`ehstate`'s entry, raiser, handler and tables around `F`, the one
+	function a fixture of this kind varies. `F` must label `F_prolog`,
+	`F_end` and `state0`, where its state 0 begins."""
+	return EH_ENTRY + function + EH_REST
+
+
+# **A call in a stub, in a function `__CxxFrameHandler4` handles.** `F` is
+# `swallowicall`'s shape, so the call runs in the stub and returns there.
+# Its `FuncInfo4` says state 0 from the call's return address, `site`, and
+# -1 before it, so the window opens in -1 and only the call's own entry in
+# the stub's segment says 0. State 0's unwind action is `D`, which sets
+# `marker`. The callee raises; `H`, the entry's own handler, catches that
+# code alone -- the original still dies on its first VEX instruction --
+# and unwinds, which passes `F` and runs `D` if and only if the handler
+# finds state 0 at the stub's return address. 77 if it did, 40 if not, and not 29, which is what the
+# illegal-instruction fault exits with. The tables are `build_eh`'s.
+# Finding 380.
+PROGRAMS["ehstate"] = (77, eh_program("""
+F:
+	subq	$40, %rsp
+F_prolog:
+	call	*%rax			/* two bytes; raises */
+site:
+state0:
+	vaddss	%xmm2, %xmm1, %xmm0	/* four bytes */
+next:
+	incl	%ecx			/* a target */
+	jmp	tail			/* closes a forward window too short */
+tail:
+	cmpl	$2, %ecx
+	jb	again
+	addq	$40, %rsp
+	ret
+again:
+	jmp	next			/* rel8, from below */
+F_end:
+"""))
+
+
+# **A call after a stub has given its stack back.** The `vmovss` is
+# aliased, every volatile xmm is live, the home space is the function's
+# and there is no TLS directory, so the site borrows sixteen bytes of
+# stack; the window takes the `call` after it, which runs once the
+# bracket has closed. The record that described the allocation ran to the
+# stub's end, so wine unwound the call's frame sixteen bytes too deep and
+# the exception never reached `H` -- `Starfield` has 18 such calls. 77 if
+# the unwind arrives and finds state 0 at the call's return, 40 if it
+# arrives in the wrong state, and no answer at all if it does not.
+# Finding 381.
+PROGRAMS["spillcall"] = (77, eh_program("""
+F:
+	subq	$40, %rsp
+F_prolog:
+	movq	%rcx, 0x8(%rsp)		/* the outgoing home space */
+	movq	%rcx, 0x30(%rsp)	/* and the incoming one are in use */
+	movq	%rcx, 0x38(%rsp)
+	movq	%rcx, 0x40(%rsp)
+	movq	%rcx, 0x48(%rsp)
+	vmovss	%xmm0, %xmm1, %xmm0	/* aliased: borrows */
+	call	*%rax			/* raises */
+state0:
+	addq	0x8(%rsp), %rcx
+	addq	0x30(%rsp), %rcx
+	addq	0x38(%rsp), %rcx
+	addq	0x40(%rsp), %rcx
+	addq	0x48(%rsp), %rcx
+	addss	%xmm1, %xmm0		/* every volatile is read again */
+	addss	%xmm2, %xmm0
+	addss	%xmm3, %xmm0
+	addss	%xmm4, %xmm0
+	addss	%xmm5, %xmm0
+	addq	$40, %rsp
+	ret
+F_end:
+"""))
 
 
 # **A forward hammock holding a 256-bit passenger.** Two arms load `ymm0`
@@ -7161,7 +7214,8 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 
 
 def build_eh(path, text, symbols):
-	"""Write `ehstate`: four functions, a C++ handler and two imports.
+	"""Write `ehstate` or `spillcall`: four functions, a C++ handler and two
+	imports.
 
 	`build` describes one function, and this program needs four records,
 	two of them with handlers, a `FuncInfo4` and an import table whose
@@ -7207,7 +7261,7 @@ def build_eh(path, text, symbols):
 	rdata += bytes([1 << 1, ((1 << 2) | 3) << 1]) + struct.pack("<i", rva("D"))
 	# Two entries: offset 0 state -1, the call's return state 0. Each is a
 	# compressed delta and a compressed state + 1.
-	back = symbols["site"] - symbols["F"]
+	back = symbols["state0"] - symbols["F"]
 	rdata += bytes([2 << 1, 0, 0, back << 1, 1 << 1])
 
 	pdata_rva = align(rdata_rva + len(rdata), SECTION_ALIGNMENT)
@@ -7301,7 +7355,7 @@ def main(argv):
 		return 2
 	expected, source = PROGRAMS[name]
 	text, symbols = assemble(source)
-	if name == "ehstate":
+	if name in ("ehstate", "spillcall"):
 		build_eh(output, text, symbols)
 		print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
 		      f"expected exit code {expected}")

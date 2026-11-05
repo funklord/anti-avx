@@ -2892,7 +2892,8 @@ Measured rather than inferred: the error is **exactly -16**, the spill's own all
 not applied. The encoding is not the problem -- the block reads
 `21 04 01 00 | 04 12 | 0000 | chain`, which is version 1 with `UNW_FLAG_CHAININFO`, a
 four-byte prologue, one `UWOP_ALLOC_SMALL` of sixteen bytes at offset 4, and the primary's
-entry. **A chained fragment's own unwind codes are not applied.**
+entry. **A chained fragment's own unwind codes are not applied.** (Wrong, Finding 381:
+they are applied. The -16 is the establisher frame, taken from `rsp` inside the bracket.)
 
 And they cannot be got applied by dropping the chain, because the chain is what reaches
 the handler at all:
@@ -12263,7 +12264,10 @@ its own recorded objection, and the second is a design question nobody has start
    evidence, and **Finding 68 closed it for good**: MSVC never allocates stack inside a
    chained fragment -- not once in 65,255 fragment unwind codes -- because a fragment
    shares its primary's frame rather than having one of its own. A stub that moves `rsp`
-   cannot be described.
+   cannot be described. **Partly reversed by Finding 381:** wine does apply a fragment's
+   codes, so the allocation is described once a stub's record ends where it gives the
+   stack back. What stays wrong is the establisher frame a fault inside the bracket hands
+   its handler.
 
    **`--spill=home` is the answer and is now the default** (Finding 73). It moves nothing:
    it borrows the callee home space Win64 already reserves, is worth 1,022 sites, and took
@@ -14166,6 +14170,58 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 381 -- a stub that gives its stack back ends its record there
+
+**An unwind code applies from its offset to the end of the record, and wine applies
+a chained record's own codes.** A stub that borrows the stack opens sixteen bytes
+with `STACK_OPEN` and describes them with one `UWOP_ALLOC_SMALL` at the offset the
+`lea` ends. It gives them back with `STACK_CLOSE` before the jump home, and the
+record ran on past that. So from the release to the stub's end the unwinder took
+the frame to be sixteen bytes deeper than it was. 18 calls in f380 sat there, every
+one a spilled site followed by a call its window had swallowed (`0x140300c15`'s
+`vmovss` and the `call` after it): 17 in functions with no handler and 1 in an FH4
+function. An exception through any of them read its caller's return address from
+the wrong slot.
+
+**Measured with the probe of Finding 380:** a chained stub that opens, closes and
+then calls a raiser, its record carrying the allocation, never reaches the handler.
+Wine hangs until killed, with exit code 124, twice. The same stub with its record
+ended at the release and a second, code-less chained record for the rest unwinds
+correctly (50). In the fixture the broken unwind instead returned through `F` as
+though `T` had returned (41).
+
+**This corrects Findings 49 and 68's reading** that a fragment's own codes are not
+applied. If they were not applied, the two probes could not differ. What Finding 49
+measured is consistent with codes applied and the establisher frame taken from
+`rsp` at the faulting instruction, which inside an open bracket is sixteen bytes
+below the function's. That half is unchanged: a fault *inside* the bracket still
+hands its handler that frame, and `check-unwind`'s `unwindspill` still answers 99.
+Nothing in the bracket calls out, so what remains is a memory operand faulting
+inside it, the site's or a deferred passenger's.
+
+**`CLOSE_SPLIT_RULE`:** `build_stub` records where each stub's `STACK_CLOSE` ends
+(`STUB_CLOSES`). Where anything follows the release, the stub gets two records: the
+first ends at the release and carries the allocation, and the second chains to the
+same primary with no codes. `eh_segments` gives each piece its own segment and the
+calls that return inside it.
+
+**`verify` now asks it of every stub instruction:** the allocation its record
+declares at that offset must equal what the stub has opened by then. On f380 it
+fails at 1,695 instructions, the 18 calls among them; on f381 it passes over 204,188
+records. Fixture `spillcall` is Starfield's shape inside `ehstate`'s scaffolding: an
+aliased `vmovss` in a function whose home spaces are all live, so it borrows the
+stack, then `call *%rax` to the raiser. It answers 77 with the rule, 41 without and
+29 for the original.
+
+**f381, measured:** the frontier sites and every other `verify` line are
+unchanged from f380. 1,205 stubs are split, giving 440,615 function table entries
+against 439,410, and all 443 stub calls run with the stack their record declares.
+The 174 FH4 stub calls still find the original's state. 103 of all stub calls are
+the last instruction of a stub that falls into the next (Finding 370), so they
+return to that stub's first byte. Its record's first entry is the state there,
+which is the original's, and both stubs chain to the same primary in all 103. Their
+per-call entries were never looked up, and the count now names them separately.
+
 ### Finding 380 -- a stub inside a C++ function gets its own piece of the state map
 
 **A call that a stub re-emits returns into the stub, and a C++ exception thrown
@@ -14215,10 +14271,9 @@ against the image: all 458 recorded calls return where a call in `.avxsse` retur
 and 15 of them are one call recorded twice by the same build, which the map merged
 and the count no longer includes.
 
-**Still open, and the same class: 18 stub calls sit inside a stub's own 16-byte
-stack allocation** (17 in functions with no handler, 1 in FH4). Finding 49
-measured that a chained fragment's unwind codes are not applied, so the
-establisher frame of anything unwinding through those calls is 16 bytes out.
+**The same image had 18 stub calls whose record declared a stack the stub had
+already given back**, which broke the unwind itself rather than the state: Finding
+381.
 
 ### Findings 376 to 379 -- the last four sites that can run here
 
@@ -20256,7 +20311,8 @@ gate too, and at 99.6% most sites are short of something.
 and Findings 46, 49, 67 and 68 closed exactly that on measured evidence:
 
   * Wine hands a spilling stub an establisher frame **sixteen bytes out**, because a chained
-    fragment's own unwind codes are not applied (Finding 67).
+    fragment's own unwind codes are not applied (Finding 67). (The frame is right; the cause
+    is not, Finding 381.)
   * Of 65,255 unwind operations inside chained fragments in this binary, **not one allocates
     stack** -- SAVE_NONVOL and SAVE_XMM128 only. The toolchain never does it because the ABI
     says a fragment shares its primary's frame rather than having one of its own
