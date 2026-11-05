@@ -1437,6 +1437,14 @@ INDIRECT_SWALLOW_RULE = True
 # Whether a forward hammock may carry a 256-bit passenger, lowered as a
 # span of its own where it goes. Finding 379.
 UNIT_PASSENGER_RULE = True
+# Whether every stub of a function `__CxxFrameHandler4` handles gets a
+# segment of that function's IP-to-state map. Finding 380.
+EH_SEGMENT_RULE = True
+# {stub address: (window start, [(return in the stub, original return)])}
+# for every stub `build_stub` last built there, and the list the build in
+# progress appends its moved calls to. Finding 380.
+STUB_CALLS = {}
+BUILDING_CALLS = None
 # {target: address} a branch re-emitted by `moved_branch` is aimed at
 # instead, set only while an earlier stub is rebuilt. Finding 374.
 STUB_REAIM = {}
@@ -3641,6 +3649,22 @@ def moved_branch(moved, mnemonic, operands, comment, address, at,
 
 def moved_instruction(entry, at, pool=0, reasons=None, clearing=False,
                       internal=None):
+	"""`moved_one`, and a moved call's two return addresses recorded.
+
+	**A call in a stub pushes the stub's address**, and `__CxxFrameHandler4`
+	looks the frame's state up by it. What the state there must be is the
+	state at the original call's return, so the build in progress keeps
+	both. Finding 380.
+	"""
+	out = moved_one(entry, at, pool, reasons, clearing, internal)
+	if out is not None and BUILDING_CALLS is not None \
+			and entry[4].startswith("call"):
+		BUILDING_CALLS.append((at + len(out), entry[0] + len(entry[1])))
+	return out
+
+
+def moved_one(entry, at, pool=0, reasons=None, clearing=False,
+              internal=None):
 	"""One swallowed instruction, re-encoded to execute at `at`.
 
 	The sixth field is a scratch register for the swallowed instruction, and
@@ -10431,9 +10455,28 @@ def close_stub(body, displaced, stub_address, pool, spill_base, reasons,
 
 
 def build_stub(start, encoding, operands, mnemonic, window, displaced,
-               stub_address, scratch=None, pool=0, preceding=(),
-               strategy=None, spill_base=0, reasons=None, home=None,
-               tls=None):
+               stub_address, *rest, **named):
+	"""`build_one`, with the calls it moved kept under `stub_address`.
+
+	A rebuild at the same address replaces the list, so what is kept is
+	what the last build there emitted. Finding 380.
+	"""
+	global BUILDING_CALLS
+	outer, BUILDING_CALLS = BUILDING_CALLS, []
+	try:
+		out = build_one(start, encoding, operands, mnemonic, window,
+		                displaced, stub_address, *rest, **named)
+	finally:
+		calls, BUILDING_CALLS = BUILDING_CALLS, outer
+	if out is not None:
+		STUB_CALLS[stub_address] = (start, calls)
+	return out
+
+
+def build_one(start, encoding, operands, mnemonic, window, displaced,
+              stub_address, scratch=None, pool=0, preceding=(),
+              strategy=None, spill_base=0, reasons=None, home=None,
+              tls=None):
 	"""The stub body for one window, placed at stub_address.
 
 	`start` is the window's first byte, which is the site's own address
@@ -13573,6 +13616,161 @@ def existing_pdata(data):
 			out.append((begin, end, unwind))
 	out.sort()
 	return out
+
+
+def write_unsigned(value):
+	"""FH4's compressed form of `value`, which `targets.read_unsigned` reads."""
+	if value < 1 << 7:
+		return bytes([value << 1])
+	if value < 1 << 14:
+		return struct.pack("<H", (value << 2) | 1)
+	if value < 1 << 21:
+		return struct.pack("<I", (value << 3) | 3)[:3]
+	if value < 1 << 28:
+		return struct.pack("<I", (value << 4) | 7)
+	return b"\x0f" + struct.pack("<I", value)
+
+
+def ip_states(data, rva):
+	"""[(offset, state)] of the FH4 IP-to-state map at `rva`."""
+	at = rva_to_offset(data, rva)
+	count, at = target_set.read_unsigned(data, at)
+	out, ip = [], 0
+	for _ in range(count):
+		delta, at = target_set.read_unsigned(data, at)
+		plus, at = target_set.read_unsigned(data, at)
+		ip += delta
+		out.append((ip, plus - 1))
+	return out
+
+
+def state_at(states, offset):
+	"""The state FH4 reads at `offset`: the last entry at or before it."""
+	found = -1
+	for ip, state in states:
+		if ip > offset:
+			break
+		found = state
+	return found
+
+
+def eh_segments(data, stubs, existing, at_rva):
+	"""C++ EH state for the stubs. Returns (bytes placed at `at_rva`,
+	{old primary: new primary}, counts).
+
+	**`__CxxFrameHandler4` looks a frame's state up from the start of the
+	`.pdata` record that holds its IP**, in the function's IP-to-state
+	map. A stub's record starts at the stub, so a call there returning
+	two bytes in reads the state two bytes into the function -- the
+	prologue, state -1 -- and an exception through it skips the frame's
+	destructors and passes its `catch`. Measured with Microsoft's own
+	`VCRUNTIME140_1.dll`, the one the game loads: 129 of Starfield's 174
+	such calls read -1 where the original reads a live state.
+
+	**The same handler reads a SEPARATED map by record**: a list of
+	segments, each a record's begin and a map from there, which is what
+	the compiler emits for code it splits off a function. So every
+	function with a stub gets a new `FuncInfo4` marked separated, its
+	own map as the first segment and one per stub: the window start's
+	state from offset 0, and at each moved call's return the state at
+	the original's. Its unwind block is copied with the new `FuncInfo4`,
+	and the stubs chain to the copy. Nothing in `.rdata` is written.
+
+	`stubs` is [(stub rva, site rva, stub address)]. Finding 380.
+	"""
+	slot = iat_rva(data, "__CxxFrameHandler4")
+	starts = [begin for begin, _e, _u in existing]
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	image_base = struct.unpack_from("<Q", data, pe + 24 + 24)[0]
+	counts = Counter()
+	owners = defaultdict(list)
+	for stub_rva, site_rva, stub_address in stubs:
+		position = bisect.bisect_right(starts, site_rva) - 1
+		if position < 0 or site_rva >= existing[position][1]:
+			continue
+		primary = existing[position]
+		at = rva_to_offset(data, primary[2])
+		flags = data[at] >> 3
+		if not flags & 3:
+			continue
+		if flags & UNW_FLAG_CHAININFO:
+			counts["stubs in a chained fragment of a handled function"] += 1
+			continue
+		after = at + 4 + ((data[at + 2] + 1) & ~1) * 2
+		handler = struct.unpack_from("<I", data, after)[0]
+		thunk = rva_to_offset(data, handler)
+		if slot is None or thunk is None \
+				or data[thunk:thunk + 2] != b"\xff\x25" \
+				or handler + 6 + struct.unpack_from(
+					"<i", data, thunk + 2)[0] != slot:
+			counts["stubs in a function another handler handles"] += 1
+			continue
+		owners[primary].append((stub_rva, stub_address))
+	blob, replace = bytearray(), {}
+	for primary, held in sorted(owners.items()):
+		begin = primary[0]
+		at = rva_to_offset(data, primary[2])
+		codes_end = at + 4 + ((data[at + 2] + 1) & ~1) * 2
+		info = struct.unpack_from("<I", data, codes_end + 4)[0]
+		here = rva_to_offset(data, info)
+		header, field = data[here], here + 1
+		bbt = b""
+		if header & 0x04:
+			_value, after = target_set.read_unsigned(data, field)
+			bbt, field = data[field:after], after
+		maps = b""
+		for bit in (0x08, 0x10):		# the unwind map, the try map
+			if header & bit:
+				maps += data[field:field + 4]
+				field += 4
+		ipmap = struct.unpack_from("<i", data, field)[0]
+		frame = b""
+		if header & 0x01:			# a catch funclet's frame offset
+			_value, after = target_set.read_unsigned(data, field + 4)
+			frame = data[field + 4:after]
+		if header & 0x02:
+			counts["functions already separated"] += 1
+			continue
+		states = ip_states(data, ipmap)
+		segments = [(begin, ipmap)]
+		for stub_rva, stub_address in held:
+			start, calls = STUB_CALLS.get(stub_address, (None, []))
+			if start is None:
+				counts["stubs with no record of their build"] += 1
+				continue
+			entries = [(0, state_at(states, start - image_base - begin))]
+			# A build can emit the same call twice at one address, 15 times
+			# in f380; the pair is the same, so count it once.
+			for back, original in sorted(set(calls)):
+				entries.append((back - stub_address,
+				                state_at(states, original - image_base - begin)))
+				counts["moved calls given their state"] += 1
+			body, previous, kept = bytearray(), 0, []
+			for offset, state in entries:
+				if kept and kept[-1][1] == state:
+					continue
+				kept.append((offset, state))
+			body += write_unsigned(len(kept))
+			for offset, state in kept:
+				body += write_unsigned(offset - previous)
+				body += write_unsigned(state + 1)
+				previous = offset
+			segments.append((stub_rva, at_rva + len(blob)))
+			blob += body
+			counts["stubs given a segment"] += 1
+		separated = at_rva + len(blob)
+		blob += write_unsigned(len(segments))
+		for segment, where in segments:
+			blob += struct.pack("<iI", segment, where)
+		funcinfo = at_rva + len(blob)
+		blob += bytes([header | 0x02]) + bbt + maps \
+			+ struct.pack("<i", separated) + frame
+		blob += b"\0" * (-len(blob) % 4)
+		copied = at_rva + len(blob)
+		blob += data[at:codes_end + 4] + struct.pack("<I", funcinfo)
+		replace[primary] = (primary[0], primary[1], copied)
+		counts["functions given a separated map"] += 1
+	return bytes(blob), replace, counts
 
 
 def stub_unwind(extents, prologues, image_base, existing, xdata_rva):
@@ -18945,7 +19143,7 @@ def apply_all(binary, listing, output):
 	# names its unwind block by address, so that address has to exist first.
 	# Both sizes are known before either is placed -- the blocks hold only
 	# the primary's own entry, which is a `.text` address.
-	extents, prologues = [], []
+	extents, prologues, held = [], [], []
 	ordered = sorted(placed, key=lambda item: item[2])
 	for site, window, stub_address, length, prologue in ordered:
 		# A window across a chained record is described as its site's.
@@ -18954,9 +19152,23 @@ def apply_all(binary, listing, output):
 		                stub_address + length - image_base,
 		                CROSSING.get((site, window), site) - image_base))
 		prologues.append(prologue)
+		held.append((extents[-1][0], extents[-1][2], stub_address))
 	xdata_rva = next_section_rva(image)
-	xdata, pdata = stub_unwind(extents, prologues, image_base,
-	                           existing_pdata(image), xdata_rva)
+	# **The C++ EH state of every stub, ahead of the chains that name it.**
+	# A function with a stub gets a copied unwind block whose `FuncInfo4`
+	# is separated, so its stubs chain to the copy. Finding 380.
+	existing = existing_pdata(image)
+	segments, replace = b"", {}
+	if EH_SEGMENT_RULE:
+		segments, replace, told = eh_segments(image, held, existing,
+		                                      xdata_rva)
+		segments += b"\0" * (-len(segments) % 4)
+		existing = [replace.get(entry, entry) for entry in existing]
+		print("apply: C++ EH state for stubs: " + ", ".join(
+			f"{why} {count:,}" for why, count in sorted(told.items())))
+	xdata, pdata = stub_unwind(extents, prologues, image_base, existing,
+	                           xdata_rva + len(segments))
+	xdata = segments + xdata
 	image, got = add_section(image, XDATA_NAME, xdata, UNWIND_FLAGS)
 	assert got == xdata_rva, "unwind section moved"
 	pdata_rva = next_section_rva(image)

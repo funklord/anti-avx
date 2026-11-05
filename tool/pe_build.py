@@ -2021,6 +2021,109 @@ four:	.float 4.0
 """)
 
 
+# **A call in a stub, in a function `__CxxFrameHandler4` handles.** `F` is
+# `swallowicall`'s shape, so the call runs in the stub and returns there.
+# Its `FuncInfo4` says state 0 from the call's return address, `site`, and
+# -1 before it, so the window opens in -1 and only the call's own entry in
+# the stub's segment says 0. State 0's unwind action is `D`, which sets
+# `marker`. The callee raises; `H`, the
+# entry's own handler, catches that code alone -- the original still dies
+# on its first VEX instruction -- and unwinds, which passes `F` and runs
+# `D` if and only if the handler finds state 0 at the stub's return
+# address. 77 if it did, 40 if not, and not 29, which is what the
+# illegal-instruction fault exits with. The tables are `build_eh`'s.
+# Finding 380.
+PROGRAMS["ehstate"] = (77, """
+	.text
+	.globl _start
+_start:
+	subq	$40, %rsp
+O_prolog:
+	vzeroupper
+	leaq	T(%rip), %rax
+	xorl	%ecx, %ecx
+	call	F
+	movl	$41, %eax		/* T returned, which it cannot */
+	addq	$40, %rsp
+	ret
+resume:
+	movl	$40, %eax
+	cmpb	$1, marker(%rip)
+	jne	1f
+	movl	$77, %eax
+1:	addq	$40, %rsp
+	ret
+O_end:
+
+F:
+	subq	$40, %rsp
+F_prolog:
+	call	*%rax			/* two bytes; raises */
+site:
+	vaddss	%xmm2, %xmm1, %xmm0	/* four bytes */
+next:
+	incl	%ecx			/* a target */
+	jmp	tail			/* closes a forward window too short */
+tail:
+	cmpl	$2, %ecx
+	jb	again
+	addq	$40, %rsp
+	ret
+again:
+	jmp	next			/* rel8, from below */
+F_end:
+
+T:
+	subq	$40, %rsp
+T_prolog:
+	movl	$0xE0000001, %ecx
+	movl	$1, %edx		/* EXCEPTION_NONCONTINUABLE */
+	xorl	%r8d, %r8d
+	xorl	%r9d, %r9d
+	call	*iat_raise(%rip)
+	addq	$40, %rsp
+	ret
+T_end:
+
+H:
+	subq	$0x38, %rsp
+H_prolog:
+	testl	$0x66, 4(%rcx)		/* unwinding: carry on */
+	jnz	H_pass
+	cmpl	$0xE0000001, (%rcx)	/* only T's exception */
+	jne	H_pass
+	movq	%rcx, %r8		/* the record */
+	movq	%rdx, %rcx		/* target frame: the entry's */
+	leaq	resume(%rip), %rdx
+	xorl	%r9d, %r9d
+	leaq	context(%rip), %rax
+	movq	%rax, 0x20(%rsp)
+	movq	$0, 0x28(%rsp)
+	call	*iat_unwind(%rip)
+	int3
+H_pass:
+	movl	$1, %eax		/* ExceptionContinueSearch */
+	addq	$0x38, %rsp
+	ret
+H_end:
+
+D:					/* state 0's unwind action */
+	movb	$1, marker(%rip)
+	ret
+
+fh4:
+	jmp	*iat_fh4(%rip)
+func_end:
+	.p2align 4
+context: .fill	0x4d0, 1, 0
+marker:	.byte	0
+	.p2align 3
+iat_fh4: .quad	0, 0
+iat_raise: .quad 0
+iat_unwind: .quad 0, 0
+""")
+
+
 # **A forward hammock holding a 256-bit passenger.** Two arms load `ymm0`
 # and join at a 256-bit store, as at Starfield's `0x142baa477`: the second
 # arm's load is a target after a `jmp`, so nothing reaches back, and the
@@ -7057,6 +7160,124 @@ def build(path, text, code_size, handler=None, frame=0, readonly=False,
 	return sections
 
 
+def build_eh(path, text, symbols):
+	"""Write `ehstate`: four functions, a C++ handler and two imports.
+
+	`build` describes one function, and this program needs four records,
+	two of them with handlers, a `FuncInfo4` and an import table whose
+	address table sits in `.text` -- which is how the code reaches its
+	imports without a relocation, `objcopy` leaving none. Hand-written for
+	the reason `import_table` gives: a fixture built with the rewriter's
+	own file-format code could not catch a fault in it. Finding 380.
+	"""
+	text = bytearray(text)
+	text_rva = SECTION_ALIGNMENT
+	rdata_rva = align(text_rva + len(text), SECTION_ALIGNMENT)
+
+	def rva(name):
+		return text_rva + symbols[name]
+
+	def unwind(prolog, size, handler=None, data=None):
+		# Version 1, one UWOP_ALLOC_SMALL at the prologue's end, padded to
+		# an even count; a handler and its data after.
+		flags = 0 if handler is None else (3 if data else 1)
+		out = struct.pack("<BBBB", 1 | (flags << 3), prolog, 1, 0) \
+			+ struct.pack("<BB", prolog, (((size - 8) // 8) << 4) | 2) \
+			+ b"\0\0"
+		if handler is not None:
+			out += struct.pack("<II", handler, data or 0)
+		return out
+
+	rdata = bytearray()
+	where = {}
+	funcinfo = rdata_rva + 0x80		# after the four unwind blocks
+	for name, prolog, size, handler, data in (
+			("_start", "O_prolog", 40, rva("H"), None),
+			("F", "F_prolog", 40, rva("fh4"), funcinfo),
+			("T", "T_prolog", 40, None, None),
+			("H", "H_prolog", 0x38, None, None)):
+		where[name] = rdata_rva + len(rdata)
+		rdata += unwind(symbols[prolog] - symbols[name], size, handler, data)
+	rdata += bytes(0x80 - len(rdata))
+	# FuncInfo4: an unwind map and the IP-to-state map, both by RVA.
+	unwind_map = funcinfo + 9
+	ip_map = unwind_map + 6
+	rdata += struct.pack("<Bii", 0x08, unwind_map, ip_map)
+	# One entry: next state is the map's start (-1), type 3, an RVA.
+	rdata += bytes([1 << 1, ((1 << 2) | 3) << 1]) + struct.pack("<i", rva("D"))
+	# Two entries: offset 0 state -1, the call's return state 0. Each is a
+	# compressed delta and a compressed state + 1.
+	back = symbols["site"] - symbols["F"]
+	rdata += bytes([2 << 1, 0, 0, back << 1, 1 << 1])
+
+	pdata_rva = align(rdata_rva + len(rdata), SECTION_ALIGNMENT)
+	pdata = b"".join(struct.pack("<III", rva(begin), rva(end), where[begin])
+	                 for begin, end in (("_start", "O_end"), ("F", "F_end"),
+	                                    ("T", "T_end"), ("H", "H_end")))
+
+	idata_rva = align(pdata_rva + len(pdata), SECTION_ALIGNMENT)
+	dlls = (("VCRUNTIME140_1.dll", ["__CxxFrameHandler4"], "iat_fh4"),
+	        ("KERNEL32.dll", ["RaiseException", "RtlUnwindEx"], "iat_raise"))
+	descriptors = (len(dlls) + 1) * 20
+	idata = bytearray(descriptors)
+	names = {}
+	for _dll, functions, _iat in dlls:
+		for function in functions:
+			names[function] = idata_rva + len(idata)
+			idata += struct.pack("<H", 0) + function.encode() + b"\0"
+			idata += b"\0" * (len(idata) % 2)
+	for i, (dll, functions, iat) in enumerate(dlls):
+		idata += bytes(-len(idata) % 8)
+		lookup = idata_rva + len(idata)
+		for j, function in enumerate(functions):
+			idata += struct.pack("<Q", names[function])
+			struct.pack_into("<Q", text, symbols[iat] + 8 * j, names[function])
+		idata += bytes(8)
+		name = idata_rva + len(idata)
+		idata += dll.encode() + b"\0"
+		idata += b"\0" * (len(idata) % 2)
+		struct.pack_into("<IIIII", idata, i * 20, lookup, 0, 0, name, rva(iat))
+
+	sections = [(b".text", text_rva, bytes(text), CODE),
+	            (b".rdata", rdata_rva, bytes(rdata), DATA),
+	            (b".pdata", pdata_rva, pdata, DATA),
+	            (b".idata", idata_rva, bytes(idata), DATA)]
+	image = bytearray(HEADER_SIZE)
+	image[0:2] = b"MZ"
+	struct.pack_into("<I", image, 0x3C, 0x40)
+	pe = 0x40
+	image[pe:pe + 4] = b"PE\0\0"
+	struct.pack_into("<HHIIIHH", image, pe + 4, 0x8664, len(sections),
+	                 0, 0, 0, 240, 0x0022)
+	opt = pe + 24
+	struct.pack_into("<HBBIIIIII", image, opt, 0x20B, 14, 0,
+	                 align(len(text), FILE_ALIGNMENT),
+	                 sum(align(len(s[2]), FILE_ALIGNMENT) for s in sections[1:]),
+	                 0, rva("_start"), text_rva, 0)
+	struct.pack_into("<Q", image, opt + 24, IMAGE_BASE)
+	struct.pack_into("<II", image, opt + 32, SECTION_ALIGNMENT, FILE_ALIGNMENT)
+	struct.pack_into("<HHHHHHI", image, opt + 40, 6, 0, 0, 0, 6, 0, 0)
+	struct.pack_into("<II", image, opt + 56,
+	                 align(idata_rva + len(idata), SECTION_ALIGNMENT),
+	                 HEADER_SIZE)
+	struct.pack_into("<IHH", image, opt + 64, 0, 3, 0)
+	struct.pack_into("<QQQQ", image, opt + 72,
+	                 0x100000, 0x1000, 0x100000, 0x1000)
+	struct.pack_into("<II", image, opt + 104, 0, 16)
+	struct.pack_into("<II", image, opt + 112 + 1 * 8, idata_rva, descriptors)
+	struct.pack_into("<II", image, opt + 112 + 3 * 8, pdata_rva, len(pdata))
+	offset = HEADER_SIZE
+	for i, (name, section_rva, body, flags) in enumerate(sections):
+		entry = opt + 240 + i * 40
+		image[entry:entry + 8] = name.ljust(8, b"\0")
+		size = align(len(body), FILE_ALIGNMENT)
+		struct.pack_into("<IIIIIIHHI", image, entry + 8, len(body),
+		                 section_rva, size, offset, 0, 0, 0, 0, flags)
+		image += body + bytes(size - len(body))
+		offset += size
+	Path(path).write_bytes(bytes(image))
+
+
 def main(argv):
 	if not argv or argv[0] in ("-h", "--help"):
 		print(__doc__.strip())
@@ -7080,6 +7301,11 @@ def main(argv):
 		return 2
 	expected, source = PROGRAMS[name]
 	text, symbols = assemble(source)
+	if name == "ehstate":
+		build_eh(output, text, symbols)
+		print(f"pe_build: {name} -> {output}, {len(text)} bytes of .text, "
+		      f"expected exit code {expected}")
+		return 0
 	code_size = symbols["func_end"]
 	# `.text` is the first section, at SECTION_ALIGNMENT, so a symbol's
 	# RVA is known before the image is laid out.

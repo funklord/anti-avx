@@ -14166,6 +14166,60 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 380 -- a stub inside a C++ function gets its own piece of the state map
+
+**A call that a stub re-emits returns into the stub, and a C++ exception thrown
+under it was handled in the wrong state.** `__CxxFrameHandler4` looks a frame's
+state up in its function's IP-to-state map, by the return address less the begin
+of the `.pdata` record holding it -- and for a stub that is the stub's own chained
+record, not the function's. So a call returning two bytes into a stub reads offset
+2 of the function, which is its prologue, state -1: the destructors and catch
+blocks the original frame was inside are skipped. Measured, not read: `fh4probe.py`
+built one function with one unwind action and ran it under Proton's native
+`VCRUNTIME140_1` and under Wine's builtin, which agree -- a call in the function
+ran the action (51), the same call in a chained stub returning at offset 2 did not
+(50), and one returning at offset 16, past the map's edge, did (51). An entry
+exactly at the return address applies (edge 18 against 19).
+
+**On f379, 129 of the 443 stub calls were wrong.** 269 sit in functions with no
+handler, which is safe. 174 are in `__CxxFrameHandler4` functions: 39 found -1
+where the original was -1 too, by luck, 129 found -1 where the original was in a
+live state, and 6 were not matched because a RIP-relative import call is
+re-encoded. No other handler owns a stub, and no original FH4 function was already
+chained or separated.
+
+**The fix is the format's own: a separated `FuncInfo4`** (header bit `0x02`),
+whose map is a list of segments, each `{begin RVA, map RVA}`, and the handler picks
+the segment whose begin equals the record's. The probe found that too: a segment
+for the stub saying state 0 ran the action (51), and one saying -1 did not (50).
+`EH_SEGMENT_RULE` gives each FH4 function holding a stub a copied `FuncInfo4`, marked
+separated, with the function's own map as the first segment and one per stub: the
+state at the window's start, then, for each call `build_stub` moved, the state at
+the original call's return placed at the call's return in the stub.
+`moved_instruction` records those pairs; the function's primary `UNWIND_INFO` is
+copied to point at the new `FuncInfo4`, the original left untouched.
+
+**f380, the same build with the rule: 9,661 functions separated, 104,296 stub
+segments, and all 174 FH4 stub calls now find the original's state** -- 133 live,
+41 at -1, the six RIP calls matched by their absolute target. Windows, stubs,
+frontier sites and the stub section's bytes are identical to f379; unwind info
+grows from 324,844 to 2,046,868 bytes. `verify` passes.
+
+**Every one of the 104,296 segments is a single entry**, the state at the
+window's start, because a window does not cross a state change in this image. So
+the image's 174 are right by the first entry, and the per-call entries are proved
+by the fixture alone: `ehstate` changes state exactly at the call's return, so the
+window opens in -1 and only the call's own entry says 0 -- 77 with the rule, 40
+with the call record removed, 29 for the original. The record itself was checked
+against the image: all 458 recorded calls return where a call in `.avxsse` returns,
+and 15 of them are one call recorded twice by the same build, which the map merged
+and the count no longer includes.
+
+**Still open, and the same class: 18 stub calls sit inside a stub's own 16-byte
+stack allocation** (17 in functions with no handler, 1 in FH4). Finding 49
+measured that a chained fragment's unwind codes are not applied, so the
+establisher frame of anything unwinding through those calls is 16 bytes out.
+
 ### Findings 376 to 379 -- the last four sites that can run here
 
 **Four rules, one site each, and the frontier now holds only gated code.** Measured
@@ -14201,10 +14255,10 @@ and its helpers of the site. Fixture `unithammock` under `check-shadow-pe`, 77.
 reach, with no padding in reach. `moved_branch` refused anything indirect; through a
 register nothing depends on where the instruction sits, so a `call` or `jmp` that names
 no `%rip` is copied as it stands and the window widens back over it. The image runs 46
-such calls in stubs, against none before, beside 397 direct ones. **The open risk is the
-class Finding 86 opened**: a C++ exception thrown through such a call meets a return
-address in a stub, where `__CxxFrameHandler4` looks the state up by IP, and nothing here
-has measured what it finds. Fixture `swallowicall`, 77.
+such calls in stubs, against none before, beside 397 direct ones. A C++ exception
+thrown through any of the 443 meets a return address in a stub, and what
+`__CxxFrameHandler4` finds there was wrong for 129 of them until Finding 380. Fixture
+`swallowicall`, 77.
 
 **Finding 379, `UNIT_PASSENGER_RULE` -- a forward hammock may carry a 256-bit
 passenger.** `0x142baa477` is the second arm of a diamond that loads `ymm0`, and the join,
@@ -14225,8 +14279,8 @@ launched through Steam and closed by the player after about 23 minutes (the Wine
 spans 13:14 to 13:37). The only exceptions in the trace are `DBG_PRINTEXCEPTION_C`
 from the game, which is debug output, and two RPC codes from Wine's plug-and-play
 service during shutdown -- none in `.avxsse`. A short session proves only the paths it
-ran: the indirect calls of Finding 378 under a C++ throw are still unmeasured, and longer
-play over loading, combat and saving is what would reach them.
+ran. The C++ throw through a stub call it could not reach was measured offline afterwards,
+and was wrong in f379: Finding 380.
 
 ### Finding 375 -- a backward hammock may hold a site that borrows
 
