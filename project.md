@@ -23247,6 +23247,12 @@ The product, the rewritten image, is `make detour`, which needs the game binary 
 is not in the repository and takes about an hour. Both stay out of the default for
 those reasons.
 
+**The C build collects unused sections** (2026-11-05, the holder's size rule):
+`-ffunction-sections -fdata-sections` and `-Wl,--gc-sections`, in the Makefile and in
+`fmake.toml`. Measured before and after on the five test binaries: no change beyond 8
+bytes either way, since every function they link is called. `make test` and `check-isa`
+pass on the collected binaries, and so does `fmake test`.
+
 ---
 
 ## Lowering rules

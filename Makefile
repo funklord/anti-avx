@@ -29,7 +29,12 @@ CC        ?= cc
 # emitting either. -mno-f16c in particular stops it from "helpfully"
 # recognising the conversion idiom and emitting the very instruction the
 # code exists to replace.
-CFLAGS    ?= -Os -std=c11 -Wall -Wextra -msse4.1 -mno-avx -mno-f16c
+CFLAGS    ?= -Os -std=c11 -Wall -Wextra -msse4.1 -mno-avx -mno-f16c \
+             -ffunction-sections -fdata-sections
+# With the two -f flags above, each function and object gets its own
+# section, so the linker can drop the ones nothing reaches. Without them
+# it keeps every object on the link line whole.
+LDFLAGS   ?= -Wl,--gc-sections
 CPPFLAGS  += -Isrc -MMD -MP
 
 # Where build products land. Settable so an isolated run can be kept from
@@ -459,16 +464,16 @@ $(BUILD_DIR)/%.o: test/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/f16c_test: $(BUILD_DIR)/f16c_test.o $(BUILD_DIR)/f16c.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 $(BUILD_DIR)/fmaddsub_test: $(BUILD_DIR)/fmaddsub_test.o $(BUILD_DIR)/fmaddsub.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 $(BUILD_DIR)/permil_test: $(BUILD_DIR)/permil_test.o $(BUILD_DIR)/permil.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 $(BUILD_DIR)/permd_test: $(BUILD_DIR)/permd_test.o $(BUILD_DIR)/permd.o
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 # Both halves come out of one generator run, so one recipe produces both and
 # the .inc names the .s as its sibling rather than repeating the command.
@@ -488,7 +493,7 @@ $(BUILD_DIR)/lowering_test.o: test/lowering_test.c \
 
 $(BUILD_DIR)/lowering_test: $(BUILD_DIR)/lowering_test.o \
                             $(BUILD_DIR)/lowering_cases.s
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 # Named explicitly, never bare. A bare `.SECONDARY:` applies to every target
 # any pattern rule matches -- including the object pattern above -- and Make

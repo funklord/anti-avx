@@ -1,8 +1,8 @@
-# anti-avx has no program to build -- `all` is `check` -- so what fmake
-# builds here is the C tests and tool/icache_bench, which holds the one
-# main() that is not a test. The rewriter itself is Python and is nothing
-# fmake compiles; `make detour`, `make scan` and `make census` stay where
-# they are.
+# anti-avx has no program to build -- a bare `make` compiles src/ and
+# nothing links it -- so what fmake builds here is the C tests and
+# tool/icache_bench, which holds the one main() that is not a test. The
+# rewriter itself is Python and is nothing fmake compiles; `make detour`,
+# `make scan` and `make census` stay where they are.
 
 [project]
 # These are semantics, not preferences, and they are the Makefile's exactly.
@@ -11,7 +11,13 @@
 # -mno- flags keep it there if anything ever raises it. Checked rather than
 # assumed: the built f16c_test contains no vcvtph2ps, vcvtps2ph or any other
 # VEX-encoded instruction.
-cflags = ["-std=c11", "-msse4.1", "-mno-avx", "-mno-f16c"]
+cflags = ["-std=c11", "-msse4.1", "-mno-avx", "-mno-f16c",
+          "-ffunction-sections", "-fdata-sections"]
+
+# With the two section flags, the linker drops what nothing reaches, as the
+# Makefile's LDFLAGS does. Measured 2026-11-05: no change on these tests,
+# whose every function is called.
+ldflags = ["-Wl,--gc-sections"]
 
 # The generated case table is written here and included from
 # test/lowering_test.c as a plain "lowering_cases.inc".
