@@ -1273,6 +1273,53 @@ class DocsModeReportsWhatItRead(unittest.TestCase):
 	# source, five were already caught -- but this one and the interior
 	# carriage return below were real, and are theirs.
 
+	# doc_extra, 2026-11-05: a README makes the same claims about the tree
+	# as project.md and nothing read them. Each case pairs what it must
+	# catch with what it must leave alone, since an option nobody turns on
+	# passes every test that does not turn it on.
+	README_GONE = ("# R\n\n| file | note |\n|---|---|\n"
+	               "| `sub/gone.md` | not there |\n")
+
+	def test_a_further_document_is_held_to_the_tree(self) -> None:
+		rc, out = self.docs({
+			".style-gate.toml": 'floor = 0.1\ndoc_extra = ["README.md"]\n',
+			"sub/present.md": "here\n",
+			"project.md": "# One\n",
+			"README.md": self.README_GONE,
+		})
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("README.md:5:1: names a missing file: sub/gone.md", out)
+		self.assertIn("in project.md", out)
+		self.assertIn(", README.md", out)
+
+	def test_a_further_document_is_not_read_unless_named(self) -> None:
+		rc, out = self.docs({
+			".style-gate.toml": "floor = 0.1\n",
+			"sub/present.md": "here\n",
+			"project.md": "# One\n",
+			"README.md": self.README_GONE,
+		})
+		self.assertEqual(rc, 0, out)
+		self.assertNotIn("README.md", out)
+
+	def test_a_clean_further_document_reports_what_was_read(self) -> None:
+		rc, out = self.docs({
+			".style-gate.toml": 'floor = 0.1\ndoc_extra = ["README.md"]\n',
+			"sub/present.md": "here\n",
+			"project.md": "# One\n",
+			"README.md": self.README_GONE.replace("gone", "present"),
+		})
+		self.assertEqual(rc, 0, out)
+		self.assertIn("README.md (1 heading(s), 1 path(s))", out)
+
+	def test_a_missing_further_document_is_refused(self) -> None:
+		rc, out = self.docs({
+			".style-gate.toml": 'floor = 0.1\ndoc_extra = ["README.md"]\n',
+			"project.md": "# One\n",
+		})
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("README.md:1:1: no such file", out)
+
 	def test_a_document_naming_a_missing_file_is_refused(self) -> None:
 		"""Reaching this rule takes three things at once, and a fixture
 		missing any of them passes while proving nothing: the path must

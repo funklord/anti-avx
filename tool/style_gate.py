@@ -156,6 +156,15 @@ DEFAULTS: Config = {
 	# paths in it that are known not to be files -- globs, examples, things
 	# named before they exist. Listing one is a claim that it is deliberate.
 	"doc_file": "project.md",
+	# Further documents held to the same checks, opt-in per tree. A README
+	# makes the same claims about the tree as the design document -- targets,
+	# modules, what a file holds -- and nothing read them: fuzznet's README
+	# said seven modules of twenty and "25 binaries" of 74 (2026-09-04).
+	# Empty by default because turning it on everywhere would light up
+	# sixteen READMEs at once, which no tree should have done to it from
+	# outside; the holder named README staleness the biggest problem those
+	# documents have (2026-10-29), so the switch is each tree's to throw.
+	"doc_extra": [],
 	"doc_ignore": [],
 	# Paths are checked in TABLE ROWS only, and that restriction is what
 	# makes the check work. A table in a design document is a declared
@@ -1911,7 +1920,8 @@ def doc_size(counts: dict[str, int]) -> str:
 
 
 def check_docs(root: Path, cfg: Config,
-               counts: dict[str, int] | None = None) -> list[Problem]:
+               counts: dict[str, int] | None = None,
+               name: str | None = None) -> list[Problem]:
 	"""Hold the design document to the tree it describes.
 
 	A map with a module missing from it is worse than no map: a reader looking
@@ -1919,10 +1929,11 @@ def check_docs(root: Path, cfg: Config,
 	second copy. The same goes for a heading that appears twice -- whichever
 	one you find, the other is the one with the answer.
 	"""
-	doc = root / cfg["doc_file"]
+	name = cfg["doc_file"] if name is None else name
+	doc = root / name
 	problems: list[Problem] = []
 	counts = {} if counts is None else counts
-	rel = Path(cfg["doc_file"])
+	rel = Path(name)
 	if not doc.is_file():
 		# An absent document was zero problems, and zero problems is how
 		# main() spells success -- so this mode passed on a file it had
@@ -1938,7 +1949,8 @@ def check_docs(root: Path, cfg: Config,
 		# against a directory holding only a .style-gate.toml.
 		problems.append(Problem(rel, 1, 1,
 			"no such file: the document this mode checks is missing, "
-			"which is a broken doc_file rather than a clean tree"))
+			"which is a broken doc_file or doc_extra rather than a clean "
+			"tree"))
 		return problems
 	text = doc.read_text(encoding="utf-8", errors="replace")
 	# The document's own size, taken from the same read the checks below
@@ -2108,6 +2120,13 @@ def main(argv: list[str]) -> int:
 	if mode == "docs":
 		counts: dict[str, int] = {}
 		problems = check_docs(root, cfg, counts)
+		# Each further document gets its own counts, so the summary below
+		# can say what was read in each rather than one sum nobody can
+		# check against either file.
+		extra: list[tuple[str, dict[str, int]]] = []
+		for name in cfg["doc_extra"]:
+			extra.append((name, {}))
+			problems += check_docs(root, cfg, extra[-1][1], name)
 		problems += summaryless_docs(root, files, counts)
 		for problem in problems:
 			print(problem, file=sys.stderr)
@@ -2121,6 +2140,7 @@ def main(argv: list[str]) -> int:
 			# figure could not reach.
 			size = doc_size(counts).lstrip(", ")
 			where = f"{cfg['doc_file']}" + (f" ({size})" if size else "")
+			where += "".join(f", {name}" for name, _ in extra)
 			print(f"\n{len(problems)} documentation inconsistency(ies) "
 			      f"in {where}", file=sys.stderr)
 			return 1
@@ -2137,6 +2157,10 @@ def main(argv: list[str]) -> int:
 		           + (f", {counts['paths']} path(s)" if "paths" in counts
 		              else ", paths not checked")
 		           + doc_size(counts) + ")")
+		for name, c in extra:
+			scanned += (f", {name} ({c.get('headings', 0)} heading(s)"
+			            + (f", {c['paths']} path(s))" if "paths" in c
+			               else ", paths not checked)"))
 		print(f"style-gate: {cfg['doc_file']}{scanned} says nothing twice and names no "
 		      f"missing file; {counts['rust']} rust file(s) have a summary "
 		      f"line on every doc comment")
