@@ -60,8 +60,8 @@ What people do today without it is emulate, or give up.
 bit-for-bit, all sixteen registers, against the original instruction
 executed under qemu, since this machine cannot run the original itself.
 Small PEs built by the project itself, one per hazard found, must crash
-unmodified and run correctly once rewritten. A structural verifier re-derives every detour
-from the finished image.
+unmodified and run correctly once rewritten. A structural verifier
+re-derives every detour from the finished image.
 
 **What it does not do.** FMA becomes a multiply and an add, which rounds
 twice where the hardware rounds once (421 sites in Starfield). Bundled DLLs
@@ -70,7 +70,11 @@ first, because its DRM section disassembles as code that is not there.
 The tool takes the binary as an argument and reads the PE headers,
 `.pdata` and relocations, so a game update means a fresh unpack and a
 rebuild. A new build can contain shapes of code no earlier one had, and
-each of those is new work for the rewriter.
+each of those is new work for the rewriter. And a stub that needs a
+scratch register can borrow sixteen bytes of stack for a few
+instructions: a memory fault inside that span reaches its handler with
+the frame sixteen bytes off. No call runs there, so a C++ throw is not
+affected.
 
 Read [`project.md`](project.md). It is the authoritative record of intent
 and wins over the code, and its "Picking this up again" section is written
@@ -79,28 +83,28 @@ for someone starting cold.
 ## What exists
 
 ```
-project.md              the design, the measurements, and every open question
-code-style.md           style rules, copied from the global source
+project.md             the design, the measurements, and every open question
+code-style.md          the style rules
 
 tool/vex_scan.py       the inventory: every VEX site by mnemonic
 tool/lower.py          the lowering RULES; `verify` proves they assemble
 tool/patch.py          in-place patching, and the encoding primitives
-                        everything else uses
-tool/detour.py         the rewriter: collect, place_stubs, build_stub,
-                        lower_vex, apply, verify, census, selftest
+                       everything else uses
+tool/detour.py         the rewriter: plan, apply, verify, census, frontier,
+                       selftest
 tool/targets.py        branch targets from .reloc, .pdata, .xdata, switch
-                        tables and SEH scope tables
+                       tables and SEH scope tables
 tool/outside.py        the code .pdata does not describe
 tool/scratch.py        liveness: find_scratch, and `check` proves its claims
 tool/lowering_cases.py generates the executable cases from the real rules
 tool/pe_build.py       builds AVX PEs so the rewriter has a target it owns
 tool/placement.py      where detours land; icache_bench.c what they cost
 
-src/f16c.c              software half-precision conversion, since Westmere
-                        has no F16C
-src/fmaddsub.c          alternating-lane FMA, src/permil.c, src/permd.c
+src/f16c.c             software half-precision conversion, since Westmere
+                       has no F16C
+src/fmaddsub.c         alternating-lane FMA, src/permil.c, src/permd.c
 test/                  the C tests for those, and lowering_test.c, which
-                        executes the rewriter's own lowerings
+                       executes the rewriter's own lowerings
 ```
 
 ## Rewriting a binary
@@ -137,32 +141,14 @@ make hooks        install the commit-msg hook into .git/hooks
 make help         every target
 ```
 
-The C half of `make check` also builds with [fmake](../fmake), which needs
-no build file and nothing beyond the Python standard library:
+The C tests also build and run with
+[fmake](https://github.com/funklord/fmake), which needs no build file:
 
-    python3 ~/src/fmake/fmake test    # the five C tests, and they pass
+```sh
+fmake test        the five C tests
+```
 
-**Check which one you have**, because the packaged fmake may predate the
-assembly support this needs, and no tree can answer that about your
-machine:
-
-    fmake --version                         # prints a content hash
-    python3 ~/src/fmake/fmake --version     # compare them
-
-Differing hashes mean the source tree is the newer one and is what to
-run. `fmake.toml` carries the ISA flags, because here they are semantics
-rather than preference -- `-msse4.1` is the baseline these helpers are
-written against and `-mno-avx -mno-f16c` keep it there -- and one
-`[generate]` stanza for the case table, whose two halves come out of one
-run of `tool/lowering_cases.py`.
-
-**It is the C tests and `tool/icache_bench`, and nothing else.** The
-rewriter is Python: `make detour`, `make scan`, `make census` and the
-`check-pe`, `check-spill`, `check-tls` and `check-unwind` gates run tools
-and wine rather than compiling anything, and `make check` also runs the
-style gate and the lowering proof. `make` remains the interface; fmake is
-the way to build and run the C tests on a machine that has not got this
-project's toolchain set up.
+The rewriter itself is Python, so that is all fmake has to build here.
 
 `make check` needs no game binary; the others under `check-` need only `wine`.
 `make coverage`, `make scratch-check` and the `detour` targets need the binary.
