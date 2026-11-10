@@ -2,6 +2,41 @@
 
 Ahead-of-time AVX to SSE binary translation for x86-64 PE executables.
 
+## "It's not gonna happen"
+
+When this project started, posters in the Starfield thread on Steam about
+the startup crash on CPUs without AVX said it could not be done:
+
+> static binary translation of AVX to SSE without engine source code isn't
+> viable; replacing YMM registers with XMM instructions changes code size
+> and destroys memory jump offsets, which means the program crashes sooner
+> or later anyway. The engine was compiled with AVX; no converter is going
+> to fix that. [...] It's not gonna happen.
+> ([8 August 2026](https://steamcommunity.com/app/1716740/discussions/0/585056462065333351/?ctp=2#c585056732983623069))
+
+> without source code or PDBs, you have zero clue where compiler-generated
+> jump tables, relative offsets, and internal memory validations are hiding.
+> You're flying completely blind, and the binary will crash on launch.
+> ([8 August 2026](https://steamcommunity.com/app/1716740/discussions/0/585056462065333351/?ctp=2#c585056732983640990))
+
+> circumventing avx2 by other means is no option for starfield.
+> ([5 November 2026](https://steamcommunity.com/app/1716740/discussions/0/585056462065333351/?ctp=3#c564798618066777636))
+
+Each objection is specific, and each has an answer in this tree:
+
+- **Code size.** 70.5% of the VEX instructions have an SSE form of the
+  same length and are rewritten in place. The rest move to stubs, and
+  only the stub's entry is patched into the original code.
+- **Jump offsets and jump tables.** Every branch target is recovered from
+  the image itself -- relocations, `.pdata`, unwind data, SEH scope tables
+  and 1,795 switch tables -- and nothing a branch can land on is
+  overwritten.
+- **"Crashes on launch."** The rewritten game is played through Steam
+  under Proton on a Xeon X5675, where the unmodified one dies in four
+  seconds.
+- **"A 1 FPS slideshow."** Profiles of play put the rewritten code at 4
+  to 6 per cent of the game's CPU samples.
+
 A program compiled with a whole-program `/arch:AVX2` baseline will not start
 on a processor without AVX. The compiler is told it may assume the newer
 instructions everywhere. So it uses their encoding (VEX) for nearly every
