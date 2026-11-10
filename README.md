@@ -4,8 +4,8 @@ Ahead-of-time AVX to SSE binary translation for x86-64 PE executables.
 
 ## "It's not gonna happen"
 
-When this project started, posters in the Starfield thread on Steam about
-the startup crash on CPUs without AVX said it could not be done:
+When this project started, developers in the Starfield thread on Steam
+about the startup crash on CPUs without AVX said it could not be done:
 
 > static binary translation of AVX to SSE without engine source code isn't
 > viable; replacing YMM registers with XMM instructions changes code size
