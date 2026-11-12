@@ -1100,6 +1100,41 @@ class ColumnHeuristicIsReached(unittest.TestCase):
 		self.assertEqual(rc, 0, out)
 
 
+@unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+class UnreadableFileIsAFinding(unittest.TestCase):
+	"""situ 2026-11-12: seven tracked files under the other account were
+	mode 600, and the gate died with a traceback on the first. It must fail
+	naming the file, and a readable tree beside it must still pass."""
+
+	def gate(self, mode: int | None) -> tuple[int, str]:
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			(root / ".style-gate.toml").write_text("floor = 0.1\n")
+			(root / "a.c").write_text("int a;\n")
+			b = root / "b.c"
+			b.write_text("int b;\n")
+			if mode is not None:
+				b.chmod(mode)
+			try:
+				gate = Path(__file__).resolve().parent / "style_gate.py"
+				r = subprocess.run([sys.executable, str(gate), "check"], cwd=root,
+				                   capture_output=True, text=True)
+			finally:
+				b.chmod(0o644)
+			return r.returncode, r.stdout + r.stderr
+
+	def test_an_unreadable_file_fails_by_name(self) -> None:
+		rc, out = self.gate(0)
+		self.assertNotEqual(rc, 0, out)
+		self.assertIn("b.c", out)
+		self.assertIn("cannot read it", out)
+		self.assertNotIn("Traceback", out)
+
+	def test_the_same_tree_readable_passes(self) -> None:
+		rc, out = self.gate(None)
+		self.assertEqual(rc, 0, out)
+
+
 class PicoLispStringsAreContent(unittest.TestCase):
 	"""Leading whitespace inside a PicoLisp string is the value, not indent.
 

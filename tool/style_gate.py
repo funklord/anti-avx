@@ -1026,7 +1026,16 @@ def check_text(text: str, where: Path, indent: bool = True,
 def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 	rel      = path.relative_to(root)
 	problems = []
-	raw      = path.read_bytes()
+	# AN UNREADABLE FILE IS A FINDING, NOT A CRASH AND NOT A PASS. Seven
+	# tracked files in situ were mode 600 under the other account, and the
+	# gate stopped at the first with a traceback, so `make style` could not
+	# pass there for this account and said nothing useful about why
+	# (2026-11-12). A file nobody can read has not been checked, so the run
+	# fails, naming it.
+	try:
+		raw = path.read_bytes()
+	except OSError as exc:
+		return [Problem(rel, 1, 1, f"cannot read it ({exc.strerror}), so it is unchecked")]
 
 	if cfg["ascii_only"] and not (cfg["ascii_exclude_markdown"] and path.suffix == ".md"):
 		found = None
@@ -1813,7 +1822,10 @@ def fixed_text(path: Path, src: str, cfg: Config,
 
 def fix_file(path: Path, cfg: Config, write: bool) -> tuple[bool, str | None]:
 	"""-> (changed, error). Refuses to write an edit it cannot prove."""
-	src = path.read_text(encoding="utf-8", errors="surrogateescape")
+	try:
+		src = path.read_text(encoding="utf-8", errors="surrogateescape")
+	except OSError as exc:
+		return False, f"cannot read it ({exc.strerror})"
 	if not has_fixer(path):
 		return False, "no fixer for this file type; check only"
 
