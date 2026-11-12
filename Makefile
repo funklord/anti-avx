@@ -77,7 +77,7 @@ GENERATED  = $(BUILD_DIR)/lowering_cases.s $(BUILD_DIR)/lowering_cases.inc
 TEST_BIN   = $(BUILD_DIR)/f16c_test
 DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 
-.PHONY: all test check style style-source style-docs verify check-verify \
+.PHONY: all test check style style-source style-tool style-docs verify check-verify \
         check-f16c \
         check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
         check-isa \
@@ -107,7 +107,7 @@ test: check-aliasing check-lowering check-f16c check-fmaddsub \
 check: style verify check-verify check-aliasing check-lowering check-isa \
        check-f16c check-f16c-oracle check-fmaddsub check-permil check-permd check-span
 
-style: style-source style-docs
+style: style-tool style-source style-docs
 
 # Assemble every lowering rule and prove no VEX prefix survives. Needs no
 # game binary, so it belongs in `check` where `scan` and `coverage` do not.
@@ -501,6 +501,14 @@ $(BUILD_DIR)/lowering_test: $(BUILD_DIR)/lowering_test.o \
 # exists, which is how adding a source file leaves a stale binary and a
 # `make` that reports nothing to do.
 .SECONDARY: $(TEST_OBJS)
+
+# The style gate's own suite, run ahead of the gate's verdict. A checker
+# that has stopped inspecting anything passes exactly as loudly as one
+# that works, so its pass is worth reading only once its suite has.
+# tool/test_style_gate.py arrives beside tool/style_gate.py and was
+# carried here unrun until 2026-11-12, on the holder's word.
+style-tool:
+	$(PYTHON) tool/test_style_gate.py
 
 style-source:
 	$(PYTHON) tool/style_gate.py
