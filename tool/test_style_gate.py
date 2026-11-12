@@ -1100,6 +1100,39 @@ class ColumnHeuristicIsReached(unittest.TestCase):
 		self.assertEqual(rc, 0, out)
 
 
+class PicoLispStringsAreContent(unittest.TestCase):
+	"""Leading whitespace inside a PicoLisp string is the value, not indent.
+
+	hembygd 2026-11-09: of its tab-rule findings, some fall inside
+	multi-line transient symbols -- a grammar compared byte for byte,
+	shipped lexicon text -- where moving the text would change the data.
+	Each case pairs the skip with the finding it must not hide.
+	"""
+
+	CONFIG = 'floor = 0.1\nindent_suffixes = [".l"]\n'
+
+	def test_rows_inside_a_string_are_skipped(self) -> None:
+		text = '(de f ()\n\t(prinl "one\n  two\n\tthree") )\n'
+		self.assertEqual(sg.picolisp_literal_lines(text), frozenset({3, 4}))
+
+	def test_an_escaped_quote_does_not_close_the_string(self) -> None:
+		"""`(length "a\\"b")` is 3 in pil. A reader without escapes
+		closed this string early and took the code below for string
+		content: hembygd's brain/gen.l, ten lines."""
+		text = '(prinl "a\\"b\n  c")\n(x)\n  (y)\n'
+		self.assertEqual(sg.picolisp_literal_lines(text), frozenset({2}))
+
+	def test_a_quote_in_a_comment_opens_nothing(self) -> None:
+		text = '# a "quoted\nphrase\n#{ "block\n  }# (y)\n  (z)\n'
+		self.assertEqual(sg.picolisp_literal_lines(text), frozenset())
+
+	def test_the_gate_passes_a_string_and_refuses_code(self) -> None:
+		string = '(de f ()\n\t(prinl "one\n  two") )\n'
+		self.assertEqual(gate_rc({"a.l": string}, self.CONFIG), 0)
+		code = '(de f ()\n  (prinl "one") )\n'
+		self.assertNotEqual(gate_rc({"a.l": code}, self.CONFIG), 0)
+
+
 class DocsModeReportsWhatItRead(unittest.TestCase):
 	"""`docs` passed on a document it had never opened, and named it.
 

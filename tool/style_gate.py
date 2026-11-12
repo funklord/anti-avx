@@ -889,6 +889,59 @@ def python_literal_lines(text: str) -> frozenset[int]:
 	return frozenset(covered)
 
 
+def picolisp_literal_lines(text: str) -> frozenset[int]:
+	"""Rows inside multi-line PicoLisp transient symbols (its strings).
+
+	As for Python: their leading whitespace is the value. hembygd measured
+	40 of its 3563 tab-rule findings inside one, in a grammar compared
+	byte for byte and in shipped content, where moving the text flush left
+	would change the data (2026-11-09).
+
+	`#` comments to the end of the line and `#{ ... }#` blocks are read as
+	comments, because a quotation mark in English prose would otherwise
+	open a string: hembygd's first scanner, without them, reported 87
+	spans nearly all one line long. A backslash escapes the next character
+	inside a string and out of one -- `(length "a\\"b")` is 3 in pil -- which
+	that scanner assumed it did not.
+	"""
+	inside: set[int] = set()
+	i, n, line, in_str = 0, len(text), 1, False
+	while i < n:
+		c = text[i]
+		if c == "\n":
+			line += 1
+			if in_str:
+				inside.add(line)
+			i += 1
+			continue
+		if c == "\\":
+			if i + 1 < n and text[i + 1] == "\n":
+				line += 1
+				if in_str:
+					inside.add(line)
+			i += 2
+			continue
+		if in_str:
+			if c == '"':
+				in_str = False
+			i += 1
+			continue
+		if c == "#":
+			if text.startswith("#{", i):
+				j = text.find("}#", i + 2)
+				j = n if j < 0 else j + 2
+				line += text.count("\n", i, j)
+				i = j
+				continue
+			j = text.find("\n", i)
+			i = n if j < 0 else j
+			continue
+		if c == '"':
+			in_str = True
+		i += 1
+	return frozenset(inside)
+
+
 # --------------------------------------------------------------- checks
 
 class Problem:
@@ -1030,7 +1083,12 @@ def check_file(path: Path, root: Path, cfg: Config) -> list[Problem]:
 	# fixpoint check below is both authoritative and depth-aware, and the
 	# heuristic is redundant. Keep the heuristic only for the languages that
 	# have no fixer, where something is better than nothing.
-	skip = python_literal_lines(text) if is_python(path) else frozenset()
+	if is_python(path):
+		skip = python_literal_lines(text)
+	elif path.suffix == ".l":
+		skip = picolisp_literal_lines(text)
+	else:
+		skip = frozenset()
 	problems.extend(check_text(text, rel, wants_indent(path, cfg), skip,
 	                           heuristic=wants_column_heuristic(path)))
 
