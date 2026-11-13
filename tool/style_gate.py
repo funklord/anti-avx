@@ -892,10 +892,12 @@ def python_literal_lines(text: str) -> frozenset[int]:
 def picolisp_literal_lines(text: str) -> frozenset[int]:
 	"""Rows inside multi-line PicoLisp transient symbols (its strings).
 
-	As for Python: their leading whitespace is the value. hembygd measured
-	40 of its 3563 tab-rule findings inside one, in a grammar compared
-	byte for byte and in shipped content, where moving the text flush left
-	would change the data (2026-11-09).
+	As for Python: their leading whitespace is the value. In hembygd 26
+	rows of 4291 tab-rule findings sit inside one -- eight of shipped
+	pronunciation content in lexicon.l, the rest test fixtures -- where
+	moving the text flush left would change the data (re-measured
+	2026-11-12; a first count of 40, with a grammar in gen.l among them,
+	came from a scanner that did not know the escape below).
 
 	`#` comments to the end of the line and `#{ ... }#` blocks are read as
 	comments, because a quotation mark in English prose would otherwise
