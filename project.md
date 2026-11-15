@@ -60,6 +60,14 @@ project modifies somebody else's binary and holds no copyright in the result.
 it too. Licensing is a separate question and is deliberately not settled -- see
 the README.
 
+**The README opens with the objections it answers** (2026-11-10, on the holder's
+word): three posts from the Steam thread on the startup crash, "Game crashes on
+startup if CPU lacks AVX2 instructions. [Fixed]" (discussion 585056462065333351),
+each linked to its comment, then one line per objection backed by a figure from
+here -- 70.5% in place (Finding 14), 1,795 switch tables, profiles at 3.7 to 6.2%.
+Those figures, and the README's "What it does not do", which carries Finding 381's
+open stack-borrow fault, move with the findings and have to be re-read when they do.
+
 ---
 
 ## Motivation
