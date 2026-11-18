@@ -1930,6 +1930,76 @@ def heading_number(line: str) -> str:
 	                    for c in token) else ""
 
 
+def doc_tracked(root: Path) -> tuple[set[str], set[str]] | None:
+	"""What the index holds, and which of its entries are gitlinks.
+
+	The path half of `docs` mode asks whether a backticked path in a table
+	names a file that is there, and until 2026-11-18 it asked the
+	FILESYSTEM. A backticked BUILD PRODUCT then passes whenever the tree
+	happens to be built -- nearly always -- and fails only when somebody
+	runs a target that cleans first, so the verdict was a property of the
+	build state rather than of the document.
+
+	Reported by ossacli with two instances from one file in one day: a
+	size table named the integration example's built binary, every `make
+	style` of a ten-hour session passed it, and `make coverage`, which
+	begins with `make clean`, refused it. Four hours later a second table
+	named the fuzz driver's built name and only the previous run's
+	leftovers made that one fail too. Between the two occasions a session
+	could have committed either claim and a reviewer pulled it with the
+	gate green at both ends.
+
+	The index answers the same question and cannot drift with the build: a
+	tracked file is tracked whether or not anything is compiled, and a
+	build product is never tracked. It also catches the inverse the
+	filesystem cannot see at all -- a path that is there only because
+	somebody left an artifact behind.
+
+	`--recurse-submodules` rather than an exemption for submodule paths. A
+	vendored tree's files are tracked in ITS index, so the question is
+	answerable, and exempting them would stop checking the kind of path a
+	consumer is most likely to get wrong. Measured across the 23 private
+	trees holding a `project.md` before the change: exactly one backticked
+	table path was present-and-untracked, `fuzznet/notes/note.h` in
+	fuzzypickles, inside a gitlink at mode 160000 -- so the submodule case
+	was the whole of the population, and an exemption would have been a
+	rule written to skip its only instance.
+
+	The gitlink set comes back beside the names because an UNPOPULATED
+	submodule cannot be asked: `--recurse-submodules` lists nothing under
+	it and a true path would read as missing. Returning the prefixes lets
+	the caller exempt those and nothing else.
+
+	`None` where git cannot be asked at all, which is a tree that is not a
+	repository -- a `git archive` export, which is how at least one of
+	these projects builds in CI. The caller then falls back to the
+	filesystem AND says so in the verdict, because a fallback that prints
+	the same sentence as the strict check is a check nobody can tell has
+	stopped running.
+	"""
+	if not in_git_repo(root):
+		return None
+	listed = []
+	for args in (["--cached", "--recurse-submodules"], ["--stage"]):
+		out = subprocess.run(["git", "-C", str(root), "ls-files", "-z"]
+		                     + args, capture_output=True, text=True,
+		                     check=False)
+		# Same reasoning as discover(): a git that exits non-zero is a
+		# broken instrument and not an empty index, and read as an empty
+		# set it would clear every path the document names.
+		if out.returncode != 0:
+			detail = out.stderr.strip().splitlines() or [
+				f"git ls-files exited {out.returncode} and said nothing."]
+			reject(f"cannot list the tracked files in {root}.", *detail,
+			       "the path half of this mode would then pass every "
+			       "path it was given.")
+		listed.append([n for n in out.stdout.split("\0") if n])
+	# `--stage` prints "mode object stage\tname"; a gitlink is 160000.
+	gitlinks = {n.split("\t", 1)[1] for n in listed[1]
+	            if n.startswith("160000 ") and "\t" in n}
+	return set(listed[0]), gitlinks
+
+
 def doc_paths(text: str) -> list[tuple[int, str]]:
 	"""Backticked paths in table rows: the document's declared inventory.
 
@@ -2088,16 +2158,46 @@ def check_docs(root: Path, cfg: Config,
 	ignore = set(cfg["doc_ignore"])
 	tokens = list(doc_paths(text))
 	counts["paths"] = len(tokens)
+	index = doc_tracked(root)
+	# Carried to the verdict so that the weaker reading announces itself.
+	counts["doc_paths_indexed"] = int(index is not None)
 	for number, token in tokens:
-		if token in ignore or (root / token).exists():
+		if token in ignore:
 			continue
+		target = root / token
+		if index is None:
+			if target.exists():
+				continue
+		else:
+			tracked, gitlinks = index
+			# A directory reference is a legitimate inventory entry and is
+			# never in `ls-files`, so the filesystem keeps that half.
+			if token in tracked or target.is_dir():
+				continue
+			# An unpopulated submodule has no index to ask, so a path
+			# under one cannot be judged either way. Exempt exactly
+			# those prefixes rather than every path with a slash in it.
+			if any(token.startswith(f"{link}/")
+			       and not (root / link / ".git").exists()
+			       for link in gitlinks):
+				continue
 		# Only complain when the directory it names is real. A path under a
 		# directory that does not exist is describing a layout rather than
 		# pointing at a file, and flagging those buries the real findings.
-		parent = (root / token).parent
+		parent = target.parent
 		if parent != root and not parent.is_dir():
 			continue
-		problems.append(Problem(rel, number, 1, f"names a missing file: {token}"))
+		# **Two findings, not one sentence for both.** A path that is absent
+		# and a path that is present but untracked are different mistakes --
+		# a typo or a move against a build product written into an
+		# inventory -- and calling the second one missing sends the reader
+		# to look for a file that is sitting right there. Reported by
+		# ossacli 2026-11-18, whose first act on seeing it was to check
+		# whether the file existed; their two instances were both of the
+		# second kind, which is the kind this check was added for.
+		note = ("names a missing file" if not target.exists()
+		        else "names a file git does not track")
+		problems.append(Problem(rel, number, 1, f"{note}: {token}"))
 	return problems
 
 
@@ -2225,8 +2325,14 @@ def main(argv: list[str]) -> int:
 		# It also covers the quieter half: if doc_paths() stopped matching,
 		# the path check would inspect nothing and the old sentence would
 		# not have changed by a word. Now the number moves.
+		# Which instrument answered, because the fallback is weaker and
+		# a sentence that cannot tell them apart is how a check stops
+		# running unnoticed: the index cannot drift with the build state
+		# and the filesystem can.
+		by = (" by the index" if counts.get("doc_paths_indexed")
+		      else " by the filesystem, no git here")
 		scanned = (f" ({counts.get('headings', 0)} heading(s)"
-		           + (f", {counts['paths']} path(s)" if "paths" in counts
+		           + (f", {counts['paths']} path(s){by}" if "paths" in counts
 		              else ", paths not checked")
 		           + doc_size(counts) + ")")
 		for name, c in extra:

@@ -1912,5 +1912,167 @@ class RustDocCommentsHaveASummary(unittest.TestCase):
 		self.assertIn("2 rust file(s)", two)
 
 
+class DocsPathsAreAskedOfTheIndex(unittest.TestCase):
+	"""A backticked build product passed whenever the tree was built.
+
+	`check_docs` resolved a table path with `(root / token).exists()`, so
+	the verdict was a property of the build state rather than of the
+	document. Reported by ossacli 2026-11-17 with two instances from one
+	file in one day: a size table naming a built binary passed every `make
+	style` of a ten-hour session and was refused only by `make coverage`,
+	which cleans first.
+
+	Every docs test above runs in a plain temporary directory, which is
+	not a repository, so all of them exercise the FILESYSTEM fallback and
+	none of them could have caught this. That is why this class makes a
+	real repository: a fixture that cannot reach the index proves nothing
+	about the rule that reads it.
+	"""
+
+	ENV = dict(os.environ,
+	           GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@invalid",
+	           GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@invalid")
+
+	def git(self, root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+		r = subprocess.run(["git", "-C", str(root), *args], env=self.ENV,
+		                   capture_output=True, text=True, timeout=120)
+		self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+		return r
+
+	def table(self, *tokens: str) -> str:
+		rows = "".join(f"| `{t}` | a claim |\n" for t in tokens)
+		return "# One\n\n| file | note |\n|---|---|\n" + rows
+
+	def write(self, root: Path, name: str, text: str = "x\n") -> None:
+		(root / name).parent.mkdir(parents=True, exist_ok=True)
+		(root / name).write_text(text, encoding="utf-8")
+
+	def run_docs(self, root: Path) -> tuple[int, str]:
+		gate = Path(__file__).resolve().parent / "style_gate.py"
+		r = subprocess.run([sys.executable, str(gate), "docs"], cwd=root,
+		                   capture_output=True, text=True, timeout=120)
+		return r.returncode, r.stdout + r.stderr
+
+	def repo(self, tracked: dict[str, str],
+	         loose: dict[str, str] | None = None) -> tuple[int, str]:
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			self.git(root, "init", "-q")
+			for name, text in tracked.items():
+				self.write(root, name, text)
+				self.git(root, "add", "--", name)
+			self.git(root, "commit", "-qm", "fixture")
+			for name, text in (loose or {}).items():
+				self.write(root, name, text)
+			return self.run_docs(root)
+
+	def test_a_built_artifact_is_refused_although_it_is_on_disk(self) -> None:
+		"""The finding itself. The old rule passed this fixture, and the
+		exit code is the whole difference -- the file IS there."""
+		rc, out = self.repo(
+			{".style-gate.toml": "floor = 0.1\n",
+			 "project.md": self.table("build/thing")},
+			{"build/thing": "a compiled artifact\n"})
+		self.assertNotEqual(rc, 0, out)
+		# The wording is its own assertion: ossacli met this finding on two
+		# present-and-untracked paths and went looking for the file first,
+		# because the message said missing. A build product is not missing.
+		self.assertIn("names a file git does not track: build/thing", out)
+		self.assertNotIn("missing file", out)
+
+	def test_a_path_in_prose_is_not_an_inventory_entry(self) -> None:
+		"""The deliberate half of the extractor, pinned where it can be
+		read as behaviour rather than as a docstring. `doc_paths` takes
+		table rows only, because a path in prose is as often an example, a
+		glob or a layout being described -- measured at 1625 in prose
+		against 128 in tables across seventeen documents. Suggested by
+		ossacli 2026-11-18, whose first control put the path in a sentence
+		and was correctly ignored, which cost them a probe to work out."""
+		rc, out = self.repo(
+			{".style-gate.toml": "floor = 0.1\n",
+			 "project.md": "# One\n\nthe artifact lands at `build/thing`, "
+			               "which is not an inventory entry.\n"},
+			{"build/thing": "a compiled artifact\n"})
+		self.assertEqual(rc, 0, out)
+		# 0, not absent: the count is what says the extractor ran and
+		# declined this token rather than never having been reached.
+		self.assertIn("0 path(s)", out)
+
+	def test_a_tracked_file_still_passes(self) -> None:
+		"""The other side of it, so the rule is not "refuse everything":
+		a count of 1 is what says the token was read rather than lost by
+		the extractor."""
+		rc, out = self.repo({".style-gate.toml": "floor = 0.1\n",
+		                     "sub/present.md": "here\n",
+		                     "project.md": self.table("sub/present.md")})
+		self.assertEqual(rc, 0, out)
+		self.assertIn("1 path(s)", out)
+
+	def test_a_directory_reference_is_not_a_missing_file(self) -> None:
+		"""A directory is never in `ls-files`, so the filesystem keeps
+		this half. Without the exemption every inventory naming a
+		directory would turn red at once."""
+		rc, out = self.repo({".style-gate.toml": "floor = 0.1\n",
+		                     "doc/decision/0001-a.md": "here\n",
+		                     "project.md": self.table("doc/decision")})
+		self.assertEqual(rc, 0, out)
+		self.assertIn("1 path(s)", out)
+
+	def test_the_verdict_names_the_instrument(self) -> None:
+		"""A fallback that prints the strict check's sentence is a check
+		nobody can tell has stopped running, so the two are told apart in
+		the words and not only in the code."""
+		_, indexed = self.repo({".style-gate.toml": "floor = 0.1\n",
+		                        "project.md": "# One\n"})
+		self.assertIn("by the index", indexed)
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			self.write(root, ".style-gate.toml", "floor = 0.1\n")
+			self.write(root, "project.md", "# One\n")
+			_, walked = self.run_docs(root)
+		self.assertIn("by the filesystem, no git here", walked)
+
+	def submodule_tree(self, populated: bool) -> tuple[int, str]:
+		with tempfile.TemporaryDirectory() as d:
+			root, origin = Path(d) / "main", Path(d) / "origin"
+			origin.mkdir()
+			self.git(origin, "init", "-q")
+			self.write(origin, "notes/note.h", "/* a header */\n")
+			self.git(origin, "add", "--", "notes/note.h")
+			self.git(origin, "commit", "-qm", "origin")
+			root.mkdir()
+			self.git(root, "init", "-q")
+			self.write(root, ".style-gate.toml", "floor = 0.1\n")
+			self.write(root, "project.md", self.table("vendored/notes/note.h"))
+			self.git(root, "add", "--", ".style-gate.toml", "project.md")
+			self.git(root, "-c", "protocol.file.allow=always",
+			         "submodule", "--quiet", "add", str(origin), "vendored")
+			self.git(root, "commit", "-qm", "vendor it")
+			if not populated:
+				self.git(root, "submodule", "--quiet", "deinit", "-f",
+			         "vendored")
+			return self.run_docs(root)
+
+	def test_a_path_inside_a_vendored_submodule_is_checked_and_passes(self) -> None:
+		"""`--recurse-submodules`, rather than exempting anything with a
+		slash under a gitlink. Measured across the private trees before
+		the change: the ONE present-and-untracked table path in the whole
+		workspace was a header inside a vendored submodule, so an
+		exemption would have been a rule written to skip its only
+		instance."""
+		rc, out = self.submodule_tree(populated=True)
+		self.assertEqual(rc, 0, out)
+		self.assertIn("1 path(s)", out)
+
+	def test_a_path_inside_an_absent_submodule_is_not_judged(self) -> None:
+		"""The exemption that is genuinely needed: a submodule nobody has
+		checked out has no index to ask, and reporting its contents
+		missing would be a verdict about the clone rather than about the
+		document. The same fixture, one `deinit` apart."""
+		rc, out = self.submodule_tree(populated=False)
+		self.assertEqual(rc, 0, out)
+		self.assertIn("1 path(s)", out)
+
+
 if __name__ == "__main__":
 	unittest.main(verbosity=1)
