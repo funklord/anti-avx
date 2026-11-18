@@ -94,6 +94,8 @@ NDS_MNEMONICS = frozenset("""
 	vmovss vmovsd vmovhpd vmovlpd vmovhps vmovlps
 	vcvtsi2ss vcvtsi2sd vcvtsi2ssl vcvtsi2ssq vcvtsi2sdl vcvtsi2sdq
 	vcvtss2sd vcvtsd2ss
+	vpaddsb vpaddsw vpsubsb vpsubsw vpmulhw vpmulhuw vpmuldq vpmulhrsw vpavgb vpavgw vpmaxsb
+	vpmaxsd vpmaxuw vpminsb vpminsd vpminuw vpsignb vpsignw vpsignd vphaddsw vphsubsw
 """.split())
 
 # objdump disambiguates a few converts by appending an operand-size letter

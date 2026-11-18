@@ -14178,6 +14178,36 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 383 -- the rules real compilers need that Starfield never asked for
+
+**gcc's `-mavx` build of `fixture/mingw/kernels.cpp` died on `vpmaxsd %xmm0,%xmm1,%xmm0`**,
+declined `no direct SSE form`. It has one -- SSE4.1's `pmaxsd` -- and so do twenty more
+two-source integer forms nobody had listed, because Starfield uses none of them:
+`vpadds[bw]`, `vpsubs[bw]`, `vpmulh[u]w`, `vpmuldq`, `vpmulhrsw`, `vpavg[bw]`,
+`vpmax[s][bd]`/`vpmaxuw`, `vpmin[s][bd]`/`vpminuw`, `vpsign[bwd]`, `vphaddsw`,
+`vphsubsw`. They are NDS rules now with one executed case each: `check-vex` runs every
+original under qemu against its lowering, 354 cases to 375, all agreeing; the
+assembly proof is 570 lowered instructions to 612. The `-mavx` build rewrites 418 of
+418 and matches the oracle, and is `check-mingw`'s fourth route -- the `/arch:AVX`
+baseline, where integer work stays 128-bit and VEX-encoded.
+
+**Reading the 256-bit classifier for the same shape found three more.** `immreg` and
+`immreg3` passed one immediate to both halves unchanged, justified by Starfield's 108
+in-lane sites. That holds for `vshufps` and `vpblendw`; it does not hold where the
+immediate has a field per element, and the upper lane reads its own: `vblendps` bits
+7:4, `vblendpd` and `vshufpd` bits 3:2, `vmpsadbw` bits 5:3. `UPPER_IMMEDIATE_SHIFT`
+shifts the upper half's immediate down. `check-span` runs one case each with
+immediates whose two fields differ; with the shift removed all four DIFFER.
+
+AVX2's `vpblendd` and variable shifts (`vpsllv[dq]`, `vpsrlv[dq]`, `vpsravd`) have no
+SSE encoding and were not in `NO_LEGACY_FORM`, so a slot shape would have narrowed
+them into opcodes SSE never had. And a shift whose count is a memory operand was
+classified `lane`, which reads the upper half's count from `+16` where one count
+serves both halves; it is refused (`SHIFT_BY_OPERAND`). Starfield has none of any of
+these -- its one memory-count shift, at `0x140d35710`, is Finding 337's switch index
+table decoded as code. Rebuilt with all of this, the Starfield image is byte-identical
+to f382 (`cmp`), which is the measurement behind that sentence.
+
 ### Finding 382 -- real compiler output, and a load that was an operation
 
 **Every input until now was Starfield or a fixture assembled here**, so every shape the

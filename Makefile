@@ -1556,7 +1556,7 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 # widened a register, and that is the shape that had shipped wrong in
 # Starfield as a plain load. gcc's builds alone passed with it broken.
 #
-# Termination: six wine runs under timeouts, after one compile per build.
+# Termination: seven wine runs under timeouts, after one compile per build.
 # Needs mingw, clang and wine, and stays out of `check` for that reason.
 MINGW_CXX  ?= x86_64-w64-mingw32-g++
 MINGW_CLANG ?= clang++ --target=x86_64-w64-mingw32
@@ -1571,13 +1571,25 @@ MINGW_OUT   = $(BUILD_DIR)/mingw-avx2.exe $(BUILD_DIR)/mingw-sse.exe \
               $(BUILD_DIR)/mingw-clang-got.txt \
               $(BUILD_DIR)/mingw-avx2.dll $(BUILD_DIR)/mingw-sse.dll \
               $(BUILD_DIR)/mingw-rewritten.dll $(BUILD_DIR)/mingw-host.exe \
-              $(BUILD_DIR)/mingw-dll-want.txt $(BUILD_DIR)/mingw-dll-got.txt
+              $(BUILD_DIR)/mingw-dll-want.txt $(BUILD_DIR)/mingw-dll-got.txt \
+              $(BUILD_DIR)/mingw-avx1.exe $(BUILD_DIR)/mingw-avx1-sse.exe \
+              $(BUILD_DIR)/mingw-avx1-got.txt
 
 $(BUILD_DIR)/mingw-avx2.exe: $(MINGW_SRC) | $(BUILD_DIR)
 	$(MINGW_CXX) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
 
 $(BUILD_DIR)/mingw-sse.exe: $(MINGW_SRC) | $(BUILD_DIR)
 	$(MINGW_CXX) $(MINGW_FLAGS) -msse4.2 -s -o $@ $<
+
+# **`-mavx` alone**, the `/arch:AVX` baseline: integer work stays 128-bit and
+# VEX-encoded, which is where `vpmaxsd` and twenty other two-source forms
+# had no rule and the first such build died. Finding 383.
+$(BUILD_DIR)/mingw-avx1.exe: $(MINGW_SRC) | $(BUILD_DIR)
+	$(MINGW_CXX) $(MINGW_FLAGS) -mavx -s -o $@ $<
+
+$(BUILD_DIR)/mingw-avx1-sse.exe: $(BUILD_DIR)/mingw-avx1.exe anti-avx \
+                                 tool/detour.py tool/patch.py tool/resync.py
+	./anti-avx $< $@
 
 $(BUILD_DIR)/mingw-clang.exe: $(MINGW_SRC) | $(BUILD_DIR)
 	$(MINGW_CLANG) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
@@ -1628,7 +1640,8 @@ $(BUILD_DIR)/mingw-front.exe: $(BUILD_DIR)/mingw-symbols.exe anti-avx \
 check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
              $(BUILD_DIR)/mingw-symbols.exe $(BUILD_DIR)/mingw-front.exe \
              $(BUILD_DIR)/mingw-clang-sse.exe $(BUILD_DIR)/mingw-host.exe \
-             $(BUILD_DIR)/mingw-sse.dll $(BUILD_DIR)/mingw-rewritten.dll
+             $(BUILD_DIR)/mingw-sse.dll $(BUILD_DIR)/mingw-rewritten.dll \
+             $(BUILD_DIR)/mingw-avx1-sse.exe
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-mingw: wine is not installed"; exit 1; }
 	@if $(PYTHON) tool/detour.py plan $(BUILD_DIR)/mingw-symbols.exe \
@@ -1673,6 +1686,12 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
 	diff $(BUILD_DIR)/mingw-want.txt $(BUILD_DIR)/mingw-clang-got.txt || \
 		{ echo "check-mingw: clang's rewritten build disagrees with SSE"; \
 		  exit 1; }; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-avx1-sse.exe \
+		> $(BUILD_DIR)/mingw-avx1-got.txt 2>&1 || \
+		{ echo "check-mingw: the -mavx build failed"; exit 1; }; \
+	diff $(BUILD_DIR)/mingw-want.txt $(BUILD_DIR)/mingw-avx1-got.txt || \
+		{ echo "check-mingw: the -mavx build disagrees with SSE"; \
+		  exit 1; }; \
 	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-host.exe \
 		$(BUILD_DIR)/mingw-sse.dll > $(BUILD_DIR)/mingw-dll-want.txt 2>&1; \
 	grep -q "^base relocated " $(BUILD_DIR)/mingw-dll-want.txt || \
@@ -1687,7 +1706,7 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
 		  exit 1; }; \
 	echo "check-mingw: the rewritten DLL, loaded relocated, agrees"; \
 	echo "check-mingw: $$(wc -l < $(BUILD_DIR)/mingw-want.txt) results," \
-	     "every one as the SSE build computes it, by three routes"
+	     "every one as the SSE build computes it, by four routes"
 
 # Can an exception be dispatched from inside a stub? Two programs that fault
 # on purpose, both registering a handler through .pdata -- which is how a PE

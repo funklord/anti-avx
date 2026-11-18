@@ -151,12 +151,47 @@ CASES = [
 	  ("c4e27d25db", "vpmovsxdq", "%xmm3,%ymm3"),
 	  ("c5fc111f", "vmovups", "%ymm3,(%rdi)")],
 	 [("plain", 0, None), ("lane", 1, "%ymm3"), ("store", 2, "%ymm3")],
-	 {"%ymm3": 0}),
+	 {"%ymm3": 0}),	# **An immediate with a field per element** gives the upper lane its
+	# own bits, so a split that passed it through unchanged computed the
+	# upper half with the low half's selector. Each immediate below differs
+	# between its two fields, so that error would show. Finding 383.
+	("vblendps, whose upper lane reads bits 7:4 of the immediate",
+	 [("c5fc100e", "vmovups", "(%rsi),%ymm1"),
+	  ("c5fc105620", "vmovups", "0x20(%rsi),%ymm2"),
+	  ("c4e36d0cd95a", "vblendps", "$0x5a,%ymm1,%ymm2,%ymm3"),
+	  ("c5fc111f", "vmovups", "%ymm3,(%rdi)")],
+	 [("load", 0, "%ymm1"), ("load", 1, "%ymm2"), ("lane", 2, "%ymm3"),
+	  ("store", 3, "%ymm3")],
+	 {"%ymm1": 0, "%ymm2": 1, "%ymm3": 2}),
+	("vblendpd, whose upper lane reads bits 3:2 of the immediate",
+	 [("c5fc100e", "vmovups", "(%rsi),%ymm1"),
+	  ("c5fc105620", "vmovups", "0x20(%rsi),%ymm2"),
+	  ("c4e36d0dd909", "vblendpd", "$0x9,%ymm1,%ymm2,%ymm3"),
+	  ("c5fc111f", "vmovups", "%ymm3,(%rdi)")],
+	 [("load", 0, "%ymm1"), ("load", 1, "%ymm2"), ("lane", 2, "%ymm3"),
+	  ("store", 3, "%ymm3")],
+	 {"%ymm1": 0, "%ymm2": 1, "%ymm3": 2}),
+	("vshufpd, whose upper lane reads bits 3:2 of the immediate",
+	 [("c5fc100e", "vmovups", "(%rsi),%ymm1"),
+	  ("c5fc105620", "vmovups", "0x20(%rsi),%ymm2"),
+	  ("c5edc6d906", "vshufpd", "$0x6,%ymm1,%ymm2,%ymm3"),
+	  ("c5fc111f", "vmovups", "%ymm3,(%rdi)")],
+	 [("load", 0, "%ymm1"), ("load", 1, "%ymm2"), ("lane", 2, "%ymm3"),
+	  ("store", 3, "%ymm3")],
+	 {"%ymm1": 0, "%ymm2": 1, "%ymm3": 2}),
+	("vmpsadbw, whose upper lane reads bits 5:3 of the immediate",
+	 [("c5fc100e", "vmovups", "(%rsi),%ymm1"),
+	  ("c5fc105620", "vmovups", "0x20(%rsi),%ymm2"),
+	  ("c4e36d42d92b", "vmpsadbw", "$0x2b,%ymm1,%ymm2,%ymm3"),
+	  ("c5fc111f", "vmovups", "%ymm3,(%rdi)")],
+	 [("load", 0, "%ymm1"), ("load", 1, "%ymm2"), ("lane", 2, "%ymm3"),
+	  ("store", 3, "%ymm3")],
+	 {"%ymm1": 0, "%ymm2": 1, "%ymm3": 2}),
 ]
 
 # How many bytes each case writes, and how much input it reads.
 OUT_BYTES = {0: 32, 1: 64, 2: 32, 3: 32, 4: 48, 5: 32, 6: 32, 7: 32, 8: 32,
-             9: 32}
+             9: 32, 10: 32, 11: 32, 12: 32, 13: 32}
 IN_BYTES = 256
 
 

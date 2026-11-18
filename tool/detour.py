@@ -3984,6 +3984,9 @@ FMA_FORMS = frozenset(
 )
 
 NO_LEGACY_FORM = frozenset((
+	# AVX2's dword blend and variable shifts have no SSE encoding at all;
+	# narrowing one named an opcode SSE never had. Finding 383.
+	"vpblendd", "vpsllvd", "vpsllvq", "vpsrlvd", "vpsrlvq", "vpsravd",
 	"vbroadcastss", "vbroadcastsd", "vbroadcastf128", "vbroadcasti128",
 	"vpbroadcastb", "vpbroadcastw", "vpbroadcastd", "vpbroadcastq",
 	"vextractf128", "vextracti128", "vinsertf128", "vinserti128",
@@ -5212,6 +5215,34 @@ OPERATION_LOADS = frozenset(WIDEN) | frozenset((
 	"vsqrtpd", "vpabsb", "vpabsw", "vpabsd", "vmovddup", "vmovshdup",
 	"vmovsldup"))
 
+# **An immediate with a field per element, so each lane reads its own.**
+# `vblendps $imm` picks element i by bit i, so the upper lane's four are
+# bits 7:4; `vblendpd` and `vshufpd` give the upper lane bits 3:2; and
+# `vmpsadbw` takes the upper lane's block offsets from bits 5:3. The SSE
+# form reads the low field, so the upper half is emitted with the
+# immediate shifted down. `immreg` and `immreg3` passed the immediate
+# through unchanged, on the strength of Starfield's 108 in-lane sites;
+# none of these four is among them. Finding 383.
+UPPER_IMMEDIATE_SHIFT = {"vblendps": 4, "vblendpd": 2, "vshufpd": 2,
+                         "vmpsadbw": 3}
+
+# **The shifts whose count is an xmm or m128 operand.** One 64-bit count
+# applies to every element of both halves, so a split that read the upper
+# half's count from `mem+16`, as a lane-wise memory operand is read, would
+# shift it by whatever lies there. Refused rather than built: none of
+# Starfield's sites has this form. Finding 383.
+SHIFT_BY_OPERAND = frozenset(("vpsllw", "vpslld", "vpsllq", "vpsrlw",
+                              "vpsrld", "vpsrlq", "vpsraw", "vpsrad"))
+
+
+def upper_immediate(mnemonic, immediate):
+	"""The immediate bytes the upper half's SSE form takes."""
+	shift = UPPER_IMMEDIATE_SHIFT.get(mnemonic)
+	if shift is None or not immediate:
+		return immediate
+	return bytes([(immediate[0] >> shift) & 0xFF]) + immediate[1:]
+
+
 LANE_UNARY = frozenset(("vcvtdq2ps", "vcvtps2dq", "vcvttps2dq",
                         "vrcpps", "vrsqrtps", "vsqrtps", "vsqrtpd",
                         "vpabsb", "vpabsw", "vpabsd"))
@@ -5733,6 +5764,8 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 				return ("store", canonical_ymm(fields[0]))
 			return None
 		return None
+	if len(fields) == 3 and "(" in fields[0] and mnemonic in SHIFT_BY_OPERAND:
+		return None			# see SHIFT_BY_OPERAND
 	if len(fields) == 3 and len(wide) == 2 and "(" in fields[0] \
 			and fields[1] != fields[2]:
 		# **`op mem,%ymmS1,%ymmD` with a destination of its own.** The same
@@ -6772,11 +6805,11 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			low_s1 = scratch_finder.xmm_numbers(source1)[0]
 			immediate = tail[2:]
 
-			def shuffle(reg, rm):
+			def shuffle(reg, rm, selector=immediate):
 				return inplace.sse_encoding(
 					dict(vex, L=0, R=reg >> 3, X=0, B=rm >> 3),
 					tail[:1] + bytes([0xC0 | ((reg & 7) << 3)
-					                  | (rm & 7)]) + immediate)
+					                  | (rm & 7)]) + selector)
 
 			body += encode_movaps(low_dst, low_s1)
 			low = shuffle(low_dst, low_s2)
@@ -6788,7 +6821,8 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			                       at + len(body))
 			body += span_slot_move(second_helper, False, base, second,
 			                       block, at + len(body))
-			high = shuffle(helper, second_helper)
+			high = shuffle(helper, second_helper,
+			               upper_immediate(mnemonic, immediate))
 			if high is None:
 				return refuse("immreg3 high operation has no SSE form")
 			body += high
@@ -6815,7 +6849,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			                                        b"\x73")
 			immediate = tail[2:]
 
-			def immediate_op(reg, rm, extension=None):
+			def immediate_op(reg, rm, extension=None, selector=immediate):
 				"""The narrowed operation, `reg` ignored for a shift."""
 				field = extension if extension is not None else reg
 				return inplace.sse_encoding(
@@ -6823,7 +6857,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 					     R=0 if extension is not None else reg >> 3,
 					     B=rm >> 3),
 					tail[:1] + bytes([0xC0 | ((field & 7) << 3)
-					                  | (rm & 7)]) + immediate)
+					                  | (rm & 7)]) + selector)
 
 			extension = ((tail[1] >> 3) & 7) if shift else None
 			if shift and low_dst != low_src:
@@ -6837,7 +6871,8 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# operation on it, the helper into the destination's slot.
 			body += span_slot_move(helper, False, base, second, block,
 			                       at + len(body))
-			high = immediate_op(helper, helper, extension)
+			high = immediate_op(helper, helper, extension,
+			                    upper_immediate(mnemonic, immediate))
 			if high is None:
 				return refuse("immreg high operation has no SSE form")
 			body += high
