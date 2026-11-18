@@ -147,6 +147,50 @@ test/                  the C tests for those, and lowering_test.c, which
 fixture/mingw/         the C++ program, DLL and host `check-mingw` builds
 ```
 
+## Playing Starfield on a CPU without AVX
+
+1. **Unpack the executable.** Steam's copy is wrapped in SteamStub DRM,
+   and the wrapper disassembles as code that is not there. Run
+   [Steamless](https://github.com/atom0s/Steamless) on `Starfield.exe`; it
+   writes `Starfield.exe.unpacked.exe` beside it. On Windows that is the
+   Steamless window. On Linux, Steamless is a .NET program, and Proton's own
+   wine with its bundled Mono runs it where a distribution's 64-bit-only
+   wine does not:
+
+   ```sh
+   PW="$HOME/.steam/steam/steamapps/common/Proton 10.0/files"
+   export WINEPREFIX=$HOME/.wine-steamless WINEDEBUG=-all
+   export LD_LIBRARY_PATH="$PW/lib64:$PW/lib:$LD_LIBRARY_PATH"
+   "$PW/bin/wine" wineboot -i
+   mkdir -p "$WINEPREFIX/drive_c/windows/mono"
+   cp -r "$PW/share/wine/mono/wine-mono-"* "$WINEPREFIX/drive_c/windows/mono/"
+   # Steamless.CLI.exe needs Plugins/Steamless.API.dll copied next to it
+   "$PW/bin/wine" Steamless.CLI.exe Starfield.exe
+   ```
+
+2. **Rewrite it.** `./anti-avx Starfield.exe.unpacked.exe Starfield-antiavx.exe`
+   needs Python 3 and binutils, about a gigabyte free beside the output
+   for the listing while it works, and about half an hour, most of it the
+   verifier.
+
+3. **Put it beside the game** as `Starfield-antiavx.exe`, next to
+   `Starfield.exe`, which stays: the game still has to be started through
+   Steam, which checks for itself.
+
+4. **Have Steam start it.** Under Proton, set the launch options to
+
+   ```
+   bash -c 'exec "${@/Starfield.exe/Starfield-antiavx.exe}"' -- %command%
+   ```
+
+   which is how it is played on the Xeon X5675 this was built on. On
+   Windows the equivalent is to keep the original aside and put the
+   rewritten one in its place as `Starfield.exe`; that route has not been
+   tried.
+
+A game update replaces the executable, so after one, unpack and rewrite
+again.
+
 ## Rewriting a binary
 
 ```sh

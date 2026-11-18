@@ -14358,6 +14358,22 @@ measured is consistent with codes applied and the establisher frame taken from
 `rsp` at the faulting instruction, which inside an open bracket is sixteen bytes
 below the function's. That half is unchanged: a fault *inside* the bracket still
 hands its handler that frame, and `check-unwind`'s `unwindspill` still answers 99.
+
+**How it would close, measured 2026-11-18 and not built.** The borrow is Finding 204's
+fallback where no general-purpose register is free for the block pointer. f382 has
+1,675 brackets, and every one saves an xmm (`movups`, 1,842 out and 1,857 back). The
+two TEB slots `--teb-scratch=auto` asks the loader for are addressed as `%gs:disp32`
+with no register, and no bracket touches `%gs` inside it; at most 4 stub segments
+use both a bracket and a slot, and those are likely two stubs joined by a fall-through
+(Finding 370). So a borrow could save its xmm with `movlps`/`movhps` into the two
+slots instead of moving `rsp`, which removes the bracket, the allocation code and this
+frame. It needs the load-time patch scan (`teb_placeholders`) to learn those two
+encodings, `verify`'s TEB-bracket check to count them, the route offered only where
+the image imports `TlsAlloc`, and a fixture that forces a borrow: a mingw function
+holding all sixteen xmm live was not enough, because with general-purpose registers
+free the rewriter takes the per-thread block instead. Not built because what it buys
+is a fault inside one of those short spans reaching an SEH handler that reads its
+establisher frame -- possible, never observed.
 Nothing in the bracket calls out, so what remains is a memory operand faulting
 inside it, the site's or a deferred passenger's.
 
