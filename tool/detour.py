@@ -42,6 +42,10 @@ Two details are easy to get wrong and both are fatal.
   apply   <binary> <listing> <out>      in-place patches plus detours
   verify  <original> <patched>          the invariants
   census  <binary> <listing> <patched>  what survives, and why
+
+  --fma=exact   round a scalar single-precision FMA once, as the hardware
+                does, through a helper call; the default, --fma=fast, is
+                a multiply and an add, which round twice
 """
 
 import bisect
@@ -513,7 +517,8 @@ def fma_mem_piece(vex, tail, prefix, opcode, reg, delta, address, encoding,
 	return encode_mem(prefix, opcode, reg, vex, moved, address, encoding, at)
 
 
-def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0):
+def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0,
+              pool=0):
 	"""The fused multiply-adds. NOT bit-exact: two roundings replace one.
 
 	The 132/213/231 suffix says which operand is the addend, taken from the
@@ -534,6 +539,9 @@ def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0):
 	if match is None or vex["L"] or scratch is None:
 		return None
 	negated, operation, order, kind = match.groups()
+	if FMA_EXACT and kind == "ss" and operation in ("madd", "msub"):
+		return lower_fma_exact(vex, tail, negated + operation, order,
+		                       scratch, address, encoding, at, pool)
 	modrm = tail[1]
 	memory = ((modrm >> 6) & 3) != 3
 	destination = (vex["R"] << 3) | ((modrm >> 3) & 7)
@@ -596,6 +604,27 @@ def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0):
 		# a second scratch. Refused rather than approximated.
 		return None
 
+	if negated and operation == "msub":
+		# **dst = -product - addend**, which this lowered as `addend -
+		# product` -- vfnmadd's -- until the mingw FMA fixture printed the
+		# same hash for fmaf(-a, b, -c) as for fmaf(-a, b, c). Starfield
+		# has no vfnmsub, so nothing shipped it. The product's sign is
+		# flipped with a constant, not by `0 - product`, which would make
+		# -(+0) - (+0) come out +0. Finding 384.
+		if not SIGN_POOL:
+			return None
+		mask = pool + len(PERMIL_POOL) + (16 if kind[1] == "d" else 0)
+		piece = encode_rip(0x66 if kind[1] == "d" else None, b"\x0f\x57",
+		                   scratch, mask, at + len(body))
+		if piece is None:
+			return None
+		body += piece
+		piece = operate(subtract, scratch, addend)
+		if piece is None:
+			return None
+		body += piece
+		body += move_result(scratch, destination)
+		return bytes(body)
 	if negated:
 		# dst = addend - product.
 		if addend is MEMORY:
@@ -624,6 +653,233 @@ def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0):
 		return None
 	body += piece
 	body += move_result(scratch, destination)
+	return bytes(body)
+
+
+# **`--fma=exact`: one rounding, as the hardware does, for the scalar
+# single-precision forms.** Finding 4 made FMA the one rule here that is not
+# semantics-preserving -- `mulss` then `addss` rounds twice -- and recorded
+# the cost as a last-place difference that physics determinism, replay or
+# lockstep would notice. The default keeps that trade, because it costs two
+# instructions; this option buys the exact result.
+#
+# **Round to odd through double.** The product of two floats is exact in a
+# double (24 + 24 < 53 bits). TwoSum then gives the double sum `s` and its
+# exact error `e`. Where `e` is not zero, `s` is moved one ulp toward zero
+# when it was rounded away, and its last bit is set: that is the sum rounded
+# to odd, and one `cvtsd2ss` of it is the correctly rounded float, because
+# 53 >= 2 * 24 + 2 (Boldo and Melquiond, "Emulation of FMA and correctly
+# rounded sums: proved algorithms using rounding to odd", 2008). Checked
+# before it was written against glibc's correctly rounded `fmaf` on 50
+# million inputs weighted toward cancellation, with no difference; the naive
+# pair differed on 14,862. `tool/fma_oracle.py` runs the emitted bytes.
+#
+# **The sequence wants five registers and a stub has one.** So it lives out
+# of line, in helpers after the constant pool, which a stub reaches with a
+# `call`. A helper is a function with a frame and a `.pdata` record of its
+# own, so it may save what it uses -- what a stub cannot do inside its own
+# record, which describes at most the sixteen bytes of Finding 359. The stub
+# gathers the three operands into its one scratch and moves the result out.
+# `lower_permilps` declined a helper call when a stub had no `.pdata`;
+# every stub has had a record since Finding 46, and the helper has its own,
+# so an unwinder can walk out of either.
+#
+# What "exact" covers: every result that is not a NaN, under the default
+# MXCSR (round to nearest). Which NaN comes out when several go in, and its
+# sign through a negated form, follow the SSE instructions rather than the
+# FMA, as the default lowering already does. Packed and double-precision
+# FMA keep the default lowering: a double has no wider type to round to odd
+# through, and a packed form needs twelve inputs where one register holds
+# four. `apply` says how many of each it left.
+FMA_EXACT = False
+
+# The four sign arrangements, each its own helper. `nmadd` is -(a*b) + c.
+FMA_EXACT_OPS = ("madd", "msub", "nmadd", "nmsub")
+
+# Five saved registers of sixteen bytes.
+FMA_HELPER_FRAME = 0x50
+
+
+def encode_rsp(prefix, opcode, reg, displacement):
+	"""`opcode displacement(%rsp)` with `reg` in modrm.reg; disp8 only."""
+	out = bytearray()
+	if prefix is not None:
+		out.append(prefix)
+	if reg >= 8:
+		out.append(0x44)
+	out += opcode
+	out += bytes([0x44 | ((reg & 7) << 3), 0x24, displacement & 0xFF])
+	return bytes(out)
+
+
+def fma_helper(register, operation):
+	"""`register`'s low three floats a, b, c, to `register`'s low float
+	rounded once: a*b+c with the signs `operation` names.
+
+	Saves and restores every other register it touches, and writes no flag:
+	it can be called between a compare and the branch that reads it, which
+	is why the frame is moved with `lea` (Finding 363).
+	"""
+	work = [n for n in range(8) if n != register][:5]
+	x, y, s, t, u = work
+	out = bytearray(bytes([0x48, 0x8D, 0x64, 0x24,
+	                       -FMA_HELPER_FRAME & 0xFF]))
+	for k, n in enumerate(work):
+		out += encode_rsp(None, b"\x0f\x11", n, 16 * k)	# movups n,k(%rsp)
+	sd = 0xF2
+	out += encode_rr(0xF3, b"\x0f\x5a", x, register)	# cvtss2sd a
+	out += encode_rr(0x66, b"\x0f\x70", y, register, 0x55)	# pshufd b
+	out += encode_rr(0xF3, b"\x0f\x5a", y, y)
+	out += encode_rr(sd, b"\x0f\x59", x, y)			# p = a*b, exact
+	out += encode_rr(0x66, b"\x0f\x70", y, register, 0xAA)	# pshufd c
+	out += encode_rr(0xF3, b"\x0f\x5a", y, y)
+	# A sign flip is exact and keeps a zero's sign, which `0 - p` would not:
+	# -(+0) - (+0) is -0.
+	if operation in ("nmadd", "nmsub", "msub"):
+		out += encode_rr(0x66, b"\x0f\x76", s, s)		# pcmpeqd
+		out += encode_rr(0x66, b"\x0f\x73", 6, s, 63)	# psllq $63
+		if operation.startswith("n"):
+			out += encode_rr(0x66, b"\x0f\x57", x, s)	# xorpd: -p
+		if operation.endswith("msub"):
+			out += encode_rr(0x66, b"\x0f\x57", y, s)	# xorpd: -c
+	# TwoSum (Knuth): s + e == x + y exactly.
+	out += encode_rr(0x66, MOVAPS, s, x)
+	out += encode_rr(sd, b"\x0f\x58", s, y)			# s = x + y
+	out += encode_rr(0x66, MOVAPS, t, s)
+	out += encode_rr(sd, b"\x0f\x5c", t, x)			# bv = s - x
+	out += encode_rr(0x66, MOVAPS, u, s)
+	out += encode_rr(sd, b"\x0f\x5c", u, t)			# av = s - bv
+	out += encode_rr(sd, b"\x0f\x5c", x, u)			# x - av
+	out += encode_rr(sd, b"\x0f\x5c", y, t)			# y - bv
+	out += encode_rr(sd, b"\x0f\x58", x, y)			# e
+	# m: e is neither zero nor a NaN. A NaN `e` means `s` is an infinity
+	# or a NaN already, which must come through untouched.
+	out += encode_rr(0x66, b"\x0f\x57", y, y)
+	out += encode_rr(sd, b"\x0f\xc2", y, x, 4)		# cmpneqsd: 0 != e
+	out += encode_rr(0x66, MOVAPS, t, x)
+	out += encode_rr(sd, b"\x0f\xc2", t, x, 7)		# cmpordsd
+	out += encode_rr(0x66, b"\x0f\x54", y, t)		# andpd: m
+	# Toward zero by one ulp where e and s differ in sign, then the odd bit.
+	out += encode_rr(0x66, b"\x0f\x57", x, s)		# xorpd: sign bit
+	out += encode_rr(0x66, b"\x0f\x70", x, x, 0xF5)	# pshufd
+	out += encode_rr(0x66, b"\x0f\x72", 4, x, 31)	# psrad $31
+	out += encode_rr(0x66, b"\x0f\xdb", x, y)		# pand m
+	out += encode_rr(0x66, b"\x0f\xd4", s, x)		# paddq: s - 1
+	out += encode_rr(0x66, b"\x0f\x73", 2, y, 63)	# psrlq $63
+	out += encode_rr(0x66, b"\x0f\xeb", s, y)		# por: odd
+	out += encode_rr(sd, b"\x0f\x5a", register, s)	# cvtsd2ss
+	for k, n in enumerate(work):
+		out += encode_rsp(None, b"\x0f\x10", n, 16 * k)	# movups k(%rsp),n
+	out += bytes([0x48, 0x8D, 0x64, 0x24, FMA_HELPER_FRAME, 0xC3])
+	return bytes(out)
+
+
+# The allocation is complete after the first instruction, the `lea`.
+FMA_HELPER_PROLOGUE = 5
+_FMA_HELPERS = None
+
+
+def fma_helpers():
+	"""(the helpers' bytes, {(register, operation): (offset, length)})."""
+	global _FMA_HELPERS
+	if _FMA_HELPERS is None:
+		blob, where = bytearray(), {}
+		for register in range(16):
+			for operation in FMA_EXACT_OPS:
+				code = fma_helper(register, operation)
+				where[(register, operation)] = (len(blob), len(code))
+				blob += code
+		_FMA_HELPERS = (bytes(blob), where)
+	return _FMA_HELPERS
+
+
+# **The sign of every element, for vfnmsub's negated product**: four
+# single-precision sign bits, then two double. In the pool only where the
+# listing holds a vfnmsub, which `collect` decides before anything lowers,
+# so an image without one -- Starfield -- keeps the layout it had.
+#
+# **Then sixteen `int3`, which are for the disassembler.** The last
+# constant ends `00 80`, which objdump reads as an `add` with a 32-bit
+# displacement, so it ate the first helper's `lea` and verify's stack
+# check counted from the wrong instruction. No instruction is longer than
+# fifteen bytes, so a sweep that starts anywhere in the constants is back on
+# a boundary before the padding ends.
+SIGN_CONSTANTS = (bytes([0, 0, 0, 0x80] * 4) + bytes([0] * 7 + [0x80]) * 2
+                  + b"\xcc" * 16)
+SIGN_POOL = False
+
+
+def helper_base():
+	"""Where the FMA helpers start, from the section's start."""
+	return len(PERMIL_POOL) + (len(SIGN_CONSTANTS) if SIGN_POOL else 0)
+
+
+def stub_pool():
+	"""What the stub section holds before its first stub."""
+	return (PERMIL_POOL + (SIGN_CONSTANTS if SIGN_POOL else b"")
+	        + (fma_helpers()[0] if FMA_EXACT else b""))
+
+
+def fma_helper_extents():
+	"""(offset from the section start, length) of every helper, or none."""
+	if not FMA_EXACT:
+		return []
+	return sorted((helper_base() + offset, length)
+	              for offset, length in fma_helpers()[1].values())
+
+
+def lower_fma_exact(vex, tail, operation, order, scratch, address, encoding,
+                    at, pool):
+	"""A scalar single FMA as a call to its helper. See `FMA_EXACT`.
+
+	`scratch` carries the operands in and the result out: a, b and c go to
+	its lanes 0, 1 and 2 -- the product's order does not matter, since it
+	is exact -- and `movss` writes the low float of the destination and
+	leaves DEST[127:32] as the FMA does. A memory operand is read before
+	the call, where any `rsp` it is based on is still the original's.
+	"""
+	modrm = tail[1]
+	memory = ((modrm >> 6) & 3) != 3
+	destination = (vex["R"] << 3) | ((modrm >> 3) & 7)
+	source2 = MEMORY if memory else (vex["B"] << 3) | (modrm & 7)
+	source1 = vex["vvvv"]
+	if scratch in (destination, source1, source2):
+		return None
+	if order == "132":
+		factors, addend = (destination, source2), source1
+	elif order == "213":
+		factors, addend = (source1, destination), source2
+	else:
+		factors, addend = (source1, source2), destination
+
+	def insert(lane_from, lane_to, register):
+		"""insertps: `register`'s lane `lane_from` to the scratch's."""
+		return encode_rr(0x66, b"\x0f\x3a\x21", scratch, register,
+		                 (lane_from << 6) | (lane_to << 4))
+
+	body = bytearray()
+	if addend is MEMORY:
+		body += encode_mem(0xF3, b"\x0f\x10", scratch, vex, tail, address,
+		                   encoding, at)
+		body += insert(0, 2, scratch)
+		body += insert(0, 0, factors[0])
+		body += insert(0, 1, factors[1])
+	elif factors[1] is MEMORY:
+		body += encode_mem(0xF3, b"\x0f\x10", scratch, vex, tail, address,
+		                   encoding, at)
+		body += insert(0, 1, factors[0])
+		body += insert(0, 2, addend)
+	else:
+		body += encode_movaps(scratch, factors[0])
+		body += insert(0, 1, factors[1])
+		body += insert(0, 2, addend)
+	offset, _length = fma_helpers()[1][(scratch, operation)]
+	target = pool + helper_base() + offset
+	displacement = target - (at + len(body) + 5)
+	if not -(1 << 31) <= displacement < (1 << 31):
+		return None
+	body += b"\xe8" + struct.pack("<i", displacement)
+	body += encode_rr(0xF3, b"\x0f\x10", destination, scratch)	# movss
 	return bytes(body)
 
 # Load one element, then spread it. The load width is the whole point: a
@@ -969,6 +1225,7 @@ def run_configuration():
 	        f" stale-repair={'on' if STALE_REPAIR else 'off'}"
 	        f" align-guard={'on' if inplace.ALIGN_GUARD else 'off'}"
 	        f" spill={SPILL}"
+	        f" fma={'exact' if FMA_EXACT else 'fast'}"
 	        f" tool={tool_fingerprint()}")
 
 
@@ -1831,7 +2088,7 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 					reasons["lower: vpermilps would not lower"] += 1
 				return out
 			out = lower_fma(vex, tail, mnemonic, scratch, address,
-			                encoding, at)
+			                encoding, at, pool)
 			if out is None and reasons is not None:
 				reasons["lower: the FMA would not lower"] += 1
 			return out
@@ -12543,7 +12800,7 @@ def collect(binary, listing, context=None):
 	and holds 16.5 million rows twice; the second copy is what ran `verify`
 	out of memory before it was noticed. One build, shared.
 	"""
-	global UNIT_REFUSED, UNIT_EXAMPLES
+	global UNIT_REFUSED, UNIT_EXAMPLES, SIGN_POOL
 	# A run reports its own numbers, not the previous one's.
 	OVERLAP_REFUSED.clear()
 	SAVED_XMM.clear()
@@ -12567,6 +12824,8 @@ def collect(binary, listing, context=None):
 	WIDE_SITES.clear()
 	instructions, plain, blocked, sources, switch_tables, switch_seen = \
 		context if context is not None else analysis_context(binary, listing)
+	SIGN_POOL = any((row[2] or "").startswith("vfnmsub")
+	                for row in instructions)
 	ZEROED_UPPER.clear()
 	PARTLY_ZEROED.clear()
 	CLEARING_WRITERS.clear()
@@ -14080,7 +14339,8 @@ def eh_segments(data, stubs, existing, at_rva):
 	return bytes(blob), replace, counts
 
 
-def stub_unwind(extents, prologues, image_base, existing, xdata_rva):
+def stub_unwind(extents, prologues, image_base, existing, xdata_rva,
+                helpers=()):
 	"""Unwind data for every stub. Returns (xdata bytes, pdata bytes).
 
 	**A stub is a piece of the function it was cut out of, not a function.**
@@ -14104,6 +14364,10 @@ def stub_unwind(extents, prologues, image_base, existing, xdata_rva):
 	Where the stub spilled, the block also carries a `UWOP_ALLOC_SMALL` at
 	the offset the `sub` ends, so the sixteen bytes are described rather than
 	silently missing.
+
+	`helpers` are `(begin, end)` RVAs of the FMA helpers, which ARE
+	functions: one unchained block for all of them, describing the frame
+	each allocates. See `FMA_EXACT`.
 	"""
 	starts = [begin for begin, _e, _u in existing]
 	blocks, xdata, pdata = {}, bytearray(), []
@@ -14134,6 +14398,15 @@ def stub_unwind(extents, prologues, image_base, existing, xdata_rva):
 			if primary is not None:
 				xdata += struct.pack("<III", *primary)
 		pdata.append((stub_rva, stub_end, xdata_rva + offset))
+	if helpers:
+		offset = len(xdata)
+		size = (FMA_HELPER_FRAME - 8) // 8
+		xdata += struct.pack("<BBBB", 1, FMA_HELPER_PROLOGUE, 1, 0)
+		xdata += struct.pack("<BB", FMA_HELPER_PROLOGUE,
+		                     UWOP_ALLOC_SMALL | (size << 4))
+		xdata += b"\0\0"
+		for begin, end in helpers:
+			pdata.append((begin, end, xdata_rva + offset))
 	merged = sorted(existing + pdata)
 	out = bytearray()
 	for entry in merged:
@@ -16991,8 +17264,18 @@ def main(argv):
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
 	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE, TEB_SCRATCH
 	global INDEX_CONST, WRITER_CLEARS, HAMMOCK_RULE, SWITCH_GUARD
-	global LEAF_ENTRIES, STALE_REPAIR
+	global LEAF_ENTRIES, STALE_REPAIR, FMA_EXACT
 	argv = list(argv)
+	for i, item in enumerate(argv):
+		if item.startswith("--fma="):
+			want = item.split("=", 1)[1]
+			if want not in ("fast", "exact"):
+				print(f"detour.py: --fma wants fast or exact, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			FMA_EXACT = want == "exact"
+			del argv[i]
+			break
 	for i, item in enumerate(argv):
 		if item.startswith("--escape="):
 			ESCAPE_RULE = item.split("=", 1)[1]
@@ -18845,7 +19128,9 @@ def place_stubs(candidates, stub_base, spill_base=0, reasons=None,
 	"""
 	# The constant pool goes first, so its address is the section's and the
 	# 16-byte alignment SSE memory operands need comes free.
-	blob = bytearray(PERMIL_POOL)
+	# The FMA helpers, where `--fma=exact` asks for them, follow it: code,
+	# but placed like the pool, ahead of every stub. See `FMA_EXACT`.
+	blob = bytearray(stub_pool())
 	pool = stub_base
 	GAP_RUNS.clear()
 	STUB_REAIMED.clear()
@@ -19541,8 +19826,11 @@ def apply_all(binary, listing, output):
 		existing = [replace.get(entry, entry) for entry in existing]
 		print("apply: C++ EH state for stubs: " + ", ".join(
 			f"{why} {count:,}" for why, count in sorted(told.items())))
+	helpers = [(stub_base - image_base + offset,
+	            stub_base - image_base + offset + length)
+	           for offset, length in fma_helper_extents()]
 	xdata, pdata = stub_unwind(extents, prologues, image_base, existing,
-	                           xdata_rva + len(segments))
+	                           xdata_rva + len(segments), helpers)
 	xdata = segments + xdata
 	image, got = add_section(image, XDATA_NAME, xdata, UNWIND_FLAGS)
 	assert got == xdata_rva, "unwind section moved"
@@ -19632,6 +19920,19 @@ def apply_all(binary, listing, output):
 		for (cap, way), count in sorted(
 				UNIT_RUNG.items(), key=lambda kv: (-kv[1], kv[0])):
 			print(f"apply:   {cap:>3} member(s) {way:<8} {count:>8,}")
+	# What `--fma=exact` covers and what it leaves rounding twice, since
+	# the option's name claims more than its reach. See `FMA_EXACT`.
+	forms = Counter()
+	for row in instructions:
+		match = FMA_PATTERN.match(row[2] or "")
+		if match:
+			forms["exact" if FMA_EXACT and match.group(4) == "ss"
+			      and match.group(2) in ("madd", "msub")
+			      else "two roundings"] += 1
+	if forms:
+		print(f"apply: FMA {forms['exact']:,} rounded once, "
+		      f"{forms['two roundings']:,} as a multiply and an add "
+		      f"(--fma={'exact' if FMA_EXACT else 'fast'})")
 	report_regions(candidates, binary)
 	report_units(candidates, placed, home, WIDE_SITES["256-bit"],
 	             binary)
@@ -19905,6 +20206,7 @@ def covered_starts(original, patched, bounds):
 
 
 def verify(original, patched, listing=None):
+	global SIGN_POOL
 	a = open(original, "rb").read()
 	b = open(patched, "rb").read()
 	problems = 0
@@ -19945,7 +20247,11 @@ def verify(original, patched, listing=None):
 		print("verify: FAILED -- no stub section", file=sys.stderr)
 		problems += 1
 	else:
-		svaddr, svsize, _sraddr, _srsize = stubs
+		svaddr, svsize, sraddr, _srsize = stubs
+		# Read off the section, since the listing that decides it has not
+		# been parsed yet; checked against that decision below.
+		at = sraddr + len(PERMIL_POOL)
+		SIGN_POOL = b[at:at + len(SIGN_CONSTANTS)] == SIGN_CONSTANTS
 		described = 0
 		for begin, end, _unwind in table:
 			if svaddr <= begin < svaddr + svsize:
@@ -19954,7 +20260,9 @@ def verify(original, patched, listing=None):
 		# so every byte past the pool must be inside an entry -- exactly,
 		# not approximately. A stub the unwinder cannot find is a stub an
 		# exception cannot be dispatched from.
-		gap = svsize - len(PERMIL_POOL) - described
+		# The pool is data to the end of the sign constants; the FMA
+		# helpers after it are code, and are described.
+		gap = svsize - helper_base() - described
 		if gap:
 			print(f"verify: FAILED -- {gap:,} bytes of stub outside every "
 			      f"function table entry", file=sys.stderr)
@@ -19962,7 +20270,7 @@ def verify(original, patched, listing=None):
 		else:
 			print(f"verify: function table has {len(table):,} entries, "
 			      f"sorted, and covers every byte of stub past the "
-			      f"{len(PERMIL_POOL)}-byte pool")
+			      f"{helper_base()}-byte pool")
 
 	vaddr, raddr, size = inplace.text_mapping(original)
 	tail_a, tail_b = a[raddr + size:], b[raddr + size:len(a)]
@@ -20084,8 +20392,15 @@ def verify(original, patched, listing=None):
 		return 1 if problems else 0
 
 	context = analysis_context(original, listing)
+	signs_in_image = SIGN_POOL
 	patch_rows, candidates, _stats, _skipped, declined_rows, home = collect(
 		original, listing, context)
+	if signs_in_image != SIGN_POOL:
+		print(f"verify: FAILED -- the stub section "
+		      f"{'holds' if signs_in_image else 'lacks'} the sign constants "
+		      f"and the listing {'has no' if signs_in_image else 'has a'} "
+		      f"vfnmsub", file=sys.stderr)
+		problems += 1
 	instructions, _plain, blocked, sources, _tables, _seen = context
 	# **A data island must not reach the candidate loop.** `decode_vex`
 	# rejects on LENGTH alone -- under three bytes, or a `c4` under four --
@@ -20633,13 +20948,15 @@ def verify(original, patched, listing=None):
 			continue
 		declared = allocation[1] if allocation is not None \
 			and rva - record[0] >= allocation[0] else 0
-		if declared != actual:
-			mismatched.append((address, declared, actual))
 		encoding = bytes.fromhex(parts[1].replace(" ", ""))
-		if encoding == STACK_OPEN:
-			actual += 16
-		elif encoding == STACK_CLOSE:
-			actual -= 16
+		# A `ret` is an epilogue, which an unwinder recognises by its
+		# bytes rather than by the record: an FMA helper's. See `FMA_EXACT`.
+		if declared != actual and encoding != b"\xc3":
+			mismatched.append((address, declared, actual))
+		# `lea disp8(%rsp),%rsp` in general: `STACK_OPEN` and `STACK_CLOSE`
+		# move sixteen bytes, an FMA helper's frame `FMA_HELPER_FRAME`.
+		if len(encoding) == 5 and encoding[:4] == STACK_OPEN[:4]:
+			actual -= struct.unpack_from("<b", encoding, 4)[0]
 	if mismatched:
 		print(f"verify: FAILED -- {len(mismatched):,} stub instruction(s) "
 		      f"run with a stack their unwind record does not describe",
@@ -20667,6 +20984,25 @@ def verify(original, patched, listing=None):
 	# that is second-order; for a fixed global it is the whole safety
 	# argument, so it is enforced here instead. Measured zero on the first
 	# build that produced any. Finding 280.
+	# Calls to the FMA helpers, which hold no bracket and touch no saved
+	# location, so neither check below is about them. See `FMA_EXACT`.
+	helper_range = None
+	if stubs is not None and FMA_EXACT:
+		low = image_base + stubs[0] + helper_base()
+		helper_range = (low, low + len(fma_helpers()[0]))
+
+	def helper_call(line):
+		"""True if this listing line calls an FMA helper."""
+		words = line.split("\t")[-1].split()
+		if helper_range is None or len(words) < 2 \
+				or words[0] not in ("call", "callq"):
+			return False
+		try:
+			target = int(words[1], 16)
+		except ValueError:
+			return False
+		return helper_range[0] <= target < helper_range[1]
+
 	if TEB_SCRATCH is not None:
 		opened, reentrant, brackets = None, [], 0
 		save = f",%gs:0x{teb_scratch_offset():x}"
@@ -20676,7 +21012,14 @@ def verify(original, patched, listing=None):
 				opened, brackets = line.split(":")[0].strip(), brackets + 1
 			elif load in line:
 				opened = None
-			elif opened is not None and "\tcall" in line.expandtabs(1):
+			# **By the mnemonic field.** This read `"\tcall" in
+			# line.expandtabs(1)`, and `expandtabs` had already turned
+			# every tab into a space, so it could not match and the check
+			# had never been able to fail. Finding 384.
+			elif opened is not None and len(line.split("\t")) >= 3 \
+					and line.split("\t")[2].split()[:1] in (["call"],
+					                                       ["callq"]) \
+					and not helper_call(line):
 				reentrant.append((opened, line.strip()))
 				opened = None
 		if reentrant:
@@ -20726,10 +21069,13 @@ def verify(original, patched, listing=None):
 	# bytes are emitted rather than here: no call may lie between a borrow's
 	# save and its restore. See `emit_swallowed` and `build_stub`'s run
 	# branch. Finding 127.
+	helper_calls = sum(1 for line in done.stdout.splitlines()
+	                   if helper_call(line))
 	stub_calls = sum(1 for line in done.stdout.splitlines()
 	                 if len(line.split("\t")) >= 3
 	                 and line.split("\t")[2].split()[:1] in (["call"],
-	                                                          ["callq"]))
+	                                                          ["callq"])) \
+		- helper_calls
 	# Against the WINDOWS, not against `swallowed`. A window's first
 	# instruction is re-emitted like every other one it covers, and it keeps
 	# its boundary -- the jump is written there -- so it is deliberately not
@@ -20751,6 +21097,8 @@ def verify(original, patched, listing=None):
 	else:
 		print(f"verify: {stub_calls:,} call(s) in the stub section, every "
 		      f"one an instruction a window covered and re-emitted")
+	if helper_range is not None:
+		print(f"verify: {helper_calls:,} call(s) to an exact-FMA helper")
 	# **And no branch in a stub lands inside a window past its jump.** A
 	# hammock's targets are padding in `.text` now, and every branch that
 	# reached one was re-aimed at the stub's copy -- the excuse above says

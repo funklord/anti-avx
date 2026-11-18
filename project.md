@@ -267,7 +267,8 @@ roundings where the original had one**, so results differ in the last ULP.
 Almost certainly irrelevant for game rendering, but it is the only rule in this design
 that is *not* semantics-preserving, and it must be recorded as such. If any code path
 depends on exact FP reproducibility (physics determinism, replay, netcode lockstep),
-this is where it breaks.
+this is where it breaks. **`--fma=exact` rounds the 180 scalar single-precision ones
+once, bit for bit; the default is unchanged** (Finding 384).
 
 **28 of the 421 are not plain FMA and Class F does not cover them.**
 `vfmaddsub231ps` (14) and `vfmsubadd231ps` (14) *alternate* add and subtract across
@@ -14178,6 +14179,73 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 384 -- `--fma=exact`, a helper call that rounds once
+
+**Finding 4's one inexact rule now has an exact alternative, opt-in.** `--fma=exact`
+lowers the scalar single-precision FMA -- `vf[n]m{add,sub}{132,213,231}ss`, 180 of
+Starfield's 421 -- so that it rounds once, bit for bit as the hardware does. The default
+is unchanged, so physics, replay and lockstep code can have exact results on request
+without everyone paying a call per FMA.
+
+**Round to odd through double.** The product of two floats is exact in a double; TwoSum
+gives the double sum and its exact error; where the error is not zero the sum moves one
+ulp toward zero if it was rounded away, and its last bit is set. One `cvtsd2ss` of that
+is the correctly rounded float, because 53 >= 2 * 24 + 2 (Boldo and Melquiond, 2008).
+Checked first as C against glibc's correctly rounded `fmaf` over 50 million inputs
+weighted toward cancellation: no difference, against 14,862 for the multiply-and-add.
+
+**Why a call.** The sequence wants five registers, and a stub has one scratch. A stub
+cannot open a frame to save more, because its unwind record describes at most Finding
+359's sixteen bytes. So the sequence lives in 64 helpers after the constant pool, one
+per scratch register and sign arrangement, 12,336 bytes. Each helper has its own frame,
+moved with `lea` so that no flag changes (Finding 363), and a `.pdata` record of its own.
+The stub gathers a, b and c into its scratch with `insertps`, reads any memory operand
+before the call, calls, and `movss`es the result out, which leaves DEST[127:32] as the
+FMA does. `lower_permilps` once declined a helper call because stubs had no `.pdata`;
+they have had records since Finding 46.
+
+**What "exact" covers:** every result that is not a NaN, under the default MXCSR. Which
+NaN comes out of several, and its sign through a negated form, follow the SSE steps,
+as the default lowering's do. Packed and double forms keep two roundings: a double has
+no wider type to round to odd through, and a packed form needs twelve inputs where one
+register holds four. `apply` prints both counts. On Starfield, `--fma=exact` places
+202,992 detours against the default's 202,983, refuses none, leaves 28 VEX instructions
+in `.text` against 30, and passes every `verify` check with 180 helper calls.
+
+**Measured by running it.** `check-fma` (`tool/fma_oracle.py`) runs twelve forms --
+all four sign arrangements, all three operand orders, a memory factor, a memory addend,
+REX registers, one register used three times -- under qemu as the original and natively
+as the stub and helper, over two million inputs each. All sixteen xmm registers except
+the scratch are hashed; all twelve agree, and each side is also checked against glibc's
+`fmaf`, with operands named from the SDM table rather than read from `detour`. The
+multiply-and-add control differs on 440,547 inputs. The control that matters more is
+subtler: the helper without its odd bit, which is double rounding through double, is
+off `fmaf` on 282, so these inputs see that error too. The first runs differed on
+NaN-heavy inputs for a reason in the harness rather than the lowering: the C that builds
+cancelling inputs did arithmetic on NaNs, which qemu and the silicon propagate
+differently, so the two sides were fed different operands. Such inputs are now built
+only from finite products. `check-mingw` gains `fixture/mingw/fma.c`, built by mingw
+with `-mfma` and rewritten both ways: the exact build prints glibc's `fmaf` results
+exactly, and the default prints exactly the C multiply and add.
+
+**The default lowering computed `vfnmsub` as `vfnmadd`**, `addend - product` for both.
+That fixture's first default run printed one hash for `fmaf(-a, b, -c)` and for
+`fmaf(-a, b, c)`. It is `-product - addend` now, with the product's sign flipped by a
+constant, because `0 - product` would make -(+0) - (+0) come out +0. The constant joins
+the pool only when the listing holds a `vfnmsub` -- Starfield has none, so nothing
+shipped this. That is why the default Starfield build stays byte-identical to f382
+(`cmp`). `verify` reads the constant's presence from the image and fails if it
+disagrees with the listing.
+
+**And `verify`'s TEB-bracket check had never been able to fail.** It looked for a call
+with `"\tcall" in line.expandtabs(1)`, and `expandtabs` had already turned every tab
+into a space. It reads the mnemonic field now, and exempts helper calls, which save
+nothing to the TEB. On both Starfield builds it reads no call in 1,502 brackets, which
+is a measurement now rather than a default -- though no control has yet been seen to
+make it fail. The stack check reads any `lea disp8(%rsp),%rsp` and takes `ret` as
+the epilogue an unwinder sees it as. The call reconciliation counts helper calls apart
+from re-emitted swallowed ones.
+
 ### Finding 383 -- the rules real compilers need that Starfield never asked for
 
 **gcc's `-mavx` build of `fixture/mingw/kernels.cpp` died on `vpmaxsd %xmm0,%xmm1,%xmm0`**,
@@ -23703,6 +23771,8 @@ get the mapping from the SDM, not from intuition.
 
 If exact FP reproducibility matters anywhere (deterministic physics, replays, lockstep
 netcode), this rule is where it breaks. Flag every rewritten site so it can be audited.
+`--fma=exact` makes the scalar single-precision forms exact through a helper call;
+packed and double forms keep this rule (Finding 384).
 
 ### Class F-addsub — alternating lanes (28 sites)
 

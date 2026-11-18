@@ -85,7 +85,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
         census spans gprs shapes cost-bench cost status probe why check-shadow check-shadow-pe check-run-borrow check-spill check-tls check-unwind check-vex check-liveness \
-        check-lanes check-span check-shapes check-functions \
+        check-lanes check-span check-fma check-shapes check-functions \
         detour-plan detour-verify hooks clean \
         distclean help
 
@@ -105,7 +105,8 @@ test: check-aliasing check-lowering check-f16c check-fmaddsub \
       check-permil check-permd
 
 check: style verify check-verify check-aliasing check-lowering check-isa \
-       check-f16c check-f16c-oracle check-fmaddsub check-permil check-permd check-span
+       check-f16c check-f16c-oracle check-fmaddsub check-permil check-permd check-span \
+       check-fma
 
 style: style-tool style-source style-docs
 
@@ -161,6 +162,13 @@ check-lanes: | $(BUILD_DIR)
 # natively, because the span is pure SSE and that is the whole point.
 check-span: | $(BUILD_DIR)
 	$(PYTHON) tool/span_oracle.py $(BUILD_DIR)
+
+# Does `--fma=exact` round a scalar FMA once, as the hardware does? The
+# original runs under qemu, the stub and its helper natively, and both are
+# checked against glibc's fmaf as well. The default lowering is the control
+# that must be told apart.
+check-fma: | $(BUILD_DIR)
+	$(PYTHON) tool/fma_oracle.py $(BUILD_DIR)
 
 # **A run that borrows a helper must not borrow one its passengers name.**
 # `runborrow` holds every volatile xmm live across a load and a store six
@@ -1556,7 +1564,7 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 # widened a register, and that is the shape that had shipped wrong in
 # Starfield as a plain load. gcc's builds alone passed with it broken.
 #
-# Termination: seven wine runs under timeouts, after one compile per build.
+# Termination: nine wine runs under timeouts, after one compile per build.
 # Needs mingw, clang and wine, and stays out of `check` for that reason.
 MINGW_CXX  ?= x86_64-w64-mingw32-g++
 MINGW_CLANG ?= clang++ --target=x86_64-w64-mingw32
@@ -1573,7 +1581,12 @@ MINGW_OUT   = $(BUILD_DIR)/mingw-avx2.exe $(BUILD_DIR)/mingw-sse.exe \
               $(BUILD_DIR)/mingw-rewritten.dll $(BUILD_DIR)/mingw-host.exe \
               $(BUILD_DIR)/mingw-dll-want.txt $(BUILD_DIR)/mingw-dll-got.txt \
               $(BUILD_DIR)/mingw-avx1.exe $(BUILD_DIR)/mingw-avx1-sse.exe \
-              $(BUILD_DIR)/mingw-avx1-got.txt
+              $(BUILD_DIR)/mingw-avx1-got.txt \
+              $(BUILD_DIR)/mingw-fma.exe $(BUILD_DIR)/mingw-fma-exact.exe \
+              $(BUILD_DIR)/mingw-fma-fast.exe $(BUILD_DIR)/fma-once \
+              $(BUILD_DIR)/fma-twice $(BUILD_DIR)/fma-once.txt \
+              $(BUILD_DIR)/fma-twice.txt $(BUILD_DIR)/mingw-fma-exact.txt \
+              $(BUILD_DIR)/mingw-fma-fast.txt
 
 $(BUILD_DIR)/mingw-avx2.exe: $(MINGW_SRC) | $(BUILD_DIR)
 	$(MINGW_CXX) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
@@ -1590,6 +1603,30 @@ $(BUILD_DIR)/mingw-avx1.exe: $(MINGW_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/mingw-avx1-sse.exe: $(BUILD_DIR)/mingw-avx1.exe anti-avx \
                                  tool/detour.py tool/patch.py tool/resync.py
 	./anti-avx $< $@
+
+# **Scalar FMA in all four sign arrangements**, rewritten both ways. Each
+# has a reference built for this host from the same source: glibc's fmaf,
+# rounded once, for `--fma=exact`, and the multiply and add the default
+# emits, rounded twice, for the default -- which is what caught it lowering
+# vfnmsub as vfnmadd. Finding 384.
+FMA_FLAGS = -O2 -fno-tree-vectorize -ffp-contract=off
+
+$(BUILD_DIR)/mingw-fma.exe: fixture/mingw/fma.c | $(BUILD_DIR)
+	$(MINGW_CC) $(FMA_FLAGS) -mfma -static -s -o $@ $<
+
+$(BUILD_DIR)/mingw-fma-exact.exe: $(BUILD_DIR)/mingw-fma.exe anti-avx \
+                                  tool/detour.py tool/patch.py tool/resync.py
+	./anti-avx --fma=exact $< $@
+
+$(BUILD_DIR)/mingw-fma-fast.exe: $(BUILD_DIR)/mingw-fma.exe anti-avx \
+                                 tool/detour.py tool/patch.py tool/resync.py
+	./anti-avx $< $@
+
+$(BUILD_DIR)/fma-once: fixture/mingw/fma.c | $(BUILD_DIR)
+	$(CC) $(FMA_FLAGS) -o $@ $< -lm
+
+$(BUILD_DIR)/fma-twice: fixture/mingw/fma.c | $(BUILD_DIR)
+	$(CC) $(FMA_FLAGS) -DTWO_ROUNDINGS -o $@ $< -lm
 
 $(BUILD_DIR)/mingw-clang.exe: $(MINGW_SRC) | $(BUILD_DIR)
 	$(MINGW_CLANG) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
@@ -1641,7 +1678,9 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
              $(BUILD_DIR)/mingw-symbols.exe $(BUILD_DIR)/mingw-front.exe \
              $(BUILD_DIR)/mingw-clang-sse.exe $(BUILD_DIR)/mingw-host.exe \
              $(BUILD_DIR)/mingw-sse.dll $(BUILD_DIR)/mingw-rewritten.dll \
-             $(BUILD_DIR)/mingw-avx1-sse.exe
+             $(BUILD_DIR)/mingw-avx1-sse.exe $(BUILD_DIR)/mingw-fma-exact.exe \
+             $(BUILD_DIR)/mingw-fma-fast.exe $(BUILD_DIR)/fma-once \
+             $(BUILD_DIR)/fma-twice
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-mingw: wine is not installed"; exit 1; }
 	@if $(PYTHON) tool/detour.py plan $(BUILD_DIR)/mingw-symbols.exe \
@@ -1705,6 +1744,26 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
 		{ echo "check-mingw: the rewritten DLL disagrees with SSE"; \
 		  exit 1; }; \
 	echo "check-mingw: the rewritten DLL, loaded relocated, agrees"; \
+	$(BUILD_DIR)/fma-once > $(BUILD_DIR)/fma-once.txt; \
+	$(BUILD_DIR)/fma-twice > $(BUILD_DIR)/fma-twice.txt; \
+	if cmp -s $(BUILD_DIR)/fma-once.txt $(BUILD_DIR)/fma-twice.txt; then \
+		echo "check-mingw: one rounding and two print the same, so the"; \
+		echo "             FMA inputs cannot tell them apart"; exit 1; \
+	fi; \
+	for mode in exact fast; do \
+		$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-fma-$$mode.exe \
+			> $(BUILD_DIR)/mingw-fma-$$mode.txt 2>&1 || \
+			{ echo "check-mingw: the --fma=$$mode build failed"; exit 1; }; \
+	done; \
+	tr -d '\r' < $(BUILD_DIR)/mingw-fma-exact.txt | \
+		diff $(BUILD_DIR)/fma-once.txt - || \
+		{ echo "check-mingw: --fma=exact disagrees with fmaf"; exit 1; }; \
+	tr -d '\r' < $(BUILD_DIR)/mingw-fma-fast.txt | \
+		diff $(BUILD_DIR)/fma-twice.txt - || \
+		{ echo "check-mingw: the default FMA disagrees with a multiply"; \
+		  echo "             and an add"; exit 1; }; \
+	echo "check-mingw: scalar FMA rounds once under --fma=exact and twice"; \
+	echo "             by default, each as its reference computes it"; \
 	echo "check-mingw: $$(wc -l < $(BUILD_DIR)/mingw-want.txt) results," \
 	     "every one as the SSE build computes it, by four routes"
 
@@ -1887,7 +1946,9 @@ help:
 	@echo '  check-lowering  execute every lowering and check the result'
 	@echo '  check-pe    build an AVX PE, rewrite it, run both under wine'
 	@echo '  check-mingw a C++ program mingw built with -mavx2, rewritten,'
-	@echo '              against its SSE build under wine'
+	@echo '              against its SSE build under wine, and scalar FMA'
+	@echo '              rewritten both ways against fmaf and mul+add'
+	@echo '  check-fma   --fma=exact against the original under qemu'
 	@echo '  bench       what a detour costs on this CPU (a timing run)'
 	@echo '  placement   where the detours land: functions and loop bodies'
 	@echo '  outside     the code .pdata does not describe'
