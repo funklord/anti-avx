@@ -122,10 +122,41 @@ CASES = [
 	  ("c5fc1107", "vmovups", "%ymm0,(%rdi)")],
 	 [("load", 0, "%ymm0"), ("lane", 1, "%ymm0"), ("store", 2, "%ymm0")],
 	 {"%ymm0": 0}),
+	# **An operation from memory is not a load.** These four are the
+	# shapes Finding 382 found lowered as a plain load, whose upper half is
+	# the next sixteen bytes: right for `vmovups` and wrong for anything
+	# that computes. A widening reads its upper half from +8 or +4, an
+	# element-wise operation from +16 through the operation, and the
+	# register widening that is its own source has to take its upper half
+	# before the low half overwrites it. Then `vpabsd` on the result, the
+	# `LANE_UNARY` shape the same finding added.
+	("a widening load, words to dwords, then an absolute value",
+	 [("c4e27d2306", "vpmovsxwd", "(%rsi),%ymm0"),
+	  ("c4e27d1ec0", "vpabsd", "%ymm0,%ymm0"),
+	  ("c5fc1107", "vmovups", "%ymm0,(%rdi)")],
+	 [("lane", 0, "%ymm0"), ("lane", 1, "%ymm0"), ("store", 2, "%ymm0")],
+	 {"%ymm0": 0}),
+	("a widening load by a quarter, bytes to dwords",
+	 [("c4e27d314e10", "vpmovzxbd", "0x10(%rsi),%ymm1"),
+	  ("c5fc110f", "vmovups", "%ymm1,(%rdi)")],
+	 [("lane", 0, "%ymm1"), ("store", 1, "%ymm1")],
+	 {"%ymm1": 0}),
+	("an element-wise operation from memory",
+	 [("c5fc515620", "vsqrtps", "0x20(%rsi),%ymm2"),
+	  ("c5fc1117", "vmovups", "%ymm2,(%rdi)")],
+	 [("lane", 0, "%ymm2"), ("store", 1, "%ymm2")],
+	 {"%ymm2": 0}),
+	("a register widening into its own source",
+	 [("f30f6f1e", "movdqu", "(%rsi),%xmm3"),
+	  ("c4e27d25db", "vpmovsxdq", "%xmm3,%ymm3"),
+	  ("c5fc111f", "vmovups", "%ymm3,(%rdi)")],
+	 [("plain", 0, None), ("lane", 1, "%ymm3"), ("store", 2, "%ymm3")],
+	 {"%ymm3": 0}),
 ]
 
 # How many bytes each case writes, and how much input it reads.
-OUT_BYTES = {0: 32, 1: 64, 2: 32, 3: 32, 4: 48, 5: 32}
+OUT_BYTES = {0: 32, 1: 64, 2: 32, 3: 32, 4: 48, 5: 32, 6: 32, 7: 32, 8: 32,
+             9: 32}
 IN_BYTES = 256
 
 

@@ -95,8 +95,11 @@ What people do today without it is emulate, or give up.
 bit-for-bit, all sixteen registers, against the original instruction
 executed under qemu, since this machine cannot run the original itself.
 Small PEs built by the project itself, one per hazard found, must crash
-unmodified and run correctly once rewritten. A structural verifier
-re-derives every detour from the finished image.
+unmodified and run correctly once rewritten. Programs compiled by gcc and
+clang with `-mavx2`, a relocated DLL among them, are rewritten and must
+print exactly what their SSE builds print, so the tool is also held to real
+compiler output it did not see written. A structural verifier re-derives every detour from the finished
+image.
 
 **What it does not do.** FMA becomes a multiply and an add, which rounds
 twice where the hardware rounds once (421 sites in Starfield). Bundled DLLs
@@ -118,6 +121,7 @@ for someone starting cold.
 ## What exists
 
 ```
+anti-avx               binary in, rewritten binary out
 project.md             the design, the measurements, and every open question
 code-style.md          the style rules
 
@@ -140,9 +144,31 @@ src/f16c.c             software half-precision conversion, since Westmere
 src/fmaddsub.c         alternating-lane FMA, src/permil.c, src/permd.c
 test/                  the C tests for those, and lowering_test.c, which
                        executes the rewriter's own lowerings
+fixture/mingw/         the C++ program, DLL and host `check-mingw` builds
 ```
 
 ## Rewriting a binary
+
+```sh
+./anti-avx Game.exe Game-sse.exe
+```
+
+That is the whole of it for a user. It needs Python 3 and binutils, refuses
+an image still wrapped in Steam's DRM with a pointer to Steamless, strips a
+copy of one that carries a symbol table, makes the listing, rewrites, and
+runs the verifier, keeping the output only if it passes. `--keep-work`
+keeps the listing and the logs.
+
+```sh
+./anti-avx --survey GAME_DIRECTORY
+```
+
+lists every 64-bit executable and DLL under a directory by how much VEX
+code it carries, most first, which is where to start when it is not
+obvious which file crashes. A count is not proof the code runs: a library
+may keep its AVX behind its own CPU check.
+
+The Makefile drives the same steps one at a time, for working on the tool:
 
 ```sh
 make detour          # rewrite $(TARGET) into $(BUILD_DIR)
@@ -161,6 +187,11 @@ make scan                      # objdump + vex_scan into $(BUILD_DIR)
 make scan TARGET=other.exe     # any /arch:AVX2 PE, not just the driving case
 ```
 
+An image that still carries a COFF symbol table -- mingw's output does
+unless linked with `-s` -- is refused by these targets with the command that
+strips a copy, because objdump then names branch targets by symbol and the
+tools would not see them. `anti-avx` strips the copy itself.
+
 The listing is about 0.9 GB and `apply` takes roughly ten minutes on the real
 binary. `make clean` removes what it wrote, by name.
 
@@ -172,6 +203,8 @@ make check-pe     the PEs built here, rewritten, under wine
 make check-spill  the four ways a stub can get a scratch register
 make check-tls    whether the loader gives us per-thread bytes if asked
 make check-unwind whether an exception can be dispatched from inside a stub
+make check-mingw  gcc and clang -mavx2 builds, a DLL among them, rewritten,
+                  against their SSE builds under wine
 make hooks        install the commit-msg hook into .git/hooks
 make help         every target
 ```

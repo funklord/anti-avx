@@ -5,6 +5,10 @@
 # `make scan` and `make census` stay where they are.
 
 [project]
+# fixture/ holds Windows programs that `make check-mingw` builds with mingw
+# and rewrites; a host compile of them is meaningless. Finding 382.
+exclude = ["fixture/**"]
+
 # These are semantics, not preferences, and they are the Makefile's exactly.
 # The whole point of this code is to run where AVX and F16C do not exist, so
 # -msse4.1 sets the baseline the helpers are written against and the two

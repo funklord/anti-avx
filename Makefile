@@ -80,7 +80,7 @@ DEPS       = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
 .PHONY: all test check style style-source style-tool style-docs verify check-verify \
         check-f16c \
         check-f16c-exhaustive check-f16c-oracle check-fmaddsub check-permil \
-        check-isa \
+        check-isa check-mingw \
         scan report \
         coverage disassemble patch patch-plan patch-verify detour bench outside \
         placement check-aliasing check-lowering scratch-check check-pe \
@@ -1537,6 +1537,158 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 	done; \
 	echo "check-spill: and a site with neither lends itself sixteen bytes of TLS"
 
+# **A program the rewriter did not see written.** Every other PE here is
+# assembled by `pe_build.py`; this one is C++ compiled by mingw at -O3 with
+# -mavx2, so its shapes are gcc's rather than ours. Its first run found three
+# things Starfield never exercised: a symbol table that hid every branch
+# target from the listing parsers, gcc's table-relative switch tables, and
+# AVX2 forms with no rule -- `vpabsd`, `vpmovsxdq` into a ymm, and a scalar
+# `vcmpngtss` against memory. Finding 382.
+#
+# The SSE build of the same source is the oracle, compared line for line:
+# every result is printed in %a. `-ffp-contract=off` keeps FMA out, whose
+# lowering rounds twice (Finding 4) and would differ from the oracle by
+# design rather than by fault. `-s` strips the symbol table the tools
+# refuse; the unstripped build is kept as the control that they do.
+#
+# **And clang's build of the same source**, through the front end, because
+# clang loads straight into a widening -- `vpmovsxdq mem,%ymm4` -- where gcc
+# widened a register, and that is the shape that had shipped wrong in
+# Starfield as a plain load. gcc's builds alone passed with it broken.
+#
+# Termination: six wine runs under timeouts, after one compile per build.
+# Needs mingw, clang and wine, and stays out of `check` for that reason.
+MINGW_CXX  ?= x86_64-w64-mingw32-g++
+MINGW_CLANG ?= clang++ --target=x86_64-w64-mingw32
+MINGW_SRC   = fixture/mingw/kernels.cpp
+MINGW_FLAGS = -O3 -ffp-contract=off -static
+MINGW_OUT   = $(BUILD_DIR)/mingw-avx2.exe $(BUILD_DIR)/mingw-sse.exe \
+              $(BUILD_DIR)/mingw-symbols.exe $(BUILD_DIR)/mingw-avx2.asm \
+              $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-want.txt \
+              $(BUILD_DIR)/mingw-got.txt $(BUILD_DIR)/mingw-verify.log \
+              $(BUILD_DIR)/mingw-front.exe $(BUILD_DIR)/mingw-front.txt \
+              $(BUILD_DIR)/mingw-clang.exe $(BUILD_DIR)/mingw-clang-sse.exe \
+              $(BUILD_DIR)/mingw-clang-got.txt \
+              $(BUILD_DIR)/mingw-avx2.dll $(BUILD_DIR)/mingw-sse.dll \
+              $(BUILD_DIR)/mingw-rewritten.dll $(BUILD_DIR)/mingw-host.exe \
+              $(BUILD_DIR)/mingw-dll-want.txt $(BUILD_DIR)/mingw-dll-got.txt
+
+$(BUILD_DIR)/mingw-avx2.exe: $(MINGW_SRC) | $(BUILD_DIR)
+	$(MINGW_CXX) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
+
+$(BUILD_DIR)/mingw-sse.exe: $(MINGW_SRC) | $(BUILD_DIR)
+	$(MINGW_CXX) $(MINGW_FLAGS) -msse4.2 -s -o $@ $<
+
+$(BUILD_DIR)/mingw-clang.exe: $(MINGW_SRC) | $(BUILD_DIR)
+	$(MINGW_CLANG) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
+
+$(BUILD_DIR)/mingw-clang-sse.exe: $(BUILD_DIR)/mingw-clang.exe anti-avx \
+                                  tool/detour.py tool/patch.py tool/resync.py
+	./anti-avx $< $@
+
+# **A DLL, loaded where it did not ask to be.** The host reserves the DLL's
+# preferred base before loading it, so the rewritten image runs relocated:
+# whatever a stub holds as an absolute address has to have been covered by
+# a base relocation. Plain C, so the C compiler's shapes are in too.
+MINGW_CC   ?= x86_64-w64-mingw32-gcc
+MINGW_DLL   = -O3 -ffp-contract=off -shared -s -Wl,--image-base=0x6a000000
+
+$(BUILD_DIR)/mingw-avx2.dll: fixture/mingw/lib.c | $(BUILD_DIR)
+	$(MINGW_CC) $(MINGW_DLL) -mavx2 -o $@ $<
+
+$(BUILD_DIR)/mingw-sse.dll: fixture/mingw/lib.c | $(BUILD_DIR)
+	$(MINGW_CC) $(MINGW_DLL) -msse4.2 -o $@ $<
+
+$(BUILD_DIR)/mingw-host.exe: fixture/mingw/host.c | $(BUILD_DIR)
+	$(MINGW_CC) -O2 -s -o $@ $<
+
+$(BUILD_DIR)/mingw-rewritten.dll: $(BUILD_DIR)/mingw-avx2.dll anti-avx \
+                                  tool/detour.py tool/patch.py tool/resync.py
+	./anti-avx $< $@
+
+$(BUILD_DIR)/mingw-symbols.exe: $(MINGW_SRC) | $(BUILD_DIR)
+	$(MINGW_CXX) $(MINGW_FLAGS) -mavx2 -mfma -o $@ $<
+
+$(BUILD_DIR)/mingw-avx2.asm: $(BUILD_DIR)/mingw-avx2.exe tool/resync.py
+	set -o pipefail; $(OBJDUMP) -d -j .text $< | \
+		$(PYTHON) tool/resync.py $< > $@.tmp
+	mv $@.tmp $@
+
+$(BUILD_DIR)/mingw-rewritten.exe: $(BUILD_DIR)/mingw-avx2.exe \
+                                  $(BUILD_DIR)/mingw-avx2.asm \
+                                  tool/detour.py tool/patch.py
+	$(PYTHON) tool/detour.py apply $< $(BUILD_DIR)/mingw-avx2.asm $@
+
+# The front end, from the UNSTRIPPED build: `anti-avx` strips a copy, makes
+# the listing, rewrites and verifies, which is the whole of what a user runs.
+$(BUILD_DIR)/mingw-front.exe: $(BUILD_DIR)/mingw-symbols.exe anti-avx \
+                              tool/detour.py tool/patch.py tool/resync.py
+	./anti-avx $< $@
+
+check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
+             $(BUILD_DIR)/mingw-symbols.exe $(BUILD_DIR)/mingw-front.exe \
+             $(BUILD_DIR)/mingw-clang-sse.exe $(BUILD_DIR)/mingw-host.exe \
+             $(BUILD_DIR)/mingw-sse.dll $(BUILD_DIR)/mingw-rewritten.dll
+	@command -v wine >/dev/null 2>&1 || \
+		{ echo "check-mingw: wine is not installed"; exit 1; }
+	@if $(PYTHON) tool/detour.py plan $(BUILD_DIR)/mingw-symbols.exe \
+			$(BUILD_DIR)/mingw-avx2.asm >/dev/null 2>&1; then \
+		echo "check-mingw: an image with a symbol table was accepted"; \
+		exit 1; \
+	fi
+	@echo "check-mingw: the unstripped build is refused"
+	$(PYTHON) tool/detour.py verify $(BUILD_DIR)/mingw-avx2.exe \
+		$(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-avx2.asm \
+		> $(BUILD_DIR)/mingw-verify.log
+	@grep "VEX in .text" $(BUILD_DIR)/mingw-verify.log
+	@mkdir -p $(PE_PREFIX)
+	$(WINE_CANARY)
+	@set -e; \
+	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-sse.exe \
+		> $(BUILD_DIR)/mingw-want.txt 2>&1 || \
+		{ echo "check-mingw: the SSE oracle did not run"; exit 1; }; \
+	if $(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-avx2.exe \
+			>/dev/null 2>&1; then \
+		echo "check-mingw: the ORIGINAL ran -- this CPU has AVX, so the"; \
+		echo "             test proves nothing here"; \
+		exit 1; \
+	fi; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-rewritten.exe \
+		> $(BUILD_DIR)/mingw-got.txt 2>&1 || \
+		{ echo "check-mingw: the rewritten build failed"; \
+		  cat $(BUILD_DIR)/mingw-got.txt; exit 1; }; \
+	diff $(BUILD_DIR)/mingw-want.txt $(BUILD_DIR)/mingw-got.txt || \
+		{ echo "check-mingw: the rewritten build disagrees with SSE"; \
+		  exit 1; }; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-front.exe \
+		> $(BUILD_DIR)/mingw-front.txt 2>&1 || \
+		{ echo "check-mingw: the front end's build failed"; exit 1; }; \
+	diff $(BUILD_DIR)/mingw-want.txt $(BUILD_DIR)/mingw-front.txt || \
+		{ echo "check-mingw: the front end's build disagrees with SSE"; \
+		  exit 1; }; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-clang-sse.exe \
+		> $(BUILD_DIR)/mingw-clang-got.txt 2>&1 || \
+		{ echo "check-mingw: clang's rewritten build failed"; exit 1; }; \
+	diff $(BUILD_DIR)/mingw-want.txt $(BUILD_DIR)/mingw-clang-got.txt || \
+		{ echo "check-mingw: clang's rewritten build disagrees with SSE"; \
+		  exit 1; }; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-host.exe \
+		$(BUILD_DIR)/mingw-sse.dll > $(BUILD_DIR)/mingw-dll-want.txt 2>&1; \
+	grep -q "^base relocated " $(BUILD_DIR)/mingw-dll-want.txt || \
+		{ echo "check-mingw: the DLL was not relocated, so the test"; \
+		  echo "             proves nothing about relocation"; exit 1; }; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-host.exe \
+		$(BUILD_DIR)/mingw-rewritten.dll \
+		> $(BUILD_DIR)/mingw-dll-got.txt 2>&1 || \
+		{ echo "check-mingw: the rewritten DLL failed"; exit 1; }; \
+	diff $(BUILD_DIR)/mingw-dll-want.txt $(BUILD_DIR)/mingw-dll-got.txt || \
+		{ echo "check-mingw: the rewritten DLL disagrees with SSE"; \
+		  exit 1; }; \
+	echo "check-mingw: the rewritten DLL, loaded relocated, agrees"; \
+	echo "check-mingw: $$(wc -l < $(BUILD_DIR)/mingw-want.txt) results," \
+	     "every one as the SSE build computes it, by three routes"
+
 # Can an exception be dispatched from inside a stub? Two programs that fault
 # on purpose, both registering a handler through .pdata -- which is how a PE
 # with no imports gets SEH at all.
@@ -1636,7 +1788,7 @@ clean:
 	      $(BUILD_DIR)/sse-unwindspill.exe \
 	      $(BUILD_DIR)/sse-spill-none.exe $(BUILD_DIR)/sse-spill-stack.exe \
 	      $(BUILD_DIR)/sse-spill-pool.exe \
-	      $(BUILD_DIR)/icache_bench \
+	      $(BUILD_DIR)/icache_bench $(MINGW_OUT) \
 	      $(BUILD_DIR)/after.asm $(BUILD_DIR)/patched.asm $(BUILD_DIR)/stubs.asm \
 	      $(BUILD_DIR)/isa-disasm.txt $(BUILD_DIR)/region-refused.txt \
 	      $(BUILD_DIR)/regioncarry.log $(BUILD_DIR)/sse-regioncarry-off.exe \
@@ -1715,6 +1867,8 @@ help:
 	@echo '              sections, boundaries and the stub section'
 	@echo '  check-lowering  execute every lowering and check the result'
 	@echo '  check-pe    build an AVX PE, rewrite it, run both under wine'
+	@echo '  check-mingw a C++ program mingw built with -mavx2, rewritten,'
+	@echo '              against its SSE build under wine'
 	@echo '  bench       what a detour costs on this CPU (a timing run)'
 	@echo '  placement   where the detours land: functions and loop bodies'
 	@echo '  outside     the code .pdata does not describe'

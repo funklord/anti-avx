@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Rewrite an AVX executable so it runs on a CPU without AVX.
+
+    anti-avx [OPTIONS] INPUT.exe OUTPUT.exe
+    anti-avx --survey DIRECTORY
+
+INPUT is an x86-64 Windows executable built with /arch:AVX or /arch:AVX2.
+OUTPUT is the same program with every VEX instruction a CPU without AVX can
+reach lowered to SSE, checked by the structural verifier before it is kept.
+
+`--survey` answers the question a user has first: which of a game's
+executables and DLLs carry VEX code at all. It lists every x86-64 PE under
+DIRECTORY with its count of VEX instructions in .text, most first, and
+flags one still wrapped in Steam's DRM. A count is not proof the code
+runs -- a library may keep AVX behind its own CPU check -- but a file with
+none needs nothing, and the one that crashes is usually near the top.
+
+Options:
+  --keep-work     keep the working directory (the listing and logs)
+  --no-verify     skip the verifier, which takes about twice as long as the
+                  rewrite on a large binary; not recommended
+  --version       print the version and exit
+
+Anything else starting with `--` is passed to the rewriter, `tool/detour.py`.
+
+**Everything `make detour` needs a reader to know, done in order.** The
+listing is disassembled from a stripped copy where the input has a symbol
+table (Finding 382), resynchronised at every function start (Finding 347),
+rewritten, and verified; the working files go in a directory beside OUTPUT
+and are removed afterwards. An image still wrapped in Steam's DRM is refused
+with the name of the tool that unwraps it, because its `.bind` section
+disassembles as code that is not there.
+
+Termination: four child processes run one after another, each to completion;
+nothing loops and nothing is left running.
+"""
+
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TOOL = HERE / "tool"
+sys.path.insert(0, str(TOOL))
+
+import resync				# noqa: E402 -- the path is set just above
+
+AMD64 = 0x8664
+
+# **Instructions a CPU without AVX2 also lacks, that this does not lower.**
+# They are not SSE-era vector code, so the rewriter leaves them; what each
+# does on such a CPU is the reader's to judge, and the front end says so
+# rather than calling the output clean. `-march=haswell` emits all of them.
+# Starfield has 106 `tzcnt` and none of the rest. Finding 382.
+LEFT_ALONE = {
+	"tzcnt": "runs as bsf: the same result unless the source is zero",
+	"lzcnt": "runs as bsr: a DIFFERENT result for every input",
+	"andn": "VEX-encoded BMI1: faults", "bextr": "VEX-encoded BMI1: faults",
+	"blsi": "VEX-encoded BMI1: faults", "blsmsk": "VEX-encoded BMI1: faults",
+	"blsr": "VEX-encoded BMI1: faults", "bzhi": "VEX-encoded BMI2: faults",
+	"pdep": "VEX-encoded BMI2: faults", "pext": "VEX-encoded BMI2: faults",
+	"mulx": "VEX-encoded BMI2: faults", "rorx": "VEX-encoded BMI2: faults",
+	"sarx": "VEX-encoded BMI2: faults", "shlx": "VEX-encoded BMI2: faults",
+	"shrx": "VEX-encoded BMI2: faults", "movbe": "MOVBE: faults",
+	"adcx": "ADX: faults", "adox": "ADX: faults",
+}
+
+
+def fail(message):
+	print(f"anti-avx: {message}", file=sys.stderr)
+	return 1
+
+
+def headers(path):
+	"""(machine, section names) of a PE image, or None if it is not one."""
+	data = open(path, "rb").read(4096)
+	if data[:2] != b"MZ" or len(data) < 0x40:
+		return None
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	if data[pe:pe + 4] != b"PE\0\0":
+		return None
+	machine, count = struct.unpack_from("<HH", data, pe + 4)
+	table = pe + 24 + struct.unpack_from("<H", data, pe + 20)[0]
+	names = []
+	for i in range(count):
+		raw = data[table + i * 40:table + i * 40 + 8]
+		names.append(raw.rstrip(b"\0").decode("latin-1").strip())
+	return machine, names
+
+
+def run(step, command, log):
+	"""Run one step, its output to `log`. True when it succeeded.
+
+	From the working directory, which holds no `build/`: the rewriter
+	writes its refusal rolls there when one exists, and they would land in
+	whatever directory the user ran this from.
+	"""
+	print(f"anti-avx: {step}")
+	with open(log, "w") as out:
+		done = subprocess.run(command, stdout=out, stderr=subprocess.STDOUT,
+		                      cwd=log.parent)
+	if done.returncode != 0:
+		print(f"anti-avx: {step} failed; the last lines of {log}:",
+		      file=sys.stderr)
+		lines = Path(log).read_text(errors="replace").splitlines()
+		for line in lines[-15:]:
+			print(f"    {line}", file=sys.stderr)
+		return False
+	return True
+
+
+def left_alone(listing):
+	"""{mnemonic: count} for the `LEFT_ALONE` instructions in a listing."""
+	found = {}
+	with open(listing, errors="replace") as lines:
+		for line in lines:
+			parts = line.split("\t")
+			if len(parts) < 3:
+				continue
+			word = parts[2].split(None, 1)
+			if word and word[0] in LEFT_ALONE:
+				found[word[0]] = found.get(word[0], 0) + 1
+	return found
+
+
+def vex_count(path):
+	"""(VEX instructions, instructions) in .text, from objdump's listing."""
+	sweep = subprocess.Popen(["objdump", "-d", "-j", ".text", str(path)],
+	                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+	                         text=True, errors="replace")
+	vex = total = 0
+	for line in sweep.stdout:
+		parts = line.split("\t")
+		if len(parts) < 3 or not parts[1].strip():
+			continue
+		total += 1
+		if parts[1][:2] in ("c4", "c5") and not parts[2].startswith("(bad)"):
+			vex += 1
+	sweep.wait()
+	return vex, total
+
+
+def survey(directory):
+	"""Print every x86-64 PE under `directory`, ranked by VEX count."""
+	if shutil.which("objdump") is None:
+		return fail("objdump is not installed; it comes with binutils")
+	found = []
+	for root, _dirs, names in os.walk(directory):
+		for name in names:
+			if not name.lower().endswith((".exe", ".dll")):
+				continue
+			path = Path(root) / name
+			try:
+				head = headers(path)
+			except OSError:
+				continue
+			if head is None or head[0] != AMD64:
+				continue
+			print(f"anti-avx: reading {path}", file=sys.stderr)
+			vex, total = vex_count(path)
+			found.append((vex, total, ".bind" in head[1], path))
+	found.sort(key=lambda row: (-row[0], str(row[3])))
+	for vex, total, wrapped, path in found:
+		share = f"{100 * vex / total:5.2f}%" if total else "    -"
+		note = "  (Steam DRM: unpack with Steamless first)" if wrapped else ""
+		print(f"{vex:>9,} {share}  {path}{note}")
+	print(f"anti-avx: {len(found)} x86-64 image(s), "
+	      f"{sum(1 for row in found if row[0])} with VEX code")
+	return 0
+
+
+def main(argv):
+	keep = "--keep-work" in argv
+	verify = "--no-verify" not in argv
+	if argv[:1] == ["--survey"]:
+		if len(argv) != 2 or not Path(argv[1]).is_dir():
+			return fail("--survey takes one directory")
+		return survey(Path(argv[1]))
+	if "--version" in argv:
+		return subprocess.run([sys.executable, str(TOOL / "detour.py"),
+		                       "--version"]).returncode
+	passed = [a for a in argv if a.startswith("--")
+	          and a not in ("--keep-work", "--no-verify")]
+	paths = [a for a in argv if not a.startswith("--")]
+	if len(paths) != 2:
+		print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
+		return 2
+	source, output = Path(paths[0]).resolve(), Path(paths[1]).resolve()
+	if not source.is_file():
+		return fail(f"{source}: no such file")
+	if source == output:
+		return fail("OUTPUT must differ from INPUT; the input is read again "
+		            "by the verifier")
+	found = headers(source)
+	if found is None:
+		return fail(f"{source} is not a Windows executable")
+	machine, sections = found
+	if machine != AMD64:
+		return fail(f"{source} is not x86-64 (machine 0x{machine:04x}); "
+		            f"only 64-bit images are rewritten")
+	if ".bind" in sections:
+		return fail(f"{source} is still wrapped in Steam's DRM (a .bind "
+		            f"section); unpack it with Steamless first: "
+		            f"https://github.com/atom0s/Steamless")
+	for tool in ("objdump", "objcopy"):
+		if shutil.which(tool) is None:
+			return fail(f"{tool} is not installed; it comes with binutils")
+
+	output.parent.mkdir(parents=True, exist_ok=True)
+	work = Path(tempfile.mkdtemp(prefix=".anti-avx-", dir=output.parent))
+	try:
+		image = source
+		if resync.symbol_count(source):
+			image = work / "stripped.exe"
+			if not run("stripping the symbol table from a copy",
+			           ["objcopy", "--strip-all", str(source), str(image)],
+			           work / "strip.log"):
+				return 1
+		listing = work / "text.asm"
+		print("anti-avx: disassembling .text")
+		with open(listing, "w") as out, \
+				open(work / "listing.log", "w") as err:
+			sweep = subprocess.Popen(["objdump", "-d", "-j", ".text",
+			                          str(image)], stdout=subprocess.PIPE)
+			fixed = subprocess.run([sys.executable, str(TOOL / "resync.py"),
+			                        str(image)], stdin=sweep.stdout,
+			                       stdout=out, stderr=err)
+			sweep.stdout.close()
+			if sweep.wait() != 0 or fixed.returncode != 0:
+				print((work / "listing.log").read_text(errors="replace"),
+				      file=sys.stderr, end="")
+				return fail("the listing could not be made")
+		if not run("rewriting",
+		           [sys.executable, str(TOOL / "detour.py")] + passed
+		           + ["apply", str(image), str(listing), str(output)],
+		           work / "apply.log"):
+			return 1
+		if verify:
+			if not run("verifying",
+			           [sys.executable, str(TOOL / "detour.py")] + passed
+			           + ["verify", str(image), str(output), str(listing)],
+			           work / "verify.log"):
+				output.unlink(missing_ok=True)
+				return fail(f"verification failed, so {output} was removed")
+			for line in (work / "verify.log").read_text().splitlines():
+				if line.startswith("verify: VEX in .text"):
+					print("anti-avx: " + line[len("verify: "):])
+		for mnemonic, count in sorted(left_alone(listing).items()):
+			print(f"anti-avx: left alone: {count} {mnemonic} -- "
+			      f"{LEFT_ALONE[mnemonic]}")
+		print(f"anti-avx: wrote {output}")
+		return 0
+	finally:
+		if keep:
+			print(f"anti-avx: working files kept in {work}")
+		else:
+			shutil.rmtree(work)
+
+
+if __name__ == "__main__":
+	sys.exit(main(sys.argv[1:]))

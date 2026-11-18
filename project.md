@@ -14178,6 +14178,130 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 382 -- real compiler output, and a load that was an operation
+
+**Every input until now was Starfield or a fixture assembled here**, so every shape the
+tool handled was MSVC's or ours. mingw-w64 is now on this machine, so
+`fixture/mingw/kernels.cpp` -- float, double and integer loops gcc vectorises at -O3,
+switches, `qsort` and `std::sort` callbacks, and a C++ exception thrown from AVX code
+and caught two frames up -- is compiled twice, `-mavx2` and `-msse4.2`, and the SSE
+build's output is the oracle. `-ffp-contract=off`, because FMA lowers to a multiply
+and an add that round twice (Finding 4) and would differ by design. The AVX2 build
+has 422 VEX instructions and dies of an illegal instruction on this CPU.
+
+**The most important thing it found is a wrong answer Starfield has been shipping.**
+`span_operand_shape` called any two-operand instruction with a memory source and a
+ymm destination a `load`, whatever its mnemonic, and a load's upper half is the next
+sixteen bytes. For `vmovups` that is right. For `vpmovsxwd (%r9),%ymm0`, which widens
+eight words, the upper half is words 4-7 at `+8`, and the stub read words 8-11 at
+`+16`. Starfield has four such sites, at `0x142d8b890`, `0x142d8b899`, `0x142d8b8ac`
+and `0x142d8b8c0`, converting words to floats in a loop, and f381's stub reads
+`pmovsxwd 0x10(%r9),%xmm4` where `0x8(%r9)` was meant: the top four of every eight
+results came from the next group. Every `verify` check passed, because each is about
+structure. **The loop is almost certainly 16-bit PCM audio**: it multiplies each
+converted word by the eight floats at `0x143a906c0`, every one `0x38000000`, which is
+1/32768, the standard 16-bit-to-float normalisation. So wherever that function runs,
+in every block of eight samples, samples 4-7 were replaced by 8-11 -- a distortion,
+not a crash. Which sounds go through it was not measured.
+
+**On Starfield the whole of Finding 382 changes four bytes**: f382 against f381 differs
+in the upper-half displacement of exactly those four stubs, `0x10`, `0x20`, `0x30` and
+`0x40` becoming `0x8`, `0x18`, `0x28` and `0x38`, compared with `cmp -l` over the whole
+image. The symbol guard, the gcc switch tables, `widen`, the exchanged compare and
+`vpabs*` change nothing there, which is what an MSVC image without those shapes should
+show, and the apply log is f381's line for line. The general-purpose mover the load path falls back to without a helper
+copies the bytes raw, which is right only for a move, so the same hazard covered
+`vsqrtps (mem),%ymm` and its kind in principle; Starfield has none.
+
+It was found because clang widens from memory where gcc widens a register: clang's
+build of the same program ran, and printed a different `ints` line from both
+compilers' SSE builds. **Only a move is a load now** (`YMM_MOVES`); an operation from
+memory is `loadop`, whose upper half is the operation at `+16`, or at `+WIDEN[m]` for
+a widening, run through the helper and never through a general-purpose copy; anything
+else from memory is refused. `check-span` executes four new cases against the 256-bit
+original under qemu, and with the old classification restored the two widening cases
+DIFFER, which is the oracle seeing this bug.
+
+The first gcc rewrite died, and the run found four more things Starfield never
+exercised:
+
+  * **A symbol table hides every direct branch target.** objdump names a target by
+    symbol when it has one -- `jne 14000105a <pre_c_init+0x4a>` -- and twelve parsers
+    here read a target only as `0x...`. So the rewriter saw **no** direct targets, no
+    window was kept off one, and `verify`'s check that none lands in a window passed
+    over an empty set: "all 0 direct branch targets still begin an instruction".
+    Stripped, the same image has 3,439. Starfield is stripped, so this was never
+    reached. Rather than teach twelve parsers a second form, `resync.py` and every
+    `detour.py` mode now refuse an image whose header counts COFF symbols, naming
+    `objcopy --strip-all`; a stripped copy's listing was checked to carry the same
+    instructions at the same addresses as the original's, line for line.
+  * **gcc's switch tables are table-relative.** MSVC's hold RVAs and are loaded
+    through the image base; gcc's hold `target - table`, signed, from a table whose
+    address a `lea ...(%rip)` puts in a register. `switch_relative` reads that
+    dispatch beside `switch_dispatch`; 19 tables and 282 case labels in this program,
+    262 of which nothing protected. With it disabled the image happens to come out
+    the same here -- no window met a case label -- and `verify`, which re-reads the
+    tables independently, would fail a label that stopped beginning an instruction.
+  * **AVX2 integer forms with no rule.** `vpabsb/w/d` had none even at 128 bits; they
+    are now DIRECT rules with executed cases (258 cases, qemu-checked by
+    `check-vex`) and members of `LANE_UNARY` at 256. `vpmovsxdq %xmm2,%ymm1` and
+    its kind widen an xmm into a ymm, which no lane split describes: the new `widen`
+    shape copies the source to the helper, shifts it right by what the low half
+    consumed (`WIDEN`), widens it there into the destination's slot, and then runs
+    the 128-bit form -- upper half first, so a destination that is the source stays
+    whole. The `vpmovsx*`/`vpmovzx*` family, `vcvtdq2pd` and `vcvtps2pd`.
+  * **A scalar exchanged compare against memory.** `vcmpngtss 0x22b77(%rip),%xmm1,
+    %xmm1`: SSE has no NGT, and Finding 367's exchange works only packed and between
+    registers. `lower_exchanged_compare` goes through a scratch: src2 into it, the
+    reversed predicate from Finding 367's table against src1, then the low element
+    (or the whole register, packed) to the destination, which keeps src1's upper
+    lanes as VEX does. Both gates that refused it -- the collector's direct-form test
+    and `lower_vex`'s -- now ask `exchanged_compare` first.
+
+**After all of it: gcc's build 422 of 422 removed, clang's 762 of 762, and both
+print exactly what the SSE build prints**, the exception path included. `make
+check-mingw` holds it three ways -- gcc through the Makefile, gcc's unstripped build
+through `./anti-avx`, clang's through `./anti-avx` -- and the unstripped build must be
+refused by the tools directly, and the original must fail. A fourth route is a
+DLL, `fixture/mingw/lib.c` built as C with -mavx2, which `fixture/mingw/host.c`
+loads after reserving its preferred base, so the rewritten image runs relocated: 40
+of 40 removed, and the same value as the SSE DLL's.
+
+**`./anti-avx IN OUT` is the front end** a user runs: it refuses an image still in
+Steam's DRM (a `.bind` section) with the Steamless pointer, strips a copy of one with
+a symbol table, makes and resynchronises the listing, rewrites, verifies, and keeps
+the output only if verification passes. The steps run from a working directory
+beside the output, so the refusal rolls `detour.py` writes into `./build` land
+nowhere, and the directory is removed afterwards.
+
+**It also names what it leaves alone**, because not everything a CPU without AVX2
+lacks is VEX vector code. `-march=haswell` emits BMI1/BMI2, LZCNT and MOVBE: the
+VEX-encoded ones (`shlx`, `andn`, ...) fault, and `lzcnt` and `tzcnt` are F3-prefixed
+`bsr` and `bsf`, which a Westmere runs without complaint -- `lzcnt` with a different
+answer for every input, `tzcnt` with a different one only for a zero source. The
+rewriter lowers none of them; `anti-avx` reports a count of each with what it does.
+
+**Starfield has 106 `tzcnt` and none of the others** (measured on `build/text.asm`,
+2026-11-18), and **every one is safe as `bsf`**. All sit between `0x1434dc000` and
+`0x1434e3000`, in the runtime's vector compare routines; none has its flags read (103
+are overwritten first, 3 leave before any reader), so only a zero source could tell the
+two apart -- and no source can be zero. 104 are proved by three rules over every way
+in: 93 are reached only by `jne` straight after an `xor`/`and`/`test` that set ZF from
+the source itself; 6 complement a `pmovmskb` mask of at most 16 bits, whose bits 31:16
+then are all ones; 5 complement a mask that a `jne` after `cmp $0xffffffff` proved is
+not all ones. The last 2 were read by hand: `0x1434dc8b2` is the 16-bit case entered
+through a `mov` that does not touch the register, and at `0x1434dd209` the mask was
+compared with `%eax` after a fall through `cmp $0xffffffff,%eax; jne`, so `%eax` was
+all ones. So the image needs no change for them.
+
+**`anti-avx --survey DIR` answers which files carry VEX at all**, the question a user
+has before any other. Over the Starfield install (2026-11-18), 23 x86-64 images, 9 with
+VEX code: the executable's 804,951, then `D3D12/d3d12SDKLayers.dll` 883, `nvngx_dlssg.dll`
+826, `D3D12/D3D12Core.dll` 545, `nvngx_dlss.dll` 458, `NRD.dll` 440, `steam_api64.dll`
+155, `XCurl.dll` 113, and the installed rewritten image's 30. The game runs here, so the
+DLLs' VEX is behind their own CPU checks or off the paths played -- consistent with
+"bundled DLLs are not rewritten" costing nothing so far, and not a proof of it.
+
 ### Finding 381 -- a stub that gives its stack back ends its record there
 
 **An unwind code applies from its offset to the end of the record, and wine applies
@@ -23889,7 +24013,8 @@ now.
 ### The machine, because it decides what can be tested
 
     Xeon X5675 (Westmere), SSE4.2 + AES-NI + PCLMULQDQ, no AVX, no F16C, no FMA
-    Linux, wine 10.0, binutils as/objdump/objcopy, gcc -- and no mingw
+    Linux, wine 10.0, binutils as/objdump/objcopy, gcc, and mingw-w64 g++ 14
+    (the last found installed 2026-11-18; it was absent when this was written)
 
 **The absence of AVX is the project's premise and its best test instrument.** This
 CPU cannot execute the input and can execute the output, so "the original must
@@ -23898,7 +24023,8 @@ is also why every reference has to come from somewhere other than the original
 instruction.
 
 The absence of mingw is why `tool/pe_build.py` writes PE headers by hand rather
-than compiling with MSVC or a cross-compiler.
+than compiling with MSVC or a cross-compiler. Now that it is here, `make
+check-mingw` adds the other kind of input: real compiler output (Finding 382).
 
 ### What each check proves, and what it does not
 

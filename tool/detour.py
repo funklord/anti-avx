@@ -1798,6 +1798,14 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 			if out is None and reasons is not None:
 				reasons["lower: the vvvv shift would not lower"] += 1
 			return out
+	# Before the direct-form test, which refuses every predicate SSE does
+	# not spell. See `lower_exchanged_compare`. Finding 382.
+	if exchanged_compare(encoding):
+		out = lower_exchanged_compare(vex, encoding[vex["length"]:],
+		                              address, encoding, at, scratch)
+		if out is None and reasons is not None:
+			reasons["lower: an exchanged compare has no usable scratch"] += 1
+		return out
 	if not inplace.has_direct_sse_form(mnemonic):
 		if mnemonic in SEQUENCE_MNEMONICS or FMA_PATTERN.match(mnemonic):
 			tail = encoding[vex["length"]:]
@@ -1947,6 +1955,83 @@ def lower_vex(address, encoding, operands, mnemonic, at, scratch=None,
 		             + struct.pack("<i", displacement)
 		             + operation[offset + 4:])
 	body += operation
+	return bytes(body)
+
+
+def exchanged_compare(encoding):
+	"""True for a 128-bit compare whose predicate SSE has only reversed."""
+	vex = inplace.decode_vex(encoding)
+	if vex is None or vex["L"] or vex["map"] != 1:
+		return False
+	tail = encoding[vex["length"]:]
+	return len(tail) >= 3 and tail[0] == 0xC2 \
+		and tail[-1] in EXCHANGED_PREDICATES
+
+
+def lower_exchanged_compare(vex, tail, address, encoding, at, scratch):
+	"""A 128-bit compare with an exchanged predicate. Bytes or None.
+
+	**Through a scratch, whatever the operands are.** Exchanging in place --
+	Finding 367's route -- is possible only between registers and only
+	packed: a scalar compare takes bits 127:32 from src1, so the result
+	must end in src1's register, not src2's. So src2 goes to the scratch,
+	the compare with src1 runs into it with the reversed predicate, and the
+	result is carried to the destination: whole for a packed form, the low
+	element alone for a scalar one, after src1 has been copied there.
+
+	    vcmpngtss 0x22b77(%rip),%xmm1,%xmm1
+	    movss   0x...(%rip),%xmmS        # src2, at its new displacement
+	    cmpnltss %xmm1,%xmmS             # NLT(src2, src1) is NGT(src1, src2)
+	    movss   %xmmS,%xmm1              # low element; src1's upper lanes kept
+
+	`EXCHANGED_PREDICATES` maps each predicate; `sse_encoding` would
+	otherwise refuse all eight, since its 0F C2 reads imm8[2:0] as another
+	compare. mingw's -O3 -mavx2 output has this form; Starfield has none,
+	whose exchanged compares are all packed and between registers, which
+	`exchanged` rewrites at parse time. Finding 382.
+	"""
+	if vex["L"] or vex["map"] != 1 or len(tail) < 3 or tail[0] != 0xC2:
+		return None
+	# Finding 367's table: the same compare with the sources traded, the
+	# signalling sense kept. `sse_encoding` folds 0x10-0x17 to 0-7.
+	exchanged_to = EXCHANGED_PREDICATES.get(tail[-1])
+	if exchanged_to is None or scratch is None:
+		return None
+	predicate = exchanged_to[0]
+	destination, source1 = registers_of(vex, tail)
+	register_form = ((tail[1] >> 6) & 3) == 3
+	source2 = (vex["B"] << 3) | (tail[1] & 7) if register_form else None
+	if scratch in (destination, source1, source2):
+		return None
+	scalar = vex["pp"] in (2, 3)
+	body = bytearray()
+	if register_form:
+		body += encode_movaps(scratch, source2)
+	else:
+		load = encode_mem(inplace.PP_PREFIX[vex["pp"]] if scalar else None,
+		                  b"\x0f\x10", scratch, vex, tail[:-1], address,
+		                  encoding, at)
+		if load is None:
+			return None
+		body += load
+	compare = inplace.sse_encoding(
+		dict(vex, R=scratch >> 3, X=0, B=source1 >> 3),
+		bytes([0xC2, 0xC0 | ((scratch & 7) << 3) | (source1 & 7),
+		       predicate]))
+	if compare is None:
+		return None
+	body += compare
+	if not scalar:
+		body += encode_movaps(destination, scratch)
+		return bytes(body)
+	if destination != source1:
+		body += encode_movaps(destination, source1)
+	rex = 0x40 | ((destination >> 3) << 2) | (scratch >> 3)
+	body.append(inplace.PP_PREFIX[vex["pp"]])
+	if rex != 0x40:
+		body.append(rex)
+	body += b"\x0f\x10"
+	body.append(0xC0 | ((destination & 7) << 3) | (scratch & 7))
 	return bytes(body)
 
 
@@ -5100,8 +5185,36 @@ MASK_TO_GPR = {
 	"vmovmskpd": (0x66, b"\x0f\x50", 2),
 }
 
+# **One xmm source widened into a ymm, which no lane split describes.**
+# `vpmovsxdq %xmm2,%ymm1` makes four quadwords from four dwords: the low
+# half is the same instruction one width down, and the upper half is the
+# same operation on the source's NEXT bytes -- so it is the source copied
+# into the helper, shifted right by what the low half consumed, widened in
+# place, and stored to the destination's slot. The value is that byte
+# count. The source is an xmm, so no slot is read. Register sources only.
+# Starfield has none of these in this form; a mingw -O3 -mavx2 build has
+# them in its integer loops. Finding 382.
+WIDEN = {
+	"vpmovsxbw": 8, "vpmovzxbw": 8, "vpmovsxwd": 8, "vpmovzxwd": 8,
+	"vpmovsxdq": 8, "vpmovzxdq": 8, "vpmovsxbd": 4, "vpmovzxbd": 4,
+	"vpmovsxwq": 4, "vpmovzxwq": 4, "vpmovsxbq": 2, "vpmovzxbq": 2,
+	"vcvtdq2pd": 8, "vcvtps2pd": 8,
+}
+
+# **An operation whose only source is memory and whose result is a ymm.**
+# The low half is the instruction one width down; the upper half is the same
+# instruction on the memory the low half did not read -- +16 for an
+# element-wise one, +`WIDEN[m]` for a widening one -- run into the helper
+# and stored to the slot. Never a general-purpose copy: the bytes have to
+# go through the operation. Finding 382.
+OPERATION_LOADS = frozenset(WIDEN) | frozenset((
+	"vcvtdq2ps", "vcvtps2dq", "vcvttps2dq", "vrcpps", "vrsqrtps", "vsqrtps",
+	"vsqrtpd", "vpabsb", "vpabsw", "vpabsd", "vmovddup", "vmovshdup",
+	"vmovsldup"))
+
 LANE_UNARY = frozenset(("vcvtdq2ps", "vcvtps2dq", "vcvttps2dq",
-                        "vrcpps", "vrsqrtps", "vsqrtps", "vsqrtpd"))
+                        "vrcpps", "vrsqrtps", "vsqrtps", "vsqrtpd",
+                        "vpabsb", "vpabsw", "vpabsd"))
 
 # **Operations whose operands may be exchanged with no change to the bytes
 # produced.** `op %ymmD,%ymmS,%ymmD` computes `D = S op D`, and SSE's
@@ -5577,6 +5690,11 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 			and len(wide) == 2:
 		return ("regmove", canonical_ymm(fields[1]),
 		        canonical_ymm(fields[0]))
+	# **An xmm widened into a ymm.** See `WIDEN`. Finding 382.
+	if SHADOW_REGS_RULE == SHADOW_REGS_ALL \
+			and mnemonic in WIDEN and len(fields) == 2 \
+			and fields[0].startswith("%xmm") and fields[1].startswith("%ymm"):
+		return ("widen", canonical_ymm(fields[1]), ymm_alias(fields[0]))
 	# **The same shape with the bytes transformed on the way.** See
 	# `LANE_UNARY`: one source, one destination, every element decided by
 	# itself, so the upper half is the source's slot through a helper.
@@ -5595,10 +5713,25 @@ def span_operand_shape(vex, tail, operands, tracked, mnemonic=None):
 			and len(wide) == 1 and wide[0] == fields[0]:
 		return ("maskgpr", canonical_ymm(fields[0]))
 	if len(fields) == 2 and len(wide) == 1:
+		# **Only a move is a load.** A load's upper half is the next
+		# sixteen bytes, carried by a narrowed copy of the instruction or
+		# by a general-purpose mover -- right for `vmovups`, and wrong for
+		# anything that computes. `vpmovsxwd (%r9),%ymm0` widens eight
+		# words: its upper half is words 4-7, at +8, and the load path read
+		# words 8-11 at +16. Four such sites in Starfield, shipped wrong
+		# through f381 with every `verify` check passing. So the operand
+		# shape alone no longer decides it; the mnemonic does. Finding 382.
 		if "(" in fields[0] and wide[0] == fields[1]:
-			return ("load", canonical_ymm(fields[1]))
+			if mnemonic is None or mnemonic in YMM_MOVES:
+				return ("load", canonical_ymm(fields[1]))
+			if SHADOW_REGS_RULE == SHADOW_REGS_ALL \
+					and mnemonic in OPERATION_LOADS:
+				return ("loadop", canonical_ymm(fields[1]))
+			return None
 		if "(" in fields[1] and wide[0] == fields[0]:
-			return ("store", canonical_ymm(fields[0]))
+			if mnemonic is None or mnemonic in YMM_MOVES:
+				return ("store", canonical_ymm(fields[0]))
+			return None
 		return None
 	if len(fields) == 3 and len(wide) == 2 and "(" in fields[0] \
 			and fields[1] != fields[2]:
@@ -6340,6 +6473,26 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			                     len(encoding), at + len(body))
 			if piece is None:
 				return refuse("load high half cannot be narrowed")
+			body += piece
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			continue
+		if what == "loadop":
+			# See `OPERATION_LOADS`: the operation on each half's own
+			# memory, through the helper. Finding 382.
+			if helper is None:
+				return refuse("loadop wants a helper")
+			low = narrow_piece(vex, tail, 0, address, len(encoding),
+			                   at + len(body))
+			if low is None:
+				return refuse("loadop low half cannot be narrowed")
+			body += low
+			high_vex, high_tail = retarget(vex, tail, helper)
+			piece = narrow_piece(high_vex, high_tail,
+			                     WIDEN.get(mnemonic, SLOT), address,
+			                     len(encoding), at + len(body))
+			if piece is None:
+				return refuse("loadop high half cannot be narrowed")
 			body += piece
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
@@ -7118,6 +7271,34 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			continue
+		if what == "widen":
+			# **The upper half first**, from a copy of the source, so a
+			# destination that is also the source is still whole when the
+			# low half reads it. `psrldq` is 66 0F 73 /3 ib; the widening
+			# itself is the original opcode with reg and rm both the
+			# helper, as in `lanemove`. See `WIDEN`. Finding 382.
+			if helper is None:
+				return refuse("widen wants a helper")
+			source = scratch_finder.xmm_numbers(shape[2])[0]
+			body += encode_movaps(helper, source)
+			body += bytes(([0x66, 0x41] if helper >= 8 else [0x66])
+			              + [0x0F, 0x73, 0xD8 | (helper & 7),
+			                 WIDEN[mnemonic]])
+			operation = inplace.sse_encoding(
+				dict(vex, L=0, R=helper >> 3, X=0, B=helper >> 3),
+				tail[:1] + bytes([0xC0 | ((helper & 7) << 3)
+				                  | (helper & 7)]) + tail[2:])
+			if operation is None:
+				return refuse("widen operation has no SSE form")
+			body += operation
+			body += span_slot_move(helper, True, base, slot, block,
+			                       at + len(body))
+			low = narrow_piece(vex, tail, 0, address, len(encoding),
+			                   at + len(body))
+			if low is None:
+				return refuse("widen low half cannot be narrowed")
+			body += low
+			continue
 		if what == "lanemove":
 			# **One source, and the destination's upper half is wholly
 			# overwritten** -- so unlike `lanereg` there is nothing to
@@ -7621,7 +7802,7 @@ def region_members(instructions, first, last, reasons=None):
 			return refuse("shape "
 			              + (span_shape_name(encoding, operands) or "?"))
 		what, register = shape[0], shape[1]
-		if what == "load":
+		if what in ("load", "loadop"):
 			if register not in slots:
 				# **The permanent slot when shadows are on**, so a value
 				# this region defines is visible to every later one. A
@@ -7681,7 +7862,7 @@ def region_members(instructions, first, last, reasons=None):
 				                   and shadow_index(register) is not None
 				                   else len(slots))
 			defined.add(register)
-		elif what in ("bcastmem", "bcastreg"):
+		elif what in ("bcastmem", "bcastreg", "widen"):
 			# Defines the destination's upper half from a value that is
 			# not an upper half at all, so nothing has to be proved about
 			# what came before it.
@@ -11228,6 +11409,10 @@ SWITCH_WIDE = dict(zip(
 	+ [f"r{i}" for i in range(8, 16)]))
 SWITCH_LOAD = re.compile(r"^(0x[0-9a-f]+)\(%(\w+),%(\w+),4\),%(\w+)$")
 SWITCH_ADD = re.compile(r"^%(\w+),%(\w+)$")
+# gcc's form, read by `switch_relative`: `movslq (%rdx,%rcx,4),%rax` from
+# a table whose address `lea 0x22ac9(%rip),%rdx` put in the base.
+SWITCH_RELATIVE = re.compile(r"^\(%(\w+),%(\w+),4\),%(\w+)$")
+SWITCH_RIP = re.compile(r"^(-?0x[0-9a-f]+)\(%rip\),%(\w+)$")
 SWITCH_BACK = 16			# how far back a dispatch may be spread
 # The byte table a two-level dispatch reads its case number from first:
 # `movzbl 0xd35718(%rax,%r13,1),%eax`, the image base on either side.
@@ -11414,6 +11599,61 @@ def switch_dispatch(window):
 	return None
 
 
+def switch_relative(window):
+	"""The address of a table of table-relative offsets, or None. Pure.
+
+	**gcc and clang hold `target - table`, not an RVA**, and load the
+	table's address PC-relative rather than through the image base:
+
+	    lea    0x22ac9(%rip),%rdx        # the table
+	    movslq (%rdx,%rcx,4),%rax         # a signed offset from it
+	    add    %rdx,%rax
+	    jmp    *%rax
+
+	`switch_dispatch` reads only MSVC's form, so a mingw build's switch
+	tables went unread, nothing kept a window off a case label, and verify
+	said "no switch dispatch in this image". Finding 382.
+
+	The `add` names two registers, one of them the jump's. The `movslq`
+	must load into one of them through the other as its base, with no
+	displacement, and the `lea` must put a RIP-relative address into that
+	base. The table's address is the `lea`'s: the end of its row plus its
+	displacement, so this needs rows with a real address and encoding.
+	"""
+	rows = list(window)
+	if not rows:
+		return None
+	operands = rows[-1][3] or ""
+	if rows[-1][2] != "jmp" or not operands.startswith("*%"):
+		return None
+	register = operands[2:].strip()
+	back = rows[-2::-1]
+	pair = None
+	for prior in back:
+		match = SWITCH_ADD.match(prior[3] or "")
+		if prior[2] == "add" and match and match.group(2) == register:
+			pair = (match.group(1), match.group(2))
+			break
+	if pair is None:
+		return None
+	table = None
+	for prior in back:
+		match = SWITCH_RELATIVE.match(prior[3] or "")
+		if prior[2] != "movslq" or not match:
+			continue
+		holds, _index, into = match.groups()
+		if into in pair and holds in pair and holds != into:
+			table = holds
+			break
+	if table is None:
+		return None
+	for prior in back:
+		match = SWITCH_RIP.match(prior[3] or "")
+		if prior[2] == "lea" and match and match.group(2) == table:
+			return prior[0] + len(prior[1]) + int(match.group(1), 16)
+	return None
+
+
 def switch_index(window):
 	"""(offset, length) of the byte table a dispatch indexes first, or None.
 
@@ -11592,8 +11832,14 @@ def switch_targets(instructions, binary, starts):
 		if mnemonic != "jmp" or not operands.startswith("*%"):
 			continue
 		offset = switch_dispatch(window)
+		# gcc's tables hold offsets from the table itself, signed; MSVC's
+		# hold RVAs. `origin` is what an entry is added to. Finding 382.
+		origin, layout = base, "<I"
 		if offset is None:
-			continue
+			table = switch_relative(window)
+			if table is None:
+				continue
+			offset, origin, layout = table - base, table, "<i"
 		dispatches += 1
 		where = at(base + offset)
 		if where is None:
@@ -11603,10 +11849,10 @@ def switch_targets(instructions, binary, starts):
 		# coincidence should not become a table.
 		entries, k = [], 0
 		while where + k * 4 + 4 <= len(data):
-			value = struct.unpack_from("<I", data, where + k * 4)[0]
-			if base + value not in starts:
+			value = struct.unpack_from(layout, data, where + k * 4)[0]
+			if origin + value not in starts:
 				break
-			entries.append(base + value)
+			entries.append(origin + value)
 			k += 1
 		# **The table is data whatever it held**, even an entry short of
 		# being counted as one: the dispatch reads it, so its bytes are
@@ -12963,7 +13209,8 @@ def collect(binary, listing, context=None):
 		# that is DIRECT-only -- vcomiss and the rest -- as well as the
 		# sequences, long after the code below had learned to handle them.
 		needs_sequence = (mnemonic in SEQUENCE_MNEMONICS
-		                  or FMA_PATTERN.match(mnemonic) is not None)
+		                  or FMA_PATTERN.match(mnemonic) is not None
+		                  or exchanged_compare(encoding))
 		# **A 256-bit site no Y strategy claimed cannot be lowered at all**,
 		# and the collector has to say so rather than accept it and let the
 		# stub fail. The test below asks whether the MNEMONIC has an SSE
@@ -15873,6 +16120,14 @@ def switch_selftest():
 			print(f"selftest: {what}: switch_dispatch gave {shown}, "
 			      f"want {want}", file=sys.stderr)
 			failures += 1
+	for what, rows, expected in SWITCH_RELATIVE_CASES:
+		got = switch_relative(rows)
+		if got != expected:
+			shown = "None" if got is None else hex(got)
+			want = "None" if expected is None else hex(expected)
+			print(f"selftest: {what}: switch_relative gave {shown}, "
+			      f"want {want}", file=sys.stderr)
+			failures += 1
 	for what, rows, expected in SWITCH_INDEX_CASES:
 		window = [(0, b"", mnemonic, operands) for mnemonic, operands in rows]
 		got = switch_index(window)
@@ -15881,9 +16136,48 @@ def switch_selftest():
 			      f"{expected}", file=sys.stderr)
 			failures += 1
 	if not failures:
-		print(f"selftest: {len(SWITCH_CASES)} switch dispatches and "
+		print(f"selftest: {len(SWITCH_CASES)} switch dispatches, "
+		      f"{len(SWITCH_RELATIVE_CASES)} table-relative ones and "
 		      f"{len(SWITCH_INDEX_CASES)} index tables, read and refused")
 	return failures
+
+
+# gcc's dispatch, from a mingw -O3 -mavx2 build at 0x140001530: the table
+# is at 0x140001537 + 0x22ac9. Rows carry address and encoding, because
+# the table's address is the `lea`'s end plus its displacement. Finding 382.
+SWITCH_RELATIVE_CASES = [
+	("gcc's dispatch",
+	 [(0x14000152a, bytes(6), "ja", "0x140001611"),
+	  (0x140001530, bytes(7), "lea", "0x22ac9(%rip),%rdx"),
+	  (0x140001537, bytes(4), "movslq", "(%rdx,%rcx,4),%rax"),
+	  (0x14000153b, bytes(3), "add", "%rdx,%rax"),
+	  (0x14000153e, bytes(2), "jmp", "*%rax")],
+	 0x140024000),
+	("the add the other way round, a negative displacement",
+	 [(0x1000, bytes(7), "lea", "-0x100(%rip),%rdx"),
+	  (0x1007, bytes(4), "movslq", "(%rdx,%rcx,4),%rax"),
+	  (0x100b, bytes(3), "add", "%rax,%rdx"),
+	  (0x100e, bytes(2), "jmp", "*%rdx")],
+	 0x1007 - 0x100),
+	("the lea fills another register",
+	 [(0x1000, bytes(7), "lea", "0x100(%rip),%rsi"),
+	  (0x1007, bytes(4), "movslq", "(%rdx,%rcx,4),%rax"),
+	  (0x100b, bytes(3), "add", "%rdx,%rax"),
+	  (0x100e, bytes(2), "jmp", "*%rax")],
+	 None),
+	("a load with a displacement is not this form",
+	 [(0x1000, bytes(7), "lea", "0x100(%rip),%rdx"),
+	  (0x1007, bytes(4), "movslq", "0x8(%rdx,%rcx,4),%rax"),
+	  (0x100b, bytes(3), "add", "%rdx,%rax"),
+	  (0x100e, bytes(2), "jmp", "*%rax")],
+	 None),
+	("the add does not feed the jump",
+	 [(0x1000, bytes(7), "lea", "0x100(%rip),%rdx"),
+	  (0x1007, bytes(4), "movslq", "(%rdx,%rcx,4),%rax"),
+	  (0x100b, bytes(3), "add", "%rdx,%rax"),
+	  (0x100e, bytes(2), "jmp", "*%rbx")],
+	 None),
+]
 
 
 # The game's own two-level dispatch, at 0x140d355a6. Finding 337.
@@ -16852,6 +17146,12 @@ def main(argv):
 
 	if mode == "selftest":
 		return selftest()
+
+	# Every mode past this point reads an image as its first argument.
+	refused = resync.refuse_symbols(argv[1]) if len(argv) > 1 else None
+	if refused:
+		print(f"detour.py: {refused}", file=sys.stderr)
+		return 2
 
 	if mode == "census":
 		return census(argv[1], argv[2], argv[3])

@@ -35,6 +35,31 @@ OBJDUMP = "objdump"
 REACH = 256
 
 
+def symbol_count(path):
+	"""How many COFF symbols the image carries; 0 for a stripped one.
+
+	**Every parser here reads a direct target as `0x...`**, the form objdump
+	prints when it has no symbol to name. Given an image that still has a
+	COFF symbol table -- mingw's output does unless stripped -- it prints
+	`jne 14000105a <pre_c_init+0x4a>` instead, and the tools see no direct
+	branch target at all: nothing keeps a window off one, and the check that
+	none lands inside a window passes over an empty set. Starfield is
+	stripped, so this went unseen until a mingw build. Finding 382.
+	"""
+	data = open(path, "rb").read(4096)
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	return struct.unpack_from("<I", data, pe + 16)[0]
+
+
+def refuse_symbols(path):
+	"""A message refusing an image with a symbol table, or None."""
+	if not symbol_count(path):
+		return None
+	return (f"{path} carries a COFF symbol table, so objdump names branch "
+	        f"targets by symbol and every target would be read as absent; "
+	        f"strip a copy first: objcopy --strip-all {path} STRIPPED")
+
+
 def pdata_starts(path):
 	"""Every function start the exception directory names, as addresses."""
 	return {begin for begin, _end in pdata_ranges(path)}
@@ -207,6 +232,9 @@ def resync(binary, lines, report=None, skip=frozenset(), branches=True):
 	`branches` adds `branch_starts`, which is a second sweep of the
 	binary. Finding 365.
 	"""
+	refused = refuse_symbols(binary)
+	if refused:
+		raise Unresolved(refused)
 	starts = pdata_starts(binary) - set(skip)
 	if branches:
 		starts |= branch_starts(binary) - set(skip)

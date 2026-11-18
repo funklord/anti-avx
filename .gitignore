@@ -26,3 +26,6 @@ __pycache__/
 /lowering_test
 /permd_test
 /permil_test
+
+# The /go run file: one session's working state, not project history.
+.claude/go.md

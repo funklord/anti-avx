@@ -54,6 +54,7 @@ DIRECT_MNEMONICS = frozenset("""
 	vmovmskps vmovmskpd vpmovmskb
 	vextractps vpextrb vpextrw vpextrd vpextrq
 	vpshufd vpshuflw vpshufhw
+	vpabsb vpabsw vpabsd
 	vldmxcsr vstmxcsr
 	vcvttss2si vcvttsd2si vcvtss2si vcvtsd2si
 	vcvtps2pd vcvtpd2ps vcvtpd2psx vcvtdq2ps vcvtps2dq vcvttps2dq
