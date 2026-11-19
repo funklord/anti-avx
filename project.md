@@ -24487,6 +24487,19 @@ the project's largest risk.
 
 ## Open questions
 
+- **New (2026-11-19): do Findings 385 and 386 hold under Windows' loader, not only
+  wine's?** Both rest on it: a TLS block declared 16-byte aligned being so (wine aligns
+  it whatever the field says), and a static TLS directory in a DLL loaded with
+  `LoadLibrary` being honoured (since Vista, by the documentation). Nothing here runs
+  Windows; fmake keeps a Windows 11 VM, which is that project's to lend. Blocks only
+  the claim, not the code: `--tls-synth=off` is the A/B. The holder's call.
+- **New (2026-11-19): which build should the game folder hold?** f384x (180 scalar FMA
+  exact) is installed. The current tool's exact build rounds 396 of 421 once at 1,708
+  helper calls; its default was byte-identical to f382 when last built (0e0b46e), and
+  nothing since reaches Starfield (Finding 387). Neither image survives the
+  session's scratch, so either is a rebuild of about 35 minutes. The holder's call, since
+  it is the game they play.
+
 - ~~Does Ddisasm handle a 102 MB PE at all? Runtime and memory footprint unknown.~~
   **Resolved: not on 47 GB.** ~90 GB projected, `std::bad_alloc` at 34.3 GB observed.
   Finding 12.
