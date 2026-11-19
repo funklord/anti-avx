@@ -163,7 +163,7 @@ check-lanes: | $(BUILD_DIR)
 check-span: | $(BUILD_DIR)
 	$(PYTHON) tool/span_oracle.py $(BUILD_DIR)
 
-# Does `--fma=exact` round a scalar FMA once, as the hardware does? The
+# Does `--fma=exact` round a single FMA once, as the hardware does? The
 # original runs under qemu, the stub and its helper natively, and both are
 # checked against glibc's fmaf as well. The default lowering is the control
 # that must be told apart.
@@ -1633,7 +1633,8 @@ $(BUILD_DIR)/mingw-avx1-sse.exe: $(BUILD_DIR)/mingw-avx1.exe anti-avx \
                                  tool/detour.py tool/patch.py tool/resync.py
 	./anti-avx $< $@
 
-# **Scalar FMA in all four sign arrangements**, rewritten both ways. Each
+# **Single FMA in all four sign arrangements, and three packed forms**,
+# rewritten both ways. Each
 # has a reference built for this host from the same source: glibc's fmaf,
 # rounded once, for `--fma=exact`, and the multiply and add the default
 # emits, rounded twice, for the default -- which is what caught it lowering
@@ -1791,7 +1792,7 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
 		diff $(BUILD_DIR)/fma-twice.txt - || \
 		{ echo "check-mingw: the default FMA disagrees with a multiply"; \
 		  echo "             and an add"; exit 1; }; \
-	echo "check-mingw: scalar FMA rounds once under --fma=exact and twice"; \
+	echo "check-mingw: single FMA rounds once under --fma=exact and twice"; \
 	echo "             by default, each as its reference computes it"; \
 	echo "check-mingw: $$(wc -l < $(BUILD_DIR)/mingw-want.txt) results," \
 	     "every one as the SSE build computes it, by four routes"

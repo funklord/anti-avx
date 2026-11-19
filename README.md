@@ -103,9 +103,10 @@ image.
 
 **What it does not do.** FMA becomes a multiply and an add, which rounds
 twice where the hardware rounds once (421 sites in Starfield). `--fma=exact`
-rounds the scalar single-precision forms once, bit for bit as the hardware
-does (180 of Starfield's 421), at the price of a call per use; packed and
-double-precision FMA still round twice. Bundled DLLs
+rounds single-precision FMA once, bit for bit as the hardware does -- the
+scalar forms and the 128-bit packed ones, 230 of Starfield's 421 -- at the
+price of a call per element; 256-bit and double-precision FMA still round
+twice. Bundled DLLs
 are not rewritten. A Steam executable has to be unpacked with Steamless
 first, because its DRM section disassembles as code that is not there.
 The tool takes the binary as an argument and reads the PE headers,
@@ -204,8 +205,8 @@ That is the whole of it for a user. It needs Python 3 and binutils, refuses
 an image still wrapped in Steam's DRM with a pointer to Steamless, strips a
 copy of one that carries a symbol table, makes the listing, rewrites, and
 runs the verifier, keeping the output only if it passes. `--keep-work`
-keeps the listing and the logs. `--fma=exact` makes a scalar FMA round
-once, as the hardware does, where the default multiply and add rounds
+keeps the listing and the logs. `--fma=exact` makes a single-precision FMA
+round once, as the hardware does, where the default multiply and add rounds
 twice; it matters where results must be reproducible to the last bit, such
 as deterministic physics or a lockstep replay.
 
@@ -254,7 +255,7 @@ make check-spill  the four ways a stub can get a scratch register
 make check-tls    whether the loader gives us per-thread bytes if asked
 make check-unwind whether an exception can be dispatched from inside a stub
 make check-mingw  gcc and clang -mavx2 builds, a DLL among them, rewritten,
-                  against their SSE builds under wine, and scalar FMA
+                  against their SSE builds under wine, and single FMA
                   rewritten both ways against fmaf and a multiply and add
 make check-fma    --fma=exact against the original FMA, run under qemu
 make hooks        install the commit-msg hook into .git/hooks

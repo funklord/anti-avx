@@ -37,7 +37,9 @@ VECTORS = 2000000
 
 # `(instruction, scratch, destination, a, b, c, negate product, negate c)`.
 # Registers by number, 16 meaning the memory operand, which every case
-# addresses as 0x100(%rsi). In AT&T order an FMA is `op src2,src1,dst`:
+# addresses as 0x100(%rsi). "negate c" is a mask by lane, since `maddsub`
+# subtracts on the even lanes and `msubadd` on the odd; a scalar form uses
+# bit 0 and must leave lanes 1 to 3 of its destination alone. In AT&T order an FMA is `op src2,src1,dst`:
 #     132   dst = dst  * src2 + src1
 #     213   dst = src1 * dst  + src2
 #     231   dst = src1 * src2 + dst
@@ -58,6 +60,15 @@ CASES = [
 	("vfnmsub213ss %xmm12,%xmm13,%xmm14", 15, 14, 13, 14, 12, 1, 1),
 	# One register three times: x*x + x.
 	("vfmadd231ss %xmm5,%xmm5,%xmm5", 12, 5, 5, 5, 5, 0, 0),
+	# Packed: every lane its own call, the destination an operand.
+	("vfmadd231ps %xmm2,%xmm1,%xmm0", 7, 0, 1, 2, 0, 0, 0),
+	("vfmadd213ps %xmm2,%xmm1,%xmm0", 7, 0, 1, 0, 2, 0, 0),
+	("vfmsub132ps %xmm2,%xmm1,%xmm0", 7, 0, 0, 2, 1, 0, 15),
+	("vfnmadd231ps 0x100(%rsi),%xmm9,%xmm10", 3, 10, 9, 16, 10, 1, 0),
+	("vfnmsub213ps 0x100(%rsi),%xmm11,%xmm3", 0, 3, 11, 3, 16, 1, 15),
+	("vfmaddsub231ps %xmm2,%xmm1,%xmm0", 7, 0, 1, 2, 0, 0, 5),
+	("vfmsubadd213ps 0x100(%rsi),%xmm13,%xmm14", 15, 14, 13, 14, 16, 0, 10),
+	("vfmaddsub132ps %xmm6,%xmm6,%xmm6", 12, 6, 6, 6, 6, 0, 5),
 ]
 
 
@@ -162,38 +173,45 @@ int main(void)
 				uint32_t bits = next();
 				memcpy(&in[r][k], &bits, 4);
 			}
-		float a = pick(), b = pick(), c = pick();
-		/* The product nearly cancels the addend: where one rounding and
-		 * two disagree. Only from a finite product, because this is the
-		 * harness's own arithmetic and qemu propagates a NaN through it
-		 * differently from the silicon -- the two sides then fed the FMA
-		 * different inputs and the hashes parted for that alone. */
-		double product = (double)a * b;
-		if ((i & 3) == 0 && isfinite((float)product)) {
-			double p = (double)a * b * (NEG_P ? -1 : 1);
-			c = (float)-p + (float)((int)(next() & 0xff) - 128)
-				* 0x1p-30f * (float)p;
-			if (NEG_C)
-				c = -c;
+		float a[4], b[4], c[4];
+		for (int k = 0; k < LANES; k++) {
+			a[k] = pick(), b[k] = pick(), c[k] = pick();
+			/* The product nearly cancels the addend: where one rounding
+			 * and two disagree. Only from a finite product, because this
+			 * is the harness's own arithmetic and qemu propagates a NaN
+			 * through it differently from the silicon -- the two sides
+			 * then fed the FMA different inputs and the hashes parted for
+			 * that alone. */
+			double product = (double)a[k] * b[k];
+			if (((i + k) & 3) == 0 && isfinite((float)product)) {
+				double p = product * (NEG_P ? -1 : 1);
+				c[k] = (float)-p + (float)((int)(next() & 0xff) - 128)
+					* 0x1p-30f * (float)p;
+				if ((NEG_C >> k) & 1)
+					c[k] = -c[k];
+			}
+			in[A][k] = a[k];
+			in[B][k] = b[k];
+			in[C][k] = c[k];
 		}
-		in[A][0] = a;
-		in[B][0] = b;
-		in[C][0] = c;
 		/* where operands share a register the last write is the value */
-		a = in[A][0];
-		b = in[B][0];
-		c = in[C][0];
+		for (int k = 0; k < LANES; k++) {
+			a[k] = in[A][k];
+			b[k] = in[B][k];
+			c[k] = in[C][k];
+		}
 		float upper[3];
 		memcpy(upper, &in[D][1], 12);
 		run(out, in);
 		/* Which NaN comes out of several is the SSE instructions' choice,
 		 * not the FMA's (see FMA_EXACT), so a NaN result is hashed as
 		 * one NaN and counted. */
-		if (isnan(out[D][0])) {
-			uint32_t quiet = 0x7fc00000;
-			memcpy(&out[D][0], &quiet, 4);
-			nans++;
-		}
+		for (int k = 0; k < LANES; k++)
+			if (isnan(out[D][k])) {
+				uint32_t quiet = 0x7fc00000;
+				memcpy(&out[D][k], &quiet, 4);
+				nans++;
+			}
 		for (int r = 0; r < 16; r++) {
 			if (r == SCRATCH)
 				continue;
@@ -203,15 +221,18 @@ int main(void)
 			if (r != D && memcmp(out[r], in[r], 16))
 				moved++;
 		}
-		if (memcmp(&out[D][1], upper, 12))
+		if (LANES == 1 && memcmp(&out[D][1], upper, 12))
 			moved++;
-		float want = fmaf(NEG_P ? -a : a, b, NEG_C ? -c : c);
-		float got = out[D][0];
-		uint32_t w, g;
-		memcpy(&w, &want, 4);
-		memcpy(&g, &got, 4);
-		if (w != g && !(isnan(want) && isnan(got)))
-			wrong++;
+		for (int k = 0; k < LANES; k++) {
+			float want = fmaf(NEG_P ? -a[k] : a[k], b[k],
+			                  (NEG_C >> k) & 1 ? -c[k] : c[k]);
+			float got = out[D][k];
+			uint32_t w, g;
+			memcpy(&w, &want, 4);
+			memcpy(&g, &got, 4);
+			if (w != g && !(isnan(want) && isnan(got)))
+				wrong++;
+		}
 	}
 	printf("%016llx %ld %ld %ld\n", (unsigned long long)hash, wrong, moved,
 	       nans);
@@ -230,7 +251,8 @@ def build(where, body, case):
 	(WORK / f"{where}.s").write_text("\n".join(lines) + "\n")
 	(WORK / f"{where}.c").write_text(MAIN)
 	binary = WORK / where
-	defines = [f"-DVECTORS={VECTORS}", f"-DSCRATCH={scratch}", f"-DD={d}",
+	lanes = 4 if _text.split()[0].endswith("ps") else 1
+	defines = [f"-DLANES={lanes}", f"-DVECTORS={VECTORS}", f"-DSCRATCH={scratch}", f"-DD={d}",
 	           f"-DA={a}", f"-DB={b}", f"-DC={c}", f"-DNEG_P={negate_p}",
 	           f"-DNEG_C={negate_c}"]
 	subprocess.run(["gcc", "-O2", "-ffp-contract=off", *defines, "-o",
@@ -321,9 +343,10 @@ def main():
 		problems += 1
 
 	if not problems:
-		print(f"fma_oracle: {len(CASES)} scalar FMA form(s) lower under "
-		      f"--fma=exact to SSE that computes what the original "
-		      f"computes, bit for bit, over {VECTORS:,} inputs each")
+		print(f"fma_oracle: {len(CASES)} single-precision FMA form(s) "
+		      f"lower under --fma=exact to SSE that computes what the "
+		      f"original computes, bit for bit, over {VECTORS:,} inputs "
+		      f"each")
 	return 1 if problems else 0
 
 

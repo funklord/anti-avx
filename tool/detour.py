@@ -539,9 +539,11 @@ def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0,
 	if match is None or vex["L"] or scratch is None:
 		return None
 	negated, operation, order, kind = match.groups()
-	if FMA_EXACT and kind == "ss" and operation in ("madd", "msub"):
-		return lower_fma_exact(vex, tail, negated + operation, order,
-		                       scratch, address, encoding, at, pool)
+	if FMA_EXACT and kind in FMA_EXACT_KINDS \
+			and operation in FMA_EXACT_KINDS[kind]:
+		return lower_fma_exact(vex, tail, negated, operation, order,
+		                       scratch, address, encoding, at, pool,
+		                       kind == "ps")
 	modrm = tail[1]
 	memory = ((modrm >> 6) & 3) != 3
 	destination = (vex["R"] << 3) | ((modrm >> 3) & 7)
@@ -687,11 +689,17 @@ def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0,
 # What "exact" covers: every result that is not a NaN, under the default
 # MXCSR (round to nearest). Which NaN comes out when several go in, and its
 # sign through a negated form, follow the SSE instructions rather than the
-# FMA, as the default lowering already does. Packed and double-precision
-# FMA keep the default lowering: a double has no wider type to round to odd
-# through, and a packed form needs twelve inputs where one register holds
-# four. `apply` says how many of each it left.
+# FMA, as the default lowering already does. A packed single is the scalar
+# helper once per lane, the lane's result inserted into the destination
+# where no later lane reads it. Double precision keeps the default
+# lowering, since a double has no wider type to round to odd through, and
+# so do the 256-bit forms, which the span emitter lowers. `apply` says how
+# many of each it left.
 FMA_EXACT = False
+
+# Which FMA forms `--fma=exact` lowers, by element kind.
+FMA_EXACT_KINDS = {"ss": ("madd", "msub"),
+                   "ps": ("madd", "msub", "maddsub", "msubadd")}
 
 # The four sign arrangements, each its own helper. `nmadd` is -(a*b) + c.
 FMA_EXACT_OPS = ("madd", "msub", "nmadd", "nmsub")
@@ -828,15 +836,23 @@ def fma_helper_extents():
 	              for offset, length in fma_helpers()[1].values())
 
 
-def lower_fma_exact(vex, tail, operation, order, scratch, address, encoding,
-                    at, pool):
-	"""A scalar single FMA as a call to its helper. See `FMA_EXACT`.
+def lower_fma_exact(vex, tail, negated, operation, order, scratch, address,
+                    encoding, at, pool, packed=False):
+	"""A single-precision FMA as calls to its helper. See `FMA_EXACT`.
 
 	`scratch` carries the operands in and the result out: a, b and c go to
 	its lanes 0, 1 and 2 -- the product's order does not matter, since it
 	is exact -- and `movss` writes the low float of the destination and
 	leaves DEST[127:32] as the FMA does. A memory operand is read before
 	the call, where any `rsp` it is based on is still the original's.
+
+	**A packed form is four of these**, lane i's operands gathered with
+	`insertps` and its result inserted into the destination's lane i. That
+	is sound when the destination is also an operand because lane i is
+	written only after it is read, and no later lane reads it. A memory
+	operand is read whole each time, as the original reads it once, and
+	the lane picked out of the scratch. `maddsub` subtracts on the even
+	lanes and `msubadd` on the odd, so each lane names its own helper.
 	"""
 	modrm = tail[1]
 	memory = ((modrm >> 6) & 3) != 3
@@ -857,6 +873,11 @@ def lower_fma_exact(vex, tail, operation, order, scratch, address, encoding,
 		return encode_rr(0x66, b"\x0f\x3a\x21", scratch, register,
 		                 (lane_from << 6) | (lane_to << 4))
 
+	if packed:
+		return lower_fma_lanes(vex, tail, negated, operation, scratch,
+		                       destination, factors, addend, address,
+		                       encoding, at, pool, insert)
+	operation = negated + operation
 	body = bytearray()
 	if addend is MEMORY:
 		body += encode_mem(0xF3, b"\x0f\x10", scratch, vex, tail, address,
@@ -880,6 +901,39 @@ def lower_fma_exact(vex, tail, operation, order, scratch, address, encoding,
 		return None
 	body += b"\xe8" + struct.pack("<i", displacement)
 	body += encode_rr(0xF3, b"\x0f\x10", destination, scratch)	# movss
+	return bytes(body)
+
+
+def lower_fma_lanes(vex, tail, negated, operation, scratch, destination,
+                    factors, addend, address, encoding, at, pool, insert):
+	"""`lower_fma_exact`'s packed half: one helper call per lane."""
+	body = bytearray()
+	for lane in range(4):
+		if operation in ("maddsub", "msubadd"):
+			subtract = (lane % 2 == 0) == (operation == "maddsub")
+			step = negated + ("msub" if subtract else "madd")
+		else:
+			step = negated + operation
+		slots = {0: factors[0], 1: factors[1], 2: addend}
+		for slot, operand in slots.items():
+			if operand is MEMORY:
+				piece = encode_mem(None, b"\x0f\x10", scratch, vex, tail,
+				                   address, encoding, at + len(body))
+				if piece is None:
+					return None
+				body += piece				# movups
+				body += insert(lane, slot, scratch)
+		for slot, operand in slots.items():
+			if operand is not MEMORY:
+				body += insert(lane, slot, operand)
+		offset, _length = fma_helpers()[1][(scratch, step)]
+		target = pool + helper_base() + offset
+		displacement = target - (at + len(body) + 5)
+		if not -(1 << 31) <= displacement < (1 << 31):
+			return None
+		body += b"\xe8" + struct.pack("<i", displacement)
+		body += encode_rr(0x66, b"\x0f\x3a\x21", destination, scratch,
+		                  lane << 4)				# insertps
 	return bytes(body)
 
 # Load one element, then spread it. The load width is the whole point: a
@@ -19964,8 +20018,10 @@ def apply_all(binary, listing, output):
 	for row in instructions:
 		match = FMA_PATTERN.match(row[2] or "")
 		if match:
-			forms["exact" if FMA_EXACT and match.group(4) == "ss"
-			      and match.group(2) in ("madd", "msub")
+			kind = match.group(4)
+			forms["exact" if FMA_EXACT and kind in FMA_EXACT_KINDS
+			      and match.group(2) in FMA_EXACT_KINDS[kind]
+			      and "%ymm" not in (row[3] or "")
 			      else "two roundings"] += 1
 	if forms:
 		print(f"apply: FMA {forms['exact']:,} rounded once, "

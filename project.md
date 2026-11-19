@@ -267,8 +267,8 @@ roundings where the original had one**, so results differ in the last ULP.
 Almost certainly irrelevant for game rendering, but it is the only rule in this design
 that is *not* semantics-preserving, and it must be recorded as such. If any code path
 depends on exact FP reproducibility (physics determinism, replay, netcode lockstep),
-this is where it breaks. **`--fma=exact` rounds the 180 scalar single-precision ones
-once, bit for bit; the default is unchanged** (Finding 384).
+this is where it breaks. **`--fma=exact` rounds the 230 scalar and 128-bit packed
+single-precision ones once, bit for bit; the default is unchanged** (Finding 384).
 
 **28 of the 421 are not plain FMA and Class F does not cover them.**
 `vfmaddsub231ps` (14) and `vfmsubadd231ps` (14) *alternate* add and subtract across
@@ -14249,6 +14249,29 @@ check fires as well, so the gate greps for the bracket message. The stack check 
 the epilogue an unwinder sees it as. The call reconciliation counts helper calls apart
 from re-emitted swallowed ones.
 
+**A packed single is the same helper once per lane** (2026-11-19). Lane i's operands
+are gathered into the scratch with `insertps`, the helper called, and the result
+inserted into the destination's lane i -- which no later lane reads, so a destination
+that is also an operand is safe. `maddsub` picks `msub` on the even lanes and `madd` on
+the odd, `msubadd` the reverse. A memory operand is read whole each lane, as the
+original reads it, and the lane picked out of the scratch. That is 50 more of
+Starfield's sites, 230 rounding once and 191 twice: the 166 256-bit forms, which the
+span emitter lowers, and the 25 double. `check-fma` runs 20 forms now, 8 of them
+packed, each 0 off `fmaf` with every other register intact. Swapping the even-odd parity
+is rejected on all three alternating cases (516,000 of 800,000 lanes off), so the
+oracle can see a lane-order error. The mingw fixture has three packed forms that gcc
+emits as `vfmadd132ps`, `vfmaddsub132ps` and `vfnmadd132ps` against memory; its exact
+build prints glibc's answers and its default build the multiply and add. The exact
+Starfield build f385x places the same 202,992 detours, refuses none, and passes verify
+with 380 helper calls (180 + 50 x 4). The default build is still byte-identical to f382.
+
+**The default cannot lower a 256-bit FMA in that fixture**, and it says so: built with
+256-bit builtins, the loop's three FMA are refused ("FMA high half cannot reach its
+operand"; "negated FMA cannot reach its product") and stay VEX, so the image dies with
+SIGILL under wine. `span_slot_op` uses a slot as a packed memory operand only where
+the TLS directory declares 16-byte alignment, and mingw's does not. The forms are in
+the fixture behind `-DWIDE` until something lowers them.
+
 **The exact build is installed** (2026-11-19) as `Starfield-antiavx.exe`, `cmp`-equal
 to f384x (md5 `99623de6`). It replaced f382, the default build, which is byte-identical
 to this tree's default output and so needs only a rebuild to restore. It has not yet
@@ -23779,8 +23802,8 @@ get the mapping from the SDM, not from intuition.
 
 If exact FP reproducibility matters anywhere (deterministic physics, replays, lockstep
 netcode), this rule is where it breaks. Flag every rewritten site so it can be audited.
-`--fma=exact` makes the scalar single-precision forms exact through a helper call;
-packed and double forms keep this rule (Finding 384).
+`--fma=exact` makes the scalar and 128-bit packed single-precision forms exact through
+helper calls; 256-bit and double forms keep this rule (Finding 384).
 
 ### Class F-addsub — alternating lanes (28 sites)
 
