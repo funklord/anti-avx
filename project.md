@@ -14179,6 +14179,63 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 387 -- a full header grows, and an empty callback array gets one of its own
+
+**Rewriting the DLLs Starfield ships found two faults the game itself never showed.**
+`apply` over XCurl, steam_api64, nvngx_dlss, nvngx_dlssg and libxess -- real MSVC
+output, none rewritten for the game -- left 32 of 113, 16 of 155 and 30 of 469 VEX in
+the first three, and refused the last two outright. XCurl's leftovers are the CRT's
+`memcpy` AVX path -- `vmovntdq` stores, refused as "shape store" -- behind `cmpl
+$0x3,__isa_available; jb` at `0x18001d771`, so like Starfield's 25 they never run where
+AVX is missing and converting them would buy nothing.
+
+**The refusal was the header.** MSVC's default `SizeOfHeaders` is 0x400, and an image
+with nine or ten sections fills it: nvngx_dlssg and libxess have room for one more
+section entry, and a rewrite adds up to six (the TLS page, the pool spill, the stubs,
+their unwind data and function table, the index section). Starfield has room for
+eleven. So `apply` did all its work and stopped at `add_section`. `grown_headers` now
+grows the header by whole file-alignment units and moves everything after it down by
+the same amount. Nothing addressed by RVA moves, so what changes is exactly the fields
+holding file offsets -- each section's raw pointer, the COFF symbol table's, the
+certificate table's, each debug entry's -- and it proves its own work, comparing every
+section, the certificates and each debug entry's data at their new offsets with the
+debug pointers put back, and refusing to write on a difference. The first run refused,
+correctly: the debug entries' pointers are inside `.rdata`, and the comparison had to
+be an identity over them rather than a raw match. `main` hands `apply`, `verify` and the
+censuses the same grown copy, so no reader of file offsets has to learn about the
+shift. nvngx_dlssg: refused, then 834 to 25 VEX, and verify passes.
+
+**The second was latent in every MSVC DLL with a TLS directory and no callbacks.** Its
+callback array is `[0, ...]`, and `--index-const` wrote its callback over that first
+slot -- removing the terminator, so the next eight bytes became the loader's next
+callback, and leaving an absolute address no base relocation names. Loaded anywhere but
+its preferred base, the DLL calls its callback at the wrong address. nvngx_dlssg's array
+is that shape. Starfield's is not -- its first slot holds a callback and a relocation --
+which is why the shipped image was never exposed. Now an empty array gets an array of
+its own, `[callback, 0]` in the index section, the directory's `AddressOfCallBacks`
+pointed at it, and the base relocations rebuilt there with one block for the slot.
+`verify` sanctions the field only where the original array was empty and the new one
+lies past every original section, and checks any rebuilt relocation table opens with
+the image's own, byte for byte, with every added entry moving an address in an added
+section.
+
+**Measured under wine, relocated, both ways.** `fixture/mingw/fmadll.c` is a 256-bit
+FMA loop in a DLL built with no C runtime, so its rewrite stands a per-thread block up,
+built once with no TLS directory (Finding 386's page) and once with an empty callback
+array of its own (`-DEMPTY_TLS`). `fmahost` reserves the preferred base, loads it, and
+checks 4,096 results bit for bit from two threads. Both rewrites load relocated with 0
+wrong; the old installer's output, written by hand and then as the `callbackslot` code
+sabotage, dies at load with a page fault reading `0xFFFFFFFFFFFFFFFF`. `check-mingw`
+runs all three.
+
+**And the gates' wineserver cleanup had never run.** They said `pkill -x wineserver`,
+which aims at every wineserver the account runs, Proton's under Steam among them -- the
+holder asked whether a Steam that kept restarting was this. It was not, and could not
+have been: the process here is `wineserver64`, so the pattern matched nothing, and the
+gates' own servers were left to exit on their own. They stop with `wineserver -k`
+under the project's prefix now, measured beside a second prefix's server, which a
+`check-teb` run left up while stopping its own.
+
 ### Finding 386 -- an image with no TLS directory gets one of the rewrite's own
 
 **Every per-thread block stands on the index the loader writes for a TLS directory, and

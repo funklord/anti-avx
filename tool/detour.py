@@ -57,6 +57,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 from collections import Counter, defaultdict, deque
 
 HERE = __import__("pathlib").Path(__file__).resolve().parent
@@ -14890,6 +14891,32 @@ def tls_page_relocated(data):
 	return TLS_RELOCS_AT + size
 
 
+def callback_array(data, payload, index_rva, callback):
+	"""`(payload, (array offset, relocation size, relocation offset))`.
+
+	`payload` grown by a `[callback, 0]` array and, where the image has
+	base relocations, the whole table again with a block naming the array
+	slot. The directory's `AddressOfCallBacks` held an address already, so
+	the image's own table moves it; one holding none is refused earlier,
+	by `index_payload`. Finding 387.
+	"""
+	payload = bytearray(payload)
+	payload += b"\xcc" * (-len(payload) % 8)
+	array_off = len(payload)
+	payload += struct.pack("<QQ", callback, 0)
+	old = base_relocations(data)
+	if old is None:
+		return bytes(payload), (array_off, 0, 0)
+	target = index_rva + array_off
+	blocks = struct.pack("<IIHH", target & ~0xFFF, 12,
+	                     (IMAGE_REL_BASED_DIR64 << 12) | (target & 0xFFF),
+	                     0)				# IMAGE_REL_BASED_ABSOLUTE: pad
+	payload += b"\xcc" * (-len(payload) % 4)
+	relocation_off = len(payload)
+	payload += old + blocks
+	return bytes(payload), (array_off, len(old) + len(blocks), relocation_off)
+
+
 def set_tls_zero_fill(data, zero_fill):
 	"""Raise `SizeOfZeroFill` so the loader gives every thread the slot."""
 	found = tls_directory(data)
@@ -14901,6 +14928,134 @@ def set_tls_zero_fill(data, zero_fill):
 	image = bytearray(data)
 	struct.pack_into("<I", image, offset + 32, zero_fill)
 	return bytes(image)
+
+
+# **The most sections one rewrite adds**: the TLS page, the pool spill,
+# the stubs, their unwind data and function table, and the index section.
+SECTIONS_ADDED = 6
+SECURITY_DIRECTORY, DEBUG_DIRECTORY = 4, 6
+
+
+def grown_headers(data):
+	"""`data` with room for `SECTIONS_ADDED` more section entries, or None
+	if it has room already.
+
+	**MSVC's default header is 0x400 bytes**, and an image with nine or ten
+	sections fills it: nvngx_dlssg.dll and libxess.dll, shipped beside
+	Starfield, have room for ONE entry, so `apply` did all its work and
+	then refused at `add_section`. Starfield has eleven, which is why it
+	never met this. Finding 387.
+
+	The header grows by whole file-alignment units and everything after it
+	moves down by the same amount. Nothing addressed by RVA moves -- the
+	section table's virtual addresses, and so every pointer inside the
+	image, are untouched -- so what changes is exactly the fields that
+	hold FILE offsets: each section's raw pointer, the COFF symbol table's,
+	the certificate table's (a file offset in the security directory's RVA
+	field), and each debug directory entry's raw pointer. The header still
+	has to fit below the first section in memory, or there is no room to
+	make.
+
+	**The proof is in here, not in a caller.** Every section's raw bytes,
+	the certificates and every debug entry's data are compared at their
+	new offsets against their old ones, and a difference refuses rather
+	than writes.
+	"""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	count = struct.unpack_from("<H", data, pe + 6)[0]
+	opt = pe + 24
+	table = opt + struct.unpack_from("<H", data, pe + 20)[0]
+	file_alignment = struct.unpack_from("<I", data, opt + 36)[0]
+	headers = struct.unpack_from("<I", data, opt + 60)[0]
+	want = table + (count + SECTIONS_ADDED) * 40
+	if want <= headers:
+		return None
+	grown = (want + file_alignment - 1) // file_alignment * file_alignment
+	sections = [struct.unpack_from("<IIII", data, table + i * 40 + 8)
+	            for i in range(count)]
+	lowest_va = min(va for _vs, va, _rs, _ra in sections)
+	if grown > lowest_va:
+		raise SystemExit(f"the header would need {grown:#x} bytes and the "
+		                 f"first section is mapped at {lowest_va:#x}")
+	if any(raddr and raddr < headers for _v, _a, _r, raddr in sections):
+		raise SystemExit("a section's raw data lies inside the header")
+	shift = grown - headers
+	out = bytearray(data[:headers]) + bytearray(shift) \
+		+ bytearray(data[headers:])
+	struct.pack_into("<I", out, opt + 60, grown)
+
+	def moved(at):
+		value = struct.unpack_from("<I", out, at)[0]
+		if value:
+			struct.pack_into("<I", out, at, value + shift)
+
+	for i in range(count):
+		for field in (20, 24, 28):	# raw data, relocations, line numbers
+			moved(table + i * 40 + field)
+	moved(pe + 12)				# PointerToSymbolTable
+	directories = struct.unpack_from("<I", data, opt + 108)[0]
+	pieces = [(raddr, raddr + rsize) for _v, _a, rsize, raddr in sections
+	          if raddr and rsize]
+	restore = []
+	if directories > SECURITY_DIRECTORY:
+		where = opt + 112 + SECURITY_DIRECTORY * 8
+		offset, size = struct.unpack_from("<II", data, where)
+		if offset and size:
+			moved(where)
+			pieces.append((offset, offset + size))
+	if directories > DEBUG_DIRECTORY:
+		rva, size = struct.unpack_from("<II", data,
+		                               opt + 112 + DEBUG_DIRECTORY * 8)
+		first = rva_to_offset(bytes(out), rva) if rva and size else None
+		for k in range(size // 28 if first is not None else 0):
+			raw_at = first + k * 28 + 24
+			was = struct.unpack_from("<I", data, raw_at - shift)[0]
+			length = struct.unpack_from("<I", data, raw_at - shift - 8)[0]
+			moved(raw_at)
+			restore.append((raw_at, was))
+			if was and length:
+				pieces.append((was, was + length))
+	# The debug entries' own pointers are the one change inside a section,
+	# so the comparison puts them back first: an identity, not a skip.
+	check = bytearray(out)
+	for at, was in restore:
+		struct.pack_into("<I", check, at, was)
+	for low, high in pieces:
+		if check[low + shift:high + shift] != data[low:high]:
+			raise SystemExit(f"growing the header moved {low:#x}..{high:#x} "
+			                 f"and its bytes did not come with it")
+	return bytes(out)
+
+
+# The grown copies this process wrote, removed with it.
+GROWN = None
+
+
+def grown_input(path):
+	"""`path`, or a copy of it with room in its header for this rewrite.
+
+	`apply`, `verify` and the censuses all read file offsets out of the
+	image they are given, so every one of them is handed the same grown
+	copy -- built the same way from the same original -- rather than each
+	learning about the shift. Finding 387.
+	"""
+	global GROWN
+	data = open(path, "rb").read()
+	grown = grown_headers(data)
+	if grown is None:
+		return path
+	if GROWN is None:
+		GROWN = tempfile.TemporaryDirectory(prefix="anti-avx-")
+	copy = os.path.join(GROWN.name, os.path.basename(path))
+	with open(copy, "wb") as out:
+		out.write(grown)
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	print(f"detour.py: {os.path.basename(path)}'s header has no room for "
+	      f"{SECTIONS_ADDED} more sections, so it grows from "
+	      f"{struct.unpack_from('<I', data, pe + 24 + 60)[0]:#x} to "
+	      f"{struct.unpack_from('<I', grown, pe + 24 + 60)[0]:#x} bytes, "
+	      f"every section's raw bytes moved intact")
+	return copy
 
 
 def add_section(data, name, payload, flags):
@@ -17794,6 +17949,9 @@ def main(argv):
 		print(f"detour.py: {refused}", file=sys.stderr)
 		return 2
 
+	if mode not in ("sabotage", "plan"):
+		argv[1] = grown_input(argv[1])
+
 	if mode == "census":
 		return census(argv[1], argv[2], argv[3])
 
@@ -17865,7 +18023,8 @@ ISLAND_GAP = 256
 
 # Sabotage kinds that break the COLLECTOR rather than an image, so an
 # unchanged output is correct for them and an error for everything else.
-CODE_KINDS = ("badrow", "staleupper", "conservative", "switchbase")
+CODE_KINDS = ("badrow", "staleupper", "conservative", "switchbase",
+              "callbackslot")
 
 # **Controls for the checks no broken IMAGE can express.** `sabotage`
 # corrupts an artifact, which is enough for a check that reads bytes: the
@@ -17915,6 +18074,7 @@ SABOTAGE = {
 	"tebcall": "no call lies inside a TEB save bracket",
 	"tlsalign": "the TLS directory changes only as sanctioned",
 	"tlspage": "a TLS directory the rewrite added is the page it builds",
+	"callbackslot": "an empty callback array gets an array of its own",
 }
 
 
@@ -20269,13 +20429,41 @@ def apply_all(binary, listing, output):
 	if INDEX_CONST and index_placeholders(blob):
 		global INDEX_CONST_CALLBACK
 		payload, code_off, slot, was = index_payload(image, blob, stub_base)
-		image, index_va = add_section(image, INDEX_NAME, payload,
-		                              INDEX_FLAGS)
-		image = bytearray(image)
 		base = struct.unpack_from("<Q", bytes(image),
 		                          struct.unpack_from("<I", bytes(image),
 		                                             0x3C)[0] + 24 + 24)[0]
-		struct.pack_into("<Q", image, slot, base + index_va + code_off)
+		# **An empty callback array gets an array of its own.** Writing
+		# the callback over its terminator left the next eight bytes as
+		# the loader's next callback, and left an absolute address the
+		# image's relocations do not name -- nvngx_dlssg.dll's array is
+		# that shape, and it would have called its callback at the
+		# preferred base wherever it was loaded. So the directory is
+		# pointed at `[callback, 0]` in the index section instead, with
+		# the relocations rebuilt there to move it. The page `tls_page`
+		# lays down is exempt: its array is ours and already relocated.
+		# Finding 387.
+		redirect = None
+		if not was and tls_page_rva is None \
+				and CODE_SABOTAGE != "callbackslot":
+			index_rva = next_section_rva(image)
+			payload, redirect = callback_array(image, payload, index_rva,
+			                                   base + index_rva + code_off)
+		image, index_va = add_section(image, INDEX_NAME, payload,
+		                              INDEX_FLAGS)
+		image = bytearray(image)
+		if redirect is not None:
+			assert index_va == index_rva, "index section moved"
+			array_off, relocations, relocation_off = redirect
+			pe_i = struct.unpack_from("<I", bytes(image), 0x3C)[0]
+			directory = tls_directory(bytes(image))[0]
+			struct.pack_into("<Q", image, directory + 24,
+			                 base + index_va + array_off)
+			if relocations:
+				struct.pack_into(
+					"<II", image, pe_i + 24 + 112 + BASERELOC_DIRECTORY * 8,
+					index_va + relocation_off, relocations)
+		else:
+			struct.pack_into("<Q", image, slot, base + index_va + code_off)
 		if tls_page_rva is not None and tls_page_relocated(bytes(image)):
 			# The slot now holds an address, so the loader has to move it
 			# with the image: the no-op entry `tls_page` reserved becomes
@@ -20719,7 +20907,7 @@ def verify(original, patched, listing=None):
 		# again. A check that merely tolerated a difference somewhere in
 		# the TLS directory would tolerate a difference anywhere in it,
 		# and the directory holds four pointers this must never move.
-		raised, realigned = None, False
+		raised, realigned, redirected = None, False, False
 		found = tls_directory(bytes(a))
 		if found is not None and len(tail_a) == len(tail_b):
 			restored = bytearray(tail_a)
@@ -20761,6 +20949,19 @@ def verify(original, patched, listing=None):
 					ok = False
 				else:
 					restored[spot:spot + 8] = tail_b[spot:spot + 8]
+					# **Or the directory names an array of the rewrite's
+					# own**, which it does only where the image's was
+					# empty, and only an array past every original
+					# section. Finding 387.
+					field = at - 8
+					was = struct.unpack_from("<Q", bytes(tail_a), field)[0]
+					now = struct.unpack_from("<Q", bytes(tail_b), field)[0]
+					if was != now:
+						first = struct.unpack_from("<Q", bytes(tail_a),
+						                           spot)[0]
+						ok = not first and now >= sections_end_of(bytes(a))
+						redirected = ok
+						restored[field:field + 8] = tail_b[field:field + 8]
 			if ok and bytes(restored) == bytes(tail_b):
 				raised = struct.unpack_from("<I", bytes(tail_b), at)[0]
 		if raised is None:
@@ -20778,7 +20979,11 @@ def verify(original, patched, listing=None):
 			if realigned:
 				allowed.append(f"the block's declared alignment, raised to "
 				               f"{SLOT} so a slot may be a packed operand")
-			if INDEX_CONST:
+			if INDEX_CONST and redirected:
+				allowed.append("the TLS directory's callback array, which "
+				               "was empty and is now one of this rewrite's "
+				               "naming the index callback")
+			elif INDEX_CONST:
 				allowed.append("the TLS callback array's first slot, which "
 				               "now names the index callback and tail-jumps "
 				               "to what it replaced")
@@ -20824,6 +21029,45 @@ def verify(original, patched, listing=None):
 			print(f"verify: the TLS directory this rewrite added at "
 			      f"0x{base_a + tls_b[0]:x} is the page it builds"
 			      f"{', relocations included' if relocations else ''}")
+	# **Relocations this rewrite rebuilt keep every original one**: the
+	# new table must open with the image's own, byte for byte, and every
+	# entry after it must move an address inside a section the rewrite
+	# added. A table that dropped or changed one would move nothing the
+	# loader expected, silently. Findings 386 and 387.
+	old_relocations = base_relocations(bytes(a))
+	new_relocations = base_relocations(bytes(b))
+	if new_relocations != old_relocations:
+		end_a = sections_end_of(bytes(a)) - struct.unpack_from(
+			"<Q", bytes(a), pe_b + 24 + 24)[0]
+		why = None
+		if old_relocations is None or new_relocations is None \
+				or not new_relocations.startswith(old_relocations):
+			why = "the image's own table is not its prefix"
+		else:
+			rest, k = new_relocations[len(old_relocations):], 0
+			while k < len(rest) and why is None:
+				page, size = struct.unpack_from("<II", rest, k)
+				if size < 8 or k + size > len(rest):
+					why = "an added block is malformed"
+					break
+				for e in struct.unpack_from(f"<{(size - 8) // 2}H", rest,
+				                            k + 8):
+					kind, target = e >> 12, page + (e & 0xFFF)
+					if kind == IMAGE_REL_BASED_DIR64 and target < end_a:
+						why = (f"an added entry moves 0x{target:x}, "
+						       f"inside the original image")
+					elif kind not in (0, IMAGE_REL_BASED_DIR64):
+						why = f"an added entry has type {kind}"
+				k += size
+		if why:
+			print(f"verify: FAILED -- base relocations changed, and {why}",
+			      file=sys.stderr)
+			problems += 1
+		else:
+			print(f"verify: the base relocations are the image's own "
+			      f"{len(old_relocations):,} bytes and "
+			      f"{len(new_relocations) - len(old_relocations):,} more "
+			      f"for addresses in the sections this rewrite added")
 	# **The feature tests, which decide what the CPU is asked to run.** 179
 	# EVEX instructions in this image are unreachable only because a runtime
 	# CPUID/XGETBV test says so, and nothing checked that the rewrite left

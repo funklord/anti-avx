@@ -1679,7 +1679,13 @@ MINGW_OUT   = $(BUILD_DIR)/mingw-avx2.exe $(BUILD_DIR)/mingw-sse.exe \
               $(BUILD_DIR)/mingw-fma-wide-fast.exe \
               $(BUILD_DIR)/mingw-fma-wide-fast.txt \
               $(BUILD_DIR)/mingw-fma-wide.asm $(BUILD_DIR)/bad-tlsalign.exe \
-              $(BUILD_DIR)/verify-bad-tlsalign.log
+              $(BUILD_DIR)/verify-bad-tlsalign.log \
+              $(BUILD_DIR)/fmadll-notls.dll $(BUILD_DIR)/fmadll-empty.dll \
+              $(BUILD_DIR)/fmadll-notls-sse.dll \
+              $(BUILD_DIR)/fmadll-empty-sse.dll $(BUILD_DIR)/fmahost.exe \
+              $(BUILD_DIR)/fmadll.dll $(BUILD_DIR)/fmadll-empty.asm \
+              $(BUILD_DIR)/fmadll-notls.txt $(BUILD_DIR)/fmadll-empty.txt \
+              $(BUILD_DIR)/fmadll-old.txt
 
 $(BUILD_DIR)/mingw-avx2.exe: $(MINGW_SRC) | $(BUILD_DIR)
 	$(MINGW_CXX) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
@@ -1745,6 +1751,26 @@ $(BUILD_DIR)/fma-once-wide: fixture/mingw/fma.c | $(BUILD_DIR)
 $(BUILD_DIR)/fma-twice-wide: fixture/mingw/fma.c | $(BUILD_DIR)
 	$(CC) $(FMA_FLAGS) -DWIDE -DTWO_ROUNDINGS -o $@ $< -lm
 
+# **A DLL with no C runtime, whose rewrite stands a per-thread block up**,
+# built twice: with no TLS directory, so the rewrite adds one, and with an
+# empty callback array, nvngx_dlssg.dll's shape, so the rewrite gives it an
+# array of its own. The host loads each relocated. Findings 386 and 387.
+FMADLL_FLAGS = -O2 -ffp-contract=off -shared -nostartfiles -s \
+               -Wl,--image-base=0x6a000000 -mfma
+
+$(BUILD_DIR)/fmadll-notls.dll: fixture/mingw/fmadll.c | $(BUILD_DIR)
+	$(MINGW_CC) $(FMADLL_FLAGS) -o $@ $<
+
+$(BUILD_DIR)/fmadll-empty.dll: fixture/mingw/fmadll.c | $(BUILD_DIR)
+	$(MINGW_CC) $(FMADLL_FLAGS) -DEMPTY_TLS -o $@ $<
+
+$(BUILD_DIR)/fmadll-%-sse.dll: $(BUILD_DIR)/fmadll-%.dll anti-avx \
+                               tool/detour.py tool/patch.py tool/resync.py
+	./anti-avx $< $@
+
+$(BUILD_DIR)/fmahost.exe: fixture/mingw/fmahost.c | $(BUILD_DIR)
+	$(MINGW_CC) -O2 -ffp-contract=off -s -o $@ $<
+
 $(BUILD_DIR)/mingw-clang.exe: $(MINGW_SRC) | $(BUILD_DIR)
 	$(MINGW_CLANG) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
 
@@ -1799,7 +1825,9 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
              $(BUILD_DIR)/mingw-fma-fast.exe $(BUILD_DIR)/fma-once \
              $(BUILD_DIR)/fma-twice $(BUILD_DIR)/mingw-fma-wide-exact.exe \
              $(BUILD_DIR)/mingw-fma-wide-fast.exe \
-             $(BUILD_DIR)/fma-once-wide $(BUILD_DIR)/fma-twice-wide
+             $(BUILD_DIR)/fma-once-wide $(BUILD_DIR)/fma-twice-wide \
+             $(BUILD_DIR)/fmadll-notls-sse.dll \
+             $(BUILD_DIR)/fmadll-empty-sse.dll $(BUILD_DIR)/fmahost.exe
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-mingw: wine is not installed"; exit 1; }
 	@if $(PYTHON) tool/detour.py plan $(BUILD_DIR)/mingw-symbols.exe \
@@ -1927,6 +1955,34 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
 		  echo "             through the after-.text check"; exit 1; }; \
 	echo "check-mingw: verify allows the TLS alignment raised to sixteen"; \
 	echo "             and refuses it raised to thirty-two"; \
+	for kind in notls empty; do \
+		cp $(BUILD_DIR)/fmadll-$$kind-sse.dll $(BUILD_DIR)/fmadll.dll; \
+		$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/fmahost.exe \
+			$(BUILD_DIR)/fmadll.dll > $(BUILD_DIR)/fmadll-$$kind.txt \
+			2>&1 || { echo "check-mingw: the $$kind FMA DLL failed:"; \
+			          cat $(BUILD_DIR)/fmadll-$$kind.txt; exit 1; }; \
+		grep -q "base relocated, 0 wrong" \
+			$(BUILD_DIR)/fmadll-$$kind.txt || \
+			{ echo "check-mingw: the $$kind FMA DLL did not load"; \
+			  echo "             relocated and agree"; exit 1; }; \
+	done; \
+	objdump -d -j .text $(BUILD_DIR)/fmadll-empty.dll \
+		> $(BUILD_DIR)/fmadll-empty.asm; \
+	ANTI_AVX_SABOTAGE=callbackslot $(PYTHON) tool/detour.py apply \
+		$(BUILD_DIR)/fmadll-empty.dll $(BUILD_DIR)/fmadll-empty.asm \
+		$(BUILD_DIR)/fmadll.dll > /dev/null; \
+	if $(WINE_ENV) timeout 120 wine $(BUILD_DIR)/fmahost.exe \
+			$(BUILD_DIR)/fmadll.dll > $(BUILD_DIR)/fmadll-old.txt 2>&1; \
+	then \
+		echo "check-mingw: the callback written over an empty array's"; \
+		echo "             terminator also loaded relocated, so the"; \
+		echo "             DLL cannot tell the fix from the defect"; \
+		exit 1; \
+	fi; \
+	$(WINE_STOP); \
+	echo "check-mingw: a DLL with no TLS directory, and one with an"; \
+	echo "             empty callback array, load relocated and agree;"; \
+	echo "             the callback written over the terminator dies"; \
 	echo "check-mingw: $$(wc -l < $(BUILD_DIR)/mingw-want.txt) results," \
 	     "every one as the SSE build computes it, by four routes"
 
