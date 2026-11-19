@@ -21096,9 +21096,13 @@ def verify(original, patched, listing=None):
 		      f"window's jump, and the patched image is decoded past them")
 	after_bounds, after_vex, after_bad = inplace.disassemble(patched,
 	                                                         skip=buried)
+	# An image with no VEX at all is a share of nothing, not a division by
+	# zero: libxess.dll, shipped beside Starfield, has none. Finding 387.
+	removed = len(before_vex) - len(after_vex)
+	share = (f"{100.0 * removed / len(before_vex):.1f}%" if before_vex
+	         else "nothing to remove")
 	print(f"verify: VEX in .text {len(before_vex):,} -> {len(after_vex):,}"
-	      f"  ({len(before_vex) - len(after_vex):,} removed, "
-	      f"{100.0 * (len(before_vex) - len(after_vex)) / len(before_vex):.1f}%)")
+	      f"  ({removed:,} removed, {share})")
 	# **Counted apart from the frontier, and still counted.** These begin
 	# with a VEX prefix byte and decode to nothing, so they are not
 	# surviving instructions and were inflating the number this project

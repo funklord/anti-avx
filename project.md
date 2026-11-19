@@ -14183,8 +14183,14 @@ clashing passenger, which is why the fixture had to come from outside it.
 
 **Rewriting the DLLs Starfield ships found two faults the game itself never showed.**
 `apply` over XCurl, steam_api64, nvngx_dlss, nvngx_dlssg and libxess -- real MSVC
-output, none rewritten for the game -- left 32 of 113, 16 of 155 and 30 of 469 VEX in
-the first three, and refused the last two outright. XCurl's leftovers are the CRT's
+output, none rewritten for the game -- left 32 of 113, 16 of 155 and 16 of 458 VEX in
+the first three, and refused the last two outright. The counts are anti-avx's own
+(`patch.disassemble`, decoded VEX only). **A first pass counted rows of `objdump` whose
+first byte is `c4` or `c5`, and that is not a VEX count**: objdump wraps a long
+instruction's bytes at seven a line, so the tail of a `movb $0xc5,...` is a row
+opening `c5` with no instruction on it. It put libxess at 3,857 VEX, which has none,
+and nvngx_dlssg at 834, which has 826; the commit that landed this quoted the wrong
+pair. XCurl's leftovers are the CRT's
 `memcpy` AVX path -- `vmovntdq` stores, refused as "shape store" -- behind `cmpl
 $0x3,__isa_available; jb` at `0x18001d771`, so like Starfield's 25 they never run where
 AVX is missing and converting them would buy nothing.
@@ -14203,7 +14209,9 @@ debug pointers put back, and refusing to write on a difference. The first run re
 correctly: the debug entries' pointers are inside `.rdata`, and the comparison had to
 be an identity over them rather than a raw match. `main` hands `apply`, `verify` and the
 censuses the same grown copy, so no reader of file offsets has to learn about the
-shift. nvngx_dlssg: refused, then 834 to 25 VEX, and verify passes.
+shift. nvngx_dlssg: refused, then 826 to 17 VEX, and verify passes. libxess, which
+has no VEX, grows and rewrites to nothing, and `verify` divided by its zero VEX for
+the share it prints; it says "nothing to remove" now.
 
 **The second was latent in every MSVC DLL with a TLS directory and no callbacks.** Its
 callback array is `[0, ...]`, and `--index-const` wrote its callback over that first
