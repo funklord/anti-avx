@@ -11,7 +11,9 @@
  * without it each lane is the scalar reference above. maddsub subtracts
  * on the even lanes. With WIDE, forms 7 to 9 are the same three on
  * 256-bit vectors, which the rewriter lowers as a span: the low half in
- * the register, the upper half in a slot. */
+ * the register, the upper half in a slot, and forms 10 to 17 are spelled
+ * in asm, so the orders and the register-only shape Starfield uses are
+ * each pinned rather than left to gcc. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -39,13 +41,13 @@ static float pick(void)
 	return f;
 }
 
-static float a[COUNT], b[COUNT], c[COUNT], out[10][COUNT];
+static float a[COUNT], b[COUNT], c[COUNT], out[18][COUNT];
 
 typedef float v4 __attribute__((vector_size(16)));
 typedef float v8 __attribute__((vector_size(32)));
 
 #ifdef WIDE
-#define FORMS 10
+#define FORMS 18
 #else
 #define FORMS 7
 #endif
@@ -102,6 +104,73 @@ static void wide(int i)
 	for (int f = 0; f < 3; f++)
 		memcpy(&out[7 + f][i], &r[f], 32);
 }
+
+/* d = s1 * d + s2 and the rest, per the SDM's 132/213/231, with the
+ * subtracting lanes of maddsub even and of msubadd odd. `sub` says which
+ * lanes subtract the addend: 0 none, 0xff all, 0x55 even, 0xaa odd. */
+#ifdef __FMA__
+#define FORM(text, x, y, z, neg, sub, D, S1, S2)	\
+	asm(text : [d] "+x"(D) : [s1] "x"(S1), [s2] "x"(S2));
+#define FORM_MEM(text, x, y, z, neg, sub, D, S1, M)	\
+	asm(text : [d] "+x"(D) : [s1] "x"(S1), [m] "m"(M));
+#else
+#define FORM(text, x, y, z, neg, sub, D, S1, S2)	\
+	for (int k = 0; k < 8; k++)			\
+		D[k] = ref(x[k], y[k], z[k], neg, sub, k);
+#define FORM_MEM FORM
+
+static float ref(float x, float y, float z, int neg, int sub, int k)
+{
+	return lane(neg ? -x : x, y, (sub >> k) & 1 ? -z : z);
+}
+#endif
+
+static void spelled(int i)
+{
+	v8 a8, b8, c8, d, n8;
+	memcpy(&a8, &a[i], 32);
+	memcpy(&b8, &b[i], 32);
+	memcpy(&c8, &c[i], 32);
+	n8 = -c8;
+	/* 213: d = s1*d + s2 */
+	d = b8;
+	FORM("vfmadd213ps %[s2], %[s1], %[d]", a8, b8, c8, 0, 0,
+	     d, a8, c8)
+	memcpy(&out[10][i], &d, 32);
+	/* 231: d = s1*s2 + d */
+	d = c8;
+	FORM("vfmadd231ps %[s2], %[s1], %[d]", a8, b8, c8, 0, 0,
+	     d, a8, b8)
+	memcpy(&out[11][i], &d, 32);
+	/* 132: d = d*s2 - s1, s1 negated so that it cancels */
+	d = a8;
+	FORM("vfmsub132ps %[s2], %[s1], %[d]", a8, b8, n8, 0, 0xff,
+	     d, n8, b8)
+	memcpy(&out[12][i], &d, 32);
+	/* 213: d = -(s1*d) + s2 */
+	d = b8;
+	FORM("vfnmadd213ps %[s2], %[s1], %[d]", a8, b8, n8, 1, 0,
+	     d, a8, n8)
+	memcpy(&out[13][i], &d, 32);
+	/* 231, alternating */
+	d = c8;
+	FORM("vfmaddsub231ps %[s2], %[s1], %[d]", a8, b8, c8, 0, 0x55,
+	     d, a8, b8)
+	memcpy(&out[14][i], &d, 32);
+	d = b8;
+	FORM("vfmsubadd213ps %[s2], %[s1], %[d]", a8, b8, c8, 0, 0xaa,
+	     d, a8, c8)
+	memcpy(&out[15][i], &d, 32);
+	/* and against memory: 231 with s2 in memory, 213 with the addend */
+	d = c8;
+	FORM_MEM("vfmsubadd231ps %[m], %[s1], %[d]", a8, b8, c8, 0, 0xaa,
+	         d, a8, *(const v8 *)&b[i])
+	memcpy(&out[16][i], &d, 32);
+	d = b8;
+	FORM_MEM("vfmadd213ps %[m], %[s1], %[d]", a8, b8, c8, 0, 0,
+	         d, a8, *(const v8 *)&c[i])
+	memcpy(&out[17][i], &d, 32);
+}
 #endif
 
 static uint64_t hash(const float *v, int n)
@@ -141,8 +210,10 @@ int main(void)
 	for (int i = 0; i < COUNT; i += 4)
 		packed(i);
 #ifdef WIDE
-	for (int i = 0; i < COUNT; i += 8)
+	for (int i = 0; i < COUNT; i += 8) {
 		wide(i);
+		spelled(i);
+	}
 #endif
 	for (int k = 0; k < FORMS; k++)
 		printf("form %d: %016llx\n", k,

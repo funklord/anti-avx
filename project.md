@@ -267,8 +267,8 @@ roundings where the original had one**, so results differ in the last ULP.
 Almost certainly irrelevant for game rendering, but it is the only rule in this design
 that is *not* semantics-preserving, and it must be recorded as such. If any code path
 depends on exact FP reproducibility (physics determinism, replay, netcode lockstep),
-this is where it breaks. **`--fma=exact` rounds the 230 scalar and 128-bit packed
-single-precision ones once, bit for bit; the default is unchanged** (Finding 384).
+this is where it breaks. **`--fma=exact` rounds the 396 single-precision ones, scalar
+and packed, once, bit for bit; the default is unchanged** (Finding 384).
 
 **28 of the 421 are not plain FMA and Class F does not cover them.**
 `vfmaddsub231ps` (14) and `vfmsubadd231ps` (14) *alternate* add and subtract across
@@ -14255,8 +14255,7 @@ inserted into the destination's lane i -- which no later lane reads, so a destin
 that is also an operand is safe. `maddsub` picks `msub` on the even lanes and `madd` on
 the odd, `msubadd` the reverse. A memory operand is read whole each lane, as the
 original reads it, and the lane picked out of the scratch. That is 50 more of
-Starfield's sites, 230 rounding once and 191 twice: the 166 256-bit forms, which the
-span emitter lowers, and the 25 double. `check-fma` runs 20 forms now, 8 of them
+Starfield's sites; the 166 256-bit ones follow below. `check-fma` runs 20 forms now, 8 of them
 packed, each 0 off `fmaf` with every other register intact. Swapping the even-odd parity
 is rejected on all three alternating cases (516,000 of 800,000 lanes off), so the
 oracle can see a lane-order error. The mingw fixture has three packed forms that gcc
@@ -14264,6 +14263,33 @@ emits as `vfmadd132ps`, `vfmaddsub132ps` and `vfnmadd132ps` against memory; its 
 build prints glibc's answers and its default build the multiply and add. The exact
 Starfield build f385x places the same 202,992 detours, refuses none, and passes verify
 with 380 helper calls (180 + 50 x 4). The default build is still byte-identical to f382.
+
+**And the 256-bit forms in a span, the same way** (2026-11-19). `fma_span_exact` does
+the low half per lane on the real registers with the span's helper as the scratch, and
+the upper half per lane between slots: each operand's lane read as an m32 at the slot
+plus four bytes a lane, by `insertps` from memory, and the result stored with `movss`.
+It is gated on `FMA_EXACT` ahead of every two-rounding FMA branch in `lower_ymm_span`,
+and covers `madd`, `msub`, `nmadd`, `maddsub` and `msubadd` -- the last two needing no
+blend, since each lane picks its own helper. **No slot is a packed operand**, so it needs
+no 16-byte slot alignment, which is why it lowers in a mingw image where the default
+cannot. Starfield f386x: 396 FMA rounding once and 25 (the double forms) twice, the
+same 202,992 detours, none refused, and verify passes with 1,708 helper calls -- 180 +
+50 x 4 + 166 x 8, so every 256-bit site took this path and none fell through to a
+two-rounding one. The default build is still byte-identical to f382.
+
+The fixture's `-DWIDE` build carries three 256-bit builtins and eight forms spelled in
+asm -- 213, 231 and 132; `madd`, `msub`, `nmadd`, `maddsub`, `msubadd`; registers only,
+which is the shape Starfield's `msubadd` has, and memory as a factor and as the addend.
+`check-mingw` rewrites it under `--fma=exact` (83 VEX to 0) and its eleven 256-bit forms
+print glibc's answers under wine; each of them differs between one rounding and two,
+which the gate asserts. Breaking the slot offset to `4 * (lane & 2)` changes all three
+builtin forms' output, so the fixture sees an upper-half lane error.
+
+**Double precision stays at two roundings, deliberately.** Round to odd needs a wider
+type and a double has none; the double-double route (Dekker's exact product, TwoSum and
+an odd-rounded tail) is exact only away from overflow and underflow of the product's
+low part, so "bit for bit" would need range scaling on top. That is 25 sites against a
+claim this option makes without qualification.
 
 **The default cannot lower a 256-bit FMA in that fixture**, and it says so: built with
 256-bit builtins, the loop's three FMA are refused ("FMA high half cannot reach its
@@ -23802,8 +23828,8 @@ get the mapping from the SDM, not from intuition.
 
 If exact FP reproducibility matters anywhere (deterministic physics, replays, lockstep
 netcode), this rule is where it breaks. Flag every rewritten site so it can be audited.
-`--fma=exact` makes the scalar and 128-bit packed single-precision forms exact through
-helper calls; 256-bit and double forms keep this rule (Finding 384).
+`--fma=exact` makes every single-precision form exact through helper calls; the double
+forms keep this rule (Finding 384).
 
 ### Class F-addsub — alternating lanes (28 sites)
 

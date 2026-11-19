@@ -103,10 +103,9 @@ image.
 
 **What it does not do.** FMA becomes a multiply and an add, which rounds
 twice where the hardware rounds once (421 sites in Starfield). `--fma=exact`
-rounds single-precision FMA once, bit for bit as the hardware does -- the
-scalar forms and the 128-bit packed ones, 230 of Starfield's 421 -- at the
-price of a call per element; 256-bit and double-precision FMA still round
-twice. Bundled DLLs
+rounds single-precision FMA once, bit for bit as the hardware does -- 396
+of Starfield's 421, scalar and packed alike -- at the price of a call per
+element; double-precision FMA still rounds twice. Bundled DLLs
 are not rewritten. A Steam executable has to be unpacked with Steamless
 first, because its DRM section disassembles as code that is not there.
 The tool takes the binary as an argument and reads the PE headers,

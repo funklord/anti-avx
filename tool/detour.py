@@ -691,10 +691,10 @@ def lower_fma(vex, tail, mnemonic, scratch, address=0, encoding=b"", at=0,
 # sign through a negated form, follow the SSE instructions rather than the
 # FMA, as the default lowering already does. A packed single is the scalar
 # helper once per lane, the lane's result inserted into the destination
-# where no later lane reads it. Double precision keeps the default
-# lowering, since a double has no wider type to round to odd through, and
-# so do the 256-bit forms, which the span emitter lowers. `apply` says how
-# many of each it left.
+# where no later lane reads it; a 256-bit one in a span does the same for
+# its upper half between slots (`fma_span_exact`). Double precision keeps
+# the default lowering, since a double has no wider type to round to odd
+# through. `apply` says how many of each it left.
 FMA_EXACT = False
 
 # Which FMA forms `--fma=exact` lowers, by element kind.
@@ -934,6 +934,93 @@ def lower_fma_lanes(vex, tail, negated, operation, scratch, destination,
 		body += b"\xe8" + struct.pack("<i", displacement)
 		body += encode_rr(0x66, b"\x0f\x3a\x21", destination, scratch,
 		                  lane << 4)				# insertps
+	return bytes(body)
+
+
+def fma_span_exact(vex, tail, mnemonic, shape, slot, second, third, helper,
+                   base, block, address, encoding, at, pool):
+	"""A 256-bit single FMA in a span, rounded once per lane. Bytes or None.
+
+	The low half is `lower_fma_lanes` on the real registers with `helper`
+	as the scratch. The upper half is the same between slots: each lane's
+	operand is read as an m32 at the slot plus four bytes a lane, and the
+	result is stored as one. **Nothing here is a packed memory operand**, so
+	unlike the two-rounding emission it needs no 16-byte slot alignment
+	and lowers in an image whose TLS directory does not declare it. See
+	`FMA_EXACT` and `slot_arithmetic_safe`.
+	"""
+	if block is None or second is None:
+		return None
+	negated, operation, order = FMA_PATTERN.match(mnemonic).group(1, 2, 3)
+	low_dst = scratch_finder.xmm_numbers(shape[1])[0]
+	if shape[0] == "lanereg3":
+		if third is None:
+			return None
+		low_s2 = scratch_finder.xmm_numbers(shape[2])[0]
+		low_s1 = scratch_finder.xmm_numbers(shape[3])[0]
+		s2_slot, s1_slot = second, third
+	else:
+		low_s1 = scratch_finder.xmm_numbers(shape[2])[0]
+		low_s2, s2_slot, s1_slot = MEMORY, MEMORY, second
+	if helper in (low_dst, low_s1, low_s2):
+		return None
+	roles = {"132": (0, 1, 2), "213": (2, 0, 1), "231": (2, 1, 0)}[order]
+	low = [(low_dst, low_s2, low_s1)[k] for k in roles]
+	high = [(slot, s2_slot, s1_slot)[k] for k in roles]
+	register = block[0]
+
+	def slot_m32(prefix, opcode, which, lane, tail_bytes=b""):
+		"""`opcode` between `helper` and lane `lane` of slot `which`."""
+		out = bytearray([prefix])
+		rex = 0x40 | (0x04 if helper >= 8 else 0) \
+			| (0x01 if register >= 8 else 0)
+		if rex != 0x40:
+			out.append(rex)
+		out += opcode
+		out.append(0x80 | ((helper & 7) << 3) | (register & 7))
+		out += struct.pack("<i", base + which * SLOT + 4 * lane)
+		return bytes(out) + tail_bytes
+
+	body = bytearray()
+	for half, operands in ((0, low), (1, high)):
+		for lane in range(4):
+			if operation in ("maddsub", "msubadd"):
+				subtract = (lane % 2 == 0) == (operation == "maddsub")
+				step = negated + ("msub" if subtract else "madd")
+			else:
+				step = negated + operation
+			for k, operand in enumerate(operands):
+				if operand is MEMORY:
+					piece = fma_mem_piece(vex, tail, 0xF3, b"\x0f\x10",
+					                      helper, 16 * half + 4 * lane,
+					                      address, encoding,
+					                      at + len(body))
+					if piece is None:
+						return None
+					body += piece			# movss m32
+					if k:
+						body += encode_rr(0x66, b"\x0f\x3a\x21", helper,
+						                  helper, k << 4)
+			for k, operand in enumerate(operands):
+				if operand is MEMORY:
+					continue
+				if half == 0:
+					body += encode_rr(0x66, b"\x0f\x3a\x21", helper,
+					                  operand, (lane << 6) | (k << 4))
+				else:				# insertps m32
+					body += slot_m32(0x66, b"\x0f\x3a\x21", operand, lane,
+					                 bytes([k << 4]))
+			offset, _length = fma_helpers()[1][(helper, step)]
+			target = pool + helper_base() + offset
+			displacement = target - (at + len(body) + 5)
+			if not -(1 << 31) <= displacement < (1 << 31):
+				return None
+			body += b"\xe8" + struct.pack("<i", displacement)
+			if half == 0:
+				body += encode_rr(0x66, b"\x0f\x3a\x21", low_dst, helper,
+				                  lane << 4)
+			else:					# movss to the slot's lane
+				body += slot_m32(0xF3, b"\x0f\x11", slot, lane)
 	return bytes(body)
 
 # Load one element, then spread it. The load width is the whole point: a
@@ -7291,6 +7378,18 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += span_slot_move(helper, True, base, slot, block,
 			                       at + len(body))
 			body += encode_rr(None, MOVAPS, 0, second_helper)
+			continue
+		if FMA_EXACT and what in ("lanereg3", "lanemem") \
+				and mnemonic in FMA_SPAN_FORMS and mnemonic.endswith("ps"):
+			# Every lane through the helper, both halves. See
+			# `fma_span_exact`, and `FMA_EXACT` for what it covers.
+			piece = fma_span_exact(vex, tail, mnemonic, shape, slot,
+			                       second, third, helper, base, block,
+			                       address, encoding, at + len(body),
+			                       pool)
+			if piece is None:
+				return refuse("exact FMA cannot reach an operand")
+			body += piece
 			continue
 		if what in ("lanereg3", "lanemem") and mnemonic in FMA_SPAN_FORMS \
 				and FMA_PATTERN.match(mnemonic).group(1) == "n":
@@ -20019,9 +20118,10 @@ def apply_all(binary, listing, output):
 		match = FMA_PATTERN.match(row[2] or "")
 		if match:
 			kind = match.group(4)
+			wide = "%ymm" in (row[3] or "")
 			forms["exact" if FMA_EXACT and kind in FMA_EXACT_KINDS
 			      and match.group(2) in FMA_EXACT_KINDS[kind]
-			      and "%ymm" not in (row[3] or "")
+			      and (not wide or row[2] in FMA_SPAN_FORMS)
 			      else "two roundings"] += 1
 	if forms:
 		print(f"apply: FMA {forms['exact']:,} rounded once, "

@@ -1615,7 +1615,12 @@ MINGW_OUT   = $(BUILD_DIR)/mingw-avx2.exe $(BUILD_DIR)/mingw-sse.exe \
               $(BUILD_DIR)/mingw-fma-fast.exe $(BUILD_DIR)/fma-once \
               $(BUILD_DIR)/fma-twice $(BUILD_DIR)/fma-once.txt \
               $(BUILD_DIR)/fma-twice.txt $(BUILD_DIR)/mingw-fma-exact.txt \
-              $(BUILD_DIR)/mingw-fma-fast.txt
+              $(BUILD_DIR)/mingw-fma-fast.txt \
+              $(BUILD_DIR)/mingw-fma-wide.exe \
+              $(BUILD_DIR)/mingw-fma-wide-exact.exe \
+              $(BUILD_DIR)/fma-once-wide $(BUILD_DIR)/fma-twice-wide \
+              $(BUILD_DIR)/fma-once-wide.txt $(BUILD_DIR)/fma-twice-wide.txt \
+              $(BUILD_DIR)/mingw-fma-wide-exact.txt
 
 $(BUILD_DIR)/mingw-avx2.exe: $(MINGW_SRC) | $(BUILD_DIR)
 	$(MINGW_CXX) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
@@ -1657,6 +1662,24 @@ $(BUILD_DIR)/fma-once: fixture/mingw/fma.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/fma-twice: fixture/mingw/fma.c | $(BUILD_DIR)
 	$(CC) $(FMA_FLAGS) -DTWO_ROUNDINGS -o $@ $< -lm
+
+# **The 256-bit forms, under --fma=exact only.** The default refuses them
+# in a mingw image, whose TLS directory does not declare the 16-byte
+# alignment a slot needs as a packed operand; the exact path reads a slot
+# four bytes at a time and needs none. Finding 384.
+$(BUILD_DIR)/mingw-fma-wide.exe: fixture/mingw/fma.c | $(BUILD_DIR)
+	$(MINGW_CC) $(FMA_FLAGS) -DWIDE -mfma -static -s -o $@ $<
+
+$(BUILD_DIR)/mingw-fma-wide-exact.exe: $(BUILD_DIR)/mingw-fma-wide.exe \
+                                       anti-avx tool/detour.py tool/patch.py \
+                                       tool/resync.py
+	./anti-avx --fma=exact $< $@
+
+$(BUILD_DIR)/fma-once-wide: fixture/mingw/fma.c | $(BUILD_DIR)
+	$(CC) $(FMA_FLAGS) -DWIDE -o $@ $< -lm
+
+$(BUILD_DIR)/fma-twice-wide: fixture/mingw/fma.c | $(BUILD_DIR)
+	$(CC) $(FMA_FLAGS) -DWIDE -DTWO_ROUNDINGS -o $@ $< -lm
 
 $(BUILD_DIR)/mingw-clang.exe: $(MINGW_SRC) | $(BUILD_DIR)
 	$(MINGW_CLANG) $(MINGW_FLAGS) -mavx2 -mfma -s -o $@ $<
@@ -1710,7 +1733,8 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
              $(BUILD_DIR)/mingw-sse.dll $(BUILD_DIR)/mingw-rewritten.dll \
              $(BUILD_DIR)/mingw-avx1-sse.exe $(BUILD_DIR)/mingw-fma-exact.exe \
              $(BUILD_DIR)/mingw-fma-fast.exe $(BUILD_DIR)/fma-once \
-             $(BUILD_DIR)/fma-twice
+             $(BUILD_DIR)/fma-twice $(BUILD_DIR)/mingw-fma-wide-exact.exe \
+             $(BUILD_DIR)/fma-once-wide $(BUILD_DIR)/fma-twice-wide
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-mingw: wine is not installed"; exit 1; }
 	@if $(PYTHON) tool/detour.py plan $(BUILD_DIR)/mingw-symbols.exe \
@@ -1794,6 +1818,26 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
 		  echo "             and an add"; exit 1; }; \
 	echo "check-mingw: single FMA rounds once under --fma=exact and twice"; \
 	echo "             by default, each as its reference computes it"; \
+	$(BUILD_DIR)/fma-once-wide > $(BUILD_DIR)/fma-once-wide.txt; \
+	$(BUILD_DIR)/fma-twice-wide > $(BUILD_DIR)/fma-twice-wide.txt; \
+	for form in 7 8 9 10 11 12 13 14 15 16 17; do \
+		if [ "`grep "^form $$form:" $(BUILD_DIR)/fma-once-wide.txt`" = \
+		     "`grep "^form $$form:" $(BUILD_DIR)/fma-twice-wide.txt`" ]; \
+		then \
+			echo "check-mingw: 256-bit form $$form prints the same"; \
+			echo "             rounded once and twice"; exit 1; \
+		fi; \
+	done; \
+	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-fma-wide-exact.exe \
+		> $(BUILD_DIR)/mingw-fma-wide-exact.txt 2>&1 || \
+		{ echo "check-mingw: the 256-bit --fma=exact build failed"; \
+		  exit 1; }; \
+	tr -d '\r' < $(BUILD_DIR)/mingw-fma-wide-exact.txt | \
+		diff $(BUILD_DIR)/fma-once-wide.txt - || \
+		{ echo "check-mingw: 256-bit --fma=exact disagrees with fmaf"; \
+		  exit 1; }; \
+	echo "check-mingw: 256-bit single FMA, eleven forms, rounds once"; \
+	echo "             under --fma=exact"; \
 	echo "check-mingw: $$(wc -l < $(BUILD_DIR)/mingw-want.txt) results," \
 	     "every one as the SSE build computes it, by four routes"
 
