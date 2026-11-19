@@ -5,6 +5,11 @@ First read ~/.claude/CLAUDE.md for core directives
 Static rewriting of x86-64 PE binaries built with a whole-program `/arch:AVX` or
 `/arch:AVX2` baseline, so they run on CPUs without AVX.
 
+**Left off (2026-11-19):** the game folder holds the full `--fma=exact` build for a test;
+the holder then wants the faster default back, built at `build/Starfield-default.exe` --
+Finding 384's last paragraph has the swap. Open: whether Findings 385 and 386 hold under
+Windows' loader (Open questions). Latest work: Findings 384 to 387.
+
 **Status:** the rewriter works. `tool/detour.py` rewrites **804,923 of 804,948 VEX
 sites -- 99.99%** -- through 202,983 detours, and every `make detour-verify` invariant
 holds on the result. **25 sites are left** (Finding 379, 2026-10-23), every one behind
@@ -14458,10 +14463,13 @@ claim this option makes without qualification.
 
 **The default could not lower a 256-bit FMA in that fixture**, which is Finding 385.
 
-**The exact build is installed** (2026-11-19) as `Starfield-antiavx.exe`, `cmp`-equal
-to f384x (md5 `99623de6`). It replaced f382, the default build, which is byte-identical
-to this tree's default output and so needs only a rebuild to restore. It has not yet
-been run in the game.
+**The full exact build is installed for a test** (2026-11-19, the holder's plan): every
+single-precision FMA exact, 396 of 421, at `d50a123`'s tool -- `Starfield-antiavx.exe`,
+`cmp`-equal to `build/Starfield-exact.exe` (md5 `dad1c6ab`), verify clean with 1,708
+helper calls. After the test the game goes back to the faster default,
+`build/Starfield-default.exe`, built and verified from the same tool and ready to copy
+in its place -- check the game is not running, copy, `cmp`. Neither has been run in
+the game yet.
 
 ### Finding 383 -- the rules real compilers need that Starfield never asked for
 
@@ -24493,12 +24501,9 @@ the project's largest risk.
   `LoadLibrary` being honoured (since Vista, by the documentation). Nothing here runs
   Windows; fmake keeps a Windows 11 VM, which is that project's to lend. Blocks only
   the claim, not the code: `--tls-synth=off` is the A/B. The holder's call.
-- **New (2026-11-19): which build should the game folder hold?** f384x (180 scalar FMA
-  exact) is installed. The current tool's exact build rounds 396 of 421 once at 1,708
-  helper calls; its default was byte-identical to f382 when last built (0e0b46e), and
-  nothing since reaches Starfield (Finding 387). Neither image survives the
-  session's scratch, so either is a rebuild of about 35 minutes. The holder's call, since
-  it is the game they play.
+- ~~Which build should the game folder hold?~~ **Answered by the holder 2026-11-19**:
+  the full exact build for a test, then back to the default. Both are built in `build/`;
+  Finding 384's last paragraph says which is installed and how to swap.
 
 - ~~Does Ddisasm handle a 102 MB PE at all? Runtime and memory footprint unknown.~~
   **Resolved: not on 47 GB.** ~90 GB projected, `std::bad_alloc` at 34.3 GB observed.
