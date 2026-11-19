@@ -723,7 +723,7 @@ check-teb: $(BUILD_DIR)/pe-nogpr-320.exe
 	got=0; \
 	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-nogpr-teb.exe \
 		> /dev/null 2>&1 || got=$$?; \
-	pkill -x wineserver >/dev/null 2>&1 || true; \
+	$(WINE_STOP); \
 	if [ "$$got" != "77" ]; then \
 		echo "check-teb: the forced build returned $$got, want 77"; \
 		exit 1; \
@@ -766,11 +766,11 @@ check-teb-auto: tool/pe_build.py tool/detour.py | $(BUILD_DIR)
 	good=0; \
 	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-tebauto-teb.exe \
 		> /dev/null 2>&1 || good=$$?; \
-	pkill -x wineserver >/dev/null 2>&1 || true; \
+	$(WINE_STOP); \
 	bad=0; \
 	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-tebauto-tebconst.exe \
 		> /dev/null 2>&1 || bad=$$?; \
-	pkill -x wineserver >/dev/null 2>&1 || true; \
+	$(WINE_STOP); \
 	if [ "$$good" != "77" ]; then \
 		echo "check-teb-auto: the allocated-slot build returned $$good,"; \
 		echo "                want 77"; \
@@ -816,11 +816,11 @@ check-gaprun: tool/pe_build.py tool/detour.py | $(BUILD_DIR)
 	good=0; \
 	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-gaprun-none.exe \
 		> /dev/null 2>&1 || good=$$?; \
-	pkill -x wineserver >/dev/null 2>&1 || true; \
+	$(WINE_STOP); \
 	bad=0; \
 	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/sse-gaprun-gaprun.exe \
 		> /dev/null 2>&1 || bad=$$?; \
-	pkill -x wineserver >/dev/null 2>&1 || true; \
+	$(WINE_STOP); \
 	if [ "$$good" != "77" ]; then \
 		echo "check-gaprun: the build returned $$good, want 77"; \
 		exit 1; \
@@ -910,7 +910,7 @@ check-tls:
 	$(WINE_CANARY)
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
-	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	trap '$(WINE_STOP)' EXIT; \
 	want=`$(PYTHON) tool/pe_build.py names | \
 	      awk '$$1 == "tlsslot" { print $$2 }'`; \
 	for fill in 0 8 16 32; do \
@@ -1051,6 +1051,14 @@ WINE_CANARY = @$(WINE_ENV) timeout 300 wine cmd /c exit 0 >/dev/null 2>&1 || \
 # Measured: with the override the same crash returns 29 immediately, and 29
 # is the low byte of STATUS_ILLEGAL_INSTRUCTION.
 WINE_ENV   = WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d
+# **Stop this prefix's wineserver and nobody else's.** These recipes said
+# `pkill -x wineserver`, which aims at every wineserver the account runs --
+# Proton's under Steam among them. On this machine it hit nothing at all:
+# the process is `wineserver64`, so the cleanup had never run and the
+# danger had never fired. `wineserver -k` stops WINEPREFIX's server only;
+# measured with a second prefix's server running beside `check-teb`, which
+# stopped its own and left the other up.
+WINE_STOP  = WINEPREFIX=$(PE_PREFIX) wineserver -k >/dev/null 2>&1 || true
 
 # Named, and named HERE rather than beside the other one, because .SECONDARY
 # expands its prerequisites where it is read -- listed before PE_LISTINGS is
@@ -1413,7 +1421,7 @@ check-pe: $(PE_FIXED) $(PE_SOURCES)
 	$(WINE_CANARY)
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
-	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	trap '$(WINE_STOP)' EXIT; \
 	for name in $(PE_NAMES); do \
 		want=`$(PYTHON) tool/pe_build.py names | \
 		      awk -v n=$$name '$$1 == n { print $$2 }'`; \
@@ -1497,7 +1505,7 @@ check-spill: $(BUILD_DIR)/pe-spill.exe $(BUILD_DIR)/pe-spill.asm \
 	$(WINE_CANARY)
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
-	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	trap '$(WINE_STOP)' EXIT; \
 	want=`$(PYTHON) tool/pe_build.py names | \
 	      awk '$$1 == "spill" { print $$2 }'`; \
 	for mode in none stack pool; do \
@@ -1807,7 +1815,7 @@ check-mingw: $(BUILD_DIR)/mingw-rewritten.exe $(BUILD_DIR)/mingw-sse.exe \
 	@mkdir -p $(PE_PREFIX)
 	$(WINE_CANARY)
 	@set -e; \
-	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	trap '$(WINE_STOP)' EXIT; \
 	$(WINE_ENV) timeout 120 wine $(BUILD_DIR)/mingw-sse.exe \
 		> $(BUILD_DIR)/mingw-want.txt 2>&1 || \
 		{ echo "check-mingw: the SSE oracle did not run"; exit 1; }; \
@@ -1945,7 +1953,7 @@ check-unwind: $(BUILD_DIR)/sse-unwind.exe $(BUILD_DIR)/sse-unwindstub.exe \
 	$(WINE_CANARY)
 	@$(WINE_ENV) timeout 300 wine wineboot -i >/dev/null 2>&1 || true
 	@set -e; \
-	trap 'pkill -x wineserver >/dev/null 2>&1 || true' EXIT; \
+	trap '$(WINE_STOP)' EXIT; \
 	for name in unwind unwindstub; do \
 		want=`$(PYTHON) tool/pe_build.py names | \
 		      awk -v n=$$name '$$1 == n { print $$2 }'`; \
