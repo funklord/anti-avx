@@ -14179,6 +14179,48 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 385 -- a slot is a packed operand once the rewrite declares the alignment
+
+**gcc's 256-bit FMA, rewritten by default, died with SIGILL under wine.** The loop's
+three FMA were refused -- "FMA high half cannot reach its operand", "negated FMA cannot
+reach its product" -- and anti-avx said so (`VEX 56 -> 4`), so the image kept them.
+`span_slot_op` uses a slot as a packed memory operand only where `slot_arithmetic_safe`
+says the TLS block is 16-byte aligned, and that reads the alignment the TLS directory
+DECLARES. mingw's Characteristics is 0, which declares one byte. Starfield declares 16,
+which is why nothing there met it.
+
+**So the rewrite declares it.** `tls_slot` takes the larger of the declared alignment
+and a slot's sixteen bytes, and `raise_tls_block` writes `IMAGE_SCN_ALIGN_16BYTES` into
+the nibble where the image asked for less, beside the `SizeOfZeroFill` it already
+raises. That asks the loader for no more than an x64 heap block already is, and makes
+the promise the emitter relies on the image's own rather than the allocator's habit.
+`verify` sanctions it the way it sanctions the zero fill, as an identity: every bit of
+Characteristics outside the nibble must be unchanged, the old alignment below sixteen
+and the new one exactly sixteen, and the line names it as an exemption. A `tlsalign`
+sabotage that declares thirty-two is refused through the after-`.text` check, and so
+is a change to any other bit.
+
+**And the one FMA left was `vfmsubadd231ps` against memory**, refused as "wants the
+blend form": Finding 304 wrote the blend for registers only, since all 14 of
+Starfield's are, and left the memory shape without a site to test it against. gcc's
+`_mm256_fmsubadd_ps` over an array is one. The blend branch takes `lanemem` now: S2 is
+never the product's first factor, so the copy is always from a register, and the memory
+operand is read where a slot would be, its upper half sixteen bytes on.
+
+The `-DWIDE` fixture rewrites 83 VEX to 0 by default now, and under wine all eighteen
+forms print the multiply and add -- `check-mingw` runs it both ways. **That run does not
+show a loader honouring the declaration.** Finding 312 found the fixtures passing at a
+declared one byte because wine's allocator aligns the block anyway, so the run shows the
+emission is right and cannot show that the field is what aligned it. What the change
+rests on is that an x64 heap block is 16-byte aligned (`MEMORY_ALLOCATION_ALIGNMENT`),
+which is read from the platform rather than measured here, and the field now says so
+in the image. Finding 312's control -- a one-byte image getting no slot operand and a
+refusal -- is superseded by this: such an image is declared sixteen and lowers.
+
+Starfield, which already declared 16, builds byte-identical to f382, and the PE
+fixtures, which declare 16 since Finding 312, are unchanged; `check`, `check-verify`,
+`check-pe`, `check-vex`, `check-unwind`, `check-spill` and `check-shadow-pe` pass.
+
 ### Finding 384 -- `--fma=exact`, a helper call that rounds once
 
 **Finding 4's one inexact rule now has an exact alternative, opt-in.** `--fma=exact`
@@ -14291,12 +14333,7 @@ an odd-rounded tail) is exact only away from overflow and underflow of the produ
 low part, so "bit for bit" would need range scaling on top. That is 25 sites against a
 claim this option makes without qualification.
 
-**The default cannot lower a 256-bit FMA in that fixture**, and it says so: built with
-256-bit builtins, the loop's three FMA are refused ("FMA high half cannot reach its
-operand"; "negated FMA cannot reach its product") and stay VEX, so the image dies with
-SIGILL under wine. `span_slot_op` uses a slot as a packed memory operand only where
-the TLS directory declares 16-byte alignment, and mingw's does not. The forms are in
-the fixture behind `-DWIDE` until something lowers them.
+**The default could not lower a 256-bit FMA in that fixture**, which is Finding 385.
 
 **The exact build is installed** (2026-11-19) as `Starfield-antiavx.exe`, `cmp`-equal
 to f384x (md5 `99623de6`). It replaced f382, the default build, which is byte-identical

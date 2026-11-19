@@ -7509,7 +7509,7 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			body += span_slot_move(second_helper, True, base, slot, block,
 			                       at + len(body))
 			continue
-		if what == "lanereg3" and mnemonic in FMA_SPAN_FORMS \
+		if what in ("lanereg3", "lanemem") and mnemonic in FMA_SPAN_FORMS \
 				and FMA_PATTERN.match(mnemonic).group(2) == "msubadd":
 			# **Both results, then a blend.** See FMA_SPAN_OPS: there
 			# is no subadd instruction and negating the addend to reuse
@@ -7521,8 +7521,16 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# place for two of them: the product has to survive into a
 			# copy, so there is nothing to gain by putting it in the
 			# destination. Finding 304.
-			if second is None or third is None:
-				return refuse("lanereg3 source is in no slot")
+			#
+			# **And with S2 in memory**, which Finding 304 left refused
+			# for want of a site: gcc's `_mm256_fmsubadd_ps` against an
+			# array is one. S2 is never the product's first factor, so
+			# the copy is always from a register, and the memory operand
+			# is read where a slot would be -- its upper half sixteen
+			# bytes on. Finding 384.
+			mem = what == "lanemem"
+			if second is None or (third is None and not mem):
+				return refuse(f"{what} source is in no slot")
 			if block is None:
 				return refuse("FMA member wants a per-thread block")
 			if second_helper is None:
@@ -7533,18 +7541,39 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			mul, add = b"\x0f\x59", b"\x0f\x58"
 			take = b"\x0f\x5c"
 			low_dst = scratch_finder.xmm_numbers(shape[1])[0]
-			low_s2 = scratch_finder.xmm_numbers(shape[2])[0]
-			low_s1 = scratch_finder.xmm_numbers(shape[3])[0]
+			if mem:
+				low_s2, s2_slot = MEMORY, MEMORY
+				low_s1, s1_slot = scratch_finder.xmm_numbers(shape[2])[0], \
+					second
+			else:
+				low_s2, s2_slot = scratch_finder.xmm_numbers(shape[2])[0], \
+					second
+				low_s1, s1_slot = scratch_finder.xmm_numbers(shape[3])[0], \
+					third
 			first, other, addend = {
 				"132": (low_dst, low_s2, low_s1),
 				"213": (low_s1, low_dst, low_s2),
 				"231": (low_s1, low_s2, low_dst),
 			}[order]
+
+			def apply_low(opcode, into, operand):
+				"""`opcode operand,into`, the operand a register or memory."""
+				if operand is MEMORY:
+					return fma_mem_piece(vex, tail, prefix, opcode, into, 0,
+					                     address, encoding, at + len(body))
+				return encode_rr(prefix, opcode, into, operand)
+
 			body += encode_rr(None, MOVAPS, helper, first)
-			body += encode_rr(prefix, mul, helper, other)
+			piece = apply_low(mul, helper, other)
+			if piece is None:
+				return refuse("msubadd cannot reach its operand")
+			body += piece
 			body += encode_rr(None, MOVAPS, second_helper, helper)
-			body += encode_rr(prefix, add, helper, addend)
-			body += encode_rr(prefix, take, second_helper, addend)
+			for opcode, into in ((add, helper), (take, second_helper)):
+				piece = apply_low(opcode, into, addend)
+				if piece is None:
+					return refuse("msubadd cannot reach its operand")
+				body += piece
 			body += encode_rr(0x66, BLEND_OPCODE[kind], helper,
 			                  second_helper, BLEND_ODD[kind])
 			body += encode_rr(None, MOVAPS, low_dst, helper)
@@ -7552,21 +7581,28 @@ def lower_ymm_span(entries, base, helper, at, pool, block=None,
 			# The same shape between slots, the addend read twice as a
 			# memory operand because both results need it.
 			sf, so, sa = {
-				"132": (slot, second, third),
-				"213": (third, slot, second),
-				"231": (third, second, slot),
+				"132": (slot, s2_slot, s1_slot),
+				"213": (s1_slot, slot, s2_slot),
+				"231": (s1_slot, s2_slot, slot),
 			}[order]
+
+			def apply_high(opcode, into, which):
+				"""The same against a slot, or the memory's upper half."""
+				if which is MEMORY:
+					return fma_mem_piece(vex, tail, prefix, opcode, into,
+					                     SLOT, address, encoding,
+					                     at + len(body))
+				return span_slot_op(prefix, opcode, into, base, which, block)
+
 			body += span_slot_move(helper, False, base, sf, block,
 			                       at + len(body))
-			for opcode, into, which in ((mul, helper, so),):
-				piece = span_slot_op(prefix, opcode, into, base, which,
-				                     block)
-				if piece is None:
-					return refuse("msubadd cannot reach a slot")
-				body += piece
+			piece = apply_high(mul, helper, so)
+			if piece is None:
+				return refuse("msubadd cannot reach a slot")
+			body += piece
 			body += encode_rr(None, MOVAPS, second_helper, helper)
 			for opcode, into in ((add, helper), (take, second_helper)):
-				piece = span_slot_op(prefix, opcode, into, base, sa, block)
+				piece = apply_high(opcode, into, sa)
 				if piece is None:
 					return refuse("msubadd cannot reach a slot")
 				body += piece
@@ -14718,9 +14754,13 @@ def tls_slot(data, want=SLOT):
 	start, end, index_va, _callbacks, zero_fill, characteristics = fields
 	if not index_va or end < start:
 		return None
-	# IMAGE_SCN_ALIGN_* lives in bits 20-23 and encodes 2^(n-1) bytes.
-	shift = (characteristics >> 20) & 0xF
-	alignment = 1 << (shift - 1) if shift else 1
+	# **At least a slot's width, which this rewrite then declares.** An image
+	# asking for less -- mingw's says nothing, which reads as one byte --
+	# left every slot unfit to be a packed operand, and the default refused
+	# every 256-bit FMA in it. Raising the field asks the loader for no
+	# more than an x64 heap block already is, and `raise_tls_block` writes
+	# it, so the promise `slot_arithmetic_safe` reads is the image's own.
+	alignment = max(tls_alignment(characteristics), SLOT)
 	# Recorded for `slot_arithmetic_safe`, because this is the only place the
 	# field is read and an emitter cannot see the image.
 	global TLS_BLOCK_ALIGNMENT
@@ -14728,6 +14768,27 @@ def tls_slot(data, want=SLOT):
 	template = end - start
 	slot = (template + alignment - 1) // alignment * alignment
 	return index_va, slot, max(zero_fill, slot - template + want)
+
+
+def tls_alignment(characteristics):
+	"""The TLS block alignment a directory's Characteristics declares."""
+	# IMAGE_SCN_ALIGN_* lives in bits 20-23 and encodes 2^(n-1) bytes.
+	shift = (characteristics >> 20) & 0xF
+	return 1 << (shift - 1) if shift else 1
+
+
+# IMAGE_SCN_ALIGN_16BYTES, the declaration `tls_slot` relies on.
+TLS_ALIGN_SLOT = 0x00500000
+
+
+def raise_tls_block(data, zero_fill):
+	"""`set_tls_zero_fill`, and the declared alignment raised to a slot's."""
+	image = bytearray(set_tls_zero_fill(data, zero_fill))
+	offset, fields = tls_directory(bytes(image))
+	if tls_alignment(fields[5]) < SLOT:
+		struct.pack_into("<I", image, offset + 36,
+		                 (fields[5] & ~0x00F00000) | TLS_ALIGN_SLOT)
+	return bytes(image)
 
 
 def set_tls_zero_fill(data, zero_fill):
@@ -17743,6 +17804,7 @@ SABOTAGE = {
 	"indexconst": "the index callback fills every placeholder in",
 	"backtarget": "a window widened backwards never buries a branch target",
 	"tebcall": "no call lies inside a TEB save bracket",
+	"tlsalign": "the TLS directory changes only as sanctioned",
 }
 
 
@@ -17894,6 +17956,18 @@ def sabotage(patched, output, kind):
 				_v, _vs, raw, _rs = found
 				at = raw + len(PERMIL_POOL)
 				data[at:at + 5] = b"\xe8\x00\x00\x00\x00"
+	if kind == "tlsalign":
+		# **One step past the sanctioned alignment.** `raise_tls_block` may
+		# declare a slot's sixteen bytes and nothing more, so thirty-two in
+		# the same nibble must be refused by the check that names what
+		# changed after `.text`.
+		found = tls_directory(bytes(data))
+		if found is None:
+			print("detour.py: no TLS directory to sabotage", file=sys.stderr)
+			return 2
+		offset, fields = found
+		struct.pack_into("<I", data, offset + 36,
+		                 (fields[5] & ~0x00F00000) | 0x00600000)
 	if kind == "tebcall":
 		# **The TEB check had never been seen to fail**, and could not
 		# until Finding 384 read the mnemonic field. Plant `call` over the
@@ -20066,7 +20140,7 @@ def apply_all(binary, listing, output):
 	# added, because the directory is addressed by RVA and nothing here
 	# moves it.
 	if tls_here is not None:
-		image = bytearray(set_tls_zero_fill(bytes(image), tls_here[2]))
+		image = bytearray(raise_tls_block(bytes(image), tls_here[2]))
 
 	open(output, "wb").write(bytes(image))
 	# **What the image actually holds, which is neither the plan nor the
@@ -20481,14 +20555,26 @@ def verify(original, patched, listing=None):
 		# again. A check that merely tolerated a difference somewhere in
 		# the TLS directory would tolerate a difference anywhere in it,
 		# and the directory holds four pointers this must never move.
-		raised = None
+		raised, realigned = None, False
 		found = tls_directory(bytes(a))
 		if found is not None and len(tail_a) == len(tail_b):
 			restored = bytearray(tail_a)
 			at = found[0] + 32 - (raddr + size)
-			ok = 0 <= at and at + 4 <= len(tail_a)
+			ok = 0 <= at and at + 8 <= len(tail_a)
 			if ok:
 				restored[at:at + 4] = tail_b[at:at + 4]
+				# **And the declared alignment, up to a slot's and no
+				# further**, which `raise_tls_block` writes where the image
+				# asked for less. Every other bit of Characteristics must
+				# come through unchanged before the field is put back.
+				before = struct.unpack_from("<I", bytes(tail_a), at + 4)[0]
+				after = struct.unpack_from("<I", bytes(tail_b), at + 4)[0]
+				if after != before:
+					ok = (after & ~0x00F00000) == (before & ~0x00F00000) \
+						and tls_alignment(before) < SLOT \
+						and tls_alignment(after) == SLOT
+					realigned = ok
+					restored[at + 4:at + 8] = tail_b[at + 4:at + 8]
 			# **And the one callback slot, when `--index-const` is on.**
 			# A load-time callback has to be reachable from the image's
 			# TLS callback array, and that array is after `.text` in any
@@ -20525,6 +20611,9 @@ def verify(original, patched, listing=None):
 			# outside `.text` moved. Finding 294.
 			allowed = [f"SizeOfZeroFill, raised to {raised} so the loader "
 			           f"allocates the per-thread slot"]
+			if realigned:
+				allowed.append(f"the block's declared alignment, raised to "
+				               f"{SLOT} so a slot may be a packed operand")
 			if INDEX_CONST:
 				allowed.append("the TLS callback array's first slot, which "
 				               "now names the index callback and tail-jumps "
