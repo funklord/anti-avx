@@ -14195,6 +14195,15 @@ pair. XCurl's leftovers are the CRT's
 $0x3,__isa_available; jb` at `0x18001d771`, so like Starfield's 25 they never run where
 AVX is missing and converting them would buy nothing.
 
+**And so is everything left in the other four, which makes the result complete.**
+NRD, steam_api64, nvngx_dlss and nvngx_dlssg each keep the same sixteen -- fifteen
+`vmovntdq` and a `vmovdqu`, that `memcpy` tail behind the same `cmpl $0x3` (NRD's at
+`0x180033420`) -- and NRD and nvngx_dlssg one `vfnmadd213sd` besides, in NRD's
+`0x1800379a0`: called directly from three places, but its first test is `cmpl
+$0x0,__use_fma3_lib; jne`, and the FMA lies on that branch, which the CRT takes only
+where the CPU has FMA3. Every VEX instruction these rewrites leave is one a CPU without
+AVX never reaches.
+
 **The refusal was the header.** MSVC's default `SizeOfHeaders` is 0x400, and an image
 with nine or ten sections fills it: nvngx_dlssg and libxess have room for one more
 section entry, and a rewrite adds up to six (the TLS page, the pool spill, the stubs,
