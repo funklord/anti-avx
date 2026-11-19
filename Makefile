@@ -1308,7 +1308,36 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 		  echo "              swallowed-instruction one, does not: the"; \
 		  echo "              buried instruction is the window's member"; \
 		  echo "              rather than a passenger"; exit 1; }
-	@echo "check-verify: all fourteen controls rejected, each by its own check"
+# A TEB save bracket is a fixed address, so a call inside one could reenter
+# it. The check read `"\tcall"` after `expandtabs` had removed every tab, so
+# until Finding 384 it could not fail; this plants a call in the one bracket
+# `tebauto` builds when forced onto the TEB. The call-count check fires as
+# well, being about every call in the section, so the log is asked for the
+# bracket check's own message.
+	@set -e; \
+	$(PYTHON) tool/pe_build.py sample tebauto \
+		$(BUILD_DIR)/pe-tebauto.exe 320 >/dev/null; \
+	objdump -d -j .text $(BUILD_DIR)/pe-tebauto.exe \
+		> $(BUILD_DIR)/pe-tebauto.asm; \
+	ANTI_AVX_SABOTAGE=teb $(PYTHON) tool/detour.py --shadow-regs=all \
+		--teb-scratch=auto apply $(BUILD_DIR)/pe-tebauto.exe \
+		$(BUILD_DIR)/pe-tebauto.asm $(BUILD_DIR)/sse-tebauto-teb.exe \
+		> /dev/null; \
+	$(PYTHON) tool/detour.py sabotage $(BUILD_DIR)/sse-tebauto-teb.exe \
+		$(BUILD_DIR)/bad-tebcall.exe tebcall; \
+	if timeout 300 $(PYTHON) tool/detour.py --shadow-regs=all \
+		--teb-scratch=auto verify $(BUILD_DIR)/pe-tebauto.exe \
+		$(BUILD_DIR)/bad-tebcall.exe $(BUILD_DIR)/pe-tebauto.asm \
+		> $(BUILD_DIR)/verify-bad-tebcall.log 2>&1; then \
+		echo "check-verify: the tebcall control PASSED verify, so"; \
+		echo "              nothing watches a TEB bracket's calls"; \
+		exit 1; \
+	fi; \
+	grep -q "inside a TEB save bracket" \
+		$(BUILD_DIR)/verify-bad-tebcall.log || \
+		{ echo "check-verify: the tebcall control failed, but not"; \
+		  echo "              through the TEB bracket check"; exit 1; }
+	@echo "check-verify: all fifteen controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
@@ -1893,6 +1922,7 @@ clean:
 	      $(BUILD_DIR)/verify-bad-nostub.log \
 	      $(BUILD_DIR)/verify-bad-stubgap.log \
 	      $(BUILD_DIR)/verify-bad-stubcall.log \
+	      $(BUILD_DIR)/bad-tebcall.exe $(BUILD_DIR)/verify-bad-tebcall.log \
 	      $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@# The wine prefix is a directory this build created, so it goes

@@ -14241,10 +14241,18 @@ disagrees with the listing.
 with `"\tcall" in line.expandtabs(1)`, and `expandtabs` had already turned every tab
 into a space. It reads the mnemonic field now, and exempts helper calls, which save
 nothing to the TEB. On both Starfield builds it reads no call in 1,502 brackets, which
-is a measurement now rather than a default -- though no control has yet been seen to
-make it fail. The stack check reads any `lea disp8(%rsp),%rsp` and takes `ret` as
+is a measurement now rather than a default. **It has been seen to fail since**:
+`check-verify`'s fifteenth control, `tebcall`, plants `call` over the instruction after
+`tebauto`'s one TEB save and verify rejects it through this check's own message. On
+that same listing line the old predicate reads False and the new one True. The call-count
+check fires as well, so the gate greps for the bracket message. The stack check reads any `lea disp8(%rsp),%rsp` and takes `ret` as
 the epilogue an unwinder sees it as. The call reconciliation counts helper calls apart
 from re-emitted swallowed ones.
+
+**The exact build is installed** (2026-11-19) as `Starfield-antiavx.exe`, `cmp`-equal
+to f384x (md5 `99623de6`). It replaced f382, the default build, which is byte-identical
+to this tree's default output and so needs only a rebuild to restore. It has not yet
+been run in the game.
 
 ### Finding 383 -- the rules real compilers need that Starfield never asked for
 

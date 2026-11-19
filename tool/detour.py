@@ -17589,6 +17589,7 @@ SABOTAGE = {
 	"tebconst": "the callback fills in every TEB scratch displacement",
 	"indexconst": "the index callback fills every placeholder in",
 	"backtarget": "a window widened backwards never buries a branch target",
+	"tebcall": "no call lies inside a TEB save bracket",
 }
 
 
@@ -17740,6 +17741,43 @@ def sabotage(patched, output, kind):
 				_v, _vs, raw, _rs = found
 				at = raw + len(PERMIL_POOL)
 				data[at:at + 5] = b"\xe8\x00\x00\x00\x00"
+	if kind == "tebcall":
+		# **The TEB check had never been seen to fail**, and could not
+		# until Finding 384 read the mnemonic field. Plant `call` over the
+		# first instruction after a TEB save: the bracket then holds a
+		# transfer whose callee could reenter the fixed save location.
+		# The call-count check also fires, being about every call in the
+		# section; the gate asks for this check's own message.
+		done = subprocess.run(["objdump", "-d", "-j",
+		                       SECTION_NAME.rstrip(b"\0").decode(), patched],
+		                      capture_output=True, text=True,
+		                      errors="replace")
+		rows = []
+		for line in done.stdout.splitlines():
+			field = line.split("\t")
+			if len(field) < 3 or not field[0].strip().endswith(":"):
+				continue
+			try:
+				rows.append((int(field[0].strip()[:-1], 16), field[2]))
+			except ValueError:
+				continue
+		spot = None
+		for (at, text), (after, _), (end, _) in zip(rows, rows[1:],
+		                                            rows[2:]):
+			if text.startswith("mov") and ",%gs:0x" in text \
+					and end - after >= 5:
+				spot = (after, end - after)
+				break
+		found = section_named(bytes(data), SECTION_NAME)
+		if spot is None or found is None:
+			print("detour.py: no TEB save bracket to plant a call in",
+			      file=sys.stderr)
+			return 2
+		vaddr, _vs, raw, _rs = found
+		pe = struct.unpack_from("<I", bytes(data), 0x3C)[0]
+		base = struct.unpack_from("<Q", bytes(data), pe + 24 + 24)[0]
+		at = raw + spot[0] - base - vaddr
+		data[at:at + spot[1]] = b"\xe8\0\0\0\0" + b"\x90" * (spot[1] - 5)
 	# **A sabotage that did not apply and a check that cannot fail are
 	# indistinguishable from the output**, which is `evidence.md`'s rule and
 	# was met here rather than quoted: `stubbad` was added to the dispatch
