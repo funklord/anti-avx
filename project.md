@@ -14179,6 +14179,55 @@ number that is easy to compute is not thereby the number the claim needs.
 **`make check` was green throughout.** Nothing in the suite exercises a borrowing run with a
 clashing passenger, which is why the fixture had to come from outside it.
 
+### Finding 386 -- an image with no TLS directory gets one of the rewrite's own
+
+**Every per-thread block stands on the index the loader writes for a TLS directory, and
+an image without one got no block at all.** NRD.dll, an MSVC DLL Starfield ships, has
+none: rewritten by default it kept 53 of its 440 VEX sites, 76 unit lowerings refused as
+"no per-thread block, so no permanent slots" and every one of its 66 256-bit sites
+outside the slot representation. Planned with a pretend block -- `tls_slot` answering
+for a directory that was not there, the image thrown away -- it kept 17. An MSVC image
+has a TLS directory only if something in it asked for thread-local storage, so this is
+the common case for a DLL rather than a corner of one.
+
+**So the rewrite adds one.** `tls_synthetic` is true of an image with no directory, and
+for it `stub_base_of` reserves a page ahead of the stub section -- the pool spill's
+precedent -- that `tls_page` fills: a directory with an empty template, the index the
+loader writes, a two-slot callback array, and the image's base relocations copied whole
+with one block more, DIR64 entries for the directory's four addresses and a sixth that
+is a no-op until `--index-const` installs its callback in the array, when it becomes the
+slot's DIR64. The page's length never depends on the callback, so the stub section's
+address is known before the callback is. `tls_slot` plans the block from the same page,
+so `apply`, `verify` and `census` agree by construction, and `apply` points the TLS and
+base relocation directories at it. `--tls-synth=off` is the A/B.
+
+**`verify` rebuilds the page from the original and compares it whole**, taking only the
+zero fill and the callback slot from the image -- the two values chosen later -- and
+checks the relocation directory names the table. The `tlspage` control moves the index
+address eight bytes and is refused through that check: `check-verify`'s sixteenth.
+
+**Under a loader, relocated.** NRD.dll rewritten this way verifies, keeps 17 VEX, and
+loads under wine with its preferred base reserved, so the loader has to move it: the
+loader wrote TLS index 1 into the page, and the callback, reached through the slot the
+added relocation moved, patched a stub's placeholder from `0x5a5a5a5a` to 8, index
+times eight. A thread created afterwards ran. That is wine's loader; Windows has
+honoured a static TLS directory in a dynamically loaded DLL since Vista, which is read
+rather than measured here.
+
+**Two gates had been passing on the absence**, and both were about something else. Most
+PE fixtures have no TLS directory, so they all gain a page now. `check-verify`'s
+`conservative` control relies on a site the walk cannot rule out; with a block that site
+takes a slot strategy, nothing is conservative, and the control passed verify for want
+of its subject. `check-run-borrow` relies on a run that must decline a borrow and leave
+the VEX to die on, 29; with a block it lowers and returns 77, the right answer. Both
+build with `--tls-synth=off` now, since their subject is the path without a block, and
+`check-run-borrow` asks the default build for the 77 as well -- real arithmetic through
+a TLS directory the rewrite added, run under wine.
+
+`check`, `check-shadow`, `check-shadow-pe`, `check-teb`, `check-teb-auto`,
+`check-gaprun`, `check-tls`, `check-shapes`, `check-functions`, `check-verify`,
+`check-pe`, `check-spill`, `check-unwind`, `check-run-borrow` and `check-mingw` pass.
+
 ### Finding 385 -- a slot is a packed operand once the rewrite declares the alignment
 
 **gcc's 256-bit FMA, rewritten by default, died with SIGILL under wine.** The loop's

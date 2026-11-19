@@ -183,6 +183,13 @@ check-fma: | $(BUILD_DIR)
 # refusal. Without it the program RUNS and computes 10 where the same
 # arithmetic in legacy SSE gives 77. A gate that could only tell "worked"
 # from "crashed" would have called the broken one healthier.
+#
+# **The fixture has no TLS directory, so that build asks for none.** Given
+# one, the site takes a per-thread slot instead of a borrow and computes
+# 77 -- right, and no longer the shape under test. So the borrow is built
+# with `--tls-synth=off`, and the default build is asked for the 77 as a
+# second, positive answer: real arithmetic through a TLS directory the
+# rewrite added. Finding 386.
 check-run-borrow: | $(BUILD_DIR)
 	@command -v wine >/dev/null 2>&1 || \
 		{ echo "check-run-borrow: wine is not installed"; exit 1; }
@@ -192,8 +199,8 @@ check-run-borrow: | $(BUILD_DIR)
 	objdump -d -j .text $(BUILD_DIR)/pe-runborrow.exe \
 		> $(BUILD_DIR)/pe-runborrow.asm; \
 	mkdir -p $(PE_PREFIX); \
-	$(PYTHON) tool/detour.py apply $(BUILD_DIR)/pe-runborrow.exe \
-		$(BUILD_DIR)/pe-runborrow.asm \
+	$(PYTHON) tool/detour.py --tls-synth=off apply \
+		$(BUILD_DIR)/pe-runborrow.exe $(BUILD_DIR)/pe-runborrow.asm \
 		$(BUILD_DIR)/sse-runborrow.exe > /dev/null; \
 	got=0; \
 	WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d \
@@ -210,7 +217,24 @@ check-run-borrow: | $(BUILD_DIR)
 	fi; \
 	echo "check-run-borrow: the run declines rather than borrowing a"; \
 	echo "                  register its passengers name -- 29, an honest"; \
-	echo "                  refusal, where the defect computed 10"
+	echo "                  refusal, where the defect computed 10"; \
+	$(PYTHON) tool/detour.py apply $(BUILD_DIR)/pe-runborrow.exe \
+		$(BUILD_DIR)/pe-runborrow.asm \
+		$(BUILD_DIR)/sse-runborrow-tls.exe > /dev/null; \
+	if ! objdump -h $(BUILD_DIR)/sse-runborrow-tls.exe | \
+			grep -q '\.avxtls'; then \
+		echo "check-run-borrow: the default build added no TLS page, so"; \
+		echo "                  its answer is not about one"; exit 1; \
+	fi; \
+	got=0; \
+	WINEPREFIX=$(PE_PREFIX) WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d \
+		wine $(BUILD_DIR)/sse-runborrow-tls.exe > /dev/null 2>&1 || got=$$?; \
+	if [ "$$got" != "77" ]; then \
+		echo "check-run-borrow: with a TLS page of its own the site"; \
+		echo "                  returned $$got, want 77"; exit 1; \
+	fi; \
+	echo "check-run-borrow: and through a TLS directory the rewrite"; \
+	echo "                  added, the site lowers and computes 77"
 
 # The uniform shadow representation: every ymm has a PERMANENT slot, so a
 # 256-bit operation needs no proof of where its operands came from. This
@@ -1217,13 +1241,17 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 # VEX form at the price of the site (Finding 198). No corrupted image can
 # express "a repair that did not happen", so this needs a code control, and
 # the `conservative` fixture is the only input that produces one. Both
-# halves ask for the repair, which the default leaves off since Finding 340.
+# halves ask for the repair, which the default leaves off since Finding 340,
+# and neither gives the fixture a TLS directory: with a per-thread block
+# its site takes a slot strategy and no candidate is conservative, so the
+# control would pass verify for want of its subject. Finding 386.
 	@set -e; \
 	ANTI_AVX_SABOTAGE=conservative $(PYTHON) tool/detour.py \
-		--stale-repair=on apply \
+		--stale-repair=on --tls-synth=off apply \
 		$(BUILD_DIR)/pe-conservative.exe $(BUILD_DIR)/pe-conservative.asm \
 		$(BUILD_DIR)/bad-conservative.exe > /dev/null; \
-	if timeout 300 $(PYTHON) tool/detour.py --stale-repair=on verify \
+	if timeout 300 $(PYTHON) tool/detour.py --stale-repair=on \
+		--tls-synth=off verify \
 		$(BUILD_DIR)/pe-conservative.exe $(BUILD_DIR)/bad-conservative.exe \
 		$(BUILD_DIR)/pe-conservative.asm \
 		> $(BUILD_DIR)/verify-bad-conservative.log 2>&1; then \
@@ -1337,7 +1365,26 @@ check-verify: $(PE_FIXED) $(PE_SOURCES) $(PE_LISTINGS)
 		$(BUILD_DIR)/verify-bad-tebcall.log || \
 		{ echo "check-verify: the tebcall control failed, but not"; \
 		  echo "              through the TEB bracket check"; exit 1; }
-	@echo "check-verify: all fifteen controls rejected, each by its own check"
+# A TLS directory the rewrite added is rebuilt from the original and
+# compared whole; moving the index it names must be refused through that
+# comparison. `ymm` has no directory of its own, so its build has one.
+# Finding 386.
+	@set -e; \
+	$(PYTHON) tool/detour.py sabotage $(BUILD_DIR)/sse-ymm.exe \
+		$(BUILD_DIR)/bad-tlspage.exe tlspage; \
+	if timeout 300 $(PYTHON) tool/detour.py verify \
+		$(BUILD_DIR)/pe-ymm.exe $(BUILD_DIR)/bad-tlspage.exe \
+		$(BUILD_DIR)/pe-ymm.asm \
+		> $(BUILD_DIR)/verify-bad-tlspage.log 2>&1; then \
+		echo "check-verify: the tlspage control PASSED verify, so"; \
+		echo "              nothing reads the TLS page the rewrite adds"; \
+		exit 1; \
+	fi; \
+	grep -q "the image gained a TLS directory, and its bytes" \
+		$(BUILD_DIR)/verify-bad-tlspage.log || \
+		{ echo "check-verify: the tlspage control failed, but not"; \
+		  echo "              through the TLS page check"; exit 1; }
+	@echo "check-verify: all sixteen controls rejected, each by its own check"
 
 # Build AVX PEs, rewrite them, and run both halves under wine. The originals
 # must fail -- this CPU has no AVX -- and each rewritten one must return its
@@ -2002,6 +2049,8 @@ clean:
 	      $(BUILD_DIR)/verify-bad-stubgap.log \
 	      $(BUILD_DIR)/verify-bad-stubcall.log \
 	      $(BUILD_DIR)/bad-tebcall.exe $(BUILD_DIR)/verify-bad-tebcall.log \
+	      $(BUILD_DIR)/sse-runborrow.exe $(BUILD_DIR)/sse-runborrow-tls.exe \
+	      $(BUILD_DIR)/bad-tlspage.exe $(BUILD_DIR)/verify-bad-tlspage.log \
 	      $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)
 	@echo "clean: removed $(LISTING) $(REPORT) $(PATCHED) $(DETOURED) $(BUILD_DIR)/icache_bench $(OBJS) $(TEST_OBJS) $(TEST_BINS) $(DEPS)"
 	@# The wine prefix is a directory this build created, so it goes

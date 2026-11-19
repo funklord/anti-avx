@@ -43,9 +43,12 @@ Two details are easy to get wrong and both are fatal.
   verify  <original> <patched>          the invariants
   census  <binary> <listing> <patched>  what survives, and why
 
-  --fma=exact   round a scalar single-precision FMA once, as the hardware
-                does, through a helper call; the default, --fma=fast, is
-                a multiply and an add, which round twice
+  --fma=exact   round a single-precision FMA once, as the hardware does,
+                through a helper call per element; the default,
+                --fma=fast, is a multiply and an add, which round twice
+  --tls-synth=off
+                give an image with no TLS directory none; by default the
+                rewrite adds one, so its stubs have a per-thread block
 """
 
 import bisect
@@ -1367,6 +1370,7 @@ def run_configuration():
 	        f" align-guard={'on' if inplace.ALIGN_GUARD else 'off'}"
 	        f" spill={SPILL}"
 	        f" fma={'exact' if FMA_EXACT else 'fast'}"
+	        f" tls-synth={'on' if TLS_SYNTH else 'off'}"
 	        f" tool={tool_fingerprint()}")
 
 
@@ -14747,9 +14751,15 @@ def tls_slot(data, want=SLOT):
 	the field to prove the answer depends on its value rather than on the
 	template being copied. Nothing here is remembered from a manual.
 	"""
+	global TLS_BLOCK_ALIGNMENT
 	found = tls_directory(data)
 	if found is None:
-		return None
+		if not tls_synthetic(data):
+			return None
+		# The page `tls_page` lays down: an empty template, so the slot
+		# is the block's first byte.
+		TLS_BLOCK_ALIGNMENT = SLOT
+		return sections_end_of(data) + TLS_INDEX_AT, 0, want
 	_offset, fields = found
 	start, end, index_va, _callbacks, zero_fill, characteristics = fields
 	if not index_va or end < start:
@@ -14763,7 +14773,6 @@ def tls_slot(data, want=SLOT):
 	alignment = max(tls_alignment(characteristics), SLOT)
 	# Recorded for `slot_arithmetic_safe`, because this is the only place the
 	# field is read and an emitter cannot see the image.
-	global TLS_BLOCK_ALIGNMENT
 	TLS_BLOCK_ALIGNMENT = alignment
 	template = end - start
 	slot = (template + alignment - 1) // alignment * alignment
@@ -14789,6 +14798,96 @@ def raise_tls_block(data, zero_fill):
 		struct.pack_into("<I", image, offset + 36,
 		                 (fields[5] & ~0x00F00000) | TLS_ALIGN_SLOT)
 	return bytes(image)
+
+
+# **A TLS directory of the rewrite's own, where the image has none.** Every
+# per-thread block stands on the index the loader writes for a TLS
+# directory, so an image without one -- an MSVC DLL that declares no
+# `thread_local`, NRD.dll among Starfield's -- got no block and refused every
+# lowering that wants one: 53 of NRD's 440 sites stayed VEX, and 17 with a
+# block. So the rewrite lays down one writable page ahead of the stub
+# section, as the pool spill does, holding a directory with an empty
+# template, the index the loader fills in, a callback array, and -- for an
+# image the loader may move -- the image's base relocations copied whole
+# with one block more for the four addresses the directory holds.
+# `--tls-synth=off` is the A/B. Finding 386.
+TLS_SYNTH = True
+TLS_NAME = b".avxtls\0"
+TLS_SECTION_FLAGS = 0xC0000040			# initialised data, read, write
+TLS_INDEX_AT, TLS_CALLBACKS_AT, TLS_RELOCS_AT = 0x28, 0x30, 0x40
+IMAGE_REL_BASED_DIR64 = 10
+BASERELOC_DIRECTORY = 5
+
+
+def tls_synthetic(data):
+	"""True if this rewrite gives the image a TLS directory of its own."""
+	return TLS_SYNTH and tls_directory(data) is None
+
+
+def base_relocations(data):
+	"""The image's base relocation table, as bytes, or None if it has none."""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	opt = pe + 24
+	if struct.unpack_from("<I", data, opt + 108)[0] <= BASERELOC_DIRECTORY:
+		return None
+	rva, size = struct.unpack_from("<II", data,
+	                               opt + 112 + BASERELOC_DIRECTORY * 8)
+	if not rva or not size:
+		return None
+	at = rva_to_offset(data, rva)
+	if at is None:
+		raise SystemExit("the base relocation table is in no section")
+	return bytes(data[at:at + size])
+
+
+def tls_page(data, callback=0):
+	"""`(bytes, relocation table size)` of the page `tls_synthetic` adds.
+
+	Laid out at the RVA past every section of `data`, which is where
+	`stub_base_of` reserves it. The template is empty, so the block the
+	loader gives each thread is `SizeOfZeroFill` bytes of zeroes, and
+	`raise_tls_block` sizes it later exactly as it would an image's own.
+	Its length does not depend on `callback`: the callback slot's
+	relocation is a no-op entry until something is installed there, so
+	the stub section's address is fixed before the callback is known.
+	"""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	base = struct.unpack_from("<Q", data, pe + 24 + 24)[0]
+	page = sections_end_of(data) - base
+	va = base + page
+	out = bytearray(struct.pack(TLS_FIELDS, va + TLS_RELOCS_AT,
+	                            va + TLS_RELOCS_AT, va + TLS_INDEX_AT,
+	                            va + TLS_CALLBACKS_AT, 0, TLS_ALIGN_SLOT))
+	out += bytes(TLS_INDEX_AT + 8 - len(out))
+	out += struct.pack("<QQ", callback, 0)
+	assert len(out) == TLS_RELOCS_AT, "the TLS page's layout moved"
+	old = base_relocations(data)
+	if old is None:
+		return bytes(out), 0
+	entries = [(IMAGE_REL_BASED_DIR64 << 12) | at for at in (0, 8, 16, 24)]
+	entries.append((IMAGE_REL_BASED_DIR64 << 12) | TLS_CALLBACKS_AT
+	               if callback else 0)
+	entries.append(0)				# IMAGE_REL_BASED_ABSOLUTE: pad
+	block = struct.pack("<II", page, 8 + 2 * len(entries))
+	block += b"".join(struct.pack("<H", e) for e in entries)
+	out += old + block
+	return bytes(out), len(old) + len(block)
+
+
+def tls_page_relocated(data):
+	"""Offset past the TLS page's own relocation block, or 0 if it has none.
+
+	Read from the image's base relocation directory, which `apply` points
+	into the page: the block this rewrite added is the last one in it.
+	"""
+	pe = struct.unpack_from("<I", data, 0x3C)[0]
+	opt = pe + 24
+	rva, size = struct.unpack_from("<II", data,
+	                               opt + 112 + BASERELOC_DIRECTORY * 8)
+	tls_rva = struct.unpack_from("<I", data, opt + 112 + TLS_DIRECTORY * 8)[0]
+	if not size or rva != tls_rva + TLS_RELOCS_AT:
+		return 0
+	return TLS_RELOCS_AT + size
 
 
 def set_tls_zero_fill(data, zero_fill):
@@ -17478,7 +17577,7 @@ def main(argv):
 	global SPILL, RSP_RULE, SHADOW_RULE, REGION_RULE, ESCAPE_RULE
 	global REGION_PLACE, FALLBACK_RULE, SHADOW_REGS_RULE, TEB_SCRATCH
 	global INDEX_CONST, WRITER_CLEARS, HAMMOCK_RULE, SWITCH_GUARD
-	global LEAF_ENTRIES, STALE_REPAIR, FMA_EXACT
+	global LEAF_ENTRIES, STALE_REPAIR, FMA_EXACT, TLS_SYNTH
 	argv = list(argv)
 	for i, item in enumerate(argv):
 		if item.startswith("--fma="):
@@ -17576,6 +17675,16 @@ def main(argv):
 				      f"not {want!r}", file=sys.stderr)
 				return 2
 			WRITER_CLEARS = want == "on"
+			del argv[i]
+			break
+	for i, item in enumerate(argv):
+		if item.startswith("--tls-synth="):
+			want = item.split("=", 1)[1]
+			if want not in ("on", "off"):
+				print(f"detour.py: --tls-synth wants on or off, "
+				      f"not {want!r}", file=sys.stderr)
+				return 2
+			TLS_SYNTH = want == "on"
 			del argv[i]
 			break
 	for i, item in enumerate(argv):
@@ -17805,6 +17914,7 @@ SABOTAGE = {
 	"backtarget": "a window widened backwards never buries a branch target",
 	"tebcall": "no call lies inside a TEB save bracket",
 	"tlsalign": "the TLS directory changes only as sanctioned",
+	"tlspage": "a TLS directory the rewrite added is the page it builds",
 }
 
 
@@ -17968,6 +18078,20 @@ def sabotage(patched, output, kind):
 		offset, fields = found
 		struct.pack_into("<I", data, offset + 36,
 		                 (fields[5] & ~0x00F00000) | 0x00600000)
+	if kind == "tlspage":
+		# **The index the loader writes, moved eight bytes.** The page is
+		# rebuilt from the original by `verify` and compared whole, so any
+		# field will do; this one is the address every block stands on.
+		pe = struct.unpack_from("<I", bytes(data), 0x3C)[0]
+		rva = struct.unpack_from("<I", bytes(data),
+		                         pe + 24 + 112 + TLS_DIRECTORY * 8)[0]
+		at = rva_to_offset(bytes(data), rva) if rva else None
+		if at is None or section_named(bytes(data), TLS_NAME) is None:
+			print("detour.py: no TLS page of the rewrite's to sabotage",
+			      file=sys.stderr)
+			return 2
+		index = struct.unpack_from("<Q", bytes(data), at + 16)[0]
+		struct.pack_into("<Q", data, at + 16, index + 8)
 	if kind == "tebcall":
 		# **The TEB check had never been seen to fail**, and could not
 		# until Finding 384 read the mnemonic field. Plant `call` over the
@@ -19167,7 +19291,19 @@ def report_placement(candidates, placed, overlapped, refused):
 
 
 def stub_base_of(data):
-	"""Where the stub section will start: past every section, page aligned."""
+	"""Where the stub section will start: past every section, page aligned,
+	and past the TLS page when the rewrite adds one."""
+	base = sections_end_of(data)
+	if tls_synthetic(data):
+		alignment = struct.unpack_from(
+			"<I", data, struct.unpack_from("<I", data, 0x3C)[0] + 24 + 32)[0]
+		size = len(tls_page(data)[0])
+		base += (size + alignment - 1) // alignment * alignment
+	return base
+
+
+def sections_end_of(data):
+	"""The address past every section, rounded to the section alignment."""
 	pe = struct.unpack_from("<I", data, 0x3C)[0]
 	opt = pe + 24
 	alignment = struct.unpack_from("<I", data, opt + 32)[0]
@@ -20032,6 +20168,26 @@ def apply_all(binary, listing, output):
 	staged = bytes(data)
 	pe = struct.unpack_from("<I", staged, 0x3C)[0]
 	image_base = struct.unpack_from("<Q", staged, pe + 24 + 24)[0]
+	# **The TLS page first**, where `stub_base_of` reserved it, and the two
+	# data directories pointed at it. Finding 386.
+	tls_page_rva = None
+	if tls_synthetic(staged):
+		page, relocations = tls_page(staged)
+		staged, tls_page_rva = add_section(staged, TLS_NAME, page,
+		                                   TLS_SECTION_FLAGS)
+		staged = bytearray(staged)
+		directories = pe + 24 + 112
+		struct.pack_into("<II", staged, directories + TLS_DIRECTORY * 8,
+		                 tls_page_rva, struct.calcsize(TLS_FIELDS))
+		if relocations:
+			struct.pack_into("<II", staged,
+			                 directories + BASERELOC_DIRECTORY * 8,
+			                 tls_page_rva + TLS_RELOCS_AT, relocations)
+		staged = bytes(staged)
+		print(f"apply: the image has no TLS directory, so it gets one: "
+		      f"{TLS_NAME.decode().rstrip(chr(0))} at "
+		      f"0x{image_base + tls_page_rva:x}"
+		      f"{f', relocations rebuilt there' if relocations else ''}")
 	if SPILL == SPILL_POOL:
 		staged, data_va = add_section(staged, DATA_NAME, bytes(16), DATA_FLAGS)
 		assert data_va == spill_base - image_base, "spill section moved"
@@ -20120,6 +20276,14 @@ def apply_all(binary, listing, output):
 		                          struct.unpack_from("<I", bytes(image),
 		                                             0x3C)[0] + 24 + 24)[0]
 		struct.pack_into("<Q", image, slot, base + index_va + code_off)
+		if tls_page_rva is not None and tls_page_relocated(bytes(image)):
+			# The slot now holds an address, so the loader has to move it
+			# with the image: the no-op entry `tls_page` reserved becomes
+			# the slot's DIR64. Finding 386.
+			at = rva_to_offset(bytes(image), tls_page_rva) \
+				+ tls_page_relocated(bytes(image)) - 4
+			struct.pack_into("<H", image, at, (IMAGE_REL_BASED_DIR64 << 12)
+			                 | TLS_CALLBACKS_AT)
 		image = bytes(image)
 		INDEX_CONST_CALLBACK = True
 		print(f"apply: index section {INDEX_NAME.decode().rstrip(chr(0))} "
@@ -20621,6 +20785,45 @@ def verify(original, patched, listing=None):
 			print(f"verify: every section after .text is byte-identical "
 			      f"except {' and '.join(allowed)}")
 
+	# **A TLS directory this rewrite added holds what `tls_page` says**,
+	# rebuilt here from the original and compared whole, the way the field
+	# above is: the zero fill is the one value `raise_tls_block` chooses and
+	# the callback slot the one `--index-const` fills, so both are taken
+	# from the image and everything else -- four addresses, the index, the
+	# copied relocations and the block for this page -- must be equal.
+	# Finding 386.
+	pe_b = struct.unpack_from("<I", bytes(b), 0x3C)[0]
+	tls_b = struct.unpack_from("<II", bytes(b),
+	                           pe_b + 24 + 112 + TLS_DIRECTORY * 8)
+	if tls_directory(bytes(a)) is None and tls_b[0]:
+		base_a = struct.unpack_from("<Q", bytes(a), pe_b + 24 + 24)[0]
+		at = rva_to_offset(bytes(b), tls_b[0])
+		why = None
+		if not tls_synthetic(bytes(a)):
+			why = "--tls-synth is off"
+		elif tls_b[0] != sections_end_of(bytes(a)) - base_a or at is None:
+			why = "it is not where the page was reserved"
+		else:
+			callback = struct.unpack_from("<Q", bytes(b),
+			                              at + TLS_CALLBACKS_AT)[0]
+			want, relocations = tls_page(bytes(a), callback)
+			want = bytearray(want)
+			want[32:36] = b[at + 32:at + 36]
+			reloc_b = struct.unpack_from(
+				"<II", bytes(b), pe_b + 24 + 112 + BASERELOC_DIRECTORY * 8)
+			if bytes(b[at:at + len(want)]) != bytes(want):
+				why = "its bytes are not the page this rewrite builds"
+			elif relocations and reloc_b != (tls_b[0] + TLS_RELOCS_AT,
+			                                 relocations):
+				why = "the relocation directory does not name its table"
+		if why:
+			print(f"verify: FAILED -- the image gained a TLS directory, "
+			      f"and {why}", file=sys.stderr)
+			problems += 1
+		else:
+			print(f"verify: the TLS directory this rewrite added at "
+			      f"0x{base_a + tls_b[0]:x} is the page it builds"
+			      f"{', relocations included' if relocations else ''}")
 	# **The feature tests, which decide what the CPU is asked to run.** 179
 	# EVEX instructions in this image are unreachable only because a runtime
 	# CPUID/XGETBV test says so, and nothing checked that the rewrite left
