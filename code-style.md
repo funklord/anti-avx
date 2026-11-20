@@ -100,8 +100,10 @@ width -- and in Python it is a syntax error.
 
 Divergence needs a technical reason. These are accepted:
 
-- **Makefile recipe lines** -- `make` requires a literal tab. Compliant by
-  construction.
+- **Makefiles** -- a recipe line requires a literal tab, and the body of an
+  `ifeq`/`ifdef` outside a recipe may be space-indented, since after a rule
+  a tab-led line is read as a recipe. Both are correct in one file, so the
+  gate does not apply the tab rule to Makefiles.
 - **YAML** -- the spec forbids tabs for indentation. Use spaces.
 - **Markdown** -- list continuation and code fences are space-indented by
   specification. Exempt.
