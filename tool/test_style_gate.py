@@ -2076,3 +2076,172 @@ class DocsPathsAreAskedOfTheIndex(unittest.TestCase):
 
 if __name__ == "__main__":
 	unittest.main(verbosity=1)
+
+
+DOC = "project.md"
+# Concatenated: a literal citation in this file would be one in every tree
+# the suite is spread into.
+CITE = DOC + "#"
+
+
+class DecisionsAndCitations(unittest.TestCase):
+	"""A `project.md` that contradicts itself, and a citation that dangles.
+
+	Signalled from raidcfgd 2026-11-17. A /go run read a section saying a
+	question was open and parked the area; the holder had settled it three
+	days earlier, further down the same file. The same session renamed a
+	heading and left `daemon/write.h` citing the old name. Both are shapes
+	a tool can see, and these are the controls that it does.
+	"""
+
+	ENV = DocsPathsAreAskedOfTheIndex.ENV
+
+	def gate(self, root: Path, *args: str) -> tuple[int, str]:
+		gate = Path(__file__).resolve().parent / "style_gate.py"
+		r = subprocess.run([sys.executable, str(gate), *args], cwd=root,
+		                   capture_output=True, text=True, timeout=120)
+		return r.returncode, r.stdout + r.stderr
+
+	def tree(self, files: dict[str, str], *args: str,
+	         git: bool = True) -> tuple[int, str]:
+		with tempfile.TemporaryDirectory() as d:
+			root = Path(d)
+			for name, text in files.items():
+				(root / name).parent.mkdir(parents=True, exist_ok=True)
+				(root / name).write_text(text, encoding="utf-8")
+			if git:
+				for cmd in (["init", "-q"], ["add", "-A"]):
+					subprocess.run(["git", "-C", str(root), *cmd],
+					               env=self.ENV, capture_output=True,
+					               timeout=120, check=True)
+			return self.gate(root, *(args or ("docs",)))
+
+	def decision(self, title: str, status: str, key: str,
+	             anchor: str = "") -> str:
+		tag = f" {{#{anchor}}}" if anchor else ""
+		return (f"## {title}{tag}\n\nStatus:  {status}\nDecides: {key}\n\n"
+		        f"The answer to {title}. More prose.\n\n")
+
+	def test_open_beside_settled_is_refused(self) -> None:
+		"""The raidcfgd case itself."""
+		doc = (self.decision("The open question", "open", "exec-route")
+		       + self.decision("Settled", "settled 2026-11-10", "exec-route"))
+		rc, out = self.tree({DOC: doc})
+		self.assertEqual(rc, 1, out)
+		self.assertIn("`exec-route` is open here and settled", out)
+
+	def test_two_settled_are_refused(self) -> None:
+		doc = (self.decision("First", "settled 2026-11-01", "k")
+		       + self.decision("Second", "settled 2026-11-10", "k"))
+		rc, out = self.tree({DOC: doc})
+		self.assertEqual(rc, 1, out)
+		self.assertIn("mark one superseded", out)
+
+	def test_superseded_resolves_it(self) -> None:
+		"""The control on the two above: the way out they name works."""
+		doc = (self.decision("First", "superseded by #second", "k")
+		       + self.decision("Second", "settled 2026-11-10", "k"))
+		rc, out = self.tree({DOC: doc})
+		self.assertEqual(rc, 0, out)
+		self.assertIn("2 decision(s)", out)
+
+	def test_settled_needs_a_date_and_status_a_known_word(self) -> None:
+		rc, out = self.tree({DOC: self.decision("A", "settled", "k")
+		                     + self.decision("B", "decided", "j")})
+		self.assertEqual(rc, 1, out)
+		self.assertIn("settled with no date", out)
+		self.assertIn("not 'decided'", out)
+
+	def test_a_document_without_the_shapes_is_untouched(self) -> None:
+		"""Opt-in: fmake carries a top-level `Status:` line with no
+		`Decides:`, and nothing in any tree used these shapes when they
+		arrived (measured 2026-11-20, 23 trees)."""
+		rc, out = self.tree({DOC: "# fmake\n\nStatus: phases 1-6 done\n"})
+		self.assertEqual(rc, 0, out)
+		self.assertIn("0 decision(s)", out)
+
+	def test_a_dangling_citation_is_refused(self) -> None:
+		"""The renamed heading: the source still cites the old anchor."""
+		rc, out = self.tree({
+			DOC: "# Doc\n\n## Write path {#write-path}\n\nprose\n",
+			"src/write.h": f"/* see {CITE}old-name */\n"})
+		self.assertEqual(rc, 1, out)
+		self.assertIn("src/write.h:1:1: cites", out)
+		self.assertIn("old-name", out)
+
+	def test_a_resolving_citation_passes_and_is_counted(self) -> None:
+		"""Explicit anchors and GitHub's own slugs both resolve, and a
+		path from the root or from the citing file's directory both
+		name the document."""
+		rc, out = self.tree({
+			DOC: "# Doc\n\n## Write path {#write-path}\n\n"
+			     "## The `make` targets\n\nprose\n",
+			"src/a.h": f"/* {CITE}write-path */\n",
+			"src/b.h": f"/* ../{CITE}the-make-targets */\n",
+			"c.py": f"# {CITE}write-path\n"})
+		self.assertEqual(rc, 0, out)
+		self.assertIn("3 citation(s)", out)
+
+	def test_another_documents_fragment_is_not_ours(self) -> None:
+		rc, out = self.tree({DOC: "# Doc\n",
+		                     "a.md": "see doc/other-" + CITE + "x and "
+		                             "sub/" + CITE + "y\n"})
+		self.assertEqual(rc, 0, out)
+		self.assertIn("0 citation(s)", out)
+
+	def test_an_internal_link_must_resolve(self) -> None:
+		rc, out = self.tree({DOC: "# Doc\n\n## Real\n\nsee [x](#real) "
+		                          "and [y](#gone)\n"})
+		self.assertEqual(rc, 1, out)
+		self.assertIn("links to #gone", out)
+		self.assertNotIn("#real,", out)
+
+	def test_a_repeated_anchor_is_refused(self) -> None:
+		rc, out = self.tree({DOC: "# A {#x}\n\n# B {#x}\n"})
+		self.assertEqual(rc, 1, out)
+		self.assertIn("anchor #x repeats line 1", out)
+
+	def test_without_git_citations_say_so(self) -> None:
+		rc, out = self.tree({DOC: "# Doc\n"}, git=False)
+		self.assertEqual(rc, 0, out)
+		self.assertIn("citations not checked, no git here", out)
+
+	def test_index_lists_decisions_with_their_lead(self) -> None:
+		doc = (self.decision("Exec route", "settled 2026-11-10", "exec",
+		                     anchor="exec")
+		       + self.decision("Pin format", "open", "pins")
+		       + "## Narrative\n\nnothing decided\n")
+		rc, out = self.tree({DOC: doc}, "index")
+		self.assertEqual(rc, 0, out)
+		self.assertIn("settled\t2026-11-10\texec\t#exec\tExec route", out)
+		self.assertIn("The answer to Exec route.", out)
+		self.assertIn("2 of 2 decision-bearing", out)
+		self.assertNotIn("Narrative", out.split("\n\n")[0])
+		rc, out = self.tree({DOC: doc}, "index", "open")
+		self.assertIn("pins", out)
+		self.assertNotIn("\texec\t", out)
+		rc, out = self.tree({DOC: doc}, "index", "nosuchkey")
+		self.assertEqual(rc, 1, out)
+		self.assertIn("0 of 2", out)
+
+	def test_cites_finds_the_citing_lines(self) -> None:
+		files = {DOC: "# Doc\n\n## W {#w}\n",
+		         "a.c": f"x\n/* {CITE}w */\n", "b.c": f"/* {CITE}v */\n"}
+		rc, out = self.tree(files, "cites", "w")
+		self.assertEqual(rc, 0, out)
+		self.assertIn("a.c:2", out)
+		self.assertNotIn("b.c", out)
+		self.assertIn("1 of 2 citation(s)", out)
+
+
+class GateCarriesNoCitation(unittest.TestCase):
+	"""The gate and this suite travel into every tree, so a literal
+	citation in either would be a citation of that tree's document --
+	the first draft's usage text had one and turned this tree red."""
+
+	def test_no_literal_citation_in_the_spread_files(self) -> None:
+		here = Path(__file__).resolve().parent
+		for name in ("style_gate.py", "test_style_gate.py"):
+			text = (here / name).read_text(encoding="utf-8")
+			self.assertNotRegex(text, r"project\.md#[A-Za-z0-9_-]",
+			                    name)

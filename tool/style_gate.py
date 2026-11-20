@@ -39,6 +39,9 @@ Usage:
     style_gate.py fix   [--root DIR] PATH...
     style_gate.py list  [--root DIR]      # what would be checked, and why
     style_gate.py docs  [--root DIR]      # hold project.md to the tree
+    style_gate.py index [--root DIR] [open|settled|superseded|KEY]
+                                          # its decision-bearing sections
+    style_gate.py cites [--root DIR] ID   # where the document's #ID is cited
 
 Configuration is `.style-gate.toml` at the project root; every key is
 optional. See DEFAULTS below for the meaning and the shipped values.
@@ -2152,6 +2155,10 @@ def check_docs(root: Path, cfg: Config,
 					numbers[key] = number
 
 	counts["headings"] = len(seen)
+	sections = doc_sections(text)
+	problems += decision_problems(sections, rel)
+	counts["decisions"] = sum(1 for s in sections if s.decides)
+	problems += citation_problems(root, name, text, sections, counts)
 	if not cfg["doc_check_paths"]:
 		return problems
 
@@ -2199,6 +2206,270 @@ def check_docs(root: Path, cfg: Config,
 		        else "names a file git does not track")
 		problems.append(Problem(rel, number, 1, f"{note}: {token}"))
 	return problems
+
+
+# ------------------------------------------------- decisions and anchors
+#
+# A `project.md` larger than a context window cannot be authoritative,
+# because nobody can read it. Signalled from raidcfgd 2026-11-17: a /go
+# run read a section saying a question was open, parked the whole area,
+# and the holder had settled it three days earlier in a section further
+# down the same file. The same session renamed a heading and broke a
+# source comment citing it by name. Both are things a tool can see, and
+# nothing was looking.
+#
+# So three opt-in shapes, each silent in a document that does not use it:
+#
+#   ### Nothing can send either write verb {#write-exec-route}
+#
+#   Status:  settled 2026-11-10
+#   Decides: write-exec-route
+#
+# `{#id}` is pandoc's and kramdown's heading-id syntax, chosen over a
+# bracketed `[W7]` because `x[N2]` is ordinary code and a citation gate
+# must not read array subscripts. A citation is the document's name, a
+# `#` and the id -- a URL fragment, which nothing else in a source tree
+# spells. (Not written out here: this file is spread into every tree,
+# and a literal one in it would be a citation in each.) GitHub's own
+# heading slugs resolve too, so a link that works in a browser passes.
+#
+# A section is DECISION-BEARING when its header block carries `Decides:`,
+# and only those are checked -- absent is not drift, mismatched is.
+
+ANCHOR_RE = re.compile(r"\s*\{#([A-Za-z0-9_-]+)\}\s*$")
+HEADER_RE = re.compile(r"^(Status|Decides):\s*(.*?)\s*$")
+STATUS_WORDS = ("open", "settled", "superseded")
+DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+
+
+@dataclass
+class Section:
+	line: int
+	level: int
+	title: str
+	anchor: str          # the explicit {#id}, or ""
+	slug: str            # GitHub's slug of the title
+	status: str = ""     # first word of Status:, or ""
+	date: str = ""
+	decides: str = ""
+	header_at: int = 0   # line of the Decides: field
+	lead: str = ""       # the first sentence of the section's prose
+
+
+def github_slug(title: str) -> str:
+	"""The anchor GitHub gives a heading: lowercased, punctuation dropped,
+	spaces to hyphens. Backticks and asterisks are punctuation, so the
+	slug of `` `make` targets `` is `make-targets`."""
+	slug = re.sub(r"[^\w\- ]", "", title.strip().lower())
+	return slug.replace(" ", "-")
+
+
+def first_sentence(paragraph: str) -> str:
+	text = " ".join(paragraph.split())
+	match = re.search(r"(?<=[.!?])\**\s", text)
+	lead = text[:match.start()].rstrip() if match else text
+	return lead if len(lead) <= 200 else lead[:197] + "..."
+
+
+def doc_sections(text: str) -> list[Section]:
+	"""Every heading with its anchors, its header block and its lead.
+
+	The header block is the run of `Status:` and `Decides:` lines that
+	follows the heading, blank lines allowed before it. The lead is the
+	first sentence of the first paragraph after that -- extracted, never
+	written separately, which is what lets an index of them be trusted:
+	a summary somebody wrote apart from the section is a second set of
+	claims that can be wrong where no gate looks.
+	"""
+	sections: list[Section] = []
+	slugs: dict[str, int] = {}
+	lines = dict(outside_fences(text))
+	numbers = sorted(lines)
+	for pos, number in enumerate(numbers):
+		line = lines[number]
+		if not line.startswith("#"):
+			continue
+		level = len(line) - len(line.lstrip("#"))
+		if level > 6 or line[level:level + 1] not in (" ", ""):
+			continue
+		title = line[level:].strip()
+		anchor = ""
+		match = ANCHOR_RE.search(title)
+		if match:
+			anchor = match.group(1)
+			title = title[:match.start()].rstrip()
+		base = github_slug(title)
+		seen = slugs.get(base, 0)
+		slugs[base] = seen + 1
+		section = Section(number, level, title, anchor,
+		                  base if not seen else f"{base}-{seen}")
+		paragraph: list[str] = []
+		in_header = True
+		for later in numbers[pos + 1:]:
+			body = lines[later]
+			if body.startswith("#") and body.lstrip("#")[:1] in (" ", ""):
+				break
+			field = HEADER_RE.match(body) if in_header else None
+			if field:
+				key, value = field.groups()
+				if key == "Status":
+					section.status = (value.split() or [""])[0].lower()
+					date = DATE_RE.search(value)
+					section.date = date.group(1) if date else ""
+				else:
+					section.decides = value
+					section.header_at = later
+				continue
+			if not body.strip():
+				if paragraph:
+					break
+				continue
+			in_header = False
+			paragraph.append(body.strip().lstrip("-* ").strip())
+		section.lead = first_sentence(" ".join(paragraph))
+		sections.append(section)
+	return sections
+
+
+def decision_problems(sections: list[Section], rel: Path) -> list[Problem]:
+	"""Refuse a document that contradicts itself about a decision.
+
+	The raidcfgd case exactly: one section says a question is open and
+	another says it is settled, or two say settled with nothing marking
+	either superseded. A reader finds whichever one comes first.
+	"""
+	problems: list[Problem] = []
+	anchors: dict[str, int] = {}
+	by_key: dict[str, list[Section]] = {}
+	for s in sections:
+		if s.anchor:
+			if s.anchor in anchors:
+				problems.append(Problem(rel, s.line, 1,
+					f"anchor #{s.anchor} repeats line {anchors[s.anchor]}"))
+			else:
+				anchors[s.anchor] = s.line
+		if not s.decides:
+			continue
+		if s.status not in STATUS_WORDS:
+			problems.append(Problem(rel, s.header_at, 1,
+				f"Decides: {s.decides} needs a Status: of "
+				f"{', '.join(STATUS_WORDS)}"
+				+ (f", not {s.status!r}" if s.status else "")))
+			continue
+		if s.status == "settled" and not s.date:
+			problems.append(Problem(rel, s.header_at, 1,
+				f"Decides: {s.decides} is settled with no date; "
+				f"write `Status: settled YYYY-MM-DD`"))
+		by_key.setdefault(s.decides, []).append(s)
+	for key, group in by_key.items():
+		live = [s for s in group if s.status != "superseded"]
+		settled = [s for s in live if s.status == "settled"]
+		opened = [s for s in live if s.status == "open"]
+		if len(settled) > 1:
+			for s in settled[1:]:
+				problems.append(Problem(rel, s.line, 1,
+					f"`{key}` is settled here and at line "
+					f"{settled[0].line}; mark one superseded"))
+		if settled and opened:
+			for s in opened:
+				problems.append(Problem(rel, s.line, 1,
+					f"`{key}` is open here and settled at line "
+					f"{settled[0].line}; close this one or supersede "
+					f"that"))
+	return problems
+
+
+CITE_RE = r"[A-Za-z0-9_./-]*{doc}#([A-Za-z0-9_-]+)"
+
+
+def doc_citations(root: Path, name: str) -> list[tuple[str, int, str]] | None:
+	"""(file, line, id) for every `<doc>#id` in the tracked text files.
+
+	Asked of `git grep`, which reads the index's list and skips binaries,
+	so a build product or a vendored submodule's contents are never read.
+	None when there is no git to ask: the caller says so rather than
+	reporting zero citations it never looked for.
+	"""
+	pattern = CITE_RE.format(doc=re.escape(name))
+	try:
+		r = subprocess.run(["git", "-C", str(root), "grep", "-I", "-n",
+		                    "-o", "-E", pattern, "--", "."],
+		                   capture_output=True, text=True, timeout=120)
+	except (OSError, subprocess.TimeoutExpired):
+		return None
+	if r.returncode not in (0, 1):
+		return None
+	found: list[tuple[str, int, str]] = []
+	for row in r.stdout.splitlines():
+		parts = row.split(":", 2)
+		if len(parts) != 3 or not parts[1].isdigit():
+			continue
+		path, number, hit = parts
+		# The path before the name must be the document itself: from the
+		# tree root, or from the citing file's own directory.
+		prefix = hit.split("#", 1)[0]
+		cited = prefix[:-len(name)]
+		where = (root / cited / name, root / Path(path).parent / prefix)
+		if prefix != name and not any(p.resolve() == (root / name).resolve()
+		                              for p in where):
+			continue
+		found.append((path, int(number), hit.split("#", 1)[1]))
+	return found
+
+
+def citation_problems(root: Path, name: str, text: str,
+                      sections: list[Section],
+                      counts: dict[str, int]) -> list[Problem]:
+	"""A citation naming an anchor the document no longer has.
+
+	The second raidcfgd failure: a heading renamed, and `daemon/write.h`
+	still citing it by name. Nothing could catch that while citations
+	were prose; a fragment can be resolved.
+	"""
+	known = {s.anchor for s in sections if s.anchor}
+	known |= {s.slug for s in sections}
+	problems: list[Problem] = []
+	rel = Path(name)
+	# Links inside the document to its own sections.
+	for number, line in outside_fences(text):
+		for anchor in re.findall(r"\]\(#([A-Za-z0-9_-]+)\)", line):
+			if anchor not in known:
+				problems.append(Problem(rel, number, 1,
+					f"links to #{anchor}, which no heading here carries"))
+	cites = doc_citations(root, name)
+	if cites is None:
+		return problems
+	counts["citations"] = len(cites)
+	for path, number, anchor in cites:
+		if anchor not in known:
+			problems.append(Problem(Path(path), number, 1,
+				f"cites {name}#{anchor}, which no heading there carries"))
+	return problems
+
+
+def index_lines(sections: list[Section], which: str) -> list[str]:
+	"""The decision-bearing sections, one line each, for `index`.
+
+	Generated on demand rather than committed: a committed index is a
+	second file every session appending a decision must regenerate, two
+	sessions doing it at once conflict on it, and the only thing a gate
+	could check is that it equals what this function prints -- which is
+	this function, run again.
+	"""
+	rows = []
+	for s in sections:
+		if not s.decides:
+			continue
+		if which in ("open", "settled", "superseded"):
+			if s.status != which:
+				continue
+		elif which and which != s.decides:
+			continue
+		anchor = f"#{s.anchor or s.slug}"
+		rows.append(f"{s.line}\t{s.status or '?'}\t{s.date or '-'}\t"
+		            f"{s.decides}\t{anchor}\t{s.title}"
+		            + (f"\n\t{s.lead}" if s.lead else ""))
+	return rows
 
 
 def summaryless_docs(root: Path, files: list[Path],
@@ -2259,9 +2530,52 @@ def summaryless_docs(root: Path, files: list[Path],
 
 # ----------------------------------------------------------------- main
 
+def lookup(mode: str, root: Path, cfg: Config, words: list[str]) -> int:
+	"""`index [open|settled|superseded|KEY]` and `cites ID`: the named
+	lookups, so that a session asks the document a question with a tool
+	whose detector has been seen to work rather than with a grep it wrote
+	a moment ago. Exit 1 when nothing matched, so a script can tell an
+	empty answer from a failed one -- and the empty answer says how many
+	sections were looked at.
+	"""
+	name = cfg["doc_file"]
+	doc = root / name
+	if not doc.is_file():
+		print(f"style-gate: no {name} here to ask", file=sys.stderr)
+		return 2
+	sections = doc_sections(doc.read_text(encoding="utf-8",
+	                                      errors="replace"))
+	decisions = sum(1 for s in sections if s.decides)
+	if mode == "index":
+		rows = index_lines(sections, words[0] if words else "")
+		for row in rows:
+			print(row)
+		print(f"\n{len(rows)} of {decisions} decision-bearing section(s) "
+		      f"in {name} ({len(sections)} heading(s))", file=sys.stderr)
+		return 0 if rows else 1
+	if len(words) != 1:
+		print("usage: style_gate.py cites ID", file=sys.stderr)
+		return 2
+	anchor = words[0].lstrip("#")
+	cites = doc_citations(root, name)
+	if cites is None:
+		print("style-gate: no git here to ask for citations",
+		      file=sys.stderr)
+		return 2
+	hits = [c for c in cites if c[2] == anchor]
+	for path, number, _ in hits:
+		print(f"{path}:{number}")
+	target = [s for s in sections if anchor in (s.anchor, s.slug)]
+	where = (f"line {target[0].line}" if target
+	         else "which no heading carries")
+	print(f"\n{len(hits)} of {len(cites)} citation(s) of {name} name "
+	      f"#{anchor}, {where}", file=sys.stderr)
+	return 0 if hits else 1
+
+
 def resolve(argv: list[str]) -> tuple[str, Path, list[Path]]:
 	mode = argv[0] if argv else "check"
-	if mode not in ("check", "fix", "list", "docs"):
+	if mode not in ("check", "fix", "list", "docs", "index", "cites"):
 		print(__doc__, file=sys.stderr)
 		raise SystemExit(2)
 	rest = argv[1:]
@@ -2276,7 +2590,10 @@ def resolve(argv: list[str]) -> tuple[str, Path, list[Path]]:
 		if rest[i] in ("-h", "--help"):
 			print(__doc__)
 			raise SystemExit(0)
-		paths.append(Path(rest[i]).resolve())
+		# `index` and `cites` take a word rather than paths; it is carried
+		# as a Path and read back with `.name` by main().
+		paths.append(Path(rest[i]) if mode in ("index", "cites")
+		             else Path(rest[i]).resolve())
 		i += 1
 	return mode, root, paths
 
@@ -2284,6 +2601,8 @@ def resolve(argv: list[str]) -> tuple[str, Path, list[Path]]:
 def main(argv: list[str]) -> int:
 	mode, root, explicit = resolve(argv)
 	cfg = load_config(root)
+	if mode in ("index", "cites"):
+		return lookup(mode, root, cfg, [str(p) for p in explicit])
 	if explicit:
 		files, raw = explicit, 0
 	else:
@@ -2334,6 +2653,10 @@ def main(argv: list[str]) -> int:
 		scanned = (f" ({counts.get('headings', 0)} heading(s)"
 		           + (f", {counts['paths']} path(s){by}" if "paths" in counts
 		              else ", paths not checked")
+		           + f", {counts.get('decisions', 0)} decision(s)"
+		           + (f", {counts['citations']} citation(s)"
+		              if "citations" in counts
+		              else ", citations not checked, no git here")
 		           + doc_size(counts) + ")")
 		for name, c in extra:
 			scanned += (f", {name} ({c.get('headings', 0)} heading(s)"
